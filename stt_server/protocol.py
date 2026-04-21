@@ -32,7 +32,11 @@ MAX_UNCOMMITTED_SECONDS = 60
 MAX_UNCOMMITTED_BYTES = (
     MAX_UNCOMMITTED_SECONDS * AUDIO_SAMPLE_RATE_HZ * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH_BYTES
 )
-SEND_QUEUE_HIGH_WATER = 256
+# Per-session outbound-write high-water mark (bytes). When the socket's
+# pending write buffer exceeds this, the server closes the session with
+# ``send_queue_overflow`` rather than blocking the decode loop on a slow
+# consumer. 1 MiB is well above a typical burst of small JSON events.
+SEND_QUEUE_HIGH_WATER_BYTES = 1 * 1024 * 1024
 SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10.0
 
 

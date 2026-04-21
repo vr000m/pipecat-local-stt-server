@@ -13,14 +13,17 @@ Lifecycle summary:
 - ``session.close`` drains any in-flight decode, sends ``session.closed``,
   then closes the socket. ``session.cancel`` discards uncommitted audio,
   cancels the in-flight decode, sends ``session.closed`` and closes.
-- ``serve()`` installs SIGINT/SIGTERM handlers for a bounded graceful drain.
+- ``serve()`` installs SIGINT/SIGTERM handlers for a bounded graceful drain
+  that covers both connection handlers and their decode tasks.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import os
 import signal
 import time
 import uuid
@@ -29,8 +32,8 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 from websockets.asyncio.server import (
-    ServerConnection,
     Server,
+    ServerConnection,
     serve as ws_serve,
     unix_serve as ws_unix_serve,
 )
@@ -64,8 +67,16 @@ class ServerConfig:
     reject_browser_origins: bool = True
     max_append_bytes: int = P.MAX_APPEND_BYTES
     max_uncommitted_bytes: int = P.MAX_UNCOMMITTED_BYTES
-    send_queue_high_water: int = P.SEND_QUEUE_HIGH_WATER
+    # Bounded write-buffer per session: if the socket's pending-send buffer
+    # exceeds this many bytes, the server closes the session with
+    # ``send_queue_overflow`` rather than blocking the decode loop on a slow
+    # consumer.
+    send_queue_high_water_bytes: int = P.SEND_QUEUE_HIGH_WATER_BYTES
     drain_timeout_seconds: float = P.SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+    # chmod applied to UDS after bind. 0o600 restricts connect to the owning
+    # user; set to None to inherit the process umask (not recommended on
+    # shared hosts — the UDS is the V1 trust boundary).
+    unix_socket_mode: int | None = 0o600
 
     def __post_init__(self) -> None:
         if self.socket_path is None and (self.host is None or self.port is None):
@@ -79,6 +90,8 @@ class _SessionState:
     session_id: str
     config: dict = field(default_factory=lambda: {"turn_detection": None})
     buffer: bytearray = field(default_factory=bytearray)
+    # ``asyncio.Task`` here reflects the V1 in-process topology. A future
+    # worker-process backend would replace this with a cross-process handle.
     in_flight_task: asyncio.Task | None = None
     current_stream: BackendStream | None = None
     closed: bool = False
@@ -92,7 +105,8 @@ class TranscriptionServer:
         self._backend = backend
         self._config = config
         self._server: Server | None = None
-        self._active: set[asyncio.Task] = set()
+        self._active_handlers: set[asyncio.Task] = set()
+        self._active_decodes: set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
         self._started = False
 
@@ -102,12 +116,23 @@ class TranscriptionServer:
             return
         await self._backend.start()
         if self._config.socket_path:
-            self._server = await ws_unix_serve(
-                self._handle_connection,
-                path=self._config.socket_path,
-                max_size=self._config.max_append_bytes,
-                process_request=self._process_request,
-            )
+            # Restrict the socket file to owner-only before bind so the UDS
+            # trust boundary actually holds on multi-user hosts.
+            prior_umask = os.umask(0o077)
+            try:
+                self._server = await ws_unix_serve(
+                    self._handle_connection,
+                    path=self._config.socket_path,
+                    max_size=self._config.max_append_bytes,
+                    process_request=self._process_request,
+                )
+            finally:
+                os.umask(prior_umask)
+            if self._config.unix_socket_mode is not None:
+                try:
+                    os.chmod(self._config.socket_path, self._config.unix_socket_mode)
+                except OSError as exc:
+                    logger.warning("stt_server: chmod on UDS failed: %s", exc)
         else:
             self._server = await ws_serve(
                 self._handle_connection,
@@ -142,26 +167,38 @@ class TranscriptionServer:
             await self._server.wait_closed()
 
     async def shutdown(self) -> None:
-        """Stop accepting new connections and drain active sessions."""
+        """Stop accepting new connections and drain active sessions.
+
+        Drains both connection handlers and their spawned decode tasks under
+        a single bounded timeout. Force-cancels anything still running so the
+        process never wedges on MLX/Metal teardown.
+        """
         if not self._started:
             return
         self._shutdown_event.set()
         if self._server is not None:
-            self._server.close()
-        active = list(self._active)
-        if active:
+            # ``close_connections=True`` sends a close frame to every open
+            # socket so handler recv loops exit instead of blocking forever
+            # on an idle client.
+            self._server.close(close_connections=True)
+        pending = list(self._active_handlers | self._active_decodes)
+        if pending:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*active, return_exceptions=True),
+                    asyncio.gather(*pending, return_exceptions=True),
                     timeout=self._config.drain_timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "stt_server: drain timeout expired with %d sessions in flight",
-                    len(active),
+                    "stt_server: drain timeout expired with %d tasks in flight",
+                    sum(1 for t in pending if not t.done()),
                 )
-                for t in active:
-                    t.cancel()
+                for t in pending:
+                    if not t.done():
+                        t.cancel()
+                # Give the cancellations a short window to unwind before
+                # backend.close() touches shared MLX/Metal state.
+                await asyncio.gather(*pending, return_exceptions=True)
         if self._server is not None:
             await self._server.wait_closed()
         await self._backend.close()
@@ -176,20 +213,23 @@ class TranscriptionServer:
         if self._config.reject_browser_origins and origin:
             return connection.respond(403, "origin not permitted\n")
         if self._config.auth_token:
-            provided = headers.get("Authorization", "")
+            provided = headers.get("Authorization", "") or ""
             expected = f"Bearer {self._config.auth_token}"
-            if provided != expected:
+            # Constant-time compare so a loopback attacker cannot recover the
+            # token byte-by-byte via response-timing signals.
+            if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
                 return connection.respond(401, "unauthorized\n")
         return None
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
         task = asyncio.current_task()
         assert task is not None
-        self._active.add(task)
+        self._active_handlers.add(task)
         state = _SessionState(session_id=_session_id())
         try:
             await self._send(
                 ws,
+                state,
                 {
                     "type": P.EVT_SERVER_HELLO,
                     "event_id": _event_id(),
@@ -208,6 +248,7 @@ class TranscriptionServer:
             )
             await self._send(
                 ws,
+                state,
                 {
                     "type": P.EVT_SESSION_CREATED,
                     "event_id": _event_id(),
@@ -224,26 +265,26 @@ class TranscriptionServer:
                         await self._handle_text(ws, state, raw)
                 except Exception as exc:
                     logger.exception("stt_server: error handling message")
-                    await self._error(ws, P.ErrorCode.INTERNAL_ERROR, str(exc))
+                    await self._error(ws, state, P.ErrorCode.INTERNAL_ERROR, str(exc))
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            await self._teardown_session(ws, state, reason="connection_ended")
-            self._active.discard(task)
+            await self._teardown_session(ws, state)
+            self._active_handlers.discard(task)
 
     # --- message handlers ---
     async def _handle_text(self, ws: ServerConnection, state: _SessionState, raw: str) -> None:
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError as exc:
-            await self._error(ws, P.ErrorCode.INVALID_JSON, str(exc))
+            await self._error(ws, state, P.ErrorCode.INVALID_JSON, str(exc))
             return
         if not isinstance(msg, dict) or "type" not in msg:
-            await self._error(ws, P.ErrorCode.INVALID_EVENT, "missing type")
+            await self._error(ws, state, P.ErrorCode.INVALID_EVENT, "missing type")
             return
         t = msg["type"]
         if t not in P.CLIENT_EVENT_TYPES:
-            await self._error(ws, P.ErrorCode.UNSUPPORTED_EVENT, f"unknown event: {t}")
+            await self._error(ws, state, P.ErrorCode.UNSUPPORTED_EVENT, f"unknown event: {t}")
             return
 
         if t == P.EVT_SESSION_UPDATE:
@@ -262,14 +303,26 @@ class TranscriptionServer:
     async def _handle_binary_audio(
         self, ws: ServerConnection, state: _SessionState, data: bytes
     ) -> None:
+        # Reject appends while a decode is in flight rather than silently
+        # merging new audio into the next turn's buffer, which would lose the
+        # commit boundary the client just signalled.
+        if state.in_flight_task is not None and not state.in_flight_task.done():
+            await self._error(
+                ws,
+                state,
+                P.ErrorCode.INVALID_EVENT,
+                "audio append while previous decode in flight",
+            )
+            return
         if len(data) > self._config.max_append_bytes:
             await self._error(
-                ws, P.ErrorCode.PAYLOAD_TOO_LARGE, "binary audio exceeds max_append_bytes"
+                ws, state, P.ErrorCode.PAYLOAD_TOO_LARGE, "binary audio exceeds max_append_bytes"
             )
             return
         if len(state.buffer) + len(data) > self._config.max_uncommitted_bytes:
             await self._error(
                 ws,
+                state,
                 P.ErrorCode.BUFFER_OVERFLOW,
                 "uncommitted audio exceeds per-session cap",
             )
@@ -285,24 +338,25 @@ class TranscriptionServer:
         if fmt:
             if fmt.get("encoding", P.AUDIO_FORMAT) != P.AUDIO_FORMAT:
                 await self._error(
-                    ws, P.ErrorCode.INVALID_CONFIG, "only pcm16 encoding is supported"
+                    ws, state, P.ErrorCode.INVALID_CONFIG, "only pcm16 encoding is supported"
                 )
                 return
             if fmt.get("sample_rate_hz", P.AUDIO_SAMPLE_RATE_HZ) != P.AUDIO_SAMPLE_RATE_HZ:
                 await self._error(
-                    ws, P.ErrorCode.INVALID_CONFIG, "only 16000 Hz sample rate is supported"
+                    ws, state, P.ErrorCode.INVALID_CONFIG, "only 16000 Hz sample rate is supported"
                 )
                 return
             if fmt.get("channels", P.AUDIO_CHANNELS) != P.AUDIO_CHANNELS:
-                await self._error(ws, P.ErrorCode.INVALID_CONFIG, "only mono audio is supported")
+                await self._error(
+                    ws, state, P.ErrorCode.INVALID_CONFIG, "only mono audio is supported"
+                )
                 return
         if "turn_detection" in audio_in:
             td = audio_in["turn_detection"]
-            # V1 supports null only; any other value is rejected rather than
-            # silently downgraded. Server VAD is not implemented in V1.
             if td is not None:
                 await self._error(
                     ws,
+                    state,
                     P.ErrorCode.INVALID_CONFIG,
                     "server VAD is not implemented; use turn_detection: null",
                 )
@@ -313,6 +367,7 @@ class TranscriptionServer:
 
         await self._send(
             ws,
+            state,
             {
                 "type": P.EVT_SESSION_UPDATED,
                 "event_id": _event_id(),
@@ -343,25 +398,25 @@ class TranscriptionServer:
         audio_b64 = msg.get("audio")
         if not isinstance(audio_b64, str):
             await self._error(
-                ws, P.ErrorCode.INVALID_EVENT, "input_audio_buffer.append missing audio"
+                ws, state, P.ErrorCode.INVALID_EVENT, "input_audio_buffer.append missing audio"
             )
             return
         try:
             data = base64.b64decode(audio_b64, validate=True)
         except Exception as exc:
-            await self._error(ws, P.ErrorCode.INVALID_EVENT, f"audio base64 decode failed: {exc}")
+            await self._error(
+                ws, state, P.ErrorCode.INVALID_EVENT, f"audio base64 decode failed: {exc}"
+            )
             return
         await self._handle_binary_audio(ws, state, data)
 
     async def _on_commit(self, ws: ServerConnection, state: _SessionState) -> None:
         if len(state.buffer) == 0:
-            await self._error(ws, P.ErrorCode.BUFFER_EMPTY, "commit on empty buffer")
+            await self._error(ws, state, P.ErrorCode.BUFFER_EMPTY, "commit on empty buffer")
             return
         if state.in_flight_task is not None and not state.in_flight_task.done():
-            # V1 serializes decodes per session. Reject overlapping commits
-            # rather than silently interleaving.
             await self._error(
-                ws, P.ErrorCode.INVALID_EVENT, "commit while previous decode in flight"
+                ws, state, P.ErrorCode.INVALID_EVENT, "commit while previous decode in flight"
             )
             return
 
@@ -370,13 +425,17 @@ class TranscriptionServer:
         item = _item_id()
         await self._send(
             ws,
+            state,
             {
                 "type": P.EVT_AUDIO_COMMITTED,
                 "event_id": _event_id(),
                 "item_id": item,
             },
         )
-        state.in_flight_task = asyncio.create_task(self._run_decode(ws, state, audio, item))
+        decode_task = asyncio.create_task(self._run_decode(ws, state, audio, item))
+        state.in_flight_task = decode_task
+        self._active_decodes.add(decode_task)
+        decode_task.add_done_callback(self._active_decodes.discard)
 
     async def _run_decode(
         self,
@@ -396,6 +455,7 @@ class TranscriptionServer:
                 if ev.kind == "delta":
                     await self._send(
                         ws,
+                        state,
                         {
                             "type": P.EVT_TRANSCRIPT_DELTA,
                             "event_id": _event_id(),
@@ -408,6 +468,7 @@ class TranscriptionServer:
                     final_text = ev.text
             await self._send(
                 ws,
+                state,
                 {
                     "type": P.EVT_TRANSCRIPT_COMPLETED,
                     "event_id": _event_id(),
@@ -425,13 +486,14 @@ class TranscriptionServer:
             raise
         except Exception as exc:
             logger.exception("stt_server: backend decode failed")
-            await self._error(ws, P.ErrorCode.BACKEND_ERROR, str(exc), item_id=item_id)
+            await self._error(ws, state, P.ErrorCode.BACKEND_ERROR, str(exc), item_id=item_id)
         finally:
             state.current_stream = None
 
     async def _on_status(self, ws: ServerConnection, state: _SessionState) -> None:
         await self._send(
             ws,
+            state,
             {
                 "type": P.EVT_SERVER_STATUS,
                 "event_id": _event_id(),
@@ -443,26 +505,39 @@ class TranscriptionServer:
         )
 
     async def _on_close(self, ws: ServerConnection, state: _SessionState) -> None:
+        if state.closed:
+            return
         if state.in_flight_task and not state.in_flight_task.done():
             try:
                 await asyncio.wait_for(
-                    state.in_flight_task, timeout=self._config.drain_timeout_seconds
+                    asyncio.shield(state.in_flight_task),
+                    timeout=self._config.drain_timeout_seconds,
                 )
             except asyncio.TimeoutError:
+                # Force-cancel and wait for unwind so the decode can't outlive
+                # the session (and the surrounding shutdown, if this is it).
                 state.in_flight_task.cancel()
+                try:
+                    await state.in_flight_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         state.closed = True
         await self._send(
             ws,
+            state,
             {
                 "type": P.EVT_SESSION_CLOSED,
                 "event_id": _event_id(),
                 "session_id": state.session_id,
                 "reason": "client_close",
             },
+            force=True,
         )
         await ws.close()
 
     async def _on_cancel(self, ws: ServerConnection, state: _SessionState) -> None:
+        if state.closed:
+            return
         state.buffer.clear()
         if state.current_stream is not None:
             try:
@@ -478,20 +553,18 @@ class TranscriptionServer:
         state.closed = True
         await self._send(
             ws,
+            state,
             {
                 "type": P.EVT_SESSION_CLOSED,
                 "event_id": _event_id(),
                 "session_id": state.session_id,
                 "reason": "client_cancel",
             },
+            force=True,
         )
         await ws.close()
 
-    async def _teardown_session(
-        self, ws: ServerConnection, state: _SessionState, *, reason: str
-    ) -> None:
-        if state.closed:
-            return
+    async def _teardown_session(self, ws: ServerConnection, state: _SessionState) -> None:
         if state.in_flight_task and not state.in_flight_task.done():
             state.in_flight_task.cancel()
             try:
@@ -501,7 +574,33 @@ class TranscriptionServer:
         state.closed = True
 
     # --- send helpers ---
-    async def _send(self, ws: ServerConnection, payload: dict) -> None:
+    async def _send(
+        self,
+        ws: ServerConnection,
+        state: _SessionState,
+        payload: dict,
+        *,
+        force: bool = False,
+    ) -> None:
+        # Backpressure: if the socket's pending write buffer is larger than
+        # the per-session high-water mark, the consumer isn't keeping up. We
+        # surface an explicit error and close the socket rather than block
+        # the decode loop indefinitely. ``force=True`` bypasses the check for
+        # terminal events (session.closed, error) so teardown can still flush.
+        if not force and not state.closed:
+            pending = _pending_write_bytes(ws)
+            if pending is not None and pending > self._config.send_queue_high_water_bytes:
+                logger.warning(
+                    "stt_server: send-queue overflow (%d bytes pending), closing session %s",
+                    pending,
+                    state.session_id,
+                )
+                state.closed = True
+                try:
+                    await ws.close(code=1011, reason="send_queue_overflow")
+                except Exception:
+                    pass
+                return
         try:
             await ws.send(json.dumps(payload))
         except websockets.exceptions.ConnectionClosed:
@@ -510,6 +609,7 @@ class TranscriptionServer:
     async def _error(
         self,
         ws: ServerConnection,
+        state: _SessionState,
         code: P.ErrorCode,
         message: str,
         *,
@@ -522,7 +622,26 @@ class TranscriptionServer:
         }
         if item_id:
             payload["item_id"] = item_id
-        await self._send(ws, payload)
+        await self._send(ws, state, payload, force=True)
+
+
+def _pending_write_bytes(ws: ServerConnection) -> int | None:
+    """Best-effort read of the socket's pending outbound byte count.
+
+    websockets 15.x exposes the underlying asyncio transport; we look up the
+    write-buffer size through it. Returns None if we cannot determine it,
+    which disables the backpressure guard for that send.
+    """
+    try:
+        transport = ws.transport  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if transport is None:
+        return None
+    try:
+        return transport.get_write_buffer_size()
+    except Exception:
+        return None
 
 
 async def serve(

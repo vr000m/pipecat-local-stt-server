@@ -14,7 +14,7 @@ from .protocol import (
     AUDIO_FORMAT,
     MAX_APPEND_BYTES,
     MAX_UNCOMMITTED_SECONDS,
-    SEND_QUEUE_HIGH_WATER,
+    SEND_QUEUE_HIGH_WATER_BYTES,
     ErrorCode,
 )
 from .backend import TranscriptionBackend, BackendStream, TranscriptEvent, EchoBackend
@@ -28,7 +28,7 @@ __all__ = [
     "AUDIO_FORMAT",
     "MAX_APPEND_BYTES",
     "MAX_UNCOMMITTED_SECONDS",
-    "SEND_QUEUE_HIGH_WATER",
+    "SEND_QUEUE_HIGH_WATER_BYTES",
     "ErrorCode",
     "TranscriptionBackend",
     "BackendStream",
