@@ -14,7 +14,6 @@ from typing import AsyncIterator
 import numpy as np
 
 from ..backend import BackendStream, TranscriptEvent
-from ..protocol import AUDIO_SAMPLE_RATE_HZ
 
 logger = logging.getLogger("stt_server.backends.mlx")
 
@@ -50,13 +49,16 @@ class _MLXStream:
         audio = np.frombuffer(bytes(self._buf), dtype=np.int16).astype(np.float32) / 32768.0
         if audio.size == 0:
             return ""
+        # mlx_whisper.transcribe resamples internally using its own constant;
+        # audio must already be at AUDIO_SAMPLE_RATE_HZ (16 kHz), which the
+        # protocol enforces on the wire. Do not pass sample_rate — it's not a
+        # valid DecodingOptions kwarg.
         result = mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=self._model,
             language=self._language,
             fp16=True,
             verbose=False,
-            sample_rate=AUDIO_SAMPLE_RATE_HZ,
         )
         return (result.get("text") or "").strip()
 
