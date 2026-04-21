@@ -39,9 +39,16 @@ uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --b
 uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
 
-For persistent always-on operation on macOS, `scripts/install_stt_agent.sh`
-installs a LaunchAgent that keeps the server alive across login and auto-
-restarts on crash. See the Koda integration section below.
+The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,
+which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
+/ `python -m stt_server status <flags>` — see "Checking server health"
+below for the `status` subcommand.
+
+For persistent always-on operation on macOS, the Koda wrapper exposes
+`./koda stt install|start|stop|restart|status|logs` as the primary
+control surface. It delegates to `scripts/install_stt_agent.sh` (the
+underlying LaunchAgent implementation) and layers a wire-level health
+probe on top. See the Koda integration section below.
 
 ## Checking server health
 
@@ -174,8 +181,10 @@ a single shared server. `BranchVADUserStartedSpeakingFrame` /
 `BranchVADUserStoppedSpeakingFrame` stay inside Koda; the server
 intentionally has no notion of branches or speakers.
 
-For persistent operation, `scripts/install_stt_agent.sh install` renders
-a LaunchAgent (`koda.stt-server`) via `scripts/render_stt_plist.py`
-(stdlib `plistlib` + allowlist validation — do not reintroduce `sed`
-templating). Overrides: `KODA_STT_SOCKET`, `KODA_STT_BACKEND`,
-`KODA_STT_MODEL`, `KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`.
+For persistent operation, `./koda stt install` (which shells into
+`scripts/install_stt_agent.sh`) renders a LaunchAgent (`koda.stt-server`)
+via `scripts/render_stt_plist.py` (stdlib `plistlib` + allowlist
+validation — do not reintroduce `sed` templating). Overrides:
+`KODA_STT_SOCKET`, `KODA_STT_BACKEND`, `KODA_STT_MODEL`,
+`KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`. Use `./koda stt status` for
+a wire-level health check.
