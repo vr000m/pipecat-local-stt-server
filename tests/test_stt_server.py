@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import websockets
 
 from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
@@ -441,10 +442,11 @@ async def test_bearer_auth_requires_token():
     await srv.start()
     try:
         port = srv.listening_port()
-        # Wrong token rejected
+        # Wrong token rejected with 401 (not any exception).
         bad = TranscriptionClient(host="127.0.0.1", port=port, auth_token="wrong")
-        with pytest.raises(Exception):
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
             await bad.connect()
+        assert exc.value.response.status_code == 401
         # Correct token accepted
         good = TranscriptionClient(host="127.0.0.1", port=port, auth_token="s3cret")
         hello = await good.connect()
@@ -519,5 +521,67 @@ async def test_client_uri_overrides_socket_path():
         hello = await client.connect()
         assert hello["type"] == P.EVT_SERVER_HELLO
         await client.close()
+    finally:
+        await srv.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Auth contract — pins doc claims in README / AGENTS.md / architecture.md:
+#   "STT_WS_TOKEN is enforced only when the server was started with a token;
+#    TCP without a token logs a warning at startup."
+# Prevents silent drift between the documented trust model and behavior.
+# ---------------------------------------------------------------------------
+
+
+async def test_tcp_without_token_emits_startup_warning(caplog):
+    caplog.set_level("WARNING", logger="stt_server.server")
+    srv = TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(host="127.0.0.1", port=0, reject_browser_origins=False),
+    )
+    await srv.start()
+    try:
+        assert any(
+            "TCP listener is running without --auth-token" in rec.message for rec in caplog.records
+        ), "TCP server without token must warn at startup"
+    finally:
+        await srv.shutdown()
+
+
+async def test_uds_without_token_does_not_warn(caplog):
+    caplog.set_level("WARNING", logger="stt_server.server")
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = str(Path(tmp) / "stt.sock")
+        srv = TranscriptionServer(
+            EchoBackend(),
+            ServerConfig(socket_path=sock, reject_browser_origins=False),
+        )
+        await srv.start()
+        try:
+            assert not any(
+                "TCP listener is running without --auth-token" in rec.message
+                for rec in caplog.records
+            ), "UDS mode is protected by file perms; must not warn about missing token"
+        finally:
+            await srv.shutdown()
+
+
+async def test_tcp_rejects_missing_bearer_when_token_required():
+    srv = TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(
+            host="127.0.0.1",
+            port=0,
+            auth_token="s3cret",
+            reject_browser_origins=False,
+        ),
+    )
+    await srv.start()
+    try:
+        port = srv.listening_port()
+        client = TranscriptionClient(host="127.0.0.1", port=port)  # no token
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+            await client.connect()
+        assert exc.value.response.status_code == 401
     finally:
         await srv.shutdown()
