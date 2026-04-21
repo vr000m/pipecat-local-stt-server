@@ -32,6 +32,7 @@ def test_format_host_for_uri_brackets_ipv6():
 def test_format_host_for_uri_passes_hostnames_through():
     assert _format_host_for_uri("127.0.0.1") == "127.0.0.1"
     assert _format_host_for_uri("localhost") == "localhost"
+    assert _format_host_for_uri("example.local") == "example.local"
 
 
 def test_is_cleartext_remote_flags_non_loopback_ws():
@@ -72,7 +73,6 @@ def test_resolve_endpoint_from_env_empty_returns_nones():
         "host": None,
         "port": None,
     }
-    assert _format_host_for_uri("example.local") == "example.local"
 
 
 def test_client_expanduser_on_socket_path():
