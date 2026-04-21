@@ -90,8 +90,17 @@ def main() -> None:
 
     out = Path(plist_dst)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("wb") as f:
-        plistlib.dump(plist, f)
+    # Write under a restrictive umask so the plist containing
+    # KODA_STT_AUTH_TOKEN is 0o600 from the start (no race where another
+    # local user could read it between create and chmod).
+    prev_umask = os.umask(0o077)
+    try:
+        with out.open("wb") as f:
+            plistlib.dump(plist, f)
+    finally:
+        os.umask(prev_umask)
+    # Belt-and-braces: enforce 0o600 even if the file already existed.
+    os.chmod(out, 0o600)
     print(f"wrote {out}")
 
 

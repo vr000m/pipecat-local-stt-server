@@ -263,15 +263,20 @@ class TranscriptionServer:
                     },
                 },
             )
-            await self._send(
-                ws,
-                state,
-                {
-                    "type": P.EVT_SESSION_CREATED,
-                    "event_id": _event_id(),
-                    "session": {"id": state.session_id, "type": "transcription"},
-                },
-            )
+            session_snapshot = _session_snapshot(state)
+            # Emit both the legacy name (existing clients) and the OpenAI
+            # transcription-mode name so strict OpenAI clients see the event
+            # they expect. Same ``session`` payload under both.
+            for evt_type in (P.EVT_SESSION_CREATED, P.EVT_TRANSCRIPTION_SESSION_CREATED):
+                await self._send(
+                    ws,
+                    state,
+                    {
+                        "type": evt_type,
+                        "event_id": _event_id(),
+                        "session": session_snapshot,
+                    },
+                )
             async for raw in ws:
                 if state.closed:
                     break
@@ -280,9 +285,11 @@ class TranscriptionServer:
                         await self._handle_binary_audio(ws, state, bytes(raw))
                     else:
                         await self._handle_text(ws, state, raw)
-                except Exception as exc:
+                except Exception:
+                    # Don't echo raw exception text (paths, tokens in
+                    # nested RuntimeError(...) args, etc.) to the peer.
                     logger.exception("stt_server: error handling message")
-                    await self._error(ws, state, P.ErrorCode.INTERNAL_ERROR, str(exc))
+                    await self._error(ws, state, P.ErrorCode.INTERNAL_ERROR, "internal error")
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
@@ -311,12 +318,14 @@ class TranscriptionServer:
             )
             return
 
-        if t == P.EVT_SESSION_UPDATE:
-            await self._on_session_update(ws, state, msg)
+        if t in (P.EVT_SESSION_UPDATE, P.EVT_TRANSCRIPTION_SESSION_UPDATE):
+            await self._on_session_update(ws, state, msg, client_event_id)
         elif t == P.EVT_AUDIO_APPEND:
             await self._on_audio_append_json(ws, state, msg)
         elif t == P.EVT_AUDIO_COMMIT:
-            await self._on_commit(ws, state)
+            await self._on_commit(ws, state, client_event_id)
+        elif t == P.EVT_AUDIO_CLEAR:
+            await self._on_clear(ws, state, client_event_id)
         elif t == P.EVT_SERVER_STATUS_REQ:
             await self._on_status(ws, state)
         elif t == P.EVT_SESSION_CLOSE:
@@ -343,6 +352,17 @@ class TranscriptionServer:
                 ws, state, P.ErrorCode.PAYLOAD_TOO_LARGE, "binary audio exceeds max_append_bytes"
             )
             return
+        if len(data) % P.AUDIO_SAMPLE_WIDTH_BYTES != 0:
+            # PCM16 samples are 2 bytes; an odd-length append would misalign
+            # every subsequent sample (silent wrong-result transcript, not a
+            # crash). Reject at the boundary so the client notices.
+            await self._error(
+                ws,
+                state,
+                P.ErrorCode.INVALID_EVENT,
+                f"audio length {len(data)} is not a multiple of {P.AUDIO_SAMPLE_WIDTH_BYTES}",
+            )
+            return
         if len(state.buffer) + len(data) > self._config.max_uncommitted_bytes:
             await self._error(
                 ws,
@@ -354,64 +374,95 @@ class TranscriptionServer:
         state.buffer.extend(data)
 
     async def _on_session_update(
-        self, ws: ServerConnection, state: _SessionState, msg: dict
+        self,
+        ws: ServerConnection,
+        state: _SessionState,
+        msg: dict,
+        client_event_id: str | None,
     ) -> None:
         session = msg.get("session") or {}
         audio_in = (session.get("audio") or {}).get("input") or {}
-        fmt = audio_in.get("format") or {}
-        if fmt:
-            if fmt.get("encoding", P.AUDIO_FORMAT) != P.AUDIO_FORMAT:
-                await self._error(
-                    ws, state, P.ErrorCode.INVALID_CONFIG, "only pcm16 encoding is supported"
-                )
-                return
-            if fmt.get("rate", P.AUDIO_SAMPLE_RATE_HZ) != P.AUDIO_SAMPLE_RATE_HZ:
-                await self._error(
-                    ws, state, P.ErrorCode.INVALID_CONFIG, "only 16000 Hz sample rate is supported"
-                )
-                return
-            if fmt.get("channels", P.AUDIO_CHANNELS) != P.AUDIO_CHANNELS:
-                await self._error(
-                    ws, state, P.ErrorCode.INVALID_CONFIG, "only mono audio is supported"
-                )
-                return
-        if "turn_detection" in audio_in:
-            td = audio_in["turn_detection"]
-            if td is not None:
+
+        # ``input_audio_format`` — accept OpenAI's enum string at session
+        # root (``"pcm16"``) or the legacy nested dict. Only pcm16/16 kHz/
+        # mono is on the wire regardless.
+        fmt_root = session.get("input_audio_format")
+        if isinstance(fmt_root, str):
+            if fmt_root != P.AUDIO_FORMAT:
                 await self._error(
                     ws,
                     state,
                     P.ErrorCode.INVALID_CONFIG,
-                    "server VAD is not implemented; use turn_detection: null",
+                    f"only {P.AUDIO_FORMAT!r} input_audio_format is supported",
+                    client_event_id=client_event_id,
                 )
                 return
-            state.config["turn_detection"] = None
+        fmt = audio_in.get("format") or {}
+        if fmt:
+            if fmt.get("encoding", P.AUDIO_FORMAT) != P.AUDIO_FORMAT:
+                await self._error(
+                    ws,
+                    state,
+                    P.ErrorCode.INVALID_CONFIG,
+                    "only pcm16 encoding is supported",
+                    client_event_id=client_event_id,
+                )
+                return
+            if fmt.get("rate", P.AUDIO_SAMPLE_RATE_HZ) != P.AUDIO_SAMPLE_RATE_HZ:
+                await self._error(
+                    ws,
+                    state,
+                    P.ErrorCode.INVALID_CONFIG,
+                    "only 16000 Hz sample rate is supported",
+                    client_event_id=client_event_id,
+                )
+                return
+            if fmt.get("channels", P.AUDIO_CHANNELS) != P.AUDIO_CHANNELS:
+                await self._error(
+                    ws,
+                    state,
+                    P.ErrorCode.INVALID_CONFIG,
+                    "only mono audio is supported",
+                    client_event_id=client_event_id,
+                )
+                return
+
+        # ``turn_detection`` — accept at the OpenAI session root OR nested
+        # under ``session.audio.input``. Either must be null (server VAD
+        # unimplemented).
+        for td_container in (session, audio_in):
+            if "turn_detection" in td_container:
+                td = td_container["turn_detection"]
+                if td is not None:
+                    await self._error(
+                        ws,
+                        state,
+                        P.ErrorCode.INVALID_CONFIG,
+                        "server VAD is not implemented; use turn_detection: null",
+                        client_event_id=client_event_id,
+                    )
+                    return
+                state.config["turn_detection"] = None
+
+        # Language may be supplied either nested (legacy) or at the session
+        # root (pragmatic; OpenAI keeps it under input_audio_transcription).
         if "language" in audio_in:
             state.config["language"] = audio_in["language"]
+        transcription = session.get("input_audio_transcription")
+        if isinstance(transcription, dict) and "language" in transcription:
+            state.config["language"] = transcription["language"]
 
-        await self._send(
-            ws,
-            state,
-            {
-                "type": P.EVT_SESSION_UPDATED,
-                "event_id": _event_id(),
-                "session": {
-                    "id": state.session_id,
-                    "type": "transcription",
-                    "audio": {
-                        "input": {
-                            "format": {
-                                "encoding": P.AUDIO_FORMAT,
-                                "rate": P.AUDIO_SAMPLE_RATE_HZ,
-                                "channels": P.AUDIO_CHANNELS,
-                            },
-                            "turn_detection": state.config.get("turn_detection"),
-                            "language": state.config.get("language"),
-                        }
-                    },
+        session_snapshot = _session_snapshot(state)
+        for evt_type in (P.EVT_SESSION_UPDATED, P.EVT_TRANSCRIPTION_SESSION_UPDATED):
+            await self._send(
+                ws,
+                state,
+                {
+                    "type": evt_type,
+                    "event_id": _event_id(),
+                    "session": session_snapshot,
                 },
-            },
-        )
+            )
 
     async def _on_audio_append_json(
         self, ws: ServerConnection, state: _SessionState, msg: dict
@@ -433,32 +484,75 @@ class TranscriptionServer:
             return
         await self._handle_binary_audio(ws, state, data)
 
-    async def _on_commit(self, ws: ServerConnection, state: _SessionState) -> None:
+    async def _on_commit(
+        self,
+        ws: ServerConnection,
+        state: _SessionState,
+        client_event_id: str | None,
+    ) -> None:
         if len(state.buffer) == 0:
-            await self._error(ws, state, P.ErrorCode.BUFFER_EMPTY, "commit on empty buffer")
+            await self._error(
+                ws,
+                state,
+                P.ErrorCode.BUFFER_EMPTY,
+                "commit on empty buffer",
+                client_event_id=client_event_id,
+            )
             return
         if state.in_flight_task is not None and not state.in_flight_task.done():
             await self._error(
-                ws, state, P.ErrorCode.INVALID_EVENT, "commit while previous decode in flight"
+                ws,
+                state,
+                P.ErrorCode.INVALID_EVENT,
+                "commit while previous decode in flight",
+                client_event_id=client_event_id,
             )
             return
 
         audio = bytes(state.buffer)
         state.buffer.clear()
         item = _item_id()
-        await self._send(
-            ws,
-            state,
-            {
-                "type": P.EVT_AUDIO_COMMITTED,
-                "event_id": _event_id(),
-                "item_id": item,
-            },
-        )
+        payload: dict[str, Any] = {
+            "type": P.EVT_AUDIO_COMMITTED,
+            "event_id": _event_id(),
+            "item_id": item,
+        }
+        if client_event_id:
+            # Echo the client's event_id so request/response correlation works
+            # without making clients track server-minted ids.
+            payload["previous_event_id"] = client_event_id
+        await self._send(ws, state, payload)
         decode_task = asyncio.create_task(self._run_decode(ws, state, audio, item))
         state.in_flight_task = decode_task
         self._active_decodes.add(decode_task)
         decode_task.add_done_callback(self._active_decodes.discard)
+
+    async def _on_clear(
+        self,
+        ws: ServerConnection,
+        state: _SessionState,
+        client_event_id: str | None,
+    ) -> None:
+        # OpenAI ``input_audio_buffer.clear`` — drop uncommitted audio
+        # without touching session lifecycle. Different from
+        # ``session.cancel``, which also closes the session.
+        if state.in_flight_task is not None and not state.in_flight_task.done():
+            await self._error(
+                ws,
+                state,
+                P.ErrorCode.INVALID_EVENT,
+                "clear while decode in flight; use session.cancel to abort",
+                client_event_id=client_event_id,
+            )
+            return
+        state.buffer.clear()
+        payload: dict[str, Any] = {
+            "type": P.EVT_AUDIO_CLEARED,
+            "event_id": _event_id(),
+        }
+        if client_event_id:
+            payload["previous_event_id"] = client_event_id
+        await self._send(ws, state, payload)
 
     async def _run_decode(
         self,
@@ -507,9 +601,27 @@ class TranscriptionServer:
                 except Exception:
                     pass
             raise
-        except Exception as exc:
+        except Exception:
+            # Log full detail server-side; send a generic message to the
+            # client (exception text can leak filesystem paths, model names,
+            # or misconfigured backend secrets).
             logger.exception("stt_server: backend decode failed")
-            await self._error(ws, state, P.ErrorCode.BACKEND_ERROR, str(exc), item_id=item_id)
+            await self._send(
+                ws,
+                state,
+                {
+                    "type": P.EVT_TRANSCRIPT_FAILED,
+                    "event_id": _event_id(),
+                    "item_id": item_id,
+                    "content_index": 0,
+                    "error": {
+                        "type": _ERROR_TYPE_FOR_CODE[P.ErrorCode.BACKEND_ERROR],
+                        "code": P.ErrorCode.BACKEND_ERROR.value,
+                        "message": "backend decode failed",
+                    },
+                },
+                force=True,
+            )
         finally:
             state.current_stream = None
 
@@ -661,6 +773,31 @@ class TranscriptionServer:
         if item_id:
             payload["item_id"] = item_id
         await self._send(ws, state, payload, force=True)
+
+
+def _session_snapshot(state: _SessionState) -> dict[str, Any]:
+    """Build a ``session`` payload that names both legacy nested fields
+    and the OpenAI transcription-mode flat fields, so clients of either
+    shape get the values they expect."""
+    return {
+        "id": state.session_id,
+        "object": "realtime.transcription_session",
+        "type": "transcription",
+        "input_audio_format": P.AUDIO_FORMAT,
+        "turn_detection": state.config.get("turn_detection"),
+        "input_audio_transcription": {"language": state.config.get("language")},
+        "audio": {
+            "input": {
+                "format": {
+                    "encoding": P.AUDIO_FORMAT,
+                    "rate": P.AUDIO_SAMPLE_RATE_HZ,
+                    "channels": P.AUDIO_CHANNELS,
+                },
+                "turn_detection": state.config.get("turn_detection"),
+                "language": state.config.get("language"),
+            }
+        },
+    }
 
 
 def _pending_write_bytes(ws: ServerConnection) -> int | None:

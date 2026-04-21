@@ -12,7 +12,7 @@ decode, ``events()`` may yield a single large ``delta`` followed by
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import AsyncIterator, Protocol, runtime_checkable
+from typing import AsyncGenerator, Protocol, runtime_checkable
 
 
 @dataclass
@@ -29,7 +29,9 @@ class BackendStream(Protocol):
     async def end(self) -> None: ...
     # Async-generator function: implementations must be ``async def`` with
     # ``yield`` so callers can use ``async for ev in stream.events()``.
-    def events(self) -> AsyncIterator[TranscriptEvent]: ...
+    # Declared as AsyncGenerator (not AsyncIterator) so the structural match
+    # rejects implementations that return a plain coroutine.
+    def events(self) -> AsyncGenerator[TranscriptEvent, None]: ...
     async def cancel(self) -> None: ...
 
 
@@ -62,7 +64,7 @@ class _EchoStream:
         self._cancelled = True
         self._done = True
 
-    async def events(self) -> AsyncIterator[TranscriptEvent]:
+    async def events(self) -> AsyncGenerator[TranscriptEvent, None]:
         # Block until end() or cancel() was called; server always awaits these
         # before consuming events, so we can yield synchronously here.
         if self._cancelled:

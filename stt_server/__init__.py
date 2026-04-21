@@ -24,20 +24,22 @@ from .protocol import (
     AUDIO_FORMAT,
     AUDIO_SAMPLE_RATE_HZ,
     MAX_APPEND_BYTES,
-    MAX_UNCOMMITTED_SECONDS,
     PROTOCOL_VERSION,
-    SEND_QUEUE_HIGH_WATER_BYTES,
     ErrorCode,
 )
 
+# Client-facing surface only. Server-policy constants
+# (``SEND_QUEUE_HIGH_WATER_BYTES``, ``MAX_UNCOMMITTED_SECONDS``, drain
+# timeout, etc.) live in ``stt_server.protocol`` and are imported directly
+# by the server runtime — a client-only install has no business reading
+# them and exposing them here would grow the client API surface
+# unnecessarily once the package is extracted.
 __all__ = [
     "PROTOCOL_VERSION",
     "AUDIO_SAMPLE_RATE_HZ",
     "AUDIO_CHANNELS",
     "AUDIO_FORMAT",
     "MAX_APPEND_BYTES",
-    "MAX_UNCOMMITTED_SECONDS",
-    "SEND_QUEUE_HIGH_WATER_BYTES",
     "ErrorCode",
     "TranscriptionBackend",
     "BackendStream",

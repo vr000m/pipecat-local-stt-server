@@ -6,7 +6,8 @@
 #   scripts/install_stt_agent.sh [install|uninstall|restart|status|logs]
 #
 # Environment overrides:
-#   KODA_STT_SOCKET   path to the UDS socket (default: /tmp/koda-stt.sock)
+#   KODA_STT_SOCKET   path to the UDS socket
+#                     (default: $HOME/Library/Caches/koda-stt/stt.sock)
 #   KODA_STT_BACKEND  backend name (default: mlx)
 #   KODA_STT_MODEL    MLX model (default: mlx-community/whisper-large-v3-turbo)
 set -euo pipefail
@@ -34,6 +35,9 @@ cmd="${1:-install}"
 
 render_plist() {
     mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")" "$(dirname "$SOCKET_PATH")"
+    # Lock the socket's parent directory so another local user can't
+    # pre-create a socket at the same path under a permissive umask.
+    chmod 700 "$(dirname "$SOCKET_PATH")"
     # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
     # allowlist validation handle hostile values instead of sed string
     # substitution (which would allow <string> breakout + RCE).

@@ -12,6 +12,25 @@ public OpenAI Realtime transcription shape (snapshot: 2026-04-20):
   with ``turn_detection: null`` they are never emitted
 - custom events: ``server.hello``, ``server.status``, ``session.close``,
   ``session.cancel``, ``session.closed``
+
+OpenAI compatibility notes:
+
+- ``transcription_session.update`` is accepted as an alias for the
+  V1 ``session.update`` event; likewise the server emits
+  ``transcription_session.created`` / ``.updated`` alongside ``session.*``
+  so a vanilla OpenAI transcription-mode client can talk to this server.
+- ``input_audio_format`` is accepted either as an OpenAI-style string
+  (``"pcm16"``) at the session root or as the legacy nested
+  ``session.audio.input.format = {encoding, rate, channels}`` object.
+  Only 16 kHz / mono / pcm16 is supported on the wire either way.
+- ``turn_detection`` is accepted at the session root (OpenAI) or nested
+  under ``session.audio.input.turn_detection`` (legacy). Must be null.
+- ``input_audio_buffer.clear`` drops uncommitted audio without closing
+  the session (paired with an ``input_audio_buffer.cleared`` ack);
+  ``session.cancel`` remains the coarser extension that also closes.
+- Backend decode failures emit
+  ``conversation.item.input_audio_transcription.failed`` with an
+  ``item_id``; session-level errors use the generic ``error`` event.
 """
 
 from __future__ import annotations
@@ -42,8 +61,11 @@ SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10.0
 
 # --- Client -> server event types ---
 EVT_SESSION_UPDATE = "session.update"
+# OpenAI transcription-mode alias. Handled identically to session.update.
+EVT_TRANSCRIPTION_SESSION_UPDATE = "transcription_session.update"
 EVT_AUDIO_APPEND = "input_audio_buffer.append"
 EVT_AUDIO_COMMIT = "input_audio_buffer.commit"
+EVT_AUDIO_CLEAR = "input_audio_buffer.clear"
 EVT_SERVER_STATUS_REQ = "server.status"
 EVT_SESSION_CLOSE = "session.close"
 EVT_SESSION_CANCEL = "session.cancel"
@@ -51,8 +73,10 @@ EVT_SESSION_CANCEL = "session.cancel"
 CLIENT_EVENT_TYPES = frozenset(
     {
         EVT_SESSION_UPDATE,
+        EVT_TRANSCRIPTION_SESSION_UPDATE,
         EVT_AUDIO_APPEND,
         EVT_AUDIO_COMMIT,
+        EVT_AUDIO_CLEAR,
         EVT_SERVER_STATUS_REQ,
         EVT_SESSION_CLOSE,
         EVT_SESSION_CANCEL,
@@ -63,10 +87,16 @@ CLIENT_EVENT_TYPES = frozenset(
 EVT_SERVER_HELLO = "server.hello"
 EVT_SESSION_CREATED = "session.created"
 EVT_SESSION_UPDATED = "session.updated"
+# OpenAI transcription-mode counterparts, emitted alongside session.* so
+# strict OpenAI clients see the event names they expect.
+EVT_TRANSCRIPTION_SESSION_CREATED = "transcription_session.created"
+EVT_TRANSCRIPTION_SESSION_UPDATED = "transcription_session.updated"
 EVT_SESSION_CLOSED = "session.closed"
 EVT_AUDIO_COMMITTED = "input_audio_buffer.committed"
+EVT_AUDIO_CLEARED = "input_audio_buffer.cleared"
 EVT_TRANSCRIPT_DELTA = "conversation.item.input_audio_transcription.delta"
 EVT_TRANSCRIPT_COMPLETED = "conversation.item.input_audio_transcription.completed"
+EVT_TRANSCRIPT_FAILED = "conversation.item.input_audio_transcription.failed"
 EVT_SERVER_STATUS = "server.status"
 EVT_ERROR = "error"
 

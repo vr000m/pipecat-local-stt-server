@@ -26,14 +26,14 @@ def _make_backend(name: str, model: str):
     raise SystemExit(f"unknown backend: {name}")
 
 
-def _resolve_auth_token(cli_value: str | None, token_file: str | None) -> str | None:
-    # Precedence: --auth-token-file > KODA_STT_AUTH_TOKEN env > --auth-token (ps-visible, deprecated).
+def _resolve_auth_token(token_file: str | None) -> str | None:
+    # Precedence: --auth-token-file > KODA_STT_AUTH_TOKEN env.
+    # A plaintext --auth-token CLI flag is intentionally unsupported: any
+    # local user would be able to read the token via `ps`.
     if token_file:
         return Path(token_file).read_text(encoding="utf-8").strip() or None
     env_val = os.environ.get("KODA_STT_AUTH_TOKEN")
-    if env_val:
-        return env_val
-    return cli_value
+    return env_val or None
 
 
 def main() -> None:
@@ -41,14 +41,6 @@ def main() -> None:
     parser.add_argument("--socket-path", default=None)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
-        "--auth-token",
-        default=None,
-        help=(
-            "Auth token (DEPRECATED: visible to any local user via ps). "
-            "Prefer KODA_STT_AUTH_TOKEN env or --auth-token-file."
-        ),
-    )
     parser.add_argument(
         "--auth-token-file",
         default=None,
@@ -71,7 +63,7 @@ def main() -> None:
             socket_path=args.socket_path,
             host=args.host,
             port=args.port,
-            auth_token=_resolve_auth_token(args.auth_token, args.auth_token_file),
+            auth_token=_resolve_auth_token(args.auth_token_file),
         )
     )
 
