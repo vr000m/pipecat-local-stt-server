@@ -1,18 +1,30 @@
 """``python -m stt_server`` entrypoint.
 
-Starts the server with the ``EchoBackend`` by default. Pass ``--backend mlx``
-to use ``MLXWhisperBackend`` (requires ``mlx_whisper`` installed).
+Subcommands:
+
+- ``serve`` (default when no subcommand given) — runs the server. This is also
+  the implicit behavior when the first argv looks like a flag, so existing
+  invocations like ``python -m stt_server --socket-path X --backend mlx``
+  keep working unchanged.
+- ``status`` — connect, send ``server.status``, print the response, exit 0
+  on success or 1 on failure. Useful as a preflight health probe for
+  launchd keepalive scripts and for humans checking "is my server up?"
+  without writing a client.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
+import sys
 from pathlib import Path
 
+from . import protocol as P
 from .backend import EchoBackend
+from .client import TranscriptionClient
 from .server import serve
 
 
@@ -36,26 +48,22 @@ def _resolve_auth_token(token_file: str | None) -> str | None:
     return env_val or None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="stt_server")
-    parser.add_argument("--socket-path", default=None)
-    parser.add_argument("--host", default=None)
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
+def _add_endpoint_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--socket-path", default=None)
+    p.add_argument("--host", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument(
         "--auth-token-file",
         default=None,
         help="Path to a file containing the auth token (whitespace-stripped).",
     )
-    parser.add_argument("--backend", choices=("echo", "mlx"), default="echo")
-    parser.add_argument("--model", default="mlx-community/whisper-large-v3-turbo")
-    parser.add_argument("--log-level", default="INFO")
-    args = parser.parse_args()
 
+
+def _cmd_serve(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=args.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-
     backend = _make_backend(args.backend, args.model)
     asyncio.run(
         serve(
@@ -66,6 +74,120 @@ def main() -> None:
             auth_token=_resolve_auth_token(args.auth_token_file),
         )
     )
+
+
+async def _probe_status(args: argparse.Namespace) -> dict:
+    client = TranscriptionClient(
+        socket_path=args.socket_path,
+        host=args.host,
+        port=args.port,
+        auth_token=_resolve_auth_token(args.auth_token_file),
+    )
+    hello = await asyncio.wait_for(client.connect(), timeout=args.timeout)
+    try:
+        await client.status()
+
+        # Drain until we see the server.status reply, ignoring the
+        # session.updated / transcription_session.updated that may arrive
+        # first if the server echoes defaults on connect.
+        async def _next_status() -> dict:
+            async for ev in client.events():
+                if ev.get("type") == P.EVT_SERVER_STATUS:
+                    return ev
+            raise RuntimeError("socket closed before server.status reply")
+
+        status = await asyncio.wait_for(_next_status(), timeout=args.timeout)
+        return {"hello": hello, "status": status}
+    finally:
+        try:
+            await client.close_session()
+        except Exception:
+            pass
+        await client.close()
+
+
+def _cmd_status(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=logging.WARNING)
+    try:
+        result = asyncio.run(_probe_status(args))
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        print(f"stt_server: not reachable ({exc})", file=sys.stderr)
+        raise SystemExit(1)
+    except asyncio.TimeoutError:
+        print(f"stt_server: timed out after {args.timeout}s", file=sys.stderr)
+        raise SystemExit(1)
+    except OSError as exc:
+        print(f"stt_server: socket error ({exc})", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"stt_server: probe failed ({exc})", file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    hello = result["hello"]
+    status = result["status"]
+    caps = hello.get("capabilities", {})
+    audio = hello.get("audio", {})
+    print("stt_server: ok")
+    print(f"  protocol_version: {hello.get('protocol_version')}")
+    print(
+        "  audio: {fmt} @ {rate} Hz / {ch}ch".format(
+            fmt=audio.get("format"),
+            rate=audio.get("rate"),
+            ch=audio.get("channels"),
+        )
+    )
+    print(
+        "  capabilities: binary_audio={b} base64={s} server_vad={v}".format(
+            b=caps.get("binary_audio"),
+            s=caps.get("base64_audio_append"),
+            v=caps.get("server_vad"),
+        )
+    )
+    print(f"  session_id: {status.get('session_id')}")
+    print(f"  queue_depth: {status.get('queue_depth')}")
+    print(f"  uncommitted_bytes: {status.get('uncommitted_bytes')}")
+    uptime = status.get("uptime_seconds")
+    if isinstance(uptime, (int, float)):
+        print(f"  session_uptime: {uptime:.1f}s")
+
+
+def main() -> None:
+    # Accept both ``python -m stt_server <flags>`` (legacy serve path) and
+    # ``python -m stt_server <subcommand> <flags>``. Detect the latter by a
+    # non-flag first argv; otherwise dispatch to ``serve``.
+    argv = sys.argv[1:]
+    if argv and not argv[0].startswith("-") and argv[0] in {"serve", "status"}:
+        sub, rest = argv[0], argv[1:]
+    else:
+        sub, rest = "serve", argv
+
+    parser = argparse.ArgumentParser(prog="stt_server")
+    subparsers = parser.add_subparsers(dest="cmd")
+
+    p_serve = subparsers.add_parser("serve", help="run the server (default)")
+    _add_endpoint_flags(p_serve)
+    p_serve.add_argument("--backend", choices=("echo", "mlx"), default="echo")
+    p_serve.add_argument("--model", default="mlx-community/whisper-large-v3-turbo")
+    p_serve.add_argument("--log-level", default="INFO")
+
+    p_status = subparsers.add_parser(
+        "status", help="probe a running server with server.status and print its reply"
+    )
+    _add_endpoint_flags(p_status)
+    p_status.add_argument(
+        "--timeout", type=float, default=3.0, help="overall probe timeout in seconds"
+    )
+    p_status.add_argument("--json", action="store_true", help="emit raw JSON instead of text")
+
+    args = parser.parse_args([sub, *rest])
+    if args.cmd == "status":
+        _cmd_status(args)
+    else:
+        _cmd_serve(args)
 
 
 if __name__ == "__main__":
