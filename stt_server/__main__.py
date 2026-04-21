@@ -41,25 +41,28 @@ def _make_backend(name: str, model: str):
 
 
 def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:
-    # Precedence: --auth-token-file > KODA_STT_AUTH_TOKEN env.
     # A plaintext --auth-token CLI flag is intentionally unsupported: any
     # local user would be able to read the token via `ps`.
     #
-    # ``client=True`` is used by the status/probe subcommand: it also
-    # consults ``STT_WS_TOKEN`` (the env name the client library reads)
-    # so the status probe authenticates against token-protected servers
-    # the same way a consumer would — without forcing operators to
-    # duplicate the secret under a second env name.
+    # Serve path (client=False): --auth-token-file > KODA_STT_AUTH_TOKEN.
+    # Probe path (client=True):  --auth-token-file > STT_WS_TOKEN
+    #                            > KODA_STT_AUTH_TOKEN.
+    #
+    # STT_WS_TOKEN is the client-side bearer a consumer (e.g. the bot)
+    # reads to authenticate against the stt_server. KODA_STT_AUTH_TOKEN
+    # is the server-side bearer the launchd-run server expects. Probing
+    # must prefer the client-side value, otherwise a mixed setup where
+    # both env vars are exported would authenticate with the *server*
+    # token against a *remote* endpoint — the endpoint would reject it
+    # with 401 in the best case and silently log it in the worst case.
     if token_file:
         return Path(token_file).read_text(encoding="utf-8").strip() or None
-    env_val = os.environ.get("KODA_STT_AUTH_TOKEN")
-    if env_val:
-        return env_val
     if client:
-        alt = (os.environ.get("STT_WS_TOKEN") or "").strip()
-        if alt:
-            return alt
-    return None
+        client_val = (os.environ.get("STT_WS_TOKEN") or "").strip()
+        if client_val:
+            return client_val
+    env_val = (os.environ.get("KODA_STT_AUTH_TOKEN") or "").strip()
+    return env_val or None
 
 
 def _load_dotenv_best_effort() -> None:
@@ -150,13 +153,33 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
 async def _probe_status(args: argparse.Namespace) -> dict:
     from . import protocol as P
-    from .client import TranscriptionClient
+    from .client import TranscriptionClient, _format_host_for_uri, is_cleartext_remote
 
     endpoint = _resolve_probe_endpoint(args)
-    client = TranscriptionClient(
-        **endpoint,
-        auth_token=_resolve_auth_token(args.auth_token_file, client=True),
-    )
+    auth_token = _resolve_auth_token(args.auth_token_file, client=True)
+
+    # Same cleartext-token guard as the bot's runtime resolver: if a bearer
+    # is configured and the effective endpoint is cleartext-ws to a
+    # non-loopback host, warn before opening the connection. Host+port is
+    # lowered to ``ws://host:port/`` via the same formatter the client
+    # uses so the check is identical regardless of config surface.
+    if auth_token:
+        effective_uri = endpoint.get("uri")
+        if (
+            not effective_uri
+            and not endpoint.get("socket_path")
+            and endpoint.get("host")
+            and endpoint.get("port") is not None
+        ):
+            effective_uri = f"ws://{_format_host_for_uri(endpoint['host'])}:{endpoint['port']}/"
+        if effective_uri and is_cleartext_remote(effective_uri):
+            print(
+                f"stt_server: warning — auth token will be sent in cleartext to {effective_uri}. "
+                "Use wss:// for remote hosts, or bind to loopback (127.0.0.1 / ::1 / UDS).",
+                file=sys.stderr,
+            )
+
+    client = TranscriptionClient(**endpoint, auth_token=auth_token)
 
     async def _run() -> dict:
         hello = await client.connect()
