@@ -50,7 +50,13 @@ class TranscriptionClient:
         headers = {}
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
-        if self._socket_path:
+        if self._uri:
+            self._ws = await ws_connect(
+                self._uri,
+                additional_headers=headers or None,
+                max_size=P.MAX_APPEND_BYTES,
+            )
+        elif self._socket_path:
             self._ws = await ws_unix_connect(
                 self._socket_path,
                 "ws://localhost/",
@@ -58,7 +64,7 @@ class TranscriptionClient:
                 max_size=P.MAX_APPEND_BYTES,
             )
         else:
-            uri = self._uri or f"ws://{self._host}:{self._port}/"
+            uri = f"ws://{self._host}:{self._port}/"
             self._ws = await ws_connect(
                 uri,
                 additional_headers=headers or None,

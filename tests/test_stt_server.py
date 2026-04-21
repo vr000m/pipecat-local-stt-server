@@ -418,6 +418,18 @@ async def test_unix_socket_has_owner_only_permissions():
             await srv.shutdown()
 
 
+async def test_unix_socket_start_creates_parent_directory():
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "nested" / "path" / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+            assert sock.parent.is_dir()
+            assert sock.exists()
+        finally:
+            await srv.shutdown()
+
+
 async def test_unix_socket_transport():
     # AF_UNIX paths on macOS cap at ~104 bytes; use a short /tmp path.
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
@@ -438,3 +450,23 @@ async def test_unix_socket_transport():
             await c.close()
         finally:
             await srv.shutdown()
+
+
+async def test_client_uri_overrides_socket_path():
+    srv = TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(host="127.0.0.1", port=0, reject_browser_origins=False),
+    )
+    await srv.start()
+    try:
+        port = srv.listening_port()
+        assert port is not None
+        client = TranscriptionClient(
+            socket_path="/tmp/does-not-exist-koda-stt.sock",
+            uri=f"ws://127.0.0.1:{port}/",
+        )
+        hello = await client.connect()
+        assert hello["type"] == P.EVT_SERVER_HELLO
+        await client.close()
+    finally:
+        await srv.shutdown()

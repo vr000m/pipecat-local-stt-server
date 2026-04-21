@@ -28,6 +28,7 @@ import signal
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import websockets
@@ -133,13 +134,15 @@ class TranscriptionServer:
             return
         await self._backend.start()
         if self._config.socket_path:
+            socket_path = Path(self._config.socket_path)
+            socket_path.parent.mkdir(parents=True, exist_ok=True)
             # Restrict the socket file to owner-only before bind so the UDS
             # trust boundary actually holds on multi-user hosts.
             prior_umask = os.umask(0o077)
             try:
                 self._server = await ws_unix_serve(
                     self._handle_connection,
-                    path=self._config.socket_path,
+                    path=str(socket_path),
                     max_size=self._config.max_append_bytes,
                     process_request=self._process_request,
                 )
@@ -147,7 +150,7 @@ class TranscriptionServer:
                 os.umask(prior_umask)
             if self._config.unix_socket_mode is not None:
                 try:
-                    os.chmod(self._config.socket_path, self._config.unix_socket_mode)
+                    os.chmod(socket_path, self._config.unix_socket_mode)
                 except OSError as exc:
                     logger.warning("stt_server: chmod on UDS failed: %s", exc)
         else:
