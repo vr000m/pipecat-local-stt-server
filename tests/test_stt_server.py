@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+import websockets
 
 from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
@@ -429,8 +430,6 @@ async def test_double_close_is_idempotent(client):
 
 
 async def test_bearer_auth_requires_token():
-    import websockets
-
     srv = TranscriptionServer(
         EchoBackend(),
         ServerConfig(
@@ -568,8 +567,6 @@ async def test_uds_without_token_does_not_warn(caplog):
 
 
 async def test_tcp_rejects_missing_bearer_when_token_required():
-    import websockets
-
     srv = TranscriptionServer(
         EchoBackend(),
         ServerConfig(
