@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,7 +12,26 @@ import pytest
 
 from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
+from stt_server.backend import TranscriptEvent
+from stt_server.client import _format_host_for_uri
 from stt_server.server import ServerConfig, TranscriptionServer
+
+
+def test_format_host_for_uri_brackets_ipv6():
+    assert _format_host_for_uri("::1") == "[::1]"
+    assert _format_host_for_uri("fe80::1") == "[fe80::1]"
+
+
+def test_format_host_for_uri_passes_hostnames_through():
+    assert _format_host_for_uri("127.0.0.1") == "127.0.0.1"
+    assert _format_host_for_uri("localhost") == "localhost"
+    assert _format_host_for_uri("example.local") == "example.local"
+
+
+def test_client_expanduser_on_socket_path():
+    c = TranscriptionClient(socket_path="~/foo/bar.sock")
+    assert c._socket_path == os.path.expanduser("~/foo/bar.sock")
+    assert c._socket_path and not c._socket_path.startswith("~")
 
 
 # ---------------------------------------------------------------------------
@@ -324,9 +344,52 @@ async def test_shutdown_drains_in_flight_decode(client):
 
 
 async def test_audio_append_rejected_while_decode_in_flight():
-    """Binary append between commit and completion must error, not merge."""
+    """Binary append between commit and completion must error, not merge.
+
+    EchoBackend completes decode nearly instantly, so racing an append
+    between commit and completion is inherently flaky. Use a slow backend
+    that holds the decode open long enough to guarantee the append arrives
+    mid-flight, so we can actually assert the INVALID_EVENT rejection.
+    """
+
+    class _SlowStream:
+        def __init__(self) -> None:
+            self._buf = bytearray()
+            self._released = asyncio.Event()
+
+        async def feed(self, chunk: bytes) -> None:
+            self._buf.extend(chunk)
+
+        async def end(self) -> None:
+            # Block until the test signals the decode can finish.
+            await self._released.wait()
+
+        async def cancel(self) -> None:
+            self._released.set()
+
+        async def events(self):
+            yield TranscriptEvent(kind="completed", text=f"slow:{len(self._buf)}")
+
+        def release(self) -> None:
+            self._released.set()
+
+    class _SlowBackend:
+        def __init__(self) -> None:
+            self.last_stream: _SlowStream | None = None
+
+        async def start(self) -> None:
+            return None
+
+        async def open_stream(self, *, language: str | None = None) -> _SlowStream:
+            self.last_stream = _SlowStream()
+            return self.last_stream
+
+        async def close(self) -> None:
+            return None
+
+    backend = _SlowBackend()
     srv = TranscriptionServer(
-        EchoBackend(),
+        backend,
         ServerConfig(host="127.0.0.1", port=0, reject_browser_origins=False),
     )
     await srv.start()
@@ -336,28 +399,16 @@ async def test_audio_append_rejected_while_decode_in_flight():
         await c.connect()
         await c.send_audio(_pcm(800))
         await c.commit()
-        # Immediately try to append more audio before the decode finishes.
-        # EchoBackend is near-instant, but the check is synchronous so the
-        # race is fine for the test.
+        # Wait for input_audio_buffer.committed so we know decode is running.
+        await _next_event_of_types(c, {P.EVT_AUDIO_COMMITTED})
+        # Now append while the slow decode is still blocked.
         await c.send_audio(_pcm(400))
-        # Collect events until we see either the completed or the error.
-        saw_error = False
-        async for ev in c.events():
-            if ev.get("type") == P.EVT_ERROR:
-                if ev["error"]["code"] == P.ErrorCode.INVALID_EVENT.value:
-                    saw_error = True
-                    break
-            elif ev.get("type") == P.EVT_TRANSCRIPT_COMPLETED:
-                # If decode already finished before append, append would be
-                # accepted; try again to prove the guard works.
-                await c.send_audio(_pcm(400))
-                await c.commit()
-                # The second commit should succeed; no error expected.
-                break
+        err = await _next_event_of_types(c, {P.EVT_ERROR})
+        assert err["error"]["code"] == P.ErrorCode.INVALID_EVENT.value
+        # Release so shutdown can drain cleanly.
+        if backend.last_stream is not None:
+            backend.last_stream.release()
         await c.close()
-        # At least one of the two outcomes must have occurred without
-        # silently merging audio.
-        assert saw_error or True  # non-flaky: either path is valid
     finally:
         await srv.shutdown()
 

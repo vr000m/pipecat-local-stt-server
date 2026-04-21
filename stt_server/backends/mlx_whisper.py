@@ -62,6 +62,7 @@ class _MLXStream:
         model: str,
         language: str | None,
         decode_lock: asyncio.Lock,
+        thread_lock: threading.Lock,
     ) -> None:
         self._model = model
         self._language = language
@@ -70,6 +71,7 @@ class _MLXStream:
         self._cancelled = False
         self._result: str | None = None
         self._decode_lock = decode_lock
+        self._thread_lock = thread_lock
 
     async def feed(self, chunk: bytes) -> None:
         if self._cancelled:
@@ -81,16 +83,20 @@ class _MLXStream:
             return
         self._ended = True
         # Serialize decodes across all sessions: MLX/Metal is not safe for
-        # concurrent calls against the same cached model, and the daemon
-        # worker pattern combined with this lock guarantees at most one
-        # decode thread is alive in the process at any time.
+        # concurrent calls against the same cached model. The asyncio lock
+        # orders decodes on the event-loop side, but cancelling the awaiter
+        # releases it immediately while the daemon thread keeps running —
+        # so we *also* hold a ``threading.Lock`` inside ``_decode_sync``.
+        # That way a second decode thread will block until the first truly
+        # finishes, even across cancel/reconnect/shutdown boundaries.
         async with self._decode_lock:
             if self._cancelled:
                 return
             # If the caller's task is cancelled mid-decode, the await here
             # raises CancelledError and unwinds; the daemon thread keeps
-            # running but is reaped by the OS when the process exits, so
-            # shutdown is bounded regardless of MLX decode duration.
+            # running (but holds ``_thread_lock`` until it finishes) and is
+            # reaped by the OS at process exit. Shutdown is bounded
+            # regardless of MLX decode duration.
             self._result = await _run_in_daemon_thread(self._decode_sync)
 
     async def cancel(self) -> None:
@@ -103,17 +109,22 @@ class _MLXStream:
         audio = np.frombuffer(bytes(self._buf), dtype=np.int16).astype(np.float32) / 32768.0
         if audio.size == 0:
             return ""
-        # mlx_whisper.transcribe resamples internally using its own constant;
-        # audio must already be at AUDIO_SAMPLE_RATE_HZ (16 kHz), which the
-        # protocol enforces on the wire. Do not pass sample_rate — it's not a
-        # valid DecodingOptions kwarg.
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=self._model,
-            language=self._language,
-            fp16=True,
-            verbose=False,
-        )
+        # Hold the backend-scope threading lock for the entire transcribe()
+        # call so a second decode thread started after our asyncio awaiter
+        # was cancelled still blocks until this one completes. Without this,
+        # cancel-then-reopen can put two mlx-decode threads live at once.
+        with self._thread_lock:
+            # mlx_whisper.transcribe resamples internally using its own
+            # constant; audio must already be at AUDIO_SAMPLE_RATE_HZ
+            # (16 kHz), which the protocol enforces on the wire. Do not
+            # pass sample_rate — it's not a valid DecodingOptions kwarg.
+            result = mlx_whisper.transcribe(
+                audio,
+                path_or_hf_repo=self._model,
+                language=self._language,
+                fp16=True,
+                verbose=False,
+            )
         return (result.get("text") or "").strip()
 
     async def events(self) -> AsyncGenerator[TranscriptEvent, None]:
@@ -129,13 +140,17 @@ class MLXWhisperBackend:
     def __init__(self, *, model: str = "mlx-community/whisper-large-v3-turbo") -> None:
         self._model = model
         self._decode_lock = asyncio.Lock()
+        # Backend-scope thread lock — see ``_MLXStream.end``. Shared across
+        # every stream this backend opens so concurrent sessions truly
+        # serialize on the MLX/Metal side.
+        self._thread_lock = threading.Lock()
 
     async def start(self) -> None:
         # Eager import; fail fast if the extra isn't installed.
         import mlx_whisper  # type: ignore # noqa: F401
 
     async def open_stream(self, *, language: str | None = None) -> "_MLXStream":
-        return _MLXStream(self._model, language, self._decode_lock)
+        return _MLXStream(self._model, language, self._decode_lock, self._thread_lock)
 
     async def close(self) -> None:
         # No pool to drain: each decode runs on its own daemon thread that

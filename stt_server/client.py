@@ -8,8 +8,10 @@ not bake in app-specific labels, frame types, or transcript storage.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import logging
+import os
 from typing import AsyncIterator
 
 import websockets
@@ -24,6 +26,17 @@ from . import protocol as P
 logger = logging.getLogger("stt_server.client")
 
 
+def _format_host_for_uri(host: str) -> str:
+    """Bracket IPv6 literals so ``ws://[::1]:port/`` is a valid URI."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return host  # hostname / "localhost"
+    if isinstance(addr, ipaddress.IPv6Address):
+        return f"[{host}]"
+    return host
+
+
 class TranscriptionClient:
     def __init__(
         self,
@@ -36,7 +49,9 @@ class TranscriptionClient:
     ) -> None:
         if uri is None and socket_path is None and (host is None or port is None):
             raise ValueError("Provide uri=, socket_path=, or host+port")
-        self._socket_path = socket_path
+        # Expand ~ so documented defaults like
+        # STT_WS_SOCKET=~/Library/Caches/koda-stt/stt.sock actually work.
+        self._socket_path = os.path.expanduser(socket_path) if socket_path else None
         self._host = host
         self._port = port
         self._uri = uri
@@ -64,7 +79,11 @@ class TranscriptionClient:
                 max_size=P.MAX_APPEND_BYTES,
             )
         else:
-            uri = f"ws://{self._host}:{self._port}/"
+            # IPv6 literals (e.g. "::1") must be bracketed in URIs; unbracketed
+            # hosts go through unchanged so "localhost" / "127.0.0.1" / DNS
+            # names keep working.
+            host = _format_host_for_uri(self._host)
+            uri = f"ws://{host}:{self._port}/"
             self._ws = await ws_connect(
                 uri,
                 additional_headers=headers or None,
