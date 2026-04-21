@@ -12,7 +12,8 @@ import ipaddress
 import json
 import logging
 import os
-from typing import AsyncIterator
+import urllib.parse
+from typing import AsyncIterator, Mapping
 
 import websockets
 from websockets.asyncio.client import (
@@ -24,6 +25,55 @@ from websockets.asyncio.client import (
 from . import protocol as P
 
 logger = logging.getLogger("stt_server.client")
+
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def is_cleartext_remote(uri: str) -> bool:
+    """True if ``uri`` is ``ws://`` pointing at a non-loopback host.
+
+    Used to guard against attaching a bearer token to a cleartext connection
+    to a remote peer — the token would be captured by any on-path observer.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != "ws":
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host or host in _LOOPBACK_HOSTS:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # a non-loopback DNS name counts as remote
+    return not addr.is_loopback
+
+
+def resolve_endpoint_from_env(env: Mapping[str, str]) -> dict:
+    """Resolve ``STT_WS_*`` env vars into ``TranscriptionClient`` kwargs.
+
+    Enforces precedence ``STT_WS_URI > STT_WS_SOCKET > STT_WS_HOST+PORT`` by
+    zeroing lower-priority fields. Returns a dict with keys ``uri``,
+    ``socket_path``, ``host``, ``port`` — all ``None`` if nothing is set.
+    Callers supply their own default (e.g. an app-specific socket path) when
+    every field is ``None``.
+    """
+    uri = (env.get("STT_WS_URI") or "").strip() or None
+    sock = (env.get("STT_WS_SOCKET") or "").strip() or None
+    host = (env.get("STT_WS_HOST") or "").strip() or None
+    port_raw = (env.get("STT_WS_PORT") or "").strip()
+    port: int | None = int(port_raw) if port_raw else None
+    if uri:
+        sock = None
+        host = None
+        port = None
+    elif sock:
+        host = None
+        port = None
+    return {"uri": uri, "socket_path": sock, "host": host, "port": port}
 
 
 def _format_host_for_uri(host: str) -> str:

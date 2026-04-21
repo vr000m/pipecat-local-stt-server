@@ -16,7 +16,11 @@ import websockets
 from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
 from stt_server.backend import TranscriptEvent
-from stt_server.client import _format_host_for_uri
+from stt_server.client import (
+    _format_host_for_uri,
+    is_cleartext_remote,
+    resolve_endpoint_from_env,
+)
 from stt_server.server import ServerConfig, TranscriptionServer
 
 
@@ -28,6 +32,46 @@ def test_format_host_for_uri_brackets_ipv6():
 def test_format_host_for_uri_passes_hostnames_through():
     assert _format_host_for_uri("127.0.0.1") == "127.0.0.1"
     assert _format_host_for_uri("localhost") == "localhost"
+
+
+def test_is_cleartext_remote_flags_non_loopback_ws():
+    assert is_cleartext_remote("ws://example.com/") is True
+    assert is_cleartext_remote("ws://8.8.8.8:9000/") is True
+
+
+def test_is_cleartext_remote_allows_loopback_and_wss():
+    assert is_cleartext_remote("ws://localhost:9000/") is False
+    assert is_cleartext_remote("ws://127.0.0.1:9000/") is False
+    assert is_cleartext_remote("ws://[::1]:9000/") is False
+    assert is_cleartext_remote("wss://example.com/") is False
+    assert is_cleartext_remote("") is False
+
+
+def test_resolve_endpoint_from_env_precedence_uri_wins():
+    env = {
+        "STT_WS_URI": "ws://a/",
+        "STT_WS_SOCKET": "/tmp/s",
+        "STT_WS_HOST": "h",
+        "STT_WS_PORT": "1",
+    }
+    r = resolve_endpoint_from_env(env)
+    assert r == {"uri": "ws://a/", "socket_path": None, "host": None, "port": None}
+
+
+def test_resolve_endpoint_from_env_precedence_socket_over_host_port():
+    r = resolve_endpoint_from_env(
+        {"STT_WS_SOCKET": "/tmp/s", "STT_WS_HOST": "h", "STT_WS_PORT": "1"}
+    )
+    assert r == {"uri": None, "socket_path": "/tmp/s", "host": None, "port": None}
+
+
+def test_resolve_endpoint_from_env_empty_returns_nones():
+    assert resolve_endpoint_from_env({}) == {
+        "uri": None,
+        "socket_path": None,
+        "host": None,
+        "port": None,
+    }
     assert _format_host_for_uri("example.local") == "example.local"
 
 

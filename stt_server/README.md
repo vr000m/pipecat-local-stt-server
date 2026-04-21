@@ -170,10 +170,17 @@ Enable via `STT_SERVICE=websocket` in `.env`. Client env vars:
 
 | Variable | Default | Description |
 |---|---|---|
-| `STT_WS_SOCKET` | `~/Library/Caches/koda-stt/stt.sock` | UDS path |
+| `STT_WS_SOCKET` | *(unset)* | UDS path (Koda's `./koda stt` wrapper exports `STT_WS_DEFAULT_SOCKET=~/Library/Caches/koda-stt/stt.sock` as the fallback) |
 | `STT_WS_HOST` / `STT_WS_PORT` | *(unset)* | Loopback TCP target |
-| `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI |
+| `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI. Pairing `STT_WS_TOKEN` with `ws://` to a non-loopback host emits a cleartext-token WARNING. |
 | `STT_WS_TOKEN` | *(unset)* | Bearer token; only enforced when the server was started with a matching token. Configure one for any TCP deployment. |
+| `STT_WS_DEFAULT_SOCKET` | *(unset)* | Consumer-supplied fallback UDS path when no other target is configured — the library ships no built-in default. |
+
+Precedence (`STT_WS_URI > STT_WS_SOCKET > STT_WS_HOST+PORT`) is enforced by
+`stt_server.client.resolve_endpoint_from_env`. Consumers (Koda's `bot/runtime`
+and `python -m stt_server status`) both call it so the resolution rules
+cannot drift. `stt_server.client.is_cleartext_remote(uri)` is the helper
+the Koda bot uses to detect cleartext-token misconfigurations.
 
 Each `WebSocketSTTService` instance owns exactly one websocket session,
 so Koda's dual bot gets two independent sessions (`me` / `them`) against
