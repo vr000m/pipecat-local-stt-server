@@ -8,15 +8,52 @@ True streaming partials are deferred to future backends.
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import logging
-from typing import AsyncGenerator
+import threading
+from typing import AsyncGenerator, Callable, TypeVar
 
 import numpy as np
 
 from ..backend import TranscriptEvent
 
 logger = logging.getLogger("stt_server.backends.mlx")
+
+_T = TypeVar("_T")
+
+
+def _run_in_daemon_thread(func: Callable[[], _T]) -> "asyncio.Future[_T]":
+    """Run ``func`` on a fresh daemon thread and return an asyncio Future.
+
+    Unlike ``loop.run_in_executor`` with ``ThreadPoolExecutor``, the thread
+    is a daemon and is NOT registered with the ``concurrent.futures`` atexit
+    handler — so a stuck ``mlx_whisper.transcribe()`` call cannot block
+    process exit when ``session.cancel`` / ``shutdown()`` fires while a
+    decode is running. MLX has no cooperative cancellation hook; the only
+    honest way to bound shutdown is to let the OS reap the thread.
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[_T] = loop.create_future()
+
+    def _runner() -> None:
+        try:
+            result = func()
+        except BaseException as exc:  # noqa: BLE001 — marshal across threads
+            loop.call_soon_threadsafe(_set_exception_safe, fut, exc)
+        else:
+            loop.call_soon_threadsafe(_set_result_safe, fut, result)
+
+    threading.Thread(target=_runner, daemon=True, name="mlx-decode").start()
+    return fut
+
+
+def _set_result_safe(fut: "asyncio.Future", value) -> None:
+    if not fut.done():
+        fut.set_result(value)
+
+
+def _set_exception_safe(fut: "asyncio.Future", exc: BaseException) -> None:
+    if not fut.done():
+        fut.set_exception(exc)
 
 
 class _MLXStream:
@@ -25,7 +62,6 @@ class _MLXStream:
         model: str,
         language: str | None,
         decode_lock: asyncio.Lock,
-        executor: concurrent.futures.Executor,
     ) -> None:
         self._model = model
         self._language = language
@@ -34,7 +70,6 @@ class _MLXStream:
         self._cancelled = False
         self._result: str | None = None
         self._decode_lock = decode_lock
-        self._executor = executor
 
     async def feed(self, chunk: bytes) -> None:
         if self._cancelled:
@@ -45,15 +80,18 @@ class _MLXStream:
         if self._ended or self._cancelled:
             return
         self._ended = True
-        loop = asyncio.get_running_loop()
         # Serialize decodes across all sessions: MLX/Metal is not safe for
-        # concurrent calls against the same cached model from multiple
-        # threads, and the dedicated single-worker executor guarantees only
-        # one decode thread exists in the process.
+        # concurrent calls against the same cached model, and the daemon
+        # worker pattern combined with this lock guarantees at most one
+        # decode thread is alive in the process at any time.
         async with self._decode_lock:
             if self._cancelled:
                 return
-            self._result = await loop.run_in_executor(self._executor, self._decode_sync)
+            # If the caller's task is cancelled mid-decode, the await here
+            # raises CancelledError and unwinds; the daemon thread keeps
+            # running but is reaped by the OS when the process exits, so
+            # shutdown is bounded regardless of MLX decode duration.
+            self._result = await _run_in_daemon_thread(self._decode_sync)
 
     async def cancel(self) -> None:
         self._cancelled = True
@@ -91,19 +129,15 @@ class MLXWhisperBackend:
     def __init__(self, *, model: str = "mlx-community/whisper-large-v3-turbo") -> None:
         self._model = model
         self._decode_lock = asyncio.Lock()
-        # Dedicated single-worker executor — avoids the default pool where
-        # other asyncio.run_in_executor users could end up sharing threads.
-        # Exactly one thread can be inside mlx_whisper.transcribe at a time.
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="mlx-decode"
-        )
 
     async def start(self) -> None:
         # Eager import; fail fast if the extra isn't installed.
         import mlx_whisper  # type: ignore # noqa: F401
 
     async def open_stream(self, *, language: str | None = None) -> "_MLXStream":
-        return _MLXStream(self._model, language, self._decode_lock, self._executor)
+        return _MLXStream(self._model, language, self._decode_lock)
 
     async def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        # No pool to drain: each decode runs on its own daemon thread that
+        # the OS will reap at process exit.
+        return None
