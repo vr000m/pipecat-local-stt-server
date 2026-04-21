@@ -27,21 +27,39 @@ for the full design.
 ## Running the server
 
 ```bash
-# Echo backend (no ML deps, useful for smoke tests)
-uv run python -m stt_server --host 127.0.0.1 --port 8765
+# UDS (recommended for local use — no port, no bearer token)
+uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --backend echo
 
-# MLX Whisper
+# MLX Whisper over UDS
 uv sync --extra stt-server-mlx
-uv run python -m stt_server --backend mlx --host 127.0.0.1 --port 8765
+uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --backend mlx
+
+# Loopback TCP (use --auth-token-file or KODA_STT_AUTH_TOKEN env; --auth-token
+# on argv is visible via `ps` and marked DEPRECATED)
+uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
 
+For persistent always-on operation on macOS, `scripts/install_stt_agent.sh`
+installs a LaunchAgent that keeps the server alive across login and auto-
+restarts on crash. See the Koda integration section below.
+
 ## Client usage
+
+Only `TranscriptionClient` (plus `protocol`, `backend` interfaces, and
+`EchoBackend`) is re-exported from the package root — server runtime
+(`TranscriptionServer`, `ServerConfig`, `serve`) lives under
+`stt_server.server`. This lets a client-only install (`stt-server-client`
+extra) skip the `websockets.asyncio.server` dependency once the package is
+extracted.
 
 ```python
 from stt_server import TranscriptionClient
 
 async def run():
-    async with TranscriptionClient(host="127.0.0.1", port=8765) as c:
+    # UDS (recommended)
+    async with TranscriptionClient(
+        socket_path="~/Library/Caches/koda-stt/stt.sock"
+    ) as c:
         await c.update_session(turn_detection=None)
         await c.send_audio(pcm_bytes)     # binary PCM16LE frames
         await c.commit()
@@ -50,6 +68,12 @@ async def run():
                 print(ev["transcript"])
                 await c.close_session()
                 break
+
+    # Loopback TCP with bearer token
+    async with TranscriptionClient(
+        host="127.0.0.1", port=8765, auth_token="..."
+    ) as c:
+        ...
 ```
 
 The example `stt_server/examples/file_stream.py` streams a WAV file end to end.
@@ -91,14 +115,43 @@ Deviations from the OpenAI Realtime transcription snapshot (2026-04-20):
 
 ## Koda integration
 
-Not wired up yet. The planned seam is a Pipecat `STTService` wrapper that:
+Shipped. `bot/stt/websocket_stt_service.py` is a Pipecat
+`SegmentedSTTService` subclass that:
 
-- owns the WebSocket session under `start(StartFrame)` / `stop(EndFrame)` /
-  `cancel(CancelFrame)`
-- drives `commit` from the branch-local VAD + SmartTurn stack on each branch
+- owns the WebSocket session across `start(StartFrame)` / `stop(EndFrame)` /
+  `cancel(CancelFrame)` / `cleanup()`
+- drives `commit` from Koda's branch-local VAD (server-side VAD stays
+  disabled via `turn_detection: null`)
 - translates `conversation.item.input_audio_transcription.completed` into
-  `TranscriptionFrame` and preserves Koda's `me` / `them` source labels
-  outside this package
+  a single finalized `TranscriptionFrame` per segment
+- awaits `session.updated` via a one-shot future before returning from
+  `_ensure_connected`, so the first commit cannot race the language
+  config
+- on decode timeout, tears down the socket (V1 has no `item_id`
+  correlation on the client side, so a late `completed` from an
+  abandoned decode would otherwise resolve the next segment's future
+  with stale text)
+- on server crash, fails the in-flight segment fast via a reader that
+  sets `ConnectionError` on unexpected socket close, then reconnects
+  with one 250 ms-back-off retry on the next `run_stt`
 
-`BranchVADUserStartedSpeakingFrame` / `BranchVADUserStoppedSpeakingFrame` stay
-inside Koda; the server intentionally has no notion of branches or speakers.
+Enable via `STT_SERVICE=websocket` in `.env`. Client env vars:
+
+| Variable | Default | Description |
+|---|---|---|
+| `STT_WS_SOCKET` | `~/Library/Caches/koda-stt/stt.sock` | UDS path |
+| `STT_WS_HOST` / `STT_WS_PORT` | *(unset)* | Loopback TCP target |
+| `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI |
+| `STT_WS_TOKEN` | *(unset)* | Bearer token (required by default for TCP) |
+
+Each `WebSocketSTTService` instance owns exactly one websocket session,
+so Koda's dual bot gets two independent sessions (`me` / `them`) against
+a single shared server. `BranchVADUserStartedSpeakingFrame` /
+`BranchVADUserStoppedSpeakingFrame` stay inside Koda; the server
+intentionally has no notion of branches or speakers.
+
+For persistent operation, `scripts/install_stt_agent.sh install` renders
+a LaunchAgent (`koda.stt-server`) via `scripts/render_stt_plist.py`
+(stdlib `plistlib` + allowlist validation — do not reintroduce `sed`
+templating). Overrides: `KODA_STT_SOCKET`, `KODA_STT_BACKEND`,
+`KODA_STT_MODEL`, `KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`.
