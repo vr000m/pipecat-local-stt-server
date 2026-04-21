@@ -142,7 +142,7 @@ Enable via `STT_SERVICE=websocket` in `.env`. Client env vars:
 | `STT_WS_SOCKET` | `~/Library/Caches/koda-stt/stt.sock` | UDS path |
 | `STT_WS_HOST` / `STT_WS_PORT` | *(unset)* | Loopback TCP target |
 | `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI |
-| `STT_WS_TOKEN` | *(unset)* | Bearer token (required by default for TCP) |
+| `STT_WS_TOKEN` | *(unset)* | Bearer token; only enforced when the server was started with a matching token. Configure one for any TCP deployment. |
 
 Each `WebSocketSTTService` instance owns exactly one websocket session,
 so Koda's dual bot gets two independent sessions (`me` / `them`) against
