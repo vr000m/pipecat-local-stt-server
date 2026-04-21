@@ -104,6 +104,32 @@ async def test_session_update_non_null_turn_detection_errors(client):
     assert err["error"]["code"] == P.ErrorCode.INVALID_CONFIG.value
 
 
+async def test_session_update_invalid_sample_rate_errors(client):
+    # Bypass the helper so we can pass an off-rate format explicitly.
+    await client._ws.send(  # type: ignore[attr-defined]
+        json.dumps(
+            {
+                "type": P.EVT_SESSION_UPDATE,
+                "session": {
+                    "audio": {
+                        "input": {
+                            "format": {
+                                "encoding": P.AUDIO_FORMAT,
+                                "rate": 48000,
+                                "channels": P.AUDIO_CHANNELS,
+                            },
+                            "turn_detection": None,
+                        }
+                    }
+                },
+            }
+        )
+    )
+    err = await _next_event_of_types(client, {P.EVT_SESSION_UPDATED, P.EVT_ERROR})
+    assert err["type"] == P.EVT_ERROR
+    assert err["error"]["code"] == P.ErrorCode.INVALID_CONFIG.value
+
+
 async def test_unknown_event_returns_error(client):
     await client._ws.send(json.dumps({"type": "not.a.real.event"}))  # type: ignore[attr-defined]
     err = await _next_event_of_types(client, {P.EVT_ERROR})
@@ -140,6 +166,31 @@ async def test_commit_binary_audio_produces_delta_and_completed(client):
 
     completed = await _next_event_of_types(client, {P.EVT_TRANSCRIPT_COMPLETED})
     assert completed["item_id"] == item_id
+    assert completed["transcript"].startswith("echo:")
+
+
+async def test_long_turn_chunked_appends_commit_cleanly(client):
+    """A >1 MiB turn split across multiple binary appends must commit.
+
+    Regression: the Pipecat wrapper used to send the whole segment in one
+    websocket frame, hitting ``payload_too_large`` at ~32 s of 16 kHz PCM16.
+    """
+    await client.update_session(turn_detection=None)
+    await _next_event_of_types(client, {P.EVT_SESSION_UPDATED})
+
+    # 40 seconds of silence: 40 * 16000 * 2 = 1.28 MiB, > MAX_APPEND_BYTES.
+    total_samples = 40 * P.AUDIO_SAMPLE_RATE_HZ
+    payload = _pcm(total_samples)
+    assert len(payload) > P.MAX_APPEND_BYTES
+
+    chunk = 512 * 1024
+    for i in range(0, len(payload), chunk):
+        await client.send_audio(payload[i : i + chunk])
+    await client.commit()
+
+    committed = await _next_event_of_types(client, {P.EVT_AUDIO_COMMITTED, P.EVT_ERROR})
+    assert committed["type"] == P.EVT_AUDIO_COMMITTED
+    completed = await _next_event_of_types(client, {P.EVT_TRANSCRIPT_COMPLETED}, timeout=5.0)
     assert completed["transcript"].startswith("echo:")
 
 

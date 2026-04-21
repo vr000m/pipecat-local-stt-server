@@ -258,7 +258,7 @@ class TranscriptionServer:
                     },
                     "audio": {
                         "format": P.AUDIO_FORMAT,
-                        "sample_rate_hz": P.AUDIO_SAMPLE_RATE_HZ,
+                        "rate": P.AUDIO_SAMPLE_RATE_HZ,
                         "channels": P.AUDIO_CHANNELS,
                     },
                 },
@@ -365,7 +365,7 @@ class TranscriptionServer:
                     ws, state, P.ErrorCode.INVALID_CONFIG, "only pcm16 encoding is supported"
                 )
                 return
-            if fmt.get("sample_rate_hz", P.AUDIO_SAMPLE_RATE_HZ) != P.AUDIO_SAMPLE_RATE_HZ:
+            if fmt.get("rate", P.AUDIO_SAMPLE_RATE_HZ) != P.AUDIO_SAMPLE_RATE_HZ:
                 await self._error(
                     ws, state, P.ErrorCode.INVALID_CONFIG, "only 16000 Hz sample rate is supported"
                 )
