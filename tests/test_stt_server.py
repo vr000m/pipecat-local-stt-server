@@ -9,13 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from stt_server import (
-    EchoBackend,
-    ServerConfig,
-    TranscriptionClient,
-    TranscriptionServer,
-)
+from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
+from stt_server.server import ServerConfig, TranscriptionServer
 
 
 # ---------------------------------------------------------------------------
