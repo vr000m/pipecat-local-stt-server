@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -585,3 +587,47 @@ async def test_tcp_rejects_missing_bearer_when_token_required():
         assert exc.value.response.status_code == 401
     finally:
         await srv.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch regression tests
+# ---------------------------------------------------------------------------
+
+
+def _run_module(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "stt_server", *args],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_cli_top_level_help_lists_subcommands():
+    r = _run_module("--help")
+    assert r.returncode == 0, r.stderr
+    assert "serve" in r.stdout
+    assert "status" in r.stdout
+
+
+def test_cli_status_help_shows_status_flags():
+    r = _run_module("status", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--timeout" in r.stdout
+    assert "--json" in r.stdout
+    assert "--socket-path" in r.stdout
+
+
+def test_cli_serve_help_shows_serve_flags():
+    r = _run_module("serve", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--backend" in r.stdout
+    assert "--model" in r.stdout
+
+
+def test_cli_status_against_missing_server_exits_nonzero(tmp_path: Path):
+    # Point at a socket path that does not exist; probe must fail fast.
+    missing = tmp_path / "does-not-exist.sock"
+    r = _run_module("status", "--socket-path", str(missing), "--timeout", "1.0")
+    assert r.returncode == 1
+    assert "stt_server:" in r.stderr
