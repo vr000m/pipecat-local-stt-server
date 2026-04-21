@@ -13,10 +13,13 @@ set -euo pipefail
 
 LABEL="koda.stt-server"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLIST_SRC="$REPO_ROOT/scripts/koda-stt.plist.template"
+RENDER_PY="$REPO_ROOT/scripts/render_stt_plist.py"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="${KODA_STT_LOG_DIR:-$HOME/Library/Logs/koda-stt}"
-SOCKET_PATH="${KODA_STT_SOCKET:-/tmp/koda-stt.sock}"
+# Default socket lives under the user's Caches dir (not /tmp, which is
+# world-writable and lets a local attacker pre-create the path to DoS
+# the agent). Override via KODA_STT_SOCKET.
+SOCKET_PATH="${KODA_STT_SOCKET:-$HOME/Library/Caches/koda-stt/stt.sock}"
 BACKEND="${KODA_STT_BACKEND:-mlx}"
 MODEL="${KODA_STT_MODEL:-mlx-community/whisper-large-v3-turbo}"
 
@@ -30,17 +33,14 @@ fi
 cmd="${1:-install}"
 
 render_plist() {
-    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
-    sed \
-        -e "s|@PYTHON@|$PYTHON|g" \
-        -e "s|@CWD@|$REPO_ROOT|g" \
-        -e "s|@SOCKET_PATH@|$SOCKET_PATH|g" \
-        -e "s|@BACKEND@|$BACKEND|g" \
-        -e "s|@MODEL@|$MODEL|g" \
-        -e "s|@HOME@|$HOME|g" \
-        -e "s|@LOG_DIR@|$LOG_DIR|g" \
-        "$PLIST_SRC" > "$PLIST_DST"
-    echo "wrote $PLIST_DST"
+    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")" "$(dirname "$SOCKET_PATH")"
+    # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
+    # allowlist validation handle hostile values instead of sed string
+    # substitution (which would allow <string> breakout + RCE).
+    PYTHON="$PYTHON" REPO_ROOT="$REPO_ROOT" SOCKET_PATH="$SOCKET_PATH" \
+        BACKEND="$BACKEND" MODEL="$MODEL" HOME="$HOME" LOG_DIR="$LOG_DIR" \
+        PLIST_DST="$PLIST_DST" \
+        "$PYTHON" "$RENDER_PY"
 }
 
 case "$cmd" in
@@ -58,7 +58,16 @@ install)
 uninstall)
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST_DST"
-    rm -f "$SOCKET_PATH"
+    # Only remove the socket if it's owned by the current user — avoids
+    # nuking an unrelated file someone pre-created at a world-writable path.
+    if [[ -e "$SOCKET_PATH" ]]; then
+        owner=$(stat -f "%u" "$SOCKET_PATH" 2>/dev/null || echo "")
+        if [[ "$owner" == "$(id -u)" ]]; then
+            rm -f "$SOCKET_PATH"
+        else
+            echo "warning: socket at $SOCKET_PATH not owned by current user, leaving it" >&2
+        fi
+    fi
     echo "uninstalled: $LABEL"
     ;;
 restart)
