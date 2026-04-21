@@ -41,6 +41,23 @@ from websockets.asyncio.server import (
 from . import protocol as P
 from .backend import BackendStream, EchoBackend, TranscriptionBackend
 
+# OpenAI Realtime groups errors into a coarse "type" field (e.g.
+# invalid_request_error, server_error, authentication_error) alongside the
+# narrower "code". Map our ErrorCode enum into that taxonomy so strict
+# OpenAI-shaped clients can branch on error.type without parsing strings.
+_ERROR_TYPE_FOR_CODE: dict[P.ErrorCode, str] = {
+    P.ErrorCode.INVALID_JSON: "invalid_request_error",
+    P.ErrorCode.INVALID_EVENT: "invalid_request_error",
+    P.ErrorCode.UNSUPPORTED_EVENT: "invalid_request_error",
+    P.ErrorCode.INVALID_CONFIG: "invalid_request_error",
+    P.ErrorCode.BUFFER_EMPTY: "invalid_request_error",
+    P.ErrorCode.BUFFER_OVERFLOW: "invalid_request_error",
+    P.ErrorCode.PAYLOAD_TOO_LARGE: "invalid_request_error",
+    P.ErrorCode.UNAUTHORIZED: "authentication_error",
+    P.ErrorCode.BACKEND_ERROR: "server_error",
+    P.ErrorCode.INTERNAL_ERROR: "server_error",
+}
+
 logger = logging.getLogger("stt_server")
 
 
@@ -283,8 +300,15 @@ class TranscriptionServer:
             await self._error(ws, state, P.ErrorCode.INVALID_EVENT, "missing type")
             return
         t = msg["type"]
+        client_event_id = msg.get("event_id") if isinstance(msg.get("event_id"), str) else None
         if t not in P.CLIENT_EVENT_TYPES:
-            await self._error(ws, state, P.ErrorCode.UNSUPPORTED_EVENT, f"unknown event: {t}")
+            await self._error(
+                ws,
+                state,
+                P.ErrorCode.UNSUPPORTED_EVENT,
+                f"unknown event: {t}",
+                client_event_id=client_event_id,
+            )
             return
 
         if t == P.EVT_SESSION_UPDATE:
@@ -377,9 +401,8 @@ class TranscriptionServer:
                     "audio": {
                         "input": {
                             "format": {
-                                "type": "audio/pcm",
                                 "encoding": P.AUDIO_FORMAT,
-                                "sample_rate_hz": P.AUDIO_SAMPLE_RATE_HZ,
+                                "rate": P.AUDIO_SAMPLE_RATE_HZ,
                                 "channels": P.AUDIO_CHANNELS,
                             },
                             "turn_detection": state.config.get("turn_detection"),
@@ -508,19 +531,26 @@ class TranscriptionServer:
         if state.closed:
             return
         if state.in_flight_task and not state.in_flight_task.done():
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(state.in_flight_task),
-                    timeout=self._config.drain_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                # Force-cancel and wait for unwind so the decode can't outlive
-                # the session (and the surrounding shutdown, if this is it).
+            # If shutdown() is already running it owns the drain budget; don't
+            # double-spend it here or a client sending session.close during
+            # shutdown doubles the worst-case wait. Cancel immediately and
+            # let shutdown's gather clean up.
+            if self._shutdown_event.is_set():
                 state.in_flight_task.cancel()
+            else:
                 try:
-                    await state.in_flight_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                    await asyncio.wait_for(
+                        asyncio.shield(state.in_flight_task),
+                        timeout=self._config.drain_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    # Force-cancel and wait for unwind so the decode can't
+                    # outlive the session.
+                    state.in_flight_task.cancel()
+                    try:
+                        await state.in_flight_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
         state.closed = True
         await self._send(
             ws,
@@ -614,11 +644,19 @@ class TranscriptionServer:
         message: str,
         *,
         item_id: str | None = None,
+        client_event_id: str | None = None,
     ) -> None:
+        error_obj: dict[str, Any] = {
+            "type": _ERROR_TYPE_FOR_CODE.get(code, "server_error"),
+            "code": code.value,
+            "message": message,
+        }
+        if client_event_id:
+            error_obj["event_id"] = client_event_id
         payload: dict[str, Any] = {
             "type": P.EVT_ERROR,
             "event_id": _event_id(),
-            "error": {"code": code.value, "message": message},
+            "error": error_obj,
         }
         if item_id:
             payload["item_id"] = item_id

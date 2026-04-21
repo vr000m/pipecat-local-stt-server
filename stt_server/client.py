@@ -92,9 +92,8 @@ class TranscriptionClient:
             "audio": {
                 "input": {
                     "format": {
-                        "type": "audio/pcm",
                         "encoding": P.AUDIO_FORMAT,
-                        "sample_rate_hz": P.AUDIO_SAMPLE_RATE_HZ,
+                        "rate": P.AUDIO_SAMPLE_RATE_HZ,
                         "channels": P.AUDIO_CHANNELS,
                     },
                     "turn_detection": turn_detection,
