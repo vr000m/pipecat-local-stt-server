@@ -3,7 +3,7 @@
 # runs at login and is auto-restarted by launchd on crash.
 #
 # Usage:
-#   scripts/install_stt_agent.sh [install|uninstall|restart|status|logs]
+#   scripts/install_stt_agent.sh [install|uninstall|start|stop|restart|status|logs]
 #
 # Environment overrides:
 #   KODA_STT_SOCKET   path to the UDS socket
@@ -74,6 +74,25 @@ uninstall)
     fi
     echo "uninstalled: $LABEL"
     ;;
+start)
+    # Ensure running. ``launchctl kickstart`` without ``-k`` is a no-op when
+    # the service is already running — which is what "start" should mean.
+    # Use "restart" for a forced kick.
+    if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        echo "$LABEL: not loaded. Run 'install' first." >&2
+        exit 1
+    fi
+    launchctl kickstart "gui/$(id -u)/$LABEL"
+    echo "started (or already running): $LABEL"
+    ;;
+stop)
+    if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        echo "$LABEL: not loaded." >&2
+        exit 0
+    fi
+    launchctl kill SIGTERM "gui/$(id -u)/$LABEL"
+    echo "sent SIGTERM: $LABEL (KeepAlive will restart it — use 'uninstall' to disable)"
+    ;;
 restart)
     launchctl kickstart -k "gui/$(id -u)/$LABEL"
     echo "restarted: $LABEL"
@@ -86,7 +105,7 @@ logs)
     tail -F "$LOG_DIR/koda-stt.log" "$LOG_DIR/koda-stt.err"
     ;;
 *)
-    echo "usage: $0 [install|uninstall|restart|status|logs]" >&2
+    echo "usage: $0 [install|uninstall|start|stop|restart|status|logs]" >&2
     exit 2
     ;;
 esac

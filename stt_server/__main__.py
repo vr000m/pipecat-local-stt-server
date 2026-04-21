@@ -22,10 +22,12 @@ import os
 import sys
 from pathlib import Path
 
-from . import protocol as P
 from .backend import EchoBackend
-from .client import TranscriptionClient
 from .server import serve
+
+# ``TranscriptionClient`` and ``protocol`` are imported lazily inside the
+# status-subcommand helpers so the serve path (run at every launchd startup)
+# doesn't pay for ``websockets.asyncio.client`` it never uses.
 
 
 def _make_backend(name: str, model: str):
@@ -77,6 +79,9 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
 
 async def _probe_status(args: argparse.Namespace) -> dict:
+    from . import protocol as P
+    from .client import TranscriptionClient
+
     client = TranscriptionClient(
         socket_path=args.socket_path,
         host=args.host,
@@ -158,10 +163,15 @@ def _cmd_status(args: argparse.Namespace) -> None:
 def main() -> None:
     # Accept both ``python -m stt_server <flags>`` (legacy serve path) and
     # ``python -m stt_server <subcommand> <flags>``. Detect the latter by a
-    # non-flag first argv; otherwise dispatch to ``serve``.
+    # non-flag first argv; otherwise dispatch to ``serve``. Top-level
+    # ``-h``/``--help`` is NOT reinterpreted as a serve flag — that would
+    # hide the ``status`` subcommand from the help text.
     argv = sys.argv[1:]
+    top_level_help = argv and argv[0] in {"-h", "--help"}
     if argv and not argv[0].startswith("-") and argv[0] in {"serve", "status"}:
         sub, rest = argv[0], argv[1:]
+    elif top_level_help:
+        sub, rest = None, argv
     else:
         sub, rest = "serve", argv
 
@@ -183,6 +193,10 @@ def main() -> None:
     )
     p_status.add_argument("--json", action="store_true", help="emit raw JSON instead of text")
 
+    if sub is None:
+        # Top-level --help path: argparse prints both subcommands and exits.
+        parser.parse_args(rest)
+        return
     args = parser.parse_args([sub, *rest])
     if args.cmd == "status":
         _cmd_status(args)

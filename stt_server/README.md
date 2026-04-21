@@ -43,6 +43,30 @@ For persistent always-on operation on macOS, `scripts/install_stt_agent.sh`
 installs a LaunchAgent that keeps the server alive across login and auto-
 restarts on crash. See the Koda integration section below.
 
+## Checking server health
+
+The server answers a `server.status` wire event with its current session
+state (queue depth, uncommitted bytes, uptime) and, on connect, replies
+with a `server.hello` carrying protocol version, audio format, and
+capabilities. The `status` subcommand wraps that round-trip:
+
+```bash
+# Text output (exit 0 on success, 1 on not-reachable/timeout/error)
+uv run python -m stt_server status --socket-path ~/Library/Caches/koda-stt/stt.sock
+
+# Raw JSON for scripting / monitoring
+uv run python -m stt_server status --socket-path ... --json
+
+# Loopback TCP with bearer token
+uv run python -m stt_server status --host 127.0.0.1 --port 8765 \
+    --auth-token-file /path/to/token
+```
+
+Use this as a preflight before starting a client, in CI smoke tests, or
+from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
+`--port`/`--auth-token-file` endpoint flags work for both `serve` and
+`status` subcommands.
+
 ## Client usage
 
 Only `TranscriptionClient` (plus `protocol`, `backend` interfaces, and
