@@ -40,14 +40,88 @@ def _make_backend(name: str, model: str):
     raise SystemExit(f"unknown backend: {name}")
 
 
-def _resolve_auth_token(token_file: str | None) -> str | None:
+def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:
     # Precedence: --auth-token-file > KODA_STT_AUTH_TOKEN env.
     # A plaintext --auth-token CLI flag is intentionally unsupported: any
     # local user would be able to read the token via `ps`.
+    #
+    # ``client=True`` is used by the status/probe subcommand: it also
+    # consults ``STT_WS_TOKEN`` (the env name the bot reads via
+    # ``bot/runtime._resolve_stt_ws_target``) so ``./koda stt status``
+    # authenticates against token-protected servers the same way the bot
+    # does — without forcing operators to duplicate the secret under a
+    # second env name.
     if token_file:
         return Path(token_file).read_text(encoding="utf-8").strip() or None
     env_val = os.environ.get("KODA_STT_AUTH_TOKEN")
-    return env_val or None
+    if env_val:
+        return env_val
+    if client:
+        alt = (os.environ.get("STT_WS_TOKEN") or "").strip()
+        if alt:
+            return alt
+    return None
+
+
+def _load_dotenv_best_effort() -> None:
+    """Mirror the bot's dotenv discipline so ``stt_server status`` sees the
+    same ``STT_WS_*`` configuration the bot would at startup.
+
+    Kept optional (ImportError swallowed) so the serve path — which does
+    not need dotenv — stays usable if python-dotenv is absent from a
+    minimal deployment.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    # Same order and ``override=False`` semantics as bot/__main__.py and
+    # bot/dual.py so an already-exported env var always wins.
+    load_dotenv(Path.cwd() / ".env", override=False)
+    load_dotenv(Path.home() / ".secrets" / "ai.env", override=False)
+
+
+def _resolve_probe_endpoint(args: argparse.Namespace) -> dict:
+    """Return the endpoint kwargs for ``TranscriptionClient`` used by the
+    status probe. If the caller passed any endpoint flag explicitly, honor
+    exactly that (enforcing ``uri > socket_path > host+port`` so the
+    client's socket_path bias cannot mask a URI override). Otherwise load
+    dotenv and read the same ``STT_WS_*`` env vars the bot resolves at
+    startup — this is what makes ``./koda stt status`` report on the
+    same endpoint the bot would actually connect to.
+    """
+    cli_uri = getattr(args, "uri", None)
+    cli_sock = args.socket_path
+    cli_host = args.host
+    cli_port = args.port
+    if cli_uri or cli_sock or cli_host or cli_port is not None:
+        uri = cli_uri
+        sock = None if uri else cli_sock
+        host = None if (uri or sock) else cli_host
+        port = None if (uri or sock) else cli_port
+        return {"uri": uri, "socket_path": sock, "host": host, "port": port}
+
+    _load_dotenv_best_effort()
+    env = os.environ
+    uri = (env.get("STT_WS_URI") or "").strip() or None
+    sock = (env.get("STT_WS_SOCKET") or "").strip() or None
+    host = (env.get("STT_WS_HOST") or "").strip() or None
+    port_raw = (env.get("STT_WS_PORT") or "").strip()
+    port = int(port_raw) if port_raw else None
+
+    if not (uri or sock or host):
+        sock = env.get("STT_WS_DEFAULT_SOCKET") or os.path.expanduser(
+            "~/Library/Caches/koda-stt/stt.sock"
+        )
+    if uri:
+        sock = None
+        host = None
+        port = None
+    elif sock:
+        host = None
+        port = None
+
+    return {"uri": uri, "socket_path": sock, "host": host, "port": port}
 
 
 def _add_endpoint_flags(p: argparse.ArgumentParser, *, include_uri: bool = False) -> None:
@@ -90,19 +164,10 @@ async def _probe_status(args: argparse.Namespace) -> dict:
     from . import protocol as P
     from .client import TranscriptionClient
 
-    # Enforce ``uri > socket_path > host+port`` so the probe targets the
-    # same endpoint the bot's preflight would, instead of silently
-    # preferring ``socket_path`` via the client's default precedence.
-    uri = getattr(args, "uri", None)
-    socket_path = None if uri else args.socket_path
-    host = None if (uri or socket_path) else args.host
-    port = None if (uri or socket_path) else args.port
+    endpoint = _resolve_probe_endpoint(args)
     client = TranscriptionClient(
-        socket_path=socket_path,
-        host=host,
-        port=port,
-        uri=uri,
-        auth_token=_resolve_auth_token(args.auth_token_file),
+        **endpoint,
+        auth_token=_resolve_auth_token(args.auth_token_file, client=True),
     )
     hello = await asyncio.wait_for(client.connect(), timeout=args.timeout)
     try:
