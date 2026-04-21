@@ -50,10 +50,18 @@ def _resolve_auth_token(token_file: str | None) -> str | None:
     return env_val or None
 
 
-def _add_endpoint_flags(p: argparse.ArgumentParser) -> None:
+def _add_endpoint_flags(p: argparse.ArgumentParser, *, include_uri: bool = False) -> None:
     p.add_argument("--socket-path", default=None)
     p.add_argument("--host", default=None)
     p.add_argument("--port", type=int, default=None)
+    if include_uri:
+        # ``--uri`` is only meaningful for the client-side probe; the serve
+        # path builds its listener from socket-path/host+port directly.
+        p.add_argument(
+            "--uri",
+            default=None,
+            help="Full ws:// or wss:// URI (client-side override; wins over --socket-path/--host).",
+        )
     p.add_argument(
         "--auth-token-file",
         default=None,
@@ -82,10 +90,18 @@ async def _probe_status(args: argparse.Namespace) -> dict:
     from . import protocol as P
     from .client import TranscriptionClient
 
+    # Enforce ``uri > socket_path > host+port`` so the probe targets the
+    # same endpoint the bot's preflight would, instead of silently
+    # preferring ``socket_path`` via the client's default precedence.
+    uri = getattr(args, "uri", None)
+    socket_path = None if uri else args.socket_path
+    host = None if (uri or socket_path) else args.host
+    port = None if (uri or socket_path) else args.port
     client = TranscriptionClient(
-        socket_path=args.socket_path,
-        host=args.host,
-        port=args.port,
+        socket_path=socket_path,
+        host=host,
+        port=port,
+        uri=uri,
         auth_token=_resolve_auth_token(args.auth_token_file),
     )
     hello = await asyncio.wait_for(client.connect(), timeout=args.timeout)
@@ -187,7 +203,7 @@ def main() -> None:
     p_status = subparsers.add_parser(
         "status", help="probe a running server with server.status and print its reply"
     )
-    _add_endpoint_flags(p_status)
+    _add_endpoint_flags(p_status, include_uri=True)
     p_status.add_argument(
         "--timeout", type=float, default=3.0, help="overall probe timeout in seconds"
     )
