@@ -53,9 +53,10 @@ probe on top. See the Koda integration section below.
 ## Checking server health
 
 The server answers a `server.status` wire event with its current session
-state (queue depth, uncommitted bytes, uptime) and, on connect, replies
-with a `server.hello` carrying protocol version, audio format, and
-capabilities. The `status` subcommand wraps that round-trip:
+state (queue depth, uncommitted bytes, uptime) and process health (pid,
+peak RSS), and, on connect, replies with a `server.hello` carrying
+protocol version, audio format, and capabilities. The `status` subcommand
+wraps that round-trip:
 
 ```bash
 # Text output (exit 0 on success, 1 on not-reachable/timeout/error)
@@ -68,6 +69,38 @@ uv run python -m stt_server status --socket-path ... --json
 uv run python -m stt_server status --host 127.0.0.1 --port 8765 \
     --auth-token-file /path/to/token
 ```
+
+Representative text output:
+
+```
+stt_server status: ok
+  protocol: 0.1
+  audio: pcm16 @ 16000 Hz / 1ch
+  capabilities: binary_audio=True base64=True server_vad=False
+  session_id: session_abc123
+  queue_depth: 0
+  uncommitted_bytes: 0
+  session_uptime: 0.1s
+  pid: 12345
+  rss: 1800.3MB (peak)
+```
+
+`rss` is **peak** resident set size from `resource.getrusage` — it
+climbs monotonically within a process lifetime and resets on
+LaunchAgent restart. Useful for leak detection (peak only grows when
+a leak is actually growing), not for real-time memory monitoring.
+
+The `server.status` reply fields, for scripting against `--json`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `type` | string | `"server.status"` |
+| `session_id` | string | current session id |
+| `queue_depth` | int | 0 or 1 — in-flight decode tasks for this session |
+| `uncommitted_bytes` | int | PCM bytes buffered but not yet committed |
+| `uptime_seconds` | float | seconds since this session was created |
+| `pid` | int | server process id |
+| `rss_bytes` | int | peak RSS in bytes, normalized across macOS/Linux |
 
 Use this as a preflight before starting a client, in CI smoke tests, or
 from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
