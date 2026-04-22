@@ -32,6 +32,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `python -m stt_server` resolves the module via sys.path[0] = CWD. If
+# the harness is invoked from outside the repo root, `_wait_for_respond`
+# shells out with just `"$PYTHON" -m stt_server ...` and gets
+# "No module named stt_server" — every cycle would log as a timeout
+# even when the agent is healthy. Anchor here so the harness is
+# location-independent.
+cd "$REPO_ROOT"
 LABEL="koda.stt-server"
 SOCKET_PATH="${KODA_STT_SOCKET:-$HOME/Library/Caches/koda-stt/stt.sock}"
 LOG_DIR="${KODA_STT_LOG_DIR:-$HOME/Library/Logs/koda-stt}"

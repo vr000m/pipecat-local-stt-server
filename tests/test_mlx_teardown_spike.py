@@ -306,3 +306,73 @@ async def test_backend_close_called_exactly_once_on_force_cancel_path():
                 await c.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# MLX backend close drain — unit test at the backend level, not end-to-end.
+#
+# Covers the race Codex flagged where the previous implementation just did
+# ``_thread_lock.acquire(timeout=…)``: between ``threading.Thread.start()``
+# and the daemon thread reaching ``with self._thread_lock:``, the lock was
+# free, so ``close()`` could acquire-release-return while the decode was
+# still about to enter ``mlx_whisper.transcribe()``. The current
+# implementation uses an in-flight counter marked BEFORE thread spawn and
+# decremented inside the thread's finally, which closes that window.
+# ---------------------------------------------------------------------------
+
+
+async def test_mlx_backend_close_waits_for_decode_marked_before_thread_spawn():
+    """Simulate the race: mark a decode in-flight via the backend API
+    (as ``_MLXStream.end`` does before calling ``_run_in_daemon_thread``),
+    then run ``close()``. It must NOT return early — it must wait up to
+    its timeout for ``_mark_inflight_end`` to run.
+    """
+    # MLXWhisperBackend imports numpy at module load; that's fine.
+    # mlx_whisper is imported lazily inside start()/_decode_sync, so the
+    # counter logic is exercisable on non-MLX hosts.
+    from stt_server.backends.mlx_whisper import MLXWhisperBackend
+
+    backend = MLXWhisperBackend()
+    # No thread, no MLX work — just mark + schedule the "thread would
+    # have decremented" signal to simulate a slow decode that finishes
+    # just before the close timeout.
+    backend._mark_inflight_start()
+    loop = asyncio.get_running_loop()
+
+    async def _delayed_decode_end():
+        await asyncio.sleep(0.3)
+        backend._mark_inflight_end()
+
+    decode_task = asyncio.create_task(_delayed_decode_end())
+    try:
+        t0 = loop.time()
+        await backend.close()
+        elapsed = loop.time() - t0
+        # Close should have waited at least 0.3s for the simulated decode
+        # to drain, and well under the 3.0s internal timeout.
+        assert 0.25 <= elapsed <= 1.5, f"close elapsed {elapsed:.2f}s — expected ~0.3s"
+    finally:
+        await decode_task
+
+
+async def test_mlx_backend_close_times_out_if_decode_never_finishes(caplog):
+    """If the in-flight counter never reaches zero within the close
+    timeout, ``close()`` logs a warning and returns (does not hang the
+    shutdown path). Matches the documented bound.
+    """
+    from stt_server.backends.mlx_whisper import MLXWhisperBackend
+
+    backend = MLXWhisperBackend()
+    backend._mark_inflight_start()  # simulate a decode that never completes
+    # Tight internal timeout for the test — monkeypatch not available
+    # for local (closure) constants, so call the drain helper directly.
+    drained = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: backend._wait_inflight_drained(0.2)
+    )
+    assert drained is False
+    # Leave the counter marked; nothing else to assert — the real
+    # ``close()`` path would emit a warning in this case, which is what
+    # the existing Tier A test_shutdown_force_cancels_past_drain_timeout
+    # already covers end-to-end.
+    # Clean up to avoid leaking state across tests.
+    backend._mark_inflight_end()
