@@ -197,7 +197,9 @@ Shipped. `bot/stt/websocket_stt_service.py` is a Pipecat
   with stale text)
 - on server crash, fails the in-flight segment fast via a reader that
   sets `ConnectionError` on unexpected socket close, then reconnects
-  with one 250 ms-back-off retry on the next `run_stt`
+  on the next `run_stt` with up to 6 attempts on an exponential
+  schedule (0.5 → 8s, ~15.5s total budget) before surfacing an
+  `ErrorFrame`
 
 Enable via `STT_SERVICE=websocket` in `.env`. Client env vars:
 
