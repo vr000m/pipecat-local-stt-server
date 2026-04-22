@@ -153,6 +153,29 @@ class MLXWhisperBackend:
         return _MLXStream(self._model, language, self._decode_lock, self._thread_lock)
 
     async def close(self) -> None:
-        # No pool to drain: each decode runs on its own daemon thread that
-        # the OS will reap at process exit.
-        return None
+        # Give any in-flight MLX decode a bounded window to finish flushing
+        # Metal work before the process exits. Without this, SIGTERM during
+        # a decode leaves the Metal command buffer mid-commit and the
+        # process exit trips `-[IOGPUMetalCommandBuffer validate]: failed
+        # assertion 'commit command buffer with uncommitted encoder'` —
+        # measured on 2026-04-22, see the Tier B spike results in
+        # docs/dev_plans/20260420-design-whisper-websocket-server.md.
+        #
+        # The threading.Lock is held for the entire `mlx_whisper.transcribe`
+        # call in `_MLXStream._decode_sync`; acquiring it here means the
+        # current decode (if any) has drained. The bound keeps the "shutdown
+        # never wedges on MLX" invariant — if the decode is genuinely stuck
+        # we fall through and let the daemon thread get reaped at process
+        # exit (same failure mode as before, just not the common case).
+        timeout_s = 3.0
+        acquired = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self._thread_lock.acquire(timeout=timeout_s)
+        )
+        if acquired:
+            self._thread_lock.release()
+        else:
+            logger.warning(
+                "mlx_whisper: in-flight decode did not finish within %.1fs; "
+                "Metal assertion possible at process exit",
+                timeout_s,
+            )

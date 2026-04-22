@@ -59,9 +59,7 @@ async def _one_commit(sock: str, audio_bytes: bytes, budget_s: float) -> str:
         return f"error:{type(exc).__name__}:{exc}"
 
 
-async def _driver(sock: str, audio_ms: int, budget_s: float, stop: asyncio.Event) -> dict:
-    samples = int(P.AUDIO_SAMPLE_RATE_HZ * (audio_ms / 1000.0))
-    audio = (b"\x00\x01") * samples
+async def _driver(sock: str, audio: bytes, budget_s: float, stop: asyncio.Event) -> dict:
     counts: dict[str, int] = {"ok": 0, "timeout": 0, "error": 0}
     first_error: str | None = None
     started = time.monotonic()
@@ -87,6 +85,16 @@ async def _driver(sock: str, audio_ms: int, budget_s: float, stop: asyncio.Event
 
 
 async def _main(args: argparse.Namespace) -> None:
+    samples = int(P.AUDIO_SAMPLE_RATE_HZ * (args.audio_ms / 1000.0))
+    audio = (b"\x00\x01") * samples
+
+    if args.one_shot:
+        # Used by the harness to probe "is the respawned server ready?"
+        # Exit 0 iff one commit succeeds end-to-end; no looping, no signal
+        # handlers (the harness runs us under a wall-clock poll).
+        result = await _one_commit(args.socket, audio, args.budget_s)
+        sys.exit(0 if result == "ok" else 1)
+
     stop = asyncio.Event()
 
     def _handle_signal(*_):
@@ -96,7 +104,7 @@ async def _main(args: argparse.Namespace) -> None:
     loop.add_signal_handler(signal.SIGTERM, _handle_signal)
     loop.add_signal_handler(signal.SIGINT, _handle_signal)
 
-    summary = await _driver(args.socket, args.audio_ms, args.budget_s, stop)
+    summary = await _driver(args.socket, audio, args.budget_s, stop)
     print(json.dumps(summary), flush=True)
 
 
@@ -105,6 +113,11 @@ def main() -> None:
     ap.add_argument("--socket", required=True, help="path to UDS")
     ap.add_argument("--audio-ms", type=int, default=500)
     ap.add_argument("--budget-s", type=float, default=15.0)
+    ap.add_argument(
+        "--one-shot",
+        action="store_true",
+        help="attempt one commit, exit 0 on ok else 1 (harness probe)",
+    )
     asyncio.run(_main(ap.parse_args()))
 
 

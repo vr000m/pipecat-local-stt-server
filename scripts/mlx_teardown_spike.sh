@@ -79,15 +79,45 @@ _wait_for_respond() {
     echo "timeout"
 }
 
-_scan_launchd_stderr() {
-    # Returns count of lines matching the hazard patterns in the window
-    # between the two timestamps (ISO-8601 seconds).
-    local since="$1"
+_err_log_line_count() {
     [[ -f "$LOG_DIR/koda-stt.err" ]] || { echo 0; return; }
-    awk -v since="$since" '
-        $0 ~ /Metal|assertion|abort|panic|segmentation fault/ { c++ }
+    wc -l < "$LOG_DIR/koda-stt.err" | tr -d ' '
+}
+
+_scan_launchd_stderr_range() {
+    # Count hazard-pattern lines in the range [start_line..end_line] of
+    # koda-stt.err. Scoping by line number (not timestamp) works even for
+    # Metal assertions and libc++ aborts which print without timestamps —
+    # those were silently missed by the prior timestamp-based filter.
+    local start_line="$1"
+    local end_line="$2"
+    [[ -f "$LOG_DIR/koda-stt.err" ]] || { echo 0; return; }
+    awk -v s="$start_line" -v e="$end_line" '
+        NR >= s && NR <= e &&
+        $0 ~ /Metal|failed assertion|libc\+\+abi|terminating due to|mutex lock failed|abort|panic|segmentation fault/ { c++ }
         END { print c+0 }
     ' "$LOG_DIR/koda-stt.err"
+}
+
+_wait_for_first_ok_commit() {
+    # Wait until a fresh client can complete one commit end-to-end against
+    # the respawned server, and return the RSS at that point. Measuring RSS
+    # before the first successful commit is misleading — on a cold respawn
+    # MLX hasn't loaded yet, so we'd see a false "leak recovered" reading.
+    local pid="$1"
+    local deadline_s="$2"
+    local deadline=$(( $(date +%s) + deadline_s ))
+    while [[ $(date +%s) -lt $deadline ]]; do
+        if "$PYTHON" "$REPO_ROOT/scripts/_mlx_spike_driver.py" \
+             --socket "$SOCKET_PATH" --audio-ms "$AUDIO_MS" \
+             --one-shot >/dev/null 2>&1; then
+            _get_rss_kb "$pid"
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "timeout"
+    return 1
 }
 
 # Pre-flight: make sure the agent is installed.
@@ -97,8 +127,9 @@ if ! launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
 fi
 
 INITIAL_PID=$(_get_pid)
-INITIAL_RSS=$(_get_rss_kb "$INITIAL_PID")
-echo "initial: pid=$INITIAL_PID rss=${INITIAL_RSS}KB"
+# Baseline RSS after MLX is warm — comparable to the per-cycle measurement.
+INITIAL_RSS=$(_wait_for_first_ok_commit "$INITIAL_PID" 30)
+echo "initial: pid=$INITIAL_PID rss=${INITIAL_RSS}KB (post-warm)"
 echo
 
 FAILED=0
@@ -108,7 +139,7 @@ for cycle in $(seq 1 "$CYCLES"); do
     echo "--- cycle $cycle/$CYCLES ---"
     pid_before=$(_get_pid)
     rss_before=$(_get_rss_kb "$pid_before")
-    err_since=$(date -u +%Y-%m-%dT%H:%M:%S)
+    err_start_line=$(_err_log_line_count)
 
     # Spawn N concurrent drivers.
     driver_pids=()
@@ -135,8 +166,11 @@ for cycle in $(seq 1 "$CYCLES"); do
 
     respond_s=$(_wait_for_respond)
     pid_after=$(_get_pid)
-    rss_after=$(_get_rss_kb "$pid_after")
-    err_count=$(_scan_launchd_stderr "$err_since")
+    # Measure RSS *after* the first successful commit on the respawned
+    # server, so MLX is warm and the number is comparable across cycles.
+    rss_after=$(_wait_for_first_ok_commit "$pid_after" 15)
+    err_end_line=$(_err_log_line_count)
+    err_count=$(_scan_launchd_stderr_range "$((err_start_line + 1))" "$err_end_line")
 
     # Aggregate driver outcomes.
     total_ok=0; total_timeout=0; total_error=0; first_err=""
@@ -178,14 +212,16 @@ for cycle in $(seq 1 "$CYCLES"); do
     echo
 done
 
-# RSS drift check against the very first boot RSS.
+# RSS drift check against the very first boot RSS (both post-warm).
 FINAL_PID=$(_get_pid)
-FINAL_RSS=$(_get_rss_kb "$FINAL_PID")
-if [[ "$INITIAL_RSS" -gt 0 ]]; then
+FINAL_RSS=$(_wait_for_first_ok_commit "$FINAL_PID" 15)
+if [[ "$INITIAL_RSS" =~ ^[0-9]+$ && "$FINAL_RSS" =~ ^[0-9]+$ && "$INITIAL_RSS" -gt 0 ]]; then
     drift_pct=$(python3 -c "print(abs($FINAL_RSS - $INITIAL_RSS) / $INITIAL_RSS * 100)")
     drift_pass=$(python3 -c "print('yes' if $drift_pct <= 10 else 'NO')")
     echo "RSS drift: ${INITIAL_RSS}KB -> ${FINAL_RSS}KB (${drift_pct}%, <=10% ${drift_pass})"
     [[ "$drift_pass" == "NO" ]] && FAILED=1
+else
+    echo "RSS drift: skipped (initial=$INITIAL_RSS final=$FINAL_RSS)"
 fi
 
 # Summary block for pasting into the dev plan.
