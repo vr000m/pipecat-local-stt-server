@@ -24,7 +24,9 @@ import hmac
 import json
 import logging
 import os
+import resource
 import signal
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -64,6 +66,15 @@ logger = logging.getLogger("stt_server")
 
 def _event_id() -> str:
     return f"evt_{uuid.uuid4().hex[:16]}"
+
+
+def _process_peak_rss_bytes() -> int:
+    # ru_maxrss units differ by platform: bytes on macOS, kibibytes on
+    # Linux/BSD. Normalize so the wire value is always bytes.
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return int(rss)
+    return int(rss) * 1024
 
 
 def _session_id() -> str:
@@ -206,6 +217,15 @@ class TranscriptionServer:
         process never wedges on MLX/Metal teardown.
         """
         if not self._started:
+            return
+        # launchd sends SIGTERM once, but defensive double-shutdown is cheap:
+        # if a second caller races in while the first is still draining, let
+        # it wait for the first to finish and return. Without this the second
+        # call would re-gather already-awaited tasks and call
+        # ``backend.close()`` twice.
+        if self._shutdown_event.is_set():
+            while self._started:
+                await asyncio.sleep(0)
             return
         self._shutdown_event.set()
         if self._server is not None:
@@ -651,6 +671,13 @@ class TranscriptionServer:
                 "queue_depth": 1 if state.in_flight_task and not state.in_flight_task.done() else 0,
                 "uncommitted_bytes": len(state.buffer),
                 "uptime_seconds": time.monotonic() - state.started_monotonic,
+                "pid": os.getpid(),
+                # Peak RSS from getrusage — stdlib, no psutil dep. Sufficient
+                # for soak leak-detection (peak only climbs when a leak is
+                # actually growing). ru_maxrss is bytes on macOS, kibibytes
+                # on Linux/BSD — normalize to bytes so the wire contract is
+                # platform-independent.
+                "rss_bytes": _process_peak_rss_bytes(),
             },
         )
 

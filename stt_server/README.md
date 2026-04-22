@@ -39,9 +39,73 @@ uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --b
 uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
 
-For persistent always-on operation on macOS, `scripts/install_stt_agent.sh`
-installs a LaunchAgent that keeps the server alive across login and auto-
-restarts on crash. See the Koda integration section below.
+The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,
+which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
+/ `python -m stt_server status <flags>` — see "Checking server health"
+below for the `status` subcommand.
+
+For persistent always-on operation on macOS, the Koda wrapper exposes
+`./koda stt install|start|stop|restart|status|logs` as the primary
+control surface. It delegates to `scripts/install_stt_agent.sh` (the
+underlying LaunchAgent implementation) and layers a wire-level health
+probe on top. See the Koda integration section below.
+
+## Checking server health
+
+The server answers a `server.status` wire event with its current session
+state (queue depth, uncommitted bytes, uptime) and process health (pid,
+peak RSS), and, on connect, replies with a `server.hello` carrying
+protocol version, audio format, and capabilities. The `status` subcommand
+wraps that round-trip:
+
+```bash
+# Text output (exit 0 on success, 1 on not-reachable/timeout/error)
+uv run python -m stt_server status --socket-path ~/Library/Caches/koda-stt/stt.sock
+
+# Raw JSON for scripting / monitoring
+uv run python -m stt_server status --socket-path ... --json
+
+# Loopback TCP with bearer token
+uv run python -m stt_server status --host 127.0.0.1 --port 8765 \
+    --auth-token-file /path/to/token
+```
+
+Representative text output:
+
+```
+stt_server status: ok
+  protocol: 0.1
+  audio: pcm16 @ 16000 Hz / 1ch
+  capabilities: binary_audio=True base64=True server_vad=False
+  session_id: session_abc123
+  queue_depth: 0
+  uncommitted_bytes: 0
+  session_uptime: 0.1s
+  pid: 12345
+  rss: 1800.3MB (peak)
+```
+
+`rss` is **peak** resident set size from `resource.getrusage` — it
+climbs monotonically within a process lifetime and resets on
+LaunchAgent restart. Useful for leak detection (peak only grows when
+a leak is actually growing), not for real-time memory monitoring.
+
+The `server.status` reply fields, for scripting against `--json`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `type` | string | `"server.status"` |
+| `session_id` | string | current session id |
+| `queue_depth` | int | 0 or 1 — in-flight decode tasks for this session |
+| `uncommitted_bytes` | int | PCM bytes buffered but not yet committed |
+| `uptime_seconds` | float | seconds since this session was created |
+| `pid` | int | server process id |
+| `rss_bytes` | int | peak RSS in bytes, normalized across macOS/Linux |
+
+Use this as a preflight before starting a client, in CI smoke tests, or
+from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
+`--port`/`--auth-token-file` endpoint flags work for both `serve` and
+`status` subcommands.
 
 ## Client usage
 
@@ -133,16 +197,25 @@ Shipped. `bot/stt/websocket_stt_service.py` is a Pipecat
   with stale text)
 - on server crash, fails the in-flight segment fast via a reader that
   sets `ConnectionError` on unexpected socket close, then reconnects
-  with one 250 ms-back-off retry on the next `run_stt`
+  on the next `run_stt` with up to 6 attempts on an exponential
+  schedule (0.5 → 8s, ~15.5s total budget) before surfacing an
+  `ErrorFrame`
 
 Enable via `STT_SERVICE=websocket` in `.env`. Client env vars:
 
 | Variable | Default | Description |
 |---|---|---|
-| `STT_WS_SOCKET` | `~/Library/Caches/koda-stt/stt.sock` | UDS path |
+| `STT_WS_SOCKET` | *(unset)* | UDS path (Koda's `./koda stt` wrapper exports `STT_WS_DEFAULT_SOCKET=~/Library/Caches/koda-stt/stt.sock` as the fallback) |
 | `STT_WS_HOST` / `STT_WS_PORT` | *(unset)* | Loopback TCP target |
-| `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI |
+| `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI. Pairing `STT_WS_TOKEN` with `ws://` to a non-loopback host emits a cleartext-token WARNING. |
 | `STT_WS_TOKEN` | *(unset)* | Bearer token; only enforced when the server was started with a matching token. Configure one for any TCP deployment. |
+| `STT_WS_DEFAULT_SOCKET` | *(unset)* | Consumer-supplied fallback UDS path when no other target is configured — the library ships no built-in default. |
+
+Precedence (`STT_WS_URI > STT_WS_SOCKET > STT_WS_HOST+PORT`) is enforced by
+`stt_server.client.resolve_endpoint_from_env`. Consumers (Koda's `bot/runtime`
+and `python -m stt_server status`) both call it so the resolution rules
+cannot drift. `stt_server.client.is_cleartext_remote(uri)` is the helper
+the Koda bot uses to detect cleartext-token misconfigurations.
 
 Each `WebSocketSTTService` instance owns exactly one websocket session,
 so Koda's dual bot gets two independent sessions (`me` / `them`) against
@@ -150,8 +223,10 @@ a single shared server. `BranchVADUserStartedSpeakingFrame` /
 `BranchVADUserStoppedSpeakingFrame` stay inside Koda; the server
 intentionally has no notion of branches or speakers.
 
-For persistent operation, `scripts/install_stt_agent.sh install` renders
-a LaunchAgent (`koda.stt-server`) via `scripts/render_stt_plist.py`
-(stdlib `plistlib` + allowlist validation — do not reintroduce `sed`
-templating). Overrides: `KODA_STT_SOCKET`, `KODA_STT_BACKEND`,
-`KODA_STT_MODEL`, `KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`.
+For persistent operation, `./koda stt install` (which shells into
+`scripts/install_stt_agent.sh`) renders a LaunchAgent (`koda.stt-server`)
+via `scripts/render_stt_plist.py` (stdlib `plistlib` + allowlist
+validation — do not reintroduce `sed` templating). Overrides:
+`KODA_STT_SOCKET`, `KODA_STT_BACKEND`, `KODA_STT_MODEL`,
+`KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`. Use `./koda stt status` for
+a wire-level health check.

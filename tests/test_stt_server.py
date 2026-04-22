@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -14,19 +16,63 @@ import websockets
 from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
 from stt_server.backend import TranscriptEvent
-from stt_server.client import _format_host_for_uri
+from stt_server.client import (
+    format_host_for_uri,
+    is_cleartext_remote,
+    resolve_endpoint_from_env,
+)
 from stt_server.server import ServerConfig, TranscriptionServer
 
 
 def test_format_host_for_uri_brackets_ipv6():
-    assert _format_host_for_uri("::1") == "[::1]"
-    assert _format_host_for_uri("fe80::1") == "[fe80::1]"
+    assert format_host_for_uri("::1") == "[::1]"
+    assert format_host_for_uri("fe80::1") == "[fe80::1]"
 
 
 def test_format_host_for_uri_passes_hostnames_through():
-    assert _format_host_for_uri("127.0.0.1") == "127.0.0.1"
-    assert _format_host_for_uri("localhost") == "localhost"
-    assert _format_host_for_uri("example.local") == "example.local"
+    assert format_host_for_uri("127.0.0.1") == "127.0.0.1"
+    assert format_host_for_uri("localhost") == "localhost"
+    assert format_host_for_uri("example.local") == "example.local"
+
+
+def test_is_cleartext_remote_flags_non_loopback_ws():
+    assert is_cleartext_remote("ws://example.com/") is True
+    assert is_cleartext_remote("ws://8.8.8.8:9000/") is True
+
+
+def test_is_cleartext_remote_allows_loopback_and_wss():
+    assert is_cleartext_remote("ws://localhost:9000/") is False
+    assert is_cleartext_remote("ws://127.0.0.1:9000/") is False
+    assert is_cleartext_remote("ws://[::1]:9000/") is False
+    assert is_cleartext_remote("wss://example.com/") is False
+    assert is_cleartext_remote("") is False
+
+
+def test_resolve_endpoint_from_env_precedence_uri_wins():
+    env = {
+        "STT_WS_URI": "ws://a/",
+        "STT_WS_SOCKET": "/tmp/s",
+        "STT_WS_HOST": "h",
+        "STT_WS_PORT": "1",
+    }
+    r = resolve_endpoint_from_env(env)
+    assert r == {"uri": "ws://a/", "socket_path": None, "host": None, "port": None}
+
+
+def test_resolve_endpoint_from_env_precedence_socket_over_host_port():
+    r = resolve_endpoint_from_env(
+        {"STT_WS_SOCKET": "/tmp/s", "STT_WS_HOST": "h", "STT_WS_PORT": "1"}
+    )
+    assert r == {"uri": None, "socket_path": "/tmp/s", "host": None, "port": None}
+
+
+def test_resolve_endpoint_from_env_empty_returns_nones():
+    assert resolve_endpoint_from_env({}) == {
+        "uri": None,
+        "socket_path": None,
+        "host": None,
+        "port": None,
+    }
 
 
 def test_client_expanduser_on_socket_path():
@@ -281,6 +327,12 @@ async def test_server_status_reply(client):
     await client.status()
     status = await _next_event_of_types(client, {P.EVT_SERVER_STATUS})
     assert status["uncommitted_bytes"] == 1600
+    # pid / rss_bytes expose process-level health without requiring the
+    # caller to discover the server by pgrep / cmdline pattern. Both are
+    # always present; absolute RSS values are platform-dependent so the
+    # test only asserts the shape.
+    assert isinstance(status["pid"], int) and status["pid"] > 0
+    assert isinstance(status["rss_bytes"], int) and status["rss_bytes"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -585,3 +637,226 @@ async def test_tcp_rejects_missing_bearer_when_token_required():
         assert exc.value.response.status_code == 401
     finally:
         await srv.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch regression tests
+# ---------------------------------------------------------------------------
+
+
+def _run_module(
+    *args: str,
+    cwd: str | os.PathLike[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "stt_server", *args],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        cwd=cwd,
+        env=env,
+    )
+
+
+def test_cli_top_level_help_lists_subcommands():
+    r = _run_module("--help")
+    assert r.returncode == 0, r.stderr
+    assert "serve" in r.stdout
+    assert "status" in r.stdout
+
+
+def test_cli_status_help_shows_status_flags():
+    r = _run_module("status", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--timeout" in r.stdout
+    assert "--json" in r.stdout
+    assert "--socket-path" in r.stdout
+
+
+def test_cli_serve_help_shows_serve_flags():
+    r = _run_module("serve", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "--backend" in r.stdout
+    assert "--model" in r.stdout
+
+
+def test_cli_status_against_missing_server_exits_nonzero(tmp_path: Path):
+    # Point at a socket path that does not exist; probe must fail fast.
+    missing = tmp_path / "does-not-exist.sock"
+    r = _run_module("status", "--socket-path", str(missing), "--timeout", "1.0")
+    assert r.returncode == 1
+    assert "stt_server:" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Probe auth surface — regressions for:
+#   * P1: client-mode auth must NOT fall back to the server-side
+#         KODA_STT_AUTH_TOKEN (could mask bot 401s and leak the server
+#         secret to a remote STT_WS_URI).
+#   * P2: dotenv must load before the probe reads STT_WS_TOKEN even when
+#         the caller passes explicit endpoint flags.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_auth_token_client_uses_stt_ws_token(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.setenv("STT_WS_TOKEN", "abc")
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    assert _resolve_auth_token(None, client=True) == "abc"
+
+
+def test_resolve_auth_token_client_ignores_server_token(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
+    assert _resolve_auth_token(None, client=True) is None
+
+
+def test_resolve_auth_token_client_prefers_stt_ws_token_over_server(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.setenv("STT_WS_TOKEN", "client-secret")
+    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
+    assert _resolve_auth_token(None, client=True) == "client-secret"
+
+
+def test_resolve_auth_token_serve_uses_server_token(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
+    assert _resolve_auth_token(None, client=False) == "server-secret"
+
+
+def test_resolve_auth_token_file_wins_in_client_mode(monkeypatch, tmp_path: Path):
+    from stt_server.__main__ import _resolve_auth_token
+
+    tok = tmp_path / "tok"
+    tok.write_text("from-file\n", encoding="utf-8")
+    monkeypatch.setenv("STT_WS_TOKEN", "from-env")
+    assert _resolve_auth_token(str(tok), client=True) == "from-file"
+
+
+def test_resolve_auth_token_empty_and_whitespace_are_treated_as_unset(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.setenv("STT_WS_TOKEN", "   ")
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    assert _resolve_auth_token(None, client=True) is None
+
+
+def test_resolve_probe_endpoint_loads_dotenv_even_with_explicit_socket(monkeypatch, tmp_path: Path):
+    pytest.importorskip("dotenv")
+    import argparse
+
+    from stt_server.__main__ import _resolve_auth_token, _resolve_probe_endpoint
+
+    (tmp_path / ".env").write_text("STT_WS_TOKEN=from-dotenv\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # The dotenv loader also tries ~/.secrets/ai.env; neutralize it by
+    # pointing HOME at an empty directory for the duration of the test.
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setenv("HOME", str(empty_home))
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+
+    ns = argparse.Namespace(
+        socket_path=str(tmp_path / "x.sock"),
+        host=None,
+        port=None,
+        uri=None,
+        auth_token_file=None,
+    )
+    endpoint = _resolve_probe_endpoint(ns)
+    assert endpoint["socket_path"] == str(tmp_path / "x.sock")
+    assert _resolve_auth_token(None, client=True) == "from-dotenv"
+
+
+async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path: Path):
+    pytest.importorskip("dotenv")
+    sock = Path("/tmp") / f"stt-preflight-{os.getpid()}.sock"
+    sock.unlink(missing_ok=True)
+    srv = TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(socket_path=str(sock), auth_token="probe-token"),
+    )
+    await srv.start()
+    try:
+        (tmp_path / ".env").write_text("STT_WS_TOKEN=probe-token\n", encoding="utf-8")
+        # Scrub both auth vars so the probe has to pick the token up from
+        # dotenv — the whole point of the P2 regression test.
+        env = {
+            k: v for k, v in os.environ.items() if k not in {"STT_WS_TOKEN", "KODA_STT_AUTH_TOKEN"}
+        }
+        # Isolate HOME to avoid ~/.secrets/ai.env contributing another
+        # value; keep PATH/PYTHONPATH/etc. so `python -m stt_server` runs.
+        env["HOME"] = str(tmp_path / "home")
+        # cwd is tmp_path so the in-tree ``stt_server`` package is not on
+        # sys.path automatically — add the repo root explicitly.
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join([repo_root, env.get("PYTHONPATH", "")]).rstrip(
+            os.pathsep
+        )
+        (tmp_path / "home").mkdir(exist_ok=True)
+        # Probe runs in a subprocess; hand it off to a thread so the in-
+        # process server's event loop stays free to accept the connection.
+        r = await asyncio.to_thread(
+            _run_module,
+            "status",
+            "--socket-path",
+            str(sock),
+            "--timeout",
+            "3.0",
+            cwd=str(tmp_path),
+            env=env,
+        )
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "stt_server: ok" in r.stdout
+    finally:
+        await srv.shutdown()
+        sock.unlink(missing_ok=True)
+
+
+async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path):
+    """P1 regression at the CLI boundary: KODA_STT_AUTH_TOKEN alone must
+    not authenticate the probe — otherwise a health check can report ok
+    while the bot (which only reads STT_WS_TOKEN) still 401s."""
+    sock = Path("/tmp") / f"stt-preflight-p1-{os.getpid()}.sock"
+    sock.unlink(missing_ok=True)
+    srv = TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(socket_path=str(sock), auth_token="probe-token"),
+    )
+    await srv.start()
+    try:
+        env = {
+            k: v for k, v in os.environ.items() if k not in {"STT_WS_TOKEN", "KODA_STT_AUTH_TOKEN"}
+        }
+        env["KODA_STT_AUTH_TOKEN"] = "probe-token"
+        env["HOME"] = str(tmp_path / "home")
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join([repo_root, env.get("PYTHONPATH", "")]).rstrip(
+            os.pathsep
+        )
+        (tmp_path / "home").mkdir(exist_ok=True)
+        r = await asyncio.to_thread(
+            _run_module,
+            "status",
+            "--socket-path",
+            str(sock),
+            "--timeout",
+            "3.0",
+            cwd=str(tmp_path),
+            env=env,
+        )
+        assert r.returncode == 1, (
+            f"probe should reject server-only token in client mode; "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+    finally:
+        await srv.shutdown()
+        sock.unlink(missing_ok=True)
