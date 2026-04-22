@@ -170,7 +170,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
 async def _probe_status(args: argparse.Namespace) -> dict:
     from . import protocol as P
-    from .client import TranscriptionClient, _format_host_for_uri, is_cleartext_remote
+    from .client import TranscriptionClient, format_host_for_uri, is_cleartext_remote
 
     endpoint = _resolve_probe_endpoint(args)
     auth_token = _resolve_auth_token(args.auth_token_file, client=True)
@@ -188,7 +188,7 @@ async def _probe_status(args: argparse.Namespace) -> dict:
             and endpoint.get("host")
             and endpoint.get("port") is not None
         ):
-            effective_uri = f"ws://{_format_host_for_uri(endpoint['host'])}:{endpoint['port']}/"
+            effective_uri = f"ws://{format_host_for_uri(endpoint['host'])}:{endpoint['port']}/"
         if effective_uri and is_cleartext_remote(effective_uri):
             print(
                 f"stt_server: warning — auth token will be sent in cleartext to {effective_uri}. "
@@ -276,6 +276,12 @@ def _cmd_status(args: argparse.Namespace) -> None:
     uptime = status.get("uptime_seconds")
     if isinstance(uptime, (int, float)):
         print(f"  session_uptime: {uptime:.1f}s")
+    pid = status.get("pid")
+    if pid is not None:
+        print(f"  pid: {pid}")
+    rss = status.get("rss_bytes")
+    if isinstance(rss, (int, float)):
+        print(f"  rss: {rss / (1024 * 1024):.1f}MB (peak)")
 
 
 def main() -> None:

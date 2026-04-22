@@ -76,7 +76,7 @@ def resolve_endpoint_from_env(env: Mapping[str, str]) -> dict:
     return {"uri": uri, "socket_path": sock, "host": host, "port": port}
 
 
-def _format_host_for_uri(host: str) -> str:
+def format_host_for_uri(host: str) -> str:
     """Bracket IPv6 literals so ``ws://[::1]:port/`` is a valid URI."""
     try:
         addr = ipaddress.ip_address(host)
@@ -132,7 +132,7 @@ class TranscriptionClient:
             # IPv6 literals (e.g. "::1") must be bracketed in URIs; unbracketed
             # hosts go through unchanged so "localhost" / "127.0.0.1" / DNS
             # names keep working.
-            host = _format_host_for_uri(self._host)
+            host = format_host_for_uri(self._host)
             uri = f"ws://{host}:{self._port}/"
             self._ws = await ws_connect(
                 uri,

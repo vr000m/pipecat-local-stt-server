@@ -17,7 +17,7 @@ from stt_server import EchoBackend, TranscriptionClient
 from stt_server import protocol as P
 from stt_server.backend import TranscriptEvent
 from stt_server.client import (
-    _format_host_for_uri,
+    format_host_for_uri,
     is_cleartext_remote,
     resolve_endpoint_from_env,
 )
@@ -25,14 +25,14 @@ from stt_server.server import ServerConfig, TranscriptionServer
 
 
 def test_format_host_for_uri_brackets_ipv6():
-    assert _format_host_for_uri("::1") == "[::1]"
-    assert _format_host_for_uri("fe80::1") == "[fe80::1]"
+    assert format_host_for_uri("::1") == "[::1]"
+    assert format_host_for_uri("fe80::1") == "[fe80::1]"
 
 
 def test_format_host_for_uri_passes_hostnames_through():
-    assert _format_host_for_uri("127.0.0.1") == "127.0.0.1"
-    assert _format_host_for_uri("localhost") == "localhost"
-    assert _format_host_for_uri("example.local") == "example.local"
+    assert format_host_for_uri("127.0.0.1") == "127.0.0.1"
+    assert format_host_for_uri("localhost") == "localhost"
+    assert format_host_for_uri("example.local") == "example.local"
 
 
 def test_is_cleartext_remote_flags_non_loopback_ws():
@@ -327,6 +327,12 @@ async def test_server_status_reply(client):
     await client.status()
     status = await _next_event_of_types(client, {P.EVT_SERVER_STATUS})
     assert status["uncommitted_bytes"] == 1600
+    # pid / rss_bytes expose process-level health without requiring the
+    # caller to discover the server by pgrep / cmdline pattern. Both are
+    # always present; absolute RSS values are platform-dependent so the
+    # test only asserts the shape.
+    assert isinstance(status["pid"], int) and status["pid"] > 0
+    assert isinstance(status["rss_bytes"], int) and status["rss_bytes"] > 0
 
 
 # ---------------------------------------------------------------------------
