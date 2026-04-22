@@ -207,6 +207,15 @@ class TranscriptionServer:
         """
         if not self._started:
             return
+        # launchd sends SIGTERM once, but defensive double-shutdown is cheap:
+        # if a second caller races in while the first is still draining, let
+        # it wait for the first to finish and return. Without this the second
+        # call would re-gather already-awaited tasks and call
+        # ``backend.close()`` twice.
+        if self._shutdown_event.is_set():
+            while self._started:
+                await asyncio.sleep(0)
+            return
         self._shutdown_event.set()
         if self._server is not None:
             # ``close_connections=True`` sends a close frame to every open
