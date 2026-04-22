@@ -41,26 +41,35 @@ def _make_backend(name: str, model: str):
 
 
 def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:
+    # INVARIANT — do not flap. See the "Probe Auth Invariant" block in
+    # docs/dev_plans/20260420-design-whisper-websocket-server.md for the
+    # full history (four review cycles circled this); any change here
+    # must update that block and the regression tests in
+    # tests/test_stt_server.py.
+    #
     # A plaintext --auth-token CLI flag is intentionally unsupported: any
     # local user would be able to read the token via `ps`.
     #
     # Serve path (client=False): --auth-token-file > KODA_STT_AUTH_TOKEN.
-    # Probe path (client=True):  --auth-token-file > STT_WS_TOKEN
-    #                            > KODA_STT_AUTH_TOKEN.
+    # Probe path (client=True):  --auth-token-file > STT_WS_TOKEN only.
     #
     # STT_WS_TOKEN is the client-side bearer a consumer (e.g. the bot)
     # reads to authenticate against the stt_server. KODA_STT_AUTH_TOKEN
-    # is the server-side bearer the launchd-run server expects. Probing
-    # must prefer the client-side value, otherwise a mixed setup where
-    # both env vars are exported would authenticate with the *server*
-    # token against a *remote* endpoint — the endpoint would reject it
-    # with 401 in the best case and silently log it in the worst case.
+    # is the server-side bearer the launchd-run server expects. The probe
+    # MUST see exactly what the bot sees — never the server-side secret —
+    # for two reasons:
+    #   1. If the probe fell back to KODA_STT_AUTH_TOKEN it could report
+    #      "ok" against a local server while the bot still 401s at
+    #      startup, masking the misconfiguration we built this preflight
+    #      to catch.
+    #   2. If STT_WS_URI points at a remote host, that fallback would
+    #      transmit the local LaunchAgent's server-side secret to the
+    #      remote endpoint.
     if token_file:
         return Path(token_file).read_text(encoding="utf-8").strip() or None
     if client:
         client_val = (os.environ.get("STT_WS_TOKEN") or "").strip()
-        if client_val:
-            return client_val
+        return client_val or None
     env_val = (os.environ.get("KODA_STT_AUTH_TOKEN") or "").strip()
     return env_val or None
 
@@ -92,6 +101,15 @@ def _resolve_probe_endpoint(args: argparse.Namespace) -> dict:
     """
     from .client import resolve_endpoint_from_env
 
+    # Always load dotenv, even when the caller passed explicit endpoint
+    # flags. The endpoint resolution below still honors those flags
+    # verbatim, but auth resolution (``_resolve_auth_token``) reads
+    # ``STT_WS_TOKEN`` from ``os.environ``, so without this the documented
+    # "token in .env" path gets a spurious 401 whenever the operator
+    # points the probe at a specific socket/host. ``override=False`` in
+    # the loader means an already-exported env var still wins.
+    _load_dotenv_best_effort()
+
     cli_uri = getattr(args, "uri", None)
     cli_sock = args.socket_path
     cli_host = args.host
@@ -103,7 +121,6 @@ def _resolve_probe_endpoint(args: argparse.Namespace) -> dict:
         port = None if (uri or sock) else cli_port
         return {"uri": uri, "socket_path": sock, "host": host, "port": port}
 
-    _load_dotenv_best_effort()
     resolved = resolve_endpoint_from_env(os.environ)
     if not (resolved["uri"] or resolved["socket_path"] or resolved["host"]):
         # Library-level fallback: only honor the explicit escape hatch.
