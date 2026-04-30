@@ -15,6 +15,8 @@ from typing import AsyncGenerator, Callable, TypeVar
 
 import numpy as np
 
+from shared.text_quality import dominant_unigram_ratio, is_degenerate
+
 from ..backend import TranscriptEvent
 
 logger = logging.getLogger("stt_server.backends.mlx")
@@ -196,7 +198,43 @@ class _MLXStream:
                     logprob_threshold=logprob_threshold,
                     no_speech_threshold=no_speech_threshold,
                 )
-            return (result.get("text") or "").strip()
+            # Post-decode degenerate-output filter. Whisper occasionally
+            # emits a single segment that is one token repeated dozens of
+            # times (e.g. "subscription subscription ...") even with the
+            # Phase-1 suppression knobs in place. We catch those at the
+            # segment level and replace the text with empty so the rest of
+            # the pipeline treats the segment as silence. See
+            # docs/dev_plans/20260430-fix-whisper-hallucination.md Phase 2.
+            segments = result.get("segments") or []
+            if segments:
+                kept: list[str] = []
+                for seg in segments:
+                    seg_text = seg.get("text") or ""
+                    if seg_text and is_degenerate(seg_text):
+                        ratio, token, total = dominant_unigram_ratio(seg_text)
+                        logger.warning(
+                            "mlx_whisper.degenerate_dropped tokens=%d dominant=%r ratio=%.2f",
+                            total,
+                            token,
+                            ratio,
+                        )
+                        continue
+                    kept.append(seg_text)
+                return "".join(kept).strip()
+            # Fallback: backend returned no segments (older mlx_whisper, or
+            # no-speech path). Apply the filter to the joined text directly
+            # so a wholly-degenerate decode is still suppressed.
+            joined = result.get("text") or ""
+            if joined and is_degenerate(joined):
+                ratio, token, total = dominant_unigram_ratio(joined)
+                logger.warning(
+                    "mlx_whisper.degenerate_dropped tokens=%d dominant=%r ratio=%.2f",
+                    total,
+                    token,
+                    ratio,
+                )
+                return ""
+            return joined.strip()
         finally:
             self._backend._mark_inflight_end()
 

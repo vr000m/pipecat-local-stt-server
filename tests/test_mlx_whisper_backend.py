@@ -118,7 +118,10 @@ async def _run_decode(backend: MLXWhisperBackend) -> str:
     return stream._result or ""
 
 
-def test_transcribe_forwards_default_suppression_kwargs(fake_mlx):
+def test_transcribe_forwards_default_suppression_kwargs(fake_mlx, monkeypatch):
+    # Disable Phase-2 post-decode degenerate filter for this kwargs-only check
+    # so the synthetic loop signal round-trips and proves the mock was hit.
+    monkeypatch.setenv("KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO", "1.1")
     backend = MLXWhisperBackend(model="fake-model")
     result = asyncio.run(_run_decode(backend))
 
