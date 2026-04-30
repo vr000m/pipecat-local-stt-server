@@ -250,4 +250,20 @@ unset — is `False`.
 | `KODA_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
 | `KODA_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
 
-See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context.
+After decode, `_decode_sync` runs a degenerate-output filter
+(`shared/text_quality.is_degenerate`) on each segment. Segments where
+the dominant case-folded unigram exceeds the ratio threshold AND the
+segment has at least the minimum token count are replaced with an empty
+string (and a `mlx_whisper.degenerate_dropped` warning is logged).
+Defaults are calibrated against the existing transcript corpus —
+p99 = 0.36, p99.5 = 0.40 — so backchannels ("yeah yeah yeah") and other
+legitimate high-repetition paragraphs are not flagged.
+
+| Variable | Default | Description |
+|---|---|---|
+| `KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
+| `KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
+
+See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context,
+calibration histogram, and the cleanup-stage short-circuit + symmetric
+output guard that pair with these decode-time defences.
