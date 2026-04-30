@@ -6,53 +6,63 @@ Used by:
   back as a single token repeated ``N`` times (e.g. the "subscription
   subscription subscription" hallucination cascade observed on
   20260430-5492e348faa29c46).
-- ``shared/transcript_cleaner.py`` (Phase 3) — pre-cleanup short-circuit on
-  degenerate input + symmetric output guard against same-length degenerate
-  rewrites.
+- ``shared/transcript_cleaner.py`` — pre-cleanup short-circuit on degenerate
+  input + symmetric output guard against same-length degenerate rewrites.
 
 See ``docs/dev_plans/20260430-fix-whisper-hallucination.md``.
 
 Defaults are calibrated against the existing ``~/koda-data`` raw-transcript
 corpus. See ``scripts/calibrate_degenerate_threshold.py`` and the plan's
 "Final Results" section for the empirical histogram.
+
+Env vars (canonical names; STT-prefixed aliases are accepted for backward
+compat with the original ship):
+
+- ``KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO`` (alias: ``KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO``)
+- ``KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS``  (alias: ``KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS``)
+
+The canonical names drop the STT-specific prefix because this module is
+imported from cleanup as well as STT — naming it after STT was a layering
+mistake. Both names are honoured; the canonical one wins if both are set.
 """
 
 from __future__ import annotations
 
-import logging
-import os
 from collections import Counter
 
-logger = logging.getLogger("shared.text_quality")
+from shared.env import env_first
+
+_DEFAULT_RATIO = 0.40
+_DEFAULT_MIN_TOKENS = 10
+
+_RATIO_ENVS = (
+    "KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO",
+    "KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO",
+)
+_MIN_TOKENS_ENVS = (
+    "KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS",
+    "KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS",
+)
 
 
-# Defaults. Resolved at call time (not import time) so tests / operators can
-# monkeypatch env vars without re-importing the module. Mirrors the env-helper
-# pattern in ``stt_server/backends/mlx_whisper.py``.
-_FLOAT_DEFAULT_RATIO = 0.40
-_INT_DEFAULT_MIN_TOKENS = 10
-
-
-def _env_float(name: str, default: float) -> float:
-    val = os.environ.get(name)
-    if val is None or val.strip() == "":
-        return default
+def _ratio_threshold() -> float:
+    val = env_first(*_RATIO_ENVS)
+    if val is None:
+        return _DEFAULT_RATIO
     try:
         return float(val)
     except ValueError:
-        logger.warning("invalid float for %s=%r; using default %s", name, val, default)
-        return default
+        return _DEFAULT_RATIO
 
 
-def _env_int(name: str, default: int) -> int:
-    val = os.environ.get(name)
-    if val is None or val.strip() == "":
-        return default
+def _min_tokens() -> int:
+    val = env_first(*_MIN_TOKENS_ENVS)
+    if val is None:
+        return _DEFAULT_MIN_TOKENS
     try:
         return int(val)
     except ValueError:
-        logger.warning("invalid int for %s=%r; using default %s", name, val, default)
-        return default
+        return _DEFAULT_MIN_TOKENS
 
 
 def dominant_unigram_ratio(text: str) -> tuple[float, str | None, int]:
@@ -72,17 +82,15 @@ def dominant_unigram_ratio(text: str) -> tuple[float, str | None, int]:
 def is_degenerate(text: str) -> bool:
     """True when ``text`` is dominated by a single repeated token.
 
-    Degenerate := ``dominant_unigram_ratio(text) > KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO``
-    AND ``len(tokens) >= KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS``. Strictly
-    greater-than for the ratio so a perfectly-distributed input at exactly the
-    threshold is NOT flagged.
+    Degenerate := dominant-unigram ratio strictly greater than the
+    ratio threshold AND total tokens >= the min-tokens threshold. Strictly
+    greater-than for the ratio so a perfectly-distributed input at exactly
+    the threshold is NOT flagged.
     """
-    ratio_threshold = _env_float("KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO", _FLOAT_DEFAULT_RATIO)
-    min_tokens = _env_int("KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS", _INT_DEFAULT_MIN_TOKENS)
     ratio, _token, total = dominant_unigram_ratio(text)
-    if total < min_tokens:
+    if total < _min_tokens():
         return False
-    return ratio > ratio_threshold
+    return ratio > _ratio_threshold()
 
 
 def has_degenerate_paragraph(text: str) -> bool:

@@ -259,10 +259,17 @@ Defaults are calibrated against the existing transcript corpus —
 p99 = 0.36, p99.5 = 0.40 — so backchannels ("yeah yeah yeah") and other
 legitimate high-repetition paragraphs are not flagged.
 
-| Variable | Default | Description |
+| Variable (canonical) | Default | Description |
 |---|---|---|
-| `KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
-| `KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
+| `KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
+| `KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
+
+The original `KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
+`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship
+are still honoured as backward-compat aliases (canonical wins if both
+are set). New deployments should prefer the canonical names — the
+helper is also used by the cleanup stage in `shared/text_quality.py`,
+so the STT-prefixed names misrepresent its scope.
 
 See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context,
 calibration histogram, and the cleanup-stage short-circuit + symmetric

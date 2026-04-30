@@ -9,38 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 from typing import AsyncGenerator, Callable, TypeVar
 
 import numpy as np
 
+from shared.env import env_bool as _env_bool, env_float as _env_float
 from shared.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
 
 logger = logging.getLogger("stt_server.backends.mlx")
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Parse a boolean env var. Truthy values: "1", "true", "yes", "on"
-    (case-insensitive, whitespace-stripped). Anything else — including
-    "False", "0", empty string, or unset — is False."""
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return val.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, default: float) -> float:
-    val = os.environ.get(name)
-    if val is None or val.strip() == "":
-        return default
-    try:
-        return float(val)
-    except ValueError:
-        logger.warning("invalid float for %s=%r; using default %s", name, val, default)
-        return default
 
 
 # Whisper hallucination-suppression knobs. Defaults match OpenAI's reference
@@ -220,7 +199,22 @@ class _MLXStream:
                         )
                         continue
                     kept.append(seg_text)
-                return "".join(kept).strip()
+                joined_kept = "".join(kept).strip()
+                # Post-join safety net: Whisper sometimes splits a wall into
+                # multiple short segments (5-8 tokens each), each below
+                # MIN_TOKENS, which all individually pass the per-segment
+                # check. Re-run is_degenerate on the joined survivors so the
+                # reconstructed wall is still caught.
+                if joined_kept and is_degenerate(joined_kept):
+                    ratio, token, total = dominant_unigram_ratio(joined_kept)
+                    logger.warning(
+                        "mlx_whisper.degenerate_dropped post-join tokens=%d dominant=%r ratio=%.2f",
+                        total,
+                        token,
+                        ratio,
+                    )
+                    return ""
+                return joined_kept
             # Fallback: backend returned no segments (older mlx_whisper, or
             # no-speech path). Apply the filter to the joined text directly
             # so a wholly-degenerate decode is still suppressed.

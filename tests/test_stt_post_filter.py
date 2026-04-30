@@ -176,3 +176,36 @@ def test_has_degenerate_paragraph_passes_clean_transcript():
 def test_has_degenerate_paragraph_handles_empty_input():
     assert has_degenerate_paragraph("") is False
     assert has_degenerate_paragraph("   \n\n   ") is False
+
+
+# ---------------------------------------------------------------------------
+# Canonical (KODA_TEXT_QUALITY_*) env names take precedence over the
+# STT-prefixed aliases, but aliases are still honoured for backward compat.
+# ---------------------------------------------------------------------------
+
+
+CANONICAL_RATIO_ENV = "KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO"
+CANONICAL_MIN_TOKENS_ENV = "KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS"
+
+
+def test_canonical_env_var_takes_effect(monkeypatch):
+    monkeypatch.setenv(CANONICAL_RATIO_ENV, "0.99")
+    # Same input that's degenerate at 0.40 should not be at 0.99.
+    text = "subscription " * 100  # 100% subscription
+    assert is_degenerate(text) is True  # still 1.0 > 0.99
+    monkeypatch.setenv(CANONICAL_RATIO_ENV, "1.5")
+    assert is_degenerate(text) is False  # 1.0 not > 1.5
+
+
+def test_canonical_wins_over_alias(monkeypatch):
+    # Alias says relax (1.5, never degenerate); canonical says default-strict (0.40).
+    monkeypatch.setenv(RATIO_ENV, "1.5")
+    monkeypatch.setenv(CANONICAL_RATIO_ENV, "0.40")
+    text = "x x x x x a b c d e f"  # 5/11 = 0.45
+    assert is_degenerate(text) is True
+
+
+def test_alias_still_honoured_when_canonical_unset(monkeypatch):
+    monkeypatch.setenv(RATIO_ENV, "1.5")  # alias only — relax
+    text = "x x x x x a b c d e f"
+    assert is_degenerate(text) is False
