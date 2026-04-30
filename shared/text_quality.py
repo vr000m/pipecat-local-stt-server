@@ -83,3 +83,20 @@ def is_degenerate(text: str) -> bool:
     if total < min_tokens:
         return False
     return ratio > ratio_threshold
+
+
+def has_degenerate_paragraph(text: str) -> bool:
+    """True when ANY blank-line-separated paragraph in ``text`` is degenerate.
+
+    The whole-document gate misses paragraph-local hallucination walls in
+    long transcripts (e.g. one ``"subscription " * 11189`` paragraph buried
+    in 120K chars of normal speech — whole-doc dominant share stays well
+    below the 0.40 threshold). Splitting on blank lines matches the
+    paragraph shape produced by the cleanup pipeline and the repair script.
+    """
+    if not text or not text.strip():
+        return False
+    for paragraph in text.split("\n\n"):
+        if is_degenerate(paragraph):
+            return True
+    return False

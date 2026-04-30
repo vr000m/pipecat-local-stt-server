@@ -145,3 +145,34 @@ def test_env_override_min_tokens_raised_suppresses_short_walls(monkeypatch):
     assert is_degenerate(text) is True
     monkeypatch.setenv(MIN_TOKENS_ENV, "20")
     assert is_degenerate(text) is False
+
+
+# ---------------------------------------------------------------------------
+# Paragraph-aware variant — catches a single hallucinated paragraph buried
+# in an otherwise long, normal transcript. The whole-doc gate misses these
+# because the wall's share of the full document is below the 0.40 threshold.
+# ---------------------------------------------------------------------------
+
+
+from shared.text_quality import has_degenerate_paragraph  # noqa: E402
+
+
+def test_has_degenerate_paragraph_catches_buried_wall():
+    normal = " ".join(["hello world today we discussed the project"] * 50)
+    wall = "subscription " * 100
+    transcript = f"{normal}\n\n{wall}\n\n{normal}"
+    # Whole-document gate misses it (dominant share < 0.40 across the doc)
+    assert is_degenerate(transcript) is False
+    # Paragraph-aware gate catches it
+    assert has_degenerate_paragraph(transcript) is True
+
+
+def test_has_degenerate_paragraph_passes_clean_transcript():
+    normal = " ".join(["hello world today we discussed the project"] * 50)
+    transcript = f"{normal}\n\n{normal}\n\n{normal}"
+    assert has_degenerate_paragraph(transcript) is False
+
+
+def test_has_degenerate_paragraph_handles_empty_input():
+    assert has_degenerate_paragraph("") is False
+    assert has_degenerate_paragraph("   \n\n   ") is False
