@@ -230,3 +230,24 @@ validation — do not reintroduce `sed` templating). Overrides:
 `KODA_STT_SOCKET`, `KODA_STT_BACKEND`, `KODA_STT_MODEL`,
 `KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`. Use `./koda stt status` for
 a wire-level health check.
+
+### Whisper hallucination suppression (MLX backend)
+
+The MLX Whisper backend forwards four decode-time knobs to
+`mlx_whisper.transcribe()` to suppress the cascading-repetition failure
+mode (hundreds of `subscription subscription…` lines emitted as a single
+segment). Defaults match OpenAI's reference Whisper EXCEPT
+`condition_on_previous_text`, which we disable: feeding the previous
+chunk's emitted text back as a decoder prompt creates a self-amplifying
+loop on hallucinated tokens. Bool parser accepts `1`/`true`/`yes`/`on`
+(case-insensitive); anything else — including `False`, `0`, empty, or
+unset — is `False`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
+| `KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
+| `KODA_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
+| `KODA_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
+
+See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context.

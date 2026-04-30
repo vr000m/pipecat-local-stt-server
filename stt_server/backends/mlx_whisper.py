@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from typing import AsyncGenerator, Callable, TypeVar
 
@@ -17,6 +18,41 @@ import numpy as np
 from ..backend import TranscriptEvent
 
 logger = logging.getLogger("stt_server.backends.mlx")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var. Truthy values: "1", "true", "yes", "on"
+    (case-insensitive, whitespace-stripped). Anything else — including
+    "False", "0", empty string, or unset — is False."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        logger.warning("invalid float for %s=%r; using default %s", name, val, default)
+        return default
+
+
+# Whisper hallucination-suppression knobs. Defaults match OpenAI's reference
+# Whisper EXCEPT condition_on_previous_text, which we disable: feeding the
+# previous chunk's emitted text back as a decoder prompt creates a
+# self-amplifying loop on hallucinated tokens (e.g. "subscription" walls
+# from YouTube outro training data). See
+# docs/dev_plans/20260430-fix-whisper-hallucination.md.
+#
+# Resolved at call time (not import time) so tests can monkeypatch env vars.
+_BOOL_DEFAULT_CONDITION = False
+_FLOAT_DEFAULT_COMPRESSION = 2.4
+_FLOAT_DEFAULT_LOGPROB = -1.0
+_FLOAT_DEFAULT_NO_SPEECH = 0.6
 
 _T = TypeVar("_T")
 
@@ -131,12 +167,34 @@ class _MLXStream:
                 # constant; audio must already be at AUDIO_SAMPLE_RATE_HZ
                 # (16 kHz), which the protocol enforces on the wire. Do not
                 # pass sample_rate — it's not a valid DecodingOptions kwarg.
+                # Resolve suppression knobs at call time so tests / operators
+                # can monkeypatch env vars without re-importing the module.
+                condition_on_previous_text = _env_bool(
+                    "KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
+                    _BOOL_DEFAULT_CONDITION,
+                )
+                compression_ratio_threshold = _env_float(
+                    "KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD",
+                    _FLOAT_DEFAULT_COMPRESSION,
+                )
+                logprob_threshold = _env_float(
+                    "KODA_STT_WHISPER_LOGPROB_THRESHOLD",
+                    _FLOAT_DEFAULT_LOGPROB,
+                )
+                no_speech_threshold = _env_float(
+                    "KODA_STT_WHISPER_NO_SPEECH_THRESHOLD",
+                    _FLOAT_DEFAULT_NO_SPEECH,
+                )
                 result = mlx_whisper.transcribe(
                     audio,
                     path_or_hf_repo=self._model,
                     language=self._language,
                     fp16=True,
                     verbose=False,
+                    condition_on_previous_text=condition_on_previous_text,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    logprob_threshold=logprob_threshold,
+                    no_speech_threshold=no_speech_threshold,
                 )
             return (result.get("text") or "").strip()
         finally:
