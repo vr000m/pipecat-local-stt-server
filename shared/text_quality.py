@@ -28,9 +28,18 @@ mistake. Both names are honoured; the canonical one wins if both are set.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 
 from shared.env import env_first
+
+# A "word-shaped" token has at least one alphanumeric character (Unicode
+# word class). Pure-punctuation tokens like ``-``, ``--``, ``***``, ``===``,
+# ``•`` are markdown bullets / separators / page rules — semantically not
+# hallucinations even when they cross the dominance threshold (e.g. a tight
+# References-bullet list at the end of a cleaned transcript). We require the
+# *dominant* token to be word-shaped before flagging the input as degenerate.
+_WORD_RE = re.compile(r"\w", re.UNICODE)
 
 _DEFAULT_RATIO = 0.40
 _DEFAULT_MIN_TOKENS = 10
@@ -80,17 +89,25 @@ def dominant_unigram_ratio(text: str) -> tuple[float, str | None, int]:
 
 
 def is_degenerate(text: str) -> bool:
-    """True when ``text`` is dominated by a single repeated token.
+    """True when ``text`` is dominated by a single repeated word-shaped token.
 
     Degenerate := dominant-unigram ratio strictly greater than the
-    ratio threshold AND total tokens >= the min-tokens threshold. Strictly
+    ratio threshold AND total tokens >= the min-tokens threshold AND the
+    dominant token contains at least one alphanumeric character. Strictly
     greater-than for the ratio so a perfectly-distributed input at exactly
-    the threshold is NOT flagged.
+    the threshold is NOT flagged. The word-shape requirement filters out
+    markdown bullet lists and separator rules whose dominant token is pure
+    punctuation (``-``, ``*``, ``===``, ``•``) — these are not Whisper
+    hallucinations even when they technically cross the dominance gate.
     """
-    ratio, _token, total = dominant_unigram_ratio(text)
+    ratio, token, total = dominant_unigram_ratio(text)
     if total < _min_tokens():
         return False
-    return ratio > _ratio_threshold()
+    if ratio <= _ratio_threshold():
+        return False
+    if token is None or not _WORD_RE.search(token):
+        return False
+    return True
 
 
 def has_degenerate_paragraph(text: str) -> bool:

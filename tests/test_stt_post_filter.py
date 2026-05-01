@@ -188,6 +188,53 @@ def test_has_degenerate_paragraph_handles_empty_input():
     assert has_degenerate_paragraph("   \n\n   ") is False
 
 
+def test_pure_punctuation_dominant_token_is_not_degenerate():
+    """Markdown bullet lists / separator rules: dominant token is ``-`` /
+    ``*`` / ``===`` / ``•``. These are not Whisper hallucinations even when
+    the dominance ratio crosses the threshold. Regression for false
+    positives on cleaned-transcript ``References mentioned:`` sections.
+    """
+    bullets = "\n".join(
+        f"- {name}"
+        for name in [
+            "ChatGPT",
+            "OpenAI",
+            "MCP",
+            "Anthropic",
+            "Cursor",
+            "iOS",
+            "IRC",
+            "RCS",
+            "WhatsApp",
+            "iMessage",
+            "window.ai",
+            "Claude",
+            "Codex",
+        ]
+    )
+    ratio, token, total = dominant_unigram_ratio(bullets)
+    assert token == "-"
+    assert total >= 10
+    assert ratio > 0.40
+    assert is_degenerate(bullets) is False
+
+
+def test_separator_rule_is_not_degenerate():
+    text = "===== ===== ===== ===== ===== ===== ===== ===== ===== ====="
+    ratio, token, total = dominant_unigram_ratio(text)
+    assert ratio == pytest.approx(1.0)
+    assert total == 10
+    assert is_degenerate(text) is False
+
+
+def test_word_with_punctuation_attached_still_counts(monkeypatch):
+    # Defensive: a real-word repeat that happens to carry trailing
+    # punctuation (e.g. ``subscription,``) MUST still flag, because the
+    # dominant token contains an alphanumeric.
+    text = "subscription, " * 11
+    assert is_degenerate(text) is True
+
+
 def test_has_degenerate_paragraph_catches_buried_utterance_line():
     """Regression: classifier ``_build_transcript`` joins utterances with
     single newlines, not blank-line paragraphs. A repeated-token utterance
