@@ -14,9 +14,26 @@ from typing import AsyncGenerator, Callable, TypeVar
 
 import numpy as np
 
+from shared.env import env_bool, env_float
+from shared.text_quality import dominant_unigram_ratio, is_degenerate
+
 from ..backend import TranscriptEvent
 
 logger = logging.getLogger("stt_server.backends.mlx")
+
+
+# Whisper hallucination-suppression knobs. Defaults match OpenAI's reference
+# Whisper EXCEPT condition_on_previous_text, which we disable: feeding the
+# previous chunk's emitted text back as a decoder prompt creates a
+# self-amplifying loop on hallucinated tokens (e.g. "subscription" walls
+# from YouTube outro training data). See
+# docs/dev_plans/20260430-fix-whisper-hallucination.md.
+#
+# Resolved at call time (not import time) so tests can monkeypatch env vars.
+_BOOL_DEFAULT_CONDITION = False
+_FLOAT_DEFAULT_COMPRESSION = 2.4
+_FLOAT_DEFAULT_LOGPROB = -1.0
+_FLOAT_DEFAULT_NO_SPEECH = 0.6
 
 _T = TypeVar("_T")
 
@@ -131,14 +148,99 @@ class _MLXStream:
                 # constant; audio must already be at AUDIO_SAMPLE_RATE_HZ
                 # (16 kHz), which the protocol enforces on the wire. Do not
                 # pass sample_rate — it's not a valid DecodingOptions kwarg.
+                # Resolve suppression knobs at call time so tests / operators
+                # can monkeypatch env vars without re-importing the module.
+                condition_on_previous_text = env_bool(
+                    "KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
+                    _BOOL_DEFAULT_CONDITION,
+                )
+                compression_ratio_threshold = env_float(
+                    "KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD",
+                    _FLOAT_DEFAULT_COMPRESSION,
+                )
+                logprob_threshold = env_float(
+                    "KODA_STT_WHISPER_LOGPROB_THRESHOLD",
+                    _FLOAT_DEFAULT_LOGPROB,
+                )
+                no_speech_threshold = env_float(
+                    "KODA_STT_WHISPER_NO_SPEECH_THRESHOLD",
+                    _FLOAT_DEFAULT_NO_SPEECH,
+                )
                 result = mlx_whisper.transcribe(
                     audio,
                     path_or_hf_repo=self._model,
                     language=self._language,
                     fp16=True,
                     verbose=False,
+                    condition_on_previous_text=condition_on_previous_text,
+                    compression_ratio_threshold=compression_ratio_threshold,
+                    logprob_threshold=logprob_threshold,
+                    no_speech_threshold=no_speech_threshold,
                 )
-            return (result.get("text") or "").strip()
+            # Post-decode degenerate-output filter. Whisper occasionally
+            # emits a single segment that is one token repeated dozens of
+            # times (e.g. "subscription subscription ...") even with the
+            # Phase-1 suppression knobs in place. We catch those at the
+            # segment level and replace the text with empty so the rest of
+            # the pipeline treats the segment as silence. See
+            # docs/dev_plans/20260430-fix-whisper-hallucination.md Phase 2.
+            segments = result.get("segments") or []
+            if segments:
+                kept: list[str] = []
+                for seg in segments:
+                    seg_text = seg.get("text") or ""
+                    if seg_text and is_degenerate(seg_text):
+                        ratio, token, total = dominant_unigram_ratio(seg_text)
+                        logger.warning(
+                            "mlx_whisper.degenerate_dropped tokens=%d dominant=%r ratio=%.2f",
+                            total,
+                            token,
+                            ratio,
+                        )
+                        continue
+                    kept.append(seg_text)
+                # Build the on-wire return value AND the safety-net check
+                # text from the same ``kept`` list, side-by-side, so a future
+                # refactor of the segment loop cannot let them diverge.
+                #
+                # ``joined_kept`` is the on-wire return value — unmodified
+                # ``"".join(kept)`` so downstream readers see exactly what
+                # mlx_whisper produced (segments carry a leading space).
+                #
+                # ``check_text`` is a whitespace-normalised view used only
+                # by the post-join safety net below. Whisper sometimes splits
+                # a wall into multiple short segments (5-8 tokens each),
+                # each below MIN_TOKENS and individually passing the per-
+                # segment check; re-running ``is_degenerate`` on the joined
+                # survivors catches the reconstructed wall. Normalised
+                # separately so the safety net is robust if a future backend
+                # ships space-trimmed segments.
+                joined_kept = "".join(kept).strip()
+                check_text = " ".join(s.strip() for s in kept if s.strip()).strip()
+                if check_text and is_degenerate(check_text):
+                    ratio, token, total = dominant_unigram_ratio(check_text)
+                    logger.warning(
+                        "mlx_whisper.degenerate_dropped post-join tokens=%d dominant=%r ratio=%.2f",
+                        total,
+                        token,
+                        ratio,
+                    )
+                    return ""
+                return joined_kept
+            # Fallback: backend returned no segments (older mlx_whisper, or
+            # no-speech path). Apply the filter to the joined text directly
+            # so a wholly-degenerate decode is still suppressed.
+            joined = result.get("text") or ""
+            if joined and is_degenerate(joined):
+                ratio, token, total = dominant_unigram_ratio(joined)
+                logger.warning(
+                    "mlx_whisper.degenerate_dropped tokens=%d dominant=%r ratio=%.2f",
+                    total,
+                    token,
+                    ratio,
+                )
+                return ""
+            return joined.strip()
         finally:
             self._backend._mark_inflight_end()
 

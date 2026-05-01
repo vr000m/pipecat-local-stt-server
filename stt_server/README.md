@@ -230,3 +230,47 @@ validation — do not reintroduce `sed` templating). Overrides:
 `KODA_STT_SOCKET`, `KODA_STT_BACKEND`, `KODA_STT_MODEL`,
 `KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`. Use `./koda stt status` for
 a wire-level health check.
+
+### Whisper hallucination suppression (MLX backend)
+
+The MLX Whisper backend forwards four decode-time knobs to
+`mlx_whisper.transcribe()` to suppress the cascading-repetition failure
+mode (hundreds of `subscription subscription…` lines emitted as a single
+segment). Defaults match OpenAI's reference Whisper EXCEPT
+`condition_on_previous_text`, which we disable: feeding the previous
+chunk's emitted text back as a decoder prompt creates a self-amplifying
+loop on hallucinated tokens. Bool parser accepts `1`/`true`/`yes`/`on`
+(case-insensitive); anything else — including `False`, `0`, empty, or
+unset — is `False`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
+| `KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
+| `KODA_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
+| `KODA_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
+
+After decode, `_decode_sync` runs a degenerate-output filter
+(`shared/text_quality.is_degenerate`) on each segment. Segments where
+the dominant case-folded unigram exceeds the ratio threshold AND the
+segment has at least the minimum token count are replaced with an empty
+string (and a `mlx_whisper.degenerate_dropped` warning is logged).
+Defaults are calibrated against the existing transcript corpus —
+p99 = 0.36, p99.5 = 0.40 — so backchannels ("yeah yeah yeah") and other
+legitimate high-repetition paragraphs are not flagged.
+
+| Variable (canonical) | Default | Description |
+|---|---|---|
+| `KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
+| `KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
+
+The original `KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
+`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship
+are still honoured as backward-compat aliases (canonical wins if both
+are set). New deployments should prefer the canonical names — the
+helper is also used by the cleanup stage in `shared/text_quality.py`,
+so the STT-prefixed names misrepresent its scope.
+
+See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context,
+calibration histogram, and the cleanup-stage short-circuit + symmetric
+output guard that pair with these decode-time defences.
