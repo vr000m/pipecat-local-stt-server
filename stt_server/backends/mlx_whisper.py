@@ -199,19 +199,23 @@ class _MLXStream:
                         )
                         continue
                     kept.append(seg_text)
-                joined_kept = "".join(kept).strip()
-                # Post-join safety net: Whisper sometimes splits a wall into
-                # multiple short segments (5-8 tokens each), each below
-                # MIN_TOKENS, which all individually pass the per-segment
-                # check. Re-run is_degenerate on the joined survivors so the
-                # reconstructed wall is still caught.
+                # Build the on-wire return value AND the safety-net check
+                # text from the same ``kept`` list, side-by-side, so a future
+                # refactor of the segment loop cannot let them diverge.
                 #
-                # The check uses a whitespace-normalised view so it is robust
-                # if a future backend ships space-trimmed segments (current
-                # mlx_whisper segments carry a leading space; we don't want
-                # to depend on that for the safety net to fire). The on-wire
-                # return value is still the unmodified ``"".join(kept)`` so
-                # downstream readers see exactly what mlx_whisper produced.
+                # ``joined_kept`` is the on-wire return value — unmodified
+                # ``"".join(kept)`` so downstream readers see exactly what
+                # mlx_whisper produced (segments carry a leading space).
+                #
+                # ``check_text`` is a whitespace-normalised view used only
+                # by the post-join safety net below. Whisper sometimes splits
+                # a wall into multiple short segments (5-8 tokens each),
+                # each below MIN_TOKENS and individually passing the per-
+                # segment check; re-running ``is_degenerate`` on the joined
+                # survivors catches the reconstructed wall. Normalised
+                # separately so the safety net is robust if a future backend
+                # ships space-trimmed segments.
+                joined_kept = "".join(kept).strip()
                 check_text = " ".join(s.strip() for s in kept if s.strip()).strip()
                 if check_text and is_degenerate(check_text):
                     ratio, token, total = dominant_unigram_ratio(check_text)

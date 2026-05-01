@@ -3,8 +3,12 @@
 Covers the post-decode degenerate-output filter from Phase 2 of
 ``docs/dev_plans/20260430-fix-whisper-hallucination.md``. Defaults shipped:
 
-- ``KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO`` = 0.40 (strictly greater-than)
-- ``KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS`` = 10
+- ``KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO`` = 0.40 (strictly greater-than)
+- ``KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS`` = 10
+
+The ``KODA_STT_WHISPER_DEGENERATE_*`` names are accepted aliases (backward
+compat with the original ship); the canonical names are tested as the
+primary path so a future alias deprecation surfaces here.
 
 Algorithm: case-fold, whitespace-tokenise, dominant-unigram share > ratio
 AND tokens >= min_tokens.
@@ -17,20 +21,26 @@ import pytest
 from shared.text_quality import dominant_unigram_ratio, is_degenerate
 
 
-# Env vars under test — keep in sync with shared/text_quality.py.
-RATIO_ENV = "KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO"
-MIN_TOKENS_ENV = "KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS"
+# Canonical env vars under test — primary path. Keep in sync with
+# shared/text_quality.py. Aliases are exercised in the dedicated alias
+# section near the bottom of this file.
+RATIO_ENV = "KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO"
+MIN_TOKENS_ENV = "KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS"
+ALIAS_RATIO_ENV = "KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO"
+ALIAS_MIN_TOKENS_ENV = "KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS"
 
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
     """Ensure each test starts with the documented defaults.
 
-    Other tests / shells may have set these vars; clear so this file always
-    exercises the shipped defaults unless the test opts in via monkeypatch.
+    Clear both canonical and alias names — leakage from either path would
+    otherwise mask boundary-case regressions.
     """
     monkeypatch.delenv(RATIO_ENV, raising=False)
     monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(ALIAS_RATIO_ENV, raising=False)
+    monkeypatch.delenv(ALIAS_MIN_TOKENS_ENV, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -178,34 +188,41 @@ def test_has_degenerate_paragraph_handles_empty_input():
     assert has_degenerate_paragraph("   \n\n   ") is False
 
 
+def test_has_degenerate_paragraph_catches_buried_utterance_line():
+    """Regression: classifier ``_build_transcript`` joins utterances with
+    single newlines, not blank-line paragraphs. A repeated-token utterance
+    embedded between normal utterances is diluted below the 0.40 threshold
+    when evaluated as one blank-line block, so the per-line scan is what
+    actually catches it.
+    """
+    normal_lines = [
+        f"[10:00:0{i}] Me: hello world today we discussed the project for a while" for i in range(8)
+    ]
+    wall_line = "[10:00:09] Them: " + ("subscription " * 20).strip()
+    transcript = "\n".join(normal_lines + [wall_line] + normal_lines)
+    # Whole-document and blank-line-paragraph gates both miss it.
+    assert is_degenerate(transcript) is False
+    # Per-line gate catches it.
+    assert has_degenerate_paragraph(transcript) is True
+
+
 # ---------------------------------------------------------------------------
 # Canonical (KODA_TEXT_QUALITY_*) env names take precedence over the
 # STT-prefixed aliases, but aliases are still honoured for backward compat.
+# Primary tests above already exercise the canonical path; the cases below
+# specifically pin precedence and alias-only behaviour.
 # ---------------------------------------------------------------------------
-
-
-CANONICAL_RATIO_ENV = "KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO"
-CANONICAL_MIN_TOKENS_ENV = "KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS"
-
-
-def test_canonical_env_var_takes_effect(monkeypatch):
-    monkeypatch.setenv(CANONICAL_RATIO_ENV, "0.99")
-    # Same input that's degenerate at 0.40 should not be at 0.99.
-    text = "subscription " * 100  # 100% subscription
-    assert is_degenerate(text) is True  # still 1.0 > 0.99
-    monkeypatch.setenv(CANONICAL_RATIO_ENV, "1.5")
-    assert is_degenerate(text) is False  # 1.0 not > 1.5
 
 
 def test_canonical_wins_over_alias(monkeypatch):
     # Alias says relax (1.5, never degenerate); canonical says default-strict (0.40).
-    monkeypatch.setenv(RATIO_ENV, "1.5")
-    monkeypatch.setenv(CANONICAL_RATIO_ENV, "0.40")
+    monkeypatch.setenv(ALIAS_RATIO_ENV, "1.5")
+    monkeypatch.setenv(RATIO_ENV, "0.40")
     text = "x x x x x a b c d e f"  # 5/11 = 0.45
     assert is_degenerate(text) is True
 
 
 def test_alias_still_honoured_when_canonical_unset(monkeypatch):
-    monkeypatch.setenv(RATIO_ENV, "1.5")  # alias only — relax
+    monkeypatch.setenv(ALIAS_RATIO_ENV, "1.5")  # alias only — relax
     text = "x x x x x a b c d e f"
     assert is_degenerate(text) is False

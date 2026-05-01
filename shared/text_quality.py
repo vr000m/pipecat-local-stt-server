@@ -94,17 +94,28 @@ def is_degenerate(text: str) -> bool:
 
 
 def has_degenerate_paragraph(text: str) -> bool:
-    """True when ANY blank-line-separated paragraph in ``text`` is degenerate.
+    """True when ANY paragraph or utterance line in ``text`` is degenerate.
 
     The whole-document gate misses paragraph-local hallucination walls in
     long transcripts (e.g. one ``"subscription " * 11189`` paragraph buried
     in 120K chars of normal speech — whole-doc dominant share stays well
-    below the 0.40 threshold). Splitting on blank lines matches the
-    paragraph shape produced by the cleanup pipeline and the repair script.
+    below the 0.40 threshold). We scan two shapes:
+
+    - Blank-line-separated paragraphs — matches the cleaned-markdown shape
+      produced by the cleanup pipeline and the repair script.
+    - Single-newline-separated lines — matches the utterance-line shape
+      produced by ``shared.classifier._build_transcript``, where each
+      utterance is one line joined by ``"\\n"``. A wall-of-tokens utterance
+      embedded between normal lines is diluted below the per-paragraph
+      threshold when the whole transcript is one blank-line block, so the
+      per-line pass is the gate that actually catches it.
     """
     if not text or not text.strip():
         return False
     for paragraph in text.split("\n\n"):
         if is_degenerate(paragraph):
+            return True
+    for line in text.splitlines():
+        if is_degenerate(line):
             return True
     return False
