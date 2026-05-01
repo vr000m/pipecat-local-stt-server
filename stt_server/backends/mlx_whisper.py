@@ -14,7 +14,7 @@ from typing import AsyncGenerator, Callable, TypeVar
 
 import numpy as np
 
-from shared.env import env_bool as _env_bool, env_float as _env_float
+from shared.env import env_bool, env_float
 from shared.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
@@ -150,19 +150,19 @@ class _MLXStream:
                 # pass sample_rate — it's not a valid DecodingOptions kwarg.
                 # Resolve suppression knobs at call time so tests / operators
                 # can monkeypatch env vars without re-importing the module.
-                condition_on_previous_text = _env_bool(
+                condition_on_previous_text = env_bool(
                     "KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
                     _BOOL_DEFAULT_CONDITION,
                 )
-                compression_ratio_threshold = _env_float(
+                compression_ratio_threshold = env_float(
                     "KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD",
                     _FLOAT_DEFAULT_COMPRESSION,
                 )
-                logprob_threshold = _env_float(
+                logprob_threshold = env_float(
                     "KODA_STT_WHISPER_LOGPROB_THRESHOLD",
                     _FLOAT_DEFAULT_LOGPROB,
                 )
-                no_speech_threshold = _env_float(
+                no_speech_threshold = env_float(
                     "KODA_STT_WHISPER_NO_SPEECH_THRESHOLD",
                     _FLOAT_DEFAULT_NO_SPEECH,
                 )
@@ -205,8 +205,16 @@ class _MLXStream:
                 # MIN_TOKENS, which all individually pass the per-segment
                 # check. Re-run is_degenerate on the joined survivors so the
                 # reconstructed wall is still caught.
-                if joined_kept and is_degenerate(joined_kept):
-                    ratio, token, total = dominant_unigram_ratio(joined_kept)
+                #
+                # The check uses a whitespace-normalised view so it is robust
+                # if a future backend ships space-trimmed segments (current
+                # mlx_whisper segments carry a leading space; we don't want
+                # to depend on that for the safety net to fire). The on-wire
+                # return value is still the unmodified ``"".join(kept)`` so
+                # downstream readers see exactly what mlx_whisper produced.
+                check_text = " ".join(s.strip() for s in kept if s.strip()).strip()
+                if check_text and is_degenerate(check_text):
+                    ratio, token, total = dominant_unigram_ratio(check_text)
                     logger.warning(
                         "mlx_whisper.degenerate_dropped post-join tokens=%d dominant=%r ratio=%.2f",
                         total,
