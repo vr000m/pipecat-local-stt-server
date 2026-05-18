@@ -12,6 +12,10 @@ This is a one-off operator tool. It has no REST counterpart and is not a CI
 gate — run it by hand after both LaunchAgents are installed and socket-live
 (see ``stt_server/README.md`` → "Two-agent install").
 
+The two-endpoint shape (one Whisper, one Parakeet) is baked into
+``run_benchmark`` and ``PerUtterance``; adding a third ASR means changing
+those signatures, not just passing another ``Endpoint``.
+
 Usage:
     # Default: whisper on stt.sock, parakeet on parakeet.sock.
     uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus
@@ -268,8 +272,16 @@ async def decode_utterance(endpoint: Endpoint, pcm: bytes) -> DecodeResult:
                 latency = time.perf_counter() - commit_t
                 err = (ev.get("error") or {}).get("message", "backend decode failed")
                 return DecodeResult(transcript="", latency_s=latency, failed=True, error=err)
-        # Socket closed before a terminal event.
-        return DecodeResult(transcript="", latency_s=0.0, failed=True, error="no terminal event")
+        # Socket closed before a terminal event. Report the real elapsed time
+        # (consistent with the .failed path above) rather than a misleading 0.0
+        # in the per-utterance JSON — _aggregate excludes failures from the
+        # latency stats regardless.
+        return DecodeResult(
+            transcript="",
+            latency_s=time.perf_counter() - commit_t,
+            failed=True,
+            error="no terminal event",
+        )
     finally:
         await client.close()
 

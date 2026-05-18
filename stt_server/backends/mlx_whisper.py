@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import AsyncGenerator, Callable, TypeVar
+from typing import AsyncGenerator
 
 import numpy as np
 
@@ -18,6 +18,7 @@ from shared.env import env_bool, env_float
 from shared.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
+from ._thread_util import run_in_daemon_thread
 
 logger = logging.getLogger("stt_server.backends.mlx")
 
@@ -34,43 +35,6 @@ _BOOL_DEFAULT_CONDITION = False
 _FLOAT_DEFAULT_COMPRESSION = 2.4
 _FLOAT_DEFAULT_LOGPROB = -1.0
 _FLOAT_DEFAULT_NO_SPEECH = 0.6
-
-_T = TypeVar("_T")
-
-
-def _run_in_daemon_thread(func: Callable[[], _T]) -> "asyncio.Future[_T]":
-    """Run ``func`` on a fresh daemon thread and return an asyncio Future.
-
-    Unlike ``loop.run_in_executor`` with ``ThreadPoolExecutor``, the thread
-    is a daemon and is NOT registered with the ``concurrent.futures`` atexit
-    handler — so a stuck ``mlx_whisper.transcribe()`` call cannot block
-    process exit when ``session.cancel`` / ``shutdown()`` fires while a
-    decode is running. MLX has no cooperative cancellation hook; the only
-    honest way to bound shutdown is to let the OS reap the thread.
-    """
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[_T] = loop.create_future()
-
-    def _runner() -> None:
-        try:
-            result = func()
-        except BaseException as exc:  # noqa: BLE001 — marshal across threads
-            loop.call_soon_threadsafe(_set_exception_safe, fut, exc)
-        else:
-            loop.call_soon_threadsafe(_set_result_safe, fut, result)
-
-    threading.Thread(target=_runner, daemon=True, name="mlx-decode").start()
-    return fut
-
-
-def _set_result_safe(fut: "asyncio.Future", value) -> None:
-    if not fut.done():
-        fut.set_result(value)
-
-
-def _set_exception_safe(fut: "asyncio.Future", exc: BaseException) -> None:
-    if not fut.done():
-        fut.set_exception(exc)
 
 
 class _MLXStream:
@@ -123,7 +87,7 @@ class _MLXStream:
             # running (but holds ``_thread_lock`` until it finishes) and is
             # reaped by the OS at process exit. Shutdown is bounded
             # regardless of MLX decode duration.
-            self._result = await _run_in_daemon_thread(self._decode_sync)
+            self._result = await run_in_daemon_thread(self._decode_sync, thread_name="mlx-decode")
 
     async def cancel(self) -> None:
         self._cancelled = True

@@ -18,10 +18,11 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import wave
-from typing import AsyncGenerator, Callable, TypeVar
+from typing import AsyncGenerator
 
 from ..backend import TranscriptEvent
 from ..protocol import (
@@ -29,6 +30,7 @@ from ..protocol import (
     AUDIO_SAMPLE_RATE_HZ,
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
+from ._thread_util import run_in_daemon_thread
 
 logger = logging.getLogger("stt_server.backends.parakeet")
 
@@ -47,41 +49,6 @@ DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 # 24-300 s danger zone without truncation.
 _CHUNK_DURATION_S = 120.0
 _OVERLAP_DURATION_S = 15.0
-
-_T = TypeVar("_T")
-
-
-def _run_in_daemon_thread(func: Callable[[], _T]) -> "asyncio.Future[_T]":
-    """Run ``func`` on a fresh daemon thread and return an asyncio Future.
-
-    Same rationale as ``mlx_whisper._run_in_daemon_thread``: the thread is a
-    daemon and is NOT registered with the ``concurrent.futures`` atexit
-    handler, so a stuck ``parakeet_mlx`` decode cannot block process exit when
-    ``session.cancel`` / ``shutdown()`` fires while a decode is running.
-    """
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[_T] = loop.create_future()
-
-    def _runner() -> None:
-        try:
-            result = func()
-        except BaseException as exc:  # noqa: BLE001 — marshal across threads
-            loop.call_soon_threadsafe(_set_exception_safe, fut, exc)
-        else:
-            loop.call_soon_threadsafe(_set_result_safe, fut, result)
-
-    threading.Thread(target=_runner, daemon=True, name="parakeet-decode").start()
-    return fut
-
-
-def _set_result_safe(fut: "asyncio.Future", value) -> None:
-    if not fut.done():
-        fut.set_result(value)
-
-
-def _set_exception_safe(fut: "asyncio.Future", exc: BaseException) -> None:
-    if not fut.done():
-        fut.set_exception(exc)
 
 
 class _ParakeetStream:
@@ -129,7 +96,9 @@ class _ParakeetStream:
             # ``backend.close()`` observes it immediately; the daemon thread
             # owns the decrement in a finally block.
             self._backend._mark_inflight_start()
-            self._result = await _run_in_daemon_thread(self._decode_sync)
+            self._result = await run_in_daemon_thread(
+                self._decode_sync, thread_name="parakeet-decode"
+            )
 
     async def cancel(self) -> None:
         self._cancelled = True
@@ -149,14 +118,16 @@ class _ParakeetStream:
             pcm = bytes(self._buf)
             if not pcm:
                 return ""
-            model = self._backend._get_model()  # lazy first-decode load; may raise
             # ``parakeet_mlx``'s ``transcribe()`` takes a file *path* (it runs
             # ``load_audio`` internally) — unlike ``mlx_whisper.transcribe`` it
             # does NOT accept a raw audio array. Materialise the buffered
             # PCM16LE audio as a temp WAV and hand transcribe() the path. The
             # wire protocol pins channels / sample width / rate upstream, so
             # the WAV header is fully determined by the protocol constants.
-            fd, wav_path = tempfile.mkstemp(suffix=".wav")
+            # The WAV holds raw utterance audio (PII); it is written inside the
+            # backend's private 0o700 temp dir, never the world-listable system
+            # temp dir — see ``ParakeetBackend.__init__``.
+            fd, wav_path = tempfile.mkstemp(suffix=".wav", dir=self._backend._tmpdir)
             os.close(fd)
             try:
                 with wave.open(wav_path, "wb") as wav:
@@ -167,8 +138,12 @@ class _ParakeetStream:
                 # Hold the backend-scope threading lock for the entire decode
                 # so a second decode thread started after this stream's
                 # asyncio awaiter was cancelled still blocks until this one
-                # completes.
+                # completes. ``_get_model()`` is acquired INSIDE the lock: a
+                # first-ever ``from_pretrained`` does Metal work, and loading
+                # under the lock keeps it from racing another thread's
+                # ``transcribe()`` on the Metal device.
                 with self._thread_lock:
+                    model = self._backend._get_model()  # lazy load; may raise
                     # ``chunk_duration`` hands parakeet-mlx its
                     # chunk-and-concatenate path (cross-chunk token merge) so a
                     # 24-300 s utterance is chunked, never truncated.
@@ -221,6 +196,12 @@ class ParakeetBackend:
         # is kept, not just the locks.
         self._inflight_count = 0
         self._inflight_cond = threading.Condition()
+        # Private 0o700 temp dir for per-utterance decode WAVs. ``mkdtemp``
+        # makes it owner-only-traversable, so raw utterance audio (PII) is
+        # never written to the world-listable system temp dir and an orphaned
+        # WAV (SIGKILL between mkstemp and unlink) stays unreadable by other
+        # local users. Removed in ``close()``.
+        self._tmpdir = tempfile.mkdtemp(prefix="koda-parakeet-")
 
     def _mark_inflight_start(self) -> None:
         with self._inflight_cond:
@@ -279,3 +260,7 @@ class ParakeetBackend:
                 "Metal assertion possible at process exit",
                 timeout_s,
             )
+        # Remove the private decode-WAV temp dir. ``ignore_errors`` keeps
+        # shutdown best-effort — a leftover dir is harmless (0o700, owner-only)
+        # and a fresh one is created on the next process start.
+        shutil.rmtree(self._tmpdir, ignore_errors=True)

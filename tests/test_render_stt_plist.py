@@ -166,6 +166,30 @@ def test_custom_label_log_paths_are_derived_from_the_label(tmp_path: Path):
     assert plist["StandardOutPath"] != plist["StandardErrorPath"]
 
 
+@pytest.mark.parametrize(
+    ("label", "expected_basename"),
+    [
+        (None, "koda-stt"),
+        ("koda.stt-server.parakeet", "koda-stt-server-parakeet"),
+    ],
+)
+def test_log_basename_mapping_is_pinned(tmp_path: Path, label: str | None, expected_basename: str):
+    """Pin the exact label -> log-basename mapping.
+
+    ``scripts/install_stt_agent.sh`` hardcodes the SAME mapping for its
+    ``logs`` subcommand (which never calls the renderer). If these expected
+    values change, update the installer's ``LOG_BASENAME`` derivation in
+    lockstep — the two must agree or ``logs`` tails the wrong agent's file.
+    """
+    env = {} if label is None else {"KODA_STT_LABEL": label}
+    dst = tmp_path / "agent.plist"
+    r = _run_render(env, dst)
+    assert r.returncode == 0, r.stderr
+    plist = plistlib.loads(dst.read_bytes())
+    assert Path(plist["StandardOutPath"]).name == f"{expected_basename}.log"
+    assert Path(plist["StandardErrorPath"]).name == f"{expected_basename}.err"
+
+
 # ---------------------------------------------------------------------------
 # BACKEND allowlist (_BACKEND_RE) — parakeet accepted, bogus rejected
 # ---------------------------------------------------------------------------

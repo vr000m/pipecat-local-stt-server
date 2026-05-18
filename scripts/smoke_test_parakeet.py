@@ -72,18 +72,31 @@ def _load_wav(path: str) -> bytes:
 
 
 async def _wait_for_socket(sock: str, proc: subprocess.Popen, timeout_s: float) -> None:
-    """Poll until the server has created its UDS socket, or fail loudly."""
+    """Poll until the server is *accepting* on its UDS socket, or fail loudly.
+
+    Polls with a real connect rather than ``os.path.exists``: the socket file
+    appears at ``bind()`` time, a beat before ``listen()``/``accept()`` are
+    ready, so an existence check alone leaves a TOCTOU window where the client
+    connect can still be refused.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if os.path.exists(sock):
-            return
+            try:
+                _, writer = await asyncio.open_unix_connection(sock)
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+                return
+            except (ConnectionRefusedError, FileNotFoundError, OSError):
+                pass  # socket exists but the server is not accepting yet
         if proc.poll() is not None:
             raise SystemExit(
                 f"stt_server exited early (code {proc.returncode}) before "
                 f"creating its socket — see the server log above."
             )
         await asyncio.sleep(0.1)
-    raise SystemExit(f"stt_server did not create {sock} within {timeout_s:.0f}s")
+    raise SystemExit(f"stt_server did not accept on {sock} within {timeout_s:.0f}s")
 
 
 async def _decode(sock: str, pcm: bytes, timeout_s: float) -> tuple[str, float]:
