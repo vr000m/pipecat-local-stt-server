@@ -17,11 +17,26 @@ import re
 import sys
 from pathlib import Path
 
-LABEL = "koda.stt-server"
+DEFAULT_LABEL = "koda.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
-_BACKEND_RE = re.compile(r"^(echo|mlx)$")
+_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet)$")
+_LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
+
+
+def _log_basename(label: str) -> str:
+    """Derive a per-agent log-file basename from the launchd label.
+
+    The legacy default label maps to the historical ``koda-stt`` basename so
+    the default-env plist stays byte-identical to the pre-multi-instance
+    render. Any other label gets a collision-free basename by replacing the
+    ``.`` separators with ``-`` (e.g. ``koda.stt-server.parakeet`` ->
+    ``koda-stt-server-parakeet``).
+    """
+    if label == DEFAULT_LABEL:
+        return "koda-stt"
+    return label.replace(".", "-")
 
 
 def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) -> str:
@@ -38,12 +53,23 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
 
 
 def main() -> None:
+    # KODA_STT_LABEL is optional; an unset value keeps the legacy single-agent
+    # label so the default-env render stays byte-identical to today's plist.
+    label = os.environ.get("KODA_STT_LABEL") or DEFAULT_LABEL
+    if not _LABEL_RE.match(label):
+        print(
+            f"error: KODA_STT_LABEL={label!r} rejected by allowlist (alphanumerics / . _ -)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    log_basename = _log_basename(label)
+
     python = _require("PYTHON", os.environ.get("PYTHON"), _ABSPATH_RE, "absolute path")
     cwd = _require("REPO_ROOT", os.environ.get("REPO_ROOT"), _ABSPATH_RE, "absolute path")
     socket_path = _require(
         "SOCKET_PATH", os.environ.get("SOCKET_PATH"), _ABSPATH_RE, "absolute path"
     )
-    backend = _require("BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx")
+    backend = _require("BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet")
     model = _require(
         "MODEL",
         os.environ.get("MODEL"),
@@ -55,7 +81,7 @@ def main() -> None:
     plist_dst = _require("PLIST_DST", os.environ.get("PLIST_DST"), _ABSPATH_RE, "absolute path")
 
     plist: dict = {
-        "Label": LABEL,
+        "Label": label,
         "ProgramArguments": [
             python,
             "-m",
@@ -79,8 +105,8 @@ def main() -> None:
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
             "HOME": home,
         },
-        "StandardOutPath": str(Path(log_dir) / "koda-stt.log"),
-        "StandardErrorPath": str(Path(log_dir) / "koda-stt.err"),
+        "StandardOutPath": str(Path(log_dir) / f"{log_basename}.log"),
+        "StandardErrorPath": str(Path(log_dir) / f"{log_basename}.err"),
     }
 
     auth_token = os.environ.get("KODA_STT_AUTH_TOKEN")

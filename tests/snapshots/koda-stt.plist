@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/test</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>koda.stt-server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>-m</string>
+		<string>stt_server</string>
+		<string>--socket-path</string>
+		<string>/Users/test/Library/Caches/koda-stt/stt.sock</string>
+		<string>--backend</string>
+		<string>mlx</string>
+		<string>--model</string>
+		<string>mlx-community/whisper-large-v3-turbo</string>
+		<string>--log-level</string>
+		<string>INFO</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/test/Library/Logs/koda-stt/koda-stt.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/test/Library/Logs/koda-stt/koda-stt.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/test/koda-pipecat</string>
+</dict>
+</plist>
