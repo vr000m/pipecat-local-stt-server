@@ -15,13 +15,20 @@ text, ``completed`` always).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import tempfile
 import threading
+import wave
 from typing import AsyncGenerator, Callable, TypeVar
 
-import numpy as np
-
 from ..backend import TranscriptEvent
+from ..protocol import (
+    AUDIO_CHANNELS,
+    AUDIO_SAMPLE_RATE_HZ,
+    AUDIO_SAMPLE_WIDTH_BYTES,
+)
 
 logger = logging.getLogger("stt_server.backends.parakeet")
 
@@ -139,25 +146,40 @@ class _ParakeetStream:
             # ``events()``. The backend never invents a ``failed`` event kind —
             # the server's ``except`` arm synthesises the wire
             # ``transcript.failed`` + ``BACKEND_ERROR``.
-            # PCM16LE -> float32 in [-1, 1), the normalised form decoders
-            # expect (mirrors ``_MLXStream._decode_sync``). The wire protocol
-            # enforces AUDIO_SAMPLE_RATE_HZ (16 kHz) upstream.
-            audio = np.frombuffer(bytes(self._buf), dtype=np.int16).astype(np.float32) / 32768.0
-            if audio.size == 0:
+            pcm = bytes(self._buf)
+            if not pcm:
                 return ""
             model = self._backend._get_model()  # lazy first-decode load; may raise
-            # Hold the backend-scope threading lock for the entire decode so a
-            # second decode thread started after this stream's asyncio awaiter
-            # was cancelled still blocks until this one completes.
-            with self._thread_lock:
-                # ``chunk_duration`` hands parakeet-mlx its chunk-and-concatenate
-                # path (cross-chunk token merge) so a 24-300 s utterance is
-                # chunked, never truncated.
-                result = model.transcribe(
-                    audio,
-                    chunk_duration=_CHUNK_DURATION_S,
-                    overlap_duration=_OVERLAP_DURATION_S,
-                )
+            # ``parakeet_mlx``'s ``transcribe()`` takes a file *path* (it runs
+            # ``load_audio`` internally) — unlike ``mlx_whisper.transcribe`` it
+            # does NOT accept a raw audio array. Materialise the buffered
+            # PCM16LE audio as a temp WAV and hand transcribe() the path. The
+            # wire protocol pins channels / sample width / rate upstream, so
+            # the WAV header is fully determined by the protocol constants.
+            fd, wav_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            try:
+                with wave.open(wav_path, "wb") as wav:
+                    wav.setnchannels(AUDIO_CHANNELS)
+                    wav.setsampwidth(AUDIO_SAMPLE_WIDTH_BYTES)
+                    wav.setframerate(AUDIO_SAMPLE_RATE_HZ)
+                    wav.writeframes(pcm)
+                # Hold the backend-scope threading lock for the entire decode
+                # so a second decode thread started after this stream's
+                # asyncio awaiter was cancelled still blocks until this one
+                # completes.
+                with self._thread_lock:
+                    # ``chunk_duration`` hands parakeet-mlx its
+                    # chunk-and-concatenate path (cross-chunk token merge) so a
+                    # 24-300 s utterance is chunked, never truncated.
+                    result = model.transcribe(
+                        wav_path,
+                        chunk_duration=_CHUNK_DURATION_S,
+                        overlap_duration=_OVERLAP_DURATION_S,
+                    )
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(wav_path)
             text = getattr(result, "text", "") or ""
             return text.strip()
         finally:

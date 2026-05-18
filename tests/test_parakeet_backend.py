@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+import wave
 from typing import Any
 
 import numpy as np
@@ -75,14 +76,25 @@ class _FakeParakeetModel:
         self.return_text = "hello from parakeet"
         self.raise_on_transcribe: BaseException | None = None
         self.transcribe_calls = 0
-        self.last_audio: Any = None
+        self.last_path: Any = None
+        self.last_frame_count: int | None = None
         # When set, the model blocks inside transcribe() until released —
         # used to exercise cancel-mid-decode and decode serialisation.
         self._gate: "threading_Event | None" = None
 
-    def transcribe(self, audio: Any, *args: Any, **kwargs: Any) -> _FakeAlignedResult:
+    def transcribe(self, path: Any, *args: Any, **kwargs: Any) -> _FakeAlignedResult:
+        # The real ``parakeet_mlx`` ``transcribe()`` takes a file *path*. The
+        # backend writes the buffered PCM to a temp WAV and passes the path;
+        # capture the decoded frame count by reading that WAV so tests can
+        # assert no silent truncation. Read before the gate — the backend
+        # unlinks the temp file only after ``transcribe()`` returns.
         self.transcribe_calls += 1
-        self.last_audio = audio
+        self.last_path = path
+        try:
+            with wave.open(str(path), "rb") as w:
+                self.last_frame_count = w.getnframes()
+        except (OSError, wave.Error):
+            self.last_frame_count = None
         if self._gate is not None:
             self._gate.wait()
         if self.raise_on_transcribe is not None:
@@ -399,11 +411,10 @@ async def test_long_utterance_not_silently_truncated(parakeet_mod, fake_parakeet
     assert events[-1].kind == "completed"
     assert fake_parakeet.model.transcribe_calls >= 1
 
-    # No silent truncation: the audio the model saw spans the full 60 s.
-    audio_seen = fake_parakeet.model.last_audio
-    assert audio_seen is not None
-    arr = np.asarray(audio_seen)
-    duration_s = arr.size / _SAMPLE_RATE_HZ
+    # No silent truncation: the WAV the model decoded spans the full 60 s.
+    frames = fake_parakeet.model.last_frame_count
+    assert frames is not None, "model did not receive a readable WAV path"
+    duration_s = frames / _SAMPLE_RATE_HZ
     assert duration_s == pytest.approx(seconds, rel=0.02), (
         f"60s utterance silently truncated to {duration_s:.1f}s"
     )
