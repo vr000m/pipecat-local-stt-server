@@ -78,14 +78,19 @@ from statistics import mean, median
 
 # Ensure the project root is importable so `stt_server` resolves when this
 # script is run directly (mirrors scripts/benchmark_llm.py).
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
 
 from stt_server import protocol as P  # noqa: E402
 from stt_server.client import TranscriptionClient  # noqa: E402
 
 # Directories known to hold PII-bearing corpora — refuse these by default.
+# ``docs/benchmarks`` is anchored to the repo root (derived from this file's
+# location), NOT the process cwd: the script is runnable by absolute path from
+# anywhere, and a cwd-relative guard would silently fail to refuse the real
+# PII corpus whenever the caller is outside the repo root.
 _PII_CORPUS_ROOTS = (
-    Path("docs/benchmarks").resolve(),
+    (_REPO_ROOT / "docs" / "benchmarks").resolve(),
     Path(os.path.expanduser("~/koda-data")).resolve(),
 )
 
