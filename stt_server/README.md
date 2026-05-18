@@ -24,7 +24,10 @@ for the full design.
 - `MLXWhisperBackend` shipped in `stt_server/backends/mlx_whisper.py` (requires
   the `stt-server-mlx` extra)
 - `ParakeetBackend` shipped in `stt_server/backends/parakeet.py` (requires the
-  `stt-server-parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`)
+  `stt-server-parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`).
+  Parakeet decodes from a temp WAV; that WAV holds raw utterance audio (PII) and
+  is written to a per-process private `0o700` directory (created at backend
+  start, removed on `close()`), never the world-listable system temp dir.
 
 ## Running the server
 
