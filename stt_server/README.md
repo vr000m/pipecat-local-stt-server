@@ -104,6 +104,32 @@ the Parakeet agent you must re-export its `KODA_STT_LABEL` and
 `KODA_STT_SOCKET`; a default-env invocation always targets the legacy
 `koda.stt-server` agent. See the recipe in the `install_stt_agent.sh` header.
 
+### A/B benchmark — Whisper vs Parakeet
+
+With both agents installed and socket-live, `scripts/benchmark_asr_ab.py`
+replays a corpus of utterances through **both** servers and reports
+per-utterance Word Error Rate (WER) + decode latency, plus aggregates. It is
+a pure V1 client — no protocol surface added — and a one-off operator tool
+(no REST counterpart, not a CI gate).
+
+```bash
+# Default endpoints: whisper on stt.sock, parakeet on parakeet.sock.
+uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus
+
+# Write a full JSON report alongside the console summary.
+uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+    --json-out benchmarks/results/asr_ab.json
+```
+
+The corpus is a directory of `<stem>.wav` (16 kHz mono PCM16) + `<stem>.txt`
+reference-transcript pairs, named explicitly on the command line. The
+benchmark **fails fast** if only one of the two endpoints answers — it never
+silently benchmarks a single ASR. The corpus is never baked into the script;
+`docs/benchmarks` / `~/koda-data` JSON corpora carry real names and
+financials, so the script refuses a `--corpus` under those roots unless
+`--allow-pii-corpus` is passed. Use a synthetic or consented-recording corpus
+and keep it outside the repo.
+
 ## Checking server health
 
 The server answers a `server.status` wire event with its current session
