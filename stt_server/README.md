@@ -23,6 +23,8 @@ for the full design.
 - `EchoBackend` reference implementation for tests and smoke-checks
 - `MLXWhisperBackend` shipped in `stt_server/backends/mlx_whisper.py` (requires
   the `stt-server-mlx` extra)
+- `ParakeetBackend` shipped in `stt_server/backends/parakeet.py` (requires the
+  `stt-server-parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`)
 
 ## Running the server
 
@@ -49,6 +51,58 @@ For persistent always-on operation on macOS, the Koda wrapper exposes
 control surface. It delegates to `scripts/install_stt_agent.sh` (the
 underlying LaunchAgent implementation) and layers a wire-level health
 probe on top. See the Koda integration section below.
+
+## Multi-backend operation
+
+Each server process loads exactly **one** backend, pinned at launch via
+`--backend {echo,mlx,parakeet}`. To run more than one ASR — for example to
+A/B-benchmark Parakeet against Whisper — start a second server process on a
+**separate socket**. The V1 wire protocol is unchanged; the only difference
+between two ASRs from the bot's perspective is which socket it connects to.
+
+### Per-ASR socket convention
+
+| ASR | LaunchAgent label | Socket | Bot selection |
+|---|---|---|---|
+| whisper (`mlx`) | `koda.stt-server` | `~/Library/Caches/koda-stt/stt.sock` | leave `STT_WS_SOCKET` unset |
+| parakeet | `koda.stt-server.parakeet` | `~/Library/Caches/koda-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
+
+Whisper keeps the legacy label and socket, so the bot-side default in
+`bot/runtime.py` (`~/Library/Caches/koda-stt/stt.sock`) still resolves to it
+with no `.env` change. Selecting Parakeet is a one-env-var flip: point
+`STT_WS_SOCKET` at `.../parakeet.sock`. The flip is **bot-wide** — in the
+dual-input bot both the Me and Them branches connect to the same resolved
+endpoint, so both arms always use the same ASR. See `.env.example` for the
+client-side configuration.
+
+### Two-agent install
+
+`scripts/install_stt_agent.sh` is parameterised by `KODA_STT_LABEL` /
+`KODA_STT_SOCKET` / `KODA_STT_BACKEND` so two LaunchAgents can coexist
+without plist or log collisions:
+
+```bash
+# 1. Whisper agent — default env keeps the legacy label + socket.
+scripts/install_stt_agent.sh install
+
+# 2. Parakeet agent — distinct label, socket and backend.
+#    Warm the ~1.5 GB Hugging Face model cache FIRST: a cold first launch
+#    downloads it under KeepAlive + ThrottleInterval=10 and launchd may
+#    throttle-loop the agent before the download finishes.
+uv sync --extra stt-server-parakeet
+.venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
+KODA_STT_LABEL=koda.stt-server.parakeet \
+  KODA_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
+  KODA_STT_BACKEND=parakeet \
+  scripts/install_stt_agent.sh install
+```
+
+The script manages exactly **one** agent per invocation, identified by
+`KODA_STT_LABEL` (+ its socket) — there is no registry or "all" mode. To run
+any subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against
+the Parakeet agent you must re-export its `KODA_STT_LABEL` and
+`KODA_STT_SOCKET`; a default-env invocation always targets the legacy
+`koda.stt-server` agent. See the recipe in the `install_stt_agent.sh` header.
 
 ## Checking server health
 
