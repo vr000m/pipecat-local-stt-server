@@ -821,6 +821,370 @@ async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path:
         sock.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 — Parakeet backend selection wiring
+#   docs/dev_plans/20260518-feature-multi-asr-parakeet-backend.md
+#
+# Two concerns:
+#   * _make_backend / _resolve_model / argparse choices accept ``parakeet``;
+#     the ``--model`` default is backend-aware; the MLX path is unregressed.
+#   * a stubbed ``ParakeetBackend`` driven through the real ``client`` server
+#     fixture is wire-identical to the MLX/echo path for non-empty decode,
+#     empty-text decode, and a raising backend (server-synthesised
+#     ``transcript.failed``), and the ``MAX_UNCOMMITTED_*`` protocol ceiling
+#     composes with the backend regardless of backend choice.
+#
+# ``parakeet_mlx`` is stubbed via ``sys.modules`` injection so no model
+# downloads in CI — same technique as ``tests/test_parakeet_backend.py``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_parakeet_mlx(monkeypatch):
+    """Install a permissive fake ``parakeet_mlx`` so the real backend module
+    can be imported/constructed in CI without a model download.
+
+    Phase 2 exercises the ``_make_backend`` ``parakeet`` arm, which lazily
+    imports ``stt_server.backends.parakeet``; that module's own lazy
+    ``import parakeet_mlx`` lives inside ``start()``/decode, so for pure
+    construction tests the stub is not strictly needed — but installing it
+    keeps the tests robust if the import discipline ever regresses.
+    """
+    import types as _types
+
+    fake = _types.ModuleType("parakeet_mlx")
+
+    def _from_pretrained(model_id, *a, **kw):  # pragma: no cover - not driven here
+        raise AssertionError("real model load attempted in a wiring test")
+
+    fake.from_pretrained = _from_pretrained
+    monkeypatch.setitem(sys.modules, "parakeet_mlx", fake)
+    monkeypatch.delitem(sys.modules, "stt_server.backends.parakeet", raising=False)
+    return fake
+
+
+# --- _make_backend / _resolve_model / argparse choices --------------------
+
+
+def test_make_backend_parakeet_constructs_parakeet_backend(fake_parakeet_mlx):
+    from stt_server.__main__ import _make_backend
+    from stt_server.backends.parakeet import ParakeetBackend
+
+    backend = _make_backend("parakeet", "fake-parakeet-model")
+    assert isinstance(backend, ParakeetBackend)
+
+
+def test_make_backend_unknown_still_systemexits():
+    from stt_server.__main__ import _make_backend
+
+    with pytest.raises(SystemExit):
+        _make_backend("not-a-backend", "whatever")
+
+
+def test_argparse_backend_choices_include_parakeet():
+    """``--backend parakeet`` must be an accepted argparse choice."""
+    r = _run_module("serve", "--help")
+    assert r.returncode == 0, r.stderr
+    # argparse renders the choice tuple in the --backend metavar/help.
+    assert "parakeet" in r.stdout
+
+
+def test_argparse_rejects_unknown_backend():
+    """A backend outside the choice tuple must exit non-zero (argparse=2)."""
+    r = _run_module("serve", "--backend", "bogus")
+    assert r.returncode != 0
+    assert "parakeet" in r.stderr or "invalid choice" in r.stderr
+
+
+def test_resolve_model_parakeet_unset_uses_default_parakeet_model(fake_parakeet_mlx):
+    from stt_server.__main__ import _resolve_model
+    from stt_server.backends.parakeet import DEFAULT_PARAKEET_MODEL
+
+    assert _resolve_model("parakeet", None) == DEFAULT_PARAKEET_MODEL
+
+
+def test_resolve_model_mlx_unset_still_defaults_to_whisper_repo():
+    """Regression: the MLX default must not shift when the parakeet arm lands."""
+    from stt_server.__main__ import _resolve_model
+
+    assert _resolve_model("mlx", None) == "mlx-community/whisper-large-v3-turbo"
+
+
+def test_resolve_model_explicit_override_wins_for_parakeet(fake_parakeet_mlx):
+    from stt_server.__main__ import _resolve_model
+
+    assert _resolve_model("parakeet", "my-org/custom-parakeet") == "my-org/custom-parakeet"
+
+
+def test_resolve_model_explicit_override_wins_for_mlx():
+    from stt_server.__main__ import _resolve_model
+
+    assert _resolve_model("mlx", "my-org/custom-whisper") == "my-org/custom-whisper"
+
+
+def test_resolve_model_parakeet_with_whisper_repo_passes_through(fake_parakeet_mlx):
+    """Decided behaviour (``__main__._resolve_model`` docstring): an explicit
+    ``--model`` is passed through verbatim for any backend — no reject, no
+    string-heuristic reclassification. ``--backend`` is the trust anchor and a
+    mismatched repo id fails fast later in ``start()``/decode."""
+    from stt_server.__main__ import _resolve_model
+
+    whisper_repo = "mlx-community/whisper-large-v3-turbo"
+    assert _resolve_model("parakeet", whisper_repo) == whisper_repo
+
+
+def test_make_backend_parakeet_arm_does_not_import_parakeet_mlx():
+    """Lean-base invariant: importing/constructing the ``parakeet`` arm of
+    ``_make_backend`` must not transitively import ``parakeet_mlx``.
+
+    Run in a clean subprocess with the ``stt-server-parakeet`` extra assumed
+    absent — ``parakeet_mlx`` is removed from ``sys.modules`` and import is
+    blocked, so a transitive pull would raise. The base install must still
+    construct the backend; the missing-extra failure belongs in ``start()``.
+    """
+    code = (
+        "import sys, builtins\n"
+        "sys.modules.pop('parakeet_mlx', None)\n"
+        "_real_import = builtins.__import__\n"
+        "def _blocked(name, *a, **k):\n"
+        "    if name == 'parakeet_mlx' or name.startswith('parakeet_mlx.'):\n"
+        "        raise AssertionError('parakeet_mlx imported at _make_backend seam')\n"
+        "    return _real_import(name, *a, **k)\n"
+        "builtins.__import__ = _blocked\n"
+        "from stt_server.__main__ import _make_backend\n"
+        "b = _make_backend('parakeet', 'fake-model')\n"
+        "assert type(b).__name__ == 'ParakeetBackend'\n"
+        "assert 'parakeet_mlx' not in sys.modules\n"
+        "print('OK')\n"
+    )
+    env = dict(os.environ)
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join([repo_root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "OK" in r.stdout
+
+
+# --- Wire-parity: stubbed ParakeetBackend through the server fixture -------
+#
+# These mirror ``_SlowBackend`` (above) — a minimal duck-typed backend driven
+# through the real ``client`` server fixture so we assert the bytes on the
+# wire, not just ``TranscriptEvent`` objects.
+
+
+class _StubParakeetStream:
+    """A ``BackendStream``-shaped stub standing in for ``_ParakeetStream``.
+
+    ``text`` is the decoded transcript; an empty string exercises the
+    near-silence path (``completed`` only, no ``delta``). ``raise_exc``, when
+    set, makes ``end()`` raise — the server's ``except`` arm then synthesises
+    ``transcript.failed``.
+    """
+
+    def __init__(self, *, text: str, raise_exc: BaseException | None) -> None:
+        self._buf = bytearray()
+        self._text = text
+        self._raise_exc = raise_exc
+        self._cancelled = False
+
+    async def feed(self, chunk: bytes) -> None:
+        self._buf.extend(chunk)
+
+    async def end(self) -> None:
+        if self._raise_exc is not None:
+            raise self._raise_exc
+
+    async def cancel(self) -> None:
+        self._cancelled = True
+
+    async def events(self):
+        if self._cancelled:
+            return
+        # Match _MLXStream / _ParakeetStream: delta only for non-empty text.
+        if self._text:
+            yield TranscriptEvent(kind="delta", text=self._text)
+        yield TranscriptEvent(kind="completed", text=self._text)
+
+
+class _StubParakeetBackend:
+    """A ``TranscriptionBackend``-shaped stub for the Parakeet backend."""
+
+    def __init__(self, *, text: str = "parakeet decoded text", raise_exc=None) -> None:
+        self._text = text
+        self._raise_exc = raise_exc
+
+    async def start(self) -> None:
+        return None
+
+    async def open_stream(self, *, language: str | None = None) -> _StubParakeetStream:
+        return _StubParakeetStream(text=self._text, raise_exc=self._raise_exc)
+
+    async def close(self) -> None:
+        return None
+
+
+async def _serve_with_backend(backend):
+    """Start a server on an ephemeral port with the given backend; yield a
+    connected client. Caller is responsible for nothing — teardown is here."""
+    srv = TranscriptionServer(
+        backend,
+        ServerConfig(host="127.0.0.1", port=0, reject_browser_origins=False),
+    )
+    await srv.start()
+    port = srv.listening_port()
+    c = TranscriptionClient(host="127.0.0.1", port=port)
+    await c.connect()
+    return srv, c
+
+
+async def test_parakeet_nonempty_decode_is_wire_identical_to_mlx_path():
+    """Non-empty Parakeet decode -> ``delta`` + ``completed`` with the same
+    event names, field set, and ordering as the echo/MLX path."""
+    srv, c = await _serve_with_backend(_StubParakeetBackend(text="hello from parakeet"))
+    try:
+        await c.update_session(turn_detection=None)
+        await _next_event_of_types(c, {P.EVT_SESSION_UPDATED})
+        await c.send_audio(_pcm(1600))
+        await c.commit()
+
+        committed = await _next_event_of_types(c, {P.EVT_AUDIO_COMMITTED})
+        item_id = committed["item_id"]
+
+        delta = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_DELTA})
+        assert delta["type"] == P.EVT_TRANSCRIPT_DELTA
+        assert delta["item_id"] == item_id
+        assert delta["content_index"] == 0
+        assert delta["delta"] == "hello from parakeet"
+        assert set(delta) == {"type", "event_id", "item_id", "content_index", "delta"}
+
+        completed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_COMPLETED})
+        assert completed["type"] == P.EVT_TRANSCRIPT_COMPLETED
+        assert completed["item_id"] == item_id
+        assert completed["content_index"] == 0
+        assert completed["transcript"] == "hello from parakeet"
+        assert set(completed) == {"type", "event_id", "item_id", "content_index", "transcript"}
+    finally:
+        await c.close()
+        await srv.shutdown()
+
+
+async def test_parakeet_empty_text_decode_emits_completed_only():
+    """Near-silence: empty decode -> ``completed`` only, no ``delta`` —
+    byte-identical to the MLX empty-text contract."""
+    srv, c = await _serve_with_backend(_StubParakeetBackend(text=""))
+    try:
+        await c.update_session(turn_detection=None)
+        await _next_event_of_types(c, {P.EVT_SESSION_UPDATED})
+        await c.send_audio(_pcm(1600))
+        await c.commit()
+
+        seen: list[str] = []
+        async for ev in c.events():
+            seen.append(ev["type"])
+            if ev["type"] == P.EVT_TRANSCRIPT_COMPLETED:
+                assert ev["transcript"] == ""
+                break
+        assert P.EVT_TRANSCRIPT_DELTA not in seen, "empty-text decode must not emit a delta"
+        assert P.EVT_TRANSCRIPT_COMPLETED in seen
+    finally:
+        await c.close()
+        await srv.shutdown()
+
+
+async def test_parakeet_raising_backend_synthesises_transcript_failed():
+    """A raising Parakeet decode -> server synthesises ``transcript.failed``
+    with ``error.code`` BACKEND_ERROR, ``error.type``, ``item_id``,
+    ``content_index`` — byte-identical to the MLX raising path."""
+    srv, c = await _serve_with_backend(
+        _StubParakeetBackend(raise_exc=RuntimeError("metal OOM mid-decode"))
+    )
+    try:
+        await c.update_session(turn_detection=None)
+        await _next_event_of_types(c, {P.EVT_SESSION_UPDATED})
+        await c.send_audio(_pcm(1600))
+        await c.commit()
+
+        committed = await _next_event_of_types(c, {P.EVT_AUDIO_COMMITTED})
+        item_id = committed["item_id"]
+
+        failed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_FAILED})
+        assert failed["type"] == P.EVT_TRANSCRIPT_FAILED
+        assert failed["item_id"] == item_id
+        assert failed["content_index"] == 0
+        assert failed["error"]["code"] == P.ErrorCode.BACKEND_ERROR.value
+        # error.type is the coarse OpenAI-shaped group; present and non-empty.
+        assert failed["error"]["type"]
+        # The raw exception text must not leak to the wire.
+        assert "metal OOM" not in json.dumps(failed)
+    finally:
+        await c.close()
+        await srv.shutdown()
+
+
+async def test_parakeet_protocol_ceiling_rejects_over_300s_commit():
+    """A >300 s commit is rejected with ``BUFFER_OVERFLOW`` before reaching
+    the backend, regardless of backend choice."""
+    # A backend whose decode would raise if ever reached — proves the
+    # rejection happens at the protocol layer, not in the backend.
+    sentinel = _StubParakeetBackend(raise_exc=AssertionError("backend reached past the ceiling"))
+    srv, c = await _serve_with_backend(sentinel)
+    try:
+        await c.update_session(turn_detection=None)
+        await _next_event_of_types(c, {P.EVT_SESSION_UPDATED})
+
+        # 301 s of 16 kHz PCM16 > MAX_UNCOMMITTED_BYTES (300 s ceiling).
+        over_ceiling = (P.MAX_UNCOMMITTED_SECONDS + 1) * P.AUDIO_SAMPLE_RATE_HZ
+        payload = _pcm(over_ceiling)
+        assert len(payload) > P.MAX_UNCOMMITTED_BYTES
+
+        # Send every append, then commit; the server rejects the session with
+        # BUFFER_OVERFLOW once the uncommitted buffer crosses the ceiling. The
+        # rejection lands at the protocol layer — the backend is never reached.
+        chunk = 512 * 1024
+        for i in range(0, len(payload), chunk):
+            await c.send_audio(payload[i : i + chunk])
+        await c.commit()
+
+        err = await _next_event_of_types(c, {P.EVT_ERROR, P.EVT_AUDIO_COMMITTED}, timeout=10.0)
+        assert err["type"] == P.EVT_ERROR, "over-ceiling commit must be rejected, not accepted"
+        assert err["error"]["code"] == P.ErrorCode.BUFFER_OVERFLOW.value
+    finally:
+        await c.close()
+        await srv.shutdown()
+
+
+async def test_parakeet_24_to_300s_utterance_reaches_backend_intact():
+    """A 24-300 s utterance (past Parakeet's ~24 s native chunk window, under
+    the 300 s protocol ceiling) is *not* rejected — it reaches the backend and
+    produces the normal ``delta`` + ``completed`` wire output."""
+    srv, c = await _serve_with_backend(_StubParakeetBackend(text="long utterance decoded"))
+    try:
+        await c.update_session(turn_detection=None)
+        await _next_event_of_types(c, {P.EVT_SESSION_UPDATED})
+
+        # 60 s of 16 kHz PCM16 — well inside the 300 s ceiling, well past 24 s.
+        payload = _pcm(60 * P.AUDIO_SAMPLE_RATE_HZ)
+        assert len(payload) < P.MAX_UNCOMMITTED_BYTES
+        chunk = 512 * 1024
+        for i in range(0, len(payload), chunk):
+            await c.send_audio(payload[i : i + chunk])
+        await c.commit()
+
+        committed = await _next_event_of_types(c, {P.EVT_AUDIO_COMMITTED, P.EVT_ERROR})
+        assert committed["type"] == P.EVT_AUDIO_COMMITTED, "24-300s utterance must not be rejected"
+        completed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_COMPLETED}, timeout=5.0)
+        assert completed["transcript"] == "long utterance decoded"
+    finally:
+        await c.close()
+        await srv.shutdown()
+
+
 async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path):
     """P1 regression at the CLI boundary: KODA_STT_AUTH_TOKEN alone must
     not authenticate the probe — otherwise a health check can report ok

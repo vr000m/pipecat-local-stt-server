@@ -30,6 +30,14 @@ from .server import serve
 # doesn't pay for ``websockets.asyncio.client`` it never uses.
 
 
+# Whisper repo default for ``--backend mlx``. Kept as a module constant so the
+# backend-aware ``--model`` resolution and the "model unset" sentinel agree on
+# one value. ``parakeet``'s default lives in ``backends/parakeet.py`` and is
+# imported lazily (it would otherwise pull the parakeet module at every
+# launch, defeating the lean-base invariant).
+_DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+
 def _make_backend(name: str, model: str):
     if name == "echo":
         return EchoBackend()
@@ -37,7 +45,36 @@ def _make_backend(name: str, model: str):
         from .backends.mlx_whisper import MLXWhisperBackend
 
         return MLXWhisperBackend(model=model)
+    if name == "parakeet":
+        # Lazy import so a base install without the ``stt-server-parakeet``
+        # extra still constructs ``echo``/``mlx`` backends. ``parakeet.py``
+        # imports ``parakeet_mlx`` only inside ``start()`` / ``_get_model``,
+        # never at module load, so this import does NOT transitively pull
+        # ``parakeet_mlx`` — the missing-extra failure surfaces fast in
+        # ``start()``, not here at construction.
+        from .backends.parakeet import ParakeetBackend
+
+        return ParakeetBackend(model=model)
     raise SystemExit(f"unknown backend: {name}")
+
+
+def _resolve_model(backend: str, model: str | None) -> str:
+    """Resolve the effective decode model id.
+
+    An explicit ``--model`` always wins (it is passed through verbatim — the
+    server-side ``--backend`` is the trust anchor; pointing a backend at a
+    mismatched repo id fails fast in ``start()``/decode, and classifying a
+    repo id as "whisper" vs "parakeet" would need a brittle string heuristic).
+    When ``--model`` is unset the default is backend-aware: ``parakeet`` uses
+    ``DEFAULT_PARAKEET_MODEL`` rather than the Whisper repo.
+    """
+    if model is not None:
+        return model
+    if backend == "parakeet":
+        from .backends.parakeet import DEFAULT_PARAKEET_MODEL
+
+        return DEFAULT_PARAKEET_MODEL
+    return _DEFAULT_MLX_MODEL
 
 
 def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:
@@ -156,7 +193,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         level=args.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    backend = _make_backend(args.backend, args.model)
+    backend = _make_backend(args.backend, _resolve_model(args.backend, args.model))
     asyncio.run(
         serve(
             backend,
@@ -304,8 +341,11 @@ def main() -> None:
 
     p_serve = subparsers.add_parser("serve", help="run the server (default)")
     _add_endpoint_flags(p_serve)
-    p_serve.add_argument("--backend", choices=("echo", "mlx"), default="echo")
-    p_serve.add_argument("--model", default="mlx-community/whisper-large-v3-turbo")
+    p_serve.add_argument("--backend", choices=("echo", "mlx", "parakeet"), default="echo")
+    # Default is None so ``_resolve_model`` can apply a backend-aware fallback
+    # (Whisper repo for ``mlx``, ``DEFAULT_PARAKEET_MODEL`` for ``parakeet``).
+    # An explicit value always wins and is passed through verbatim.
+    p_serve.add_argument("--model", default=None)
     p_serve.add_argument("--log-level", default="INFO")
 
     p_status = subparsers.add_parser(
