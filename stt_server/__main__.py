@@ -293,6 +293,8 @@ def _cmd_status(args: argparse.Namespace) -> None:
     audio = hello.get("audio", {})
     print("stt_server: ok")
     print(f"  protocol_version: {hello.get('protocol_version')}")
+    backend = hello.get("backend") or {}
+    print(f"  backend: {backend.get('name')} (model: {backend.get('model')})")
     print(
         "  audio: {fmt} @ {rate} Hz / {ch}ch".format(
             fmt=audio.get("format"),

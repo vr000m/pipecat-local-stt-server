@@ -821,6 +821,8 @@ async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path:
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "stt_server: ok" in r.stdout
+        # The status text output names the ASR behind the socket.
+        assert "backend: echo" in r.stdout
     finally:
         await srv.shutdown()
         sock.unlink(missing_ok=True)
