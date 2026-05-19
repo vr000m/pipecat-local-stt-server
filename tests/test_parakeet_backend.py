@@ -202,6 +202,13 @@ def test_default_parakeet_model_constant_is_nonempty_string(parakeet_mod):
     assert val.strip(), "DEFAULT_PARAKEET_MODEL must be a non-empty string"
 
 
+def test_backend_exposes_identity(parakeet_mod):
+    """``backend_name`` / ``model`` feed the server.hello backend field."""
+    backend = parakeet_mod.ParakeetBackend(model="fake-parakeet")
+    assert backend.backend_name == "parakeet"
+    assert backend.model == "fake-parakeet"
+
+
 def test_no_failed_event_kind_defined(parakeet_mod):
     """The backend must not invent a ``failed`` TranscriptEvent kind."""
     src = "".join(open(parakeet_mod.__file__, encoding="utf-8").readlines())

@@ -37,6 +37,13 @@ class BackendStream(Protocol):
 
 @runtime_checkable
 class TranscriptionBackend(Protocol):
+    # Identity surfaced in the ``server.hello`` / ``server.status`` ``backend``
+    # field so a client (the A/B benchmark, the bot) can verify which ASR is
+    # actually behind a socket rather than trusting the socket path. ``model``
+    # is ``None`` for backends with no model (echo).
+    backend_name: str
+    model: str | None
+
     async def start(self) -> None: ...
     async def open_stream(self, *, language: str | None = None) -> BackendStream: ...
     async def close(self) -> None: ...
@@ -78,6 +85,9 @@ class _EchoStream:
 
 class EchoBackend:
     """Reference backend that echoes audio length. Used by tests."""
+
+    backend_name = "echo"
+    model = None
 
     async def start(self) -> None:
         return None

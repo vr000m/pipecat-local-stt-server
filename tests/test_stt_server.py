@@ -142,6 +142,8 @@ async def test_handshake_sends_hello_and_created():
         assert hello["type"] == P.EVT_SERVER_HELLO
         assert hello["protocol_version"] == P.PROTOCOL_VERSION
         assert hello["capabilities"]["binary_audio"] is True
+        # Backend identity — lets a client verify which ASR is behind a socket.
+        assert hello["backend"] == {"name": "echo", "model": None}
         await c.close()
     finally:
         await srv.shutdown()
@@ -427,6 +429,9 @@ async def test_audio_append_rejected_while_decode_in_flight():
             self._released.set()
 
     class _SlowBackend:
+        backend_name = "echo"
+        model = None
+
         def __init__(self) -> None:
             self.last_stream: _SlowStream | None = None
 
@@ -1015,6 +1020,9 @@ class _StubParakeetStream:
 class _StubParakeetBackend:
     """A ``TranscriptionBackend``-shaped stub for the Parakeet backend."""
 
+    backend_name = "parakeet"
+    model = "stub-parakeet"
+
     def __init__(self, *, text: str = "parakeet decoded text", raise_exc=None) -> None:
         self._text = text
         self._raise_exc = raise_exc
@@ -1069,6 +1077,22 @@ async def test_parakeet_nonempty_decode_is_wire_identical_to_mlx_path():
         assert completed["content_index"] == 0
         assert completed["transcript"] == "hello from parakeet"
         assert set(completed) == {"type", "event_id", "item_id", "content_index", "transcript"}
+    finally:
+        await c.close()
+        await srv.shutdown()
+
+
+async def test_backend_identity_surfaced_in_hello_and_status():
+    """server.hello AND server.status carry the backend identity, so a client
+    (the A/B benchmark, the bot) can verify which ASR is actually behind a
+    socket instead of trusting the socket path."""
+    srv, c = await _serve_with_backend(_StubParakeetBackend())
+    try:
+        # _serve_with_backend already consumed the hello; request status and
+        # check the mirrored identity there.
+        await c.status()
+        status = await _next_event_of_types(c, {P.EVT_SERVER_STATUS})
+        assert status["backend"] == {"name": "parakeet", "model": "stub-parakeet"}
     finally:
         await c.close()
         await srv.shutdown()

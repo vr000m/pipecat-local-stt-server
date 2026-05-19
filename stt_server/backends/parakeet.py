@@ -175,8 +175,12 @@ class _ParakeetStream:
 class ParakeetBackend:
     """ASR backend backed by NVIDIA Parakeet TDT models via ``parakeet-mlx``."""
 
+    backend_name = "parakeet"
+
     def __init__(self, *, model: str = DEFAULT_PARAKEET_MODEL) -> None:
         self._model_id = model
+        # Public identity for the server.hello / server.status `backend` field.
+        self.model = model
         # The loaded parakeet-mlx model. ``None`` until the first decode —
         # ``from_pretrained`` is eager and pulls a ~1.5 GB checkpoint, so it is
         # deferred out of ``start()`` (which only fails fast on a missing

@@ -218,8 +218,12 @@ class _MLXStream:
 
 
 class MLXWhisperBackend:
+    backend_name = "mlx"
+
     def __init__(self, *, model: str = "mlx-community/whisper-large-v3-turbo") -> None:
         self._model = model
+        # Public identity for the server.hello / server.status `backend` field.
+        self.model = model
         self._decode_lock = asyncio.Lock()
         # Backend-scope thread lock — see ``_MLXStream.end``. Shared across
         # every stream this backend opens so concurrent sessions truly

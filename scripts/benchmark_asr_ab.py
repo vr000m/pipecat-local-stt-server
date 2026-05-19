@@ -222,16 +222,30 @@ class Endpoint:
         return self.uri or self.socket_path or "<unset>"
 
 
-async def _probe(endpoint: Endpoint) -> str | None:
-    """Return None if the endpoint answers a connect handshake, else an error."""
+async def _probe(endpoint: Endpoint, expected_backend: str) -> str | None:
+    """Return None if the endpoint answers a connect handshake AND reports the
+    expected backend identity; else an error string.
+
+    The backend-identity check is fail-closed: an A/B comparison is worthless
+    if a socket is actually running a different ASR than its CLI label claims
+    (stale LaunchAgent, swapped socket path, mis-exported ``KODA_STT_*`` env).
+    A server too old to emit the ``backend`` field in ``server.hello`` reports
+    ``None`` here and is correctly rejected.
+    """
     client = endpoint.make_client()
     try:
-        await asyncio.wait_for(client.connect(), timeout=5.0)
-        return None
+        hello = await asyncio.wait_for(client.connect(), timeout=5.0)
     except Exception as exc:  # noqa: BLE001 — probe surfaces any failure as text
         return f"{type(exc).__name__}: {exc}"
     finally:
         await client.close()
+    reported = (hello.get("backend") or {}).get("name")
+    if reported != expected_backend:
+        return (
+            f"endpoint reports backend {reported!r}, expected {expected_backend!r} "
+            f"— this socket is not running the ASR its label claims"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -345,17 +359,18 @@ async def run_benchmark(
     whisper: Endpoint,
     parakeet: Endpoint,
 ) -> tuple[list[PerUtterance], AsrAggregate, AsrAggregate]:
-    # Fail fast: both endpoints MUST answer, or we are not doing A/B at all.
-    w_err, p_err = await asyncio.gather(_probe(whisper), _probe(parakeet))
-    unreachable = []
+    # Fail fast: both endpoints MUST answer AND report the ASR their label
+    # claims, or the A/B comparison is meaningless.
+    w_err, p_err = await asyncio.gather(_probe(whisper, "mlx"), _probe(parakeet, "parakeet"))
+    problems = []
     if w_err is not None:
-        unreachable.append(f"whisper ({whisper.describe()}): {w_err}")
+        problems.append(f"whisper ({whisper.describe()}): {w_err}")
     if p_err is not None:
-        unreachable.append(f"parakeet ({parakeet.describe()}): {p_err}")
-    if unreachable:
+        problems.append(f"parakeet ({parakeet.describe()}): {p_err}")
+    if problems:
         raise SystemExit(
-            "A/B benchmark needs BOTH servers reachable; not benchmarking a "
-            "single ASR. Unreachable:\n  " + "\n  ".join(unreachable)
+            "A/B benchmark needs BOTH servers reachable and running the ASR "
+            "their labels claim. Problems:\n  " + "\n  ".join(problems)
         )
 
     per_utterance: list[PerUtterance] = []

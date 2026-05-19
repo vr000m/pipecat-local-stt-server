@@ -309,7 +309,7 @@ def test_run_benchmark_fails_fast_when_one_unreachable(tmp_path, monkeypatch):
     # A/B benchmark must still refuse rather than silently bench one ASR.
     import scripts.benchmark_asr_ab as mod
 
-    async def _fake_probe(endpoint):
+    async def _fake_probe(endpoint, expected_backend):
         return None if endpoint.name == "whisper" else "ConnectionRefusedError: dead"
 
     monkeypatch.setattr(mod, "_probe", _fake_probe)
@@ -326,6 +326,36 @@ def test_run_benchmark_fails_fast_when_one_unreachable(tmp_path, monkeypatch):
     # only parakeet is listed as unreachable
     assert "parakeet" in msg
     assert "whisper (" not in msg
+
+
+def test_run_benchmark_fails_closed_on_backend_identity_mismatch(tmp_path, monkeypatch):
+    # A socket that answers the handshake but reports a different ASR than its
+    # label claims (stale LaunchAgent, swapped socket, mis-exported KODA_STT_*)
+    # must abort the run — never emit a mislabeled comparison.
+    import scripts.benchmark_asr_ab as mod
+
+    async def _fake_probe(endpoint, expected_backend):
+        # The "parakeet" endpoint is actually running mlx — identity mismatch.
+        if endpoint.name == "parakeet":
+            return (
+                "endpoint reports backend 'mlx', expected 'parakeet' "
+                "— this socket is not running the ASR its label claims"
+            )
+        return None
+
+    monkeypatch.setattr(mod, "_probe", _fake_probe)
+
+    whisper = Endpoint(name="whisper", socket_path=str(tmp_path / "whisper.sock"))
+    parakeet = Endpoint(name="parakeet", socket_path=str(tmp_path / "parakeet.sock"))
+    utt = Utterance(stem="x", audio_path=tmp_path / "x.wav", reference="ref")
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(run_benchmark([utt], whisper, parakeet))
+
+    msg = str(exc.value)
+    assert "running the ASR their labels claim" in msg
+    assert "not running the ASR its label claims" in msg
+    assert "parakeet" in msg
 
 
 # ---------------------------------------------------------------------------

@@ -71,6 +71,9 @@ class _SlowStream:
 
 
 class _SlowBackend:
+    backend_name = "mlx"
+    model = "slow-test-model"
+
     def __init__(self, decode_seconds: float) -> None:
         self._decode_seconds = decode_seconds
         self.close_count = 0
@@ -104,6 +107,9 @@ class _HangingStream:
 
 
 class _HangingBackend:
+    backend_name = "mlx"
+    model = "hanging-test-model"
+
     def __init__(self) -> None:
         self.close_count = 0
 

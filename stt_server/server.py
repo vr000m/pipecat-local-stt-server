@@ -296,6 +296,13 @@ class TranscriptionServer:
                         "rate": P.AUDIO_SAMPLE_RATE_HZ,
                         "channels": P.AUDIO_CHANNELS,
                     },
+                    # Backend identity — lets a client verify which ASR is
+                    # actually behind this socket instead of trusting the
+                    # socket path. Additive optional field; old readers ignore.
+                    "backend": {
+                        "name": self._backend.backend_name,
+                        "model": self._backend.model,
+                    },
                 },
             )
             session_snapshot = _session_snapshot(state)
@@ -668,6 +675,12 @@ class TranscriptionServer:
                 "type": P.EVT_SERVER_STATUS,
                 "event_id": _event_id(),
                 "session_id": state.session_id,
+                # Backend identity, mirrored from server.hello — so a status
+                # probe alone is enough to confirm which ASR is running.
+                "backend": {
+                    "name": self._backend.backend_name,
+                    "model": self._backend.model,
+                },
                 "queue_depth": 1 if state.in_flight_task and not state.in_flight_task.done() else 0,
                 "uncommitted_bytes": len(state.buffer),
                 "uptime_seconds": time.monotonic() - state.started_monotonic,

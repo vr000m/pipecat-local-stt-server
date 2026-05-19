@@ -176,3 +176,10 @@ def test_condition_unset_defaults_to_false(fake_mlx, monkeypatch):
     backend = MLXWhisperBackend(model="fake-model")
     asyncio.run(_run_decode(backend))
     assert fake_mlx.last_kwargs["condition_on_previous_text"] is False
+
+
+def test_backend_exposes_identity():
+    """``backend_name`` / ``model`` feed the server.hello backend field."""
+    backend = MLXWhisperBackend(model="fake-model")
+    assert backend.backend_name == "mlx"
+    assert backend.model == "fake-model"

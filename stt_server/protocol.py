@@ -12,6 +12,9 @@ public OpenAI Realtime transcription shape (snapshot: 2026-04-20):
   with ``turn_detection: null`` they are never emitted
 - custom events: ``server.hello``, ``server.status``, ``session.close``,
   ``session.cancel``, ``session.closed``
+- ``server.hello`` and ``server.status`` carry a ``backend`` object
+  (``{name, model}``) naming the ASR behind the socket. Additive V1 field;
+  ``PROTOCOL_VERSION`` is unchanged — readers that do not know it ignore it.
 
 OpenAI compatibility notes:
 

@@ -138,8 +138,10 @@ and keep it outside the repo.
 The server answers a `server.status` wire event with its current session
 state (queue depth, uncommitted bytes, uptime) and process health (pid,
 peak RSS), and, on connect, replies with a `server.hello` carrying
-protocol version, audio format, and capabilities. The `status` subcommand
-wraps that round-trip:
+protocol version, audio format, and capabilities. Both `server.hello` and
+`server.status` also carry a `backend` object — `{"name": ..., "model": ...}` —
+naming the ASR actually behind the socket, so a client can verify it rather
+than trust the socket path. The `status` subcommand wraps that round-trip:
 
 ```bash
 # Text output (exit 0 on success, 1 on not-reachable/timeout/error)
