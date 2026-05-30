@@ -1,12 +1,12 @@
 # Task: De-brand the runtime surface (0.2.0)
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: Install & Packaging
 **Assigned to**: Claude
 **Priority**: Medium
 **Branch**: refactor/debrand-runtime-surface
 **Created**: 2026-05-30
-**Completed**: (fill when done)
+**Completed**: 2026-05-30
 
 ## Objective
 
@@ -131,19 +131,19 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 ## Testing Notes
 
 ### Test Approach
-- [ ] Phase 1 byte-for-byte snapshot regenerated and passing; whole-file audit of `test_render_stt_plist.py` for residual koda default expectations.
-- [ ] `_log_basename` parametrize covers new default + legacy `koda.stt-server` + multi-instance (parakeet, now pipecat).
-- [ ] Full-plist explicit-legacy-label test: `KODA_STT_LABEL=koda.stt-server` → `Label==koda.stt-server`, log paths `/koda-stt.{log,err}`.
-- [ ] `tests/test_install_migration.py`: stubbed-`launchctl` assertions for dual-agent bootout during renamed-default install, fresh-machine no-op, new-label-never-booted-out, custom-label install does not retire legacy agents, and `KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` override.
-- [ ] `install_stt_agent.sh` passes `bash -n` and `shellcheck`.
-- [ ] README/CHANGELOG presence checks (Phase 3 Validation cmd) pass; grep shows zero residual `koda` value-paths in README except `:8`.
-- [ ] Full suite (`uv run python -m pytest -q`) green; `ruff format` + `ruff check` clean.
+- [x] Phase 1 byte-for-byte snapshot regenerated and passing; whole-file audit of `test_render_stt_plist.py` for residual koda default expectations.
+- [x] `_log_basename` parametrize covers new default + legacy `koda.stt-server` + multi-instance (parakeet, now pipecat).
+- [x] Full-plist explicit-legacy-label test: `KODA_STT_LABEL=koda.stt-server` → `Label==koda.stt-server`, log paths `/koda-stt.{log,err}`.
+- [x] `tests/test_install_migration.py`: stubbed-`launchctl` assertions for dual-agent bootout during renamed-default install, fresh-machine no-op, new-label-never-booted-out, custom-label install does not retire legacy agents, and `KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` override.
+- [x] `install_stt_agent.sh` passes `bash -n` and `shellcheck`.
+- [x] README/CHANGELOG presence checks (Phase 3 Validation cmd) pass; grep shows zero residual `koda` value-paths in README except `:8`.
+- [x] Full suite (`uv run python -m pytest -q`) green; `ruff format` + `ruff check` clean.
 
 ### Edge Cases Tested
-- [ ] Fresh machine with no legacy agent (migration is a no-op, exit 0).
-- [ ] Two-agent 0.1.x user: both `koda.stt-server` and `koda.stt-server.parakeet` retired.
-- [ ] Custom label still collision-free (basename = `label.replace(".", "-")`).
-- [ ] `mlx_teardown_spike.sh` log path matches the renamed default — **grep-verified, not unit-tested** (the existing `test_mlx_teardown_spike.py` asserts nothing about the script's literals).
+- [x] Fresh machine with no legacy agent (migration is a no-op, exit 0).
+- [x] Two-agent 0.1.x user: both `koda.stt-server` and `koda.stt-server.parakeet` retired.
+- [x] Custom label still collision-free (basename = `label.replace(".", "-")`).
+- [x] `mlx_teardown_spike.sh` log path matches the renamed default — **grep-verified, not unit-tested** (the existing `test_mlx_teardown_spike.py` asserts nothing about the script's literals).
 
 ## Acceptance Criteria
 
@@ -157,7 +157,13 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 
 ## Final Results
 
-[Fill when complete]
+All three phases shipped on `refactor/debrand-runtime-surface` (10 commits ahead of `main`):
+
+- **Phase 1** — `DEFAULT_LABEL` → `pipecat.stt-server`; two-literal `_log_basename` (new `pipecat` default + retained legacy `koda.stt-server`→`koda-stt` shim) in both `scripts/render_stt_plist.py` and the shell copy in `scripts/install_stt_agent.sh` (kept in lockstep). Snapshot regenerated to `tests/snapshots/pipecat-stt.plist` (legacy `koda-stt.plist` removed). All `test_render_stt_plist.py` expectations updated.
+- **Phase 2** — Dual-agent install migration retires legacy `koda.stt-server` **and** `koda.stt-server.parakeet`, guarded by `LABEL==pipecat.stt-server`, running before the new agent's bootstrap; idempotent. Pinned by `tests/test_install_migration.py` (8 hermetic stubbed-`launchctl` tests).
+- **Phase 3** — README swept (zero `koda` value tokens except the `:8` provenance line), Upgrade section added; `CHANGELOG [0.2.0]`; `pyproject.toml` → `0.2.0`; `uv.lock` synced.
+
+Verification (2026-05-30): `uv run python -m pytest -q` → **249 passed, 2 skipped**; `ruff format --check` + `ruff check` clean; `bash -n` + `shellcheck -S warning` clean on `install_stt_agent.sh`. `KODA_STT_*` env-var *names* retained as honoured aliases (out of scope). The external `koda-pipecat` wrapper is not renamed here (cross-repo, out of scope).
 <!-- reviewed: 2026-05-30 @ 1c5917b5d6440634bedf8382aa794f19afe9a173 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
@@ -170,6 +176,7 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 
 ## Findings
 
+- 2026-05-30 Pre-merge review pass (`/update-docs` → `/review` → `/security-review` → `/deep-review`). `/review`: one Minor doc-staleness fixed (`stt_server/client.py:114` cited the old `koda-stt` socket path as the example default → `pipecat-stt`). `/security-review`: clean (migration loop iterates hardcoded literals; `rm -f`/`bootout` on `$HOME`-rooted fixed paths; no untrusted-input path). `/deep-review` (Logic/Security/Architecture/Documentation; Spec skipped — no RFCs in Review Focus): Logic/Security/Documentation clean, 3 Minor Architecture findings — (1) **fixed**: added `test_installer_log_basename_matches_renderer` (drives the installer's real `LOG_BASENAME` block under bash and asserts parity with the renderer, mechanically enforcing the Python↔shell lockstep the prior test only documented in prose); (2) **won't-fix**: migration inlined in `install`'s `case` branch is fine for a one-time upgrade, idempotency is tested; (3) **won't-fix (analysis-corrected)**: making `mlx_teardown_spike.sh`'s hardcoded `LABEL` env-configurable would target a custom agent while still reading the hardcoded `pipecat-stt.err` — a label/log mismatch worse than the current intentionally-pinned default. Suite 253 passed / 2 skipped; ruff + shellcheck clean.
 - 2026-05-30 `/review-plan` (4 lenses, 13 findings: 2 Critical, 6 Important, 5 Minor) incorporated into this revision. Criticals: phases merged into one atomic rename commit (was 1+3 split that left the suite red); install migration now has an executable stubbed-`launchctl` test (was lint-only). Importants: dual-agent migration (parakeet too), `STT_WS_DEFAULT_SOCKET` consumer note, whole-file test audit, `_log_basename` two-literal rewrite, `KODA_STT_SOCKET`/`LOG_DIR` test, full-plist legacy render test. Minors: grep-based README sweep, shim-lifespan decision, REPO_ROOT de-brand reframe, mlx grep guard, doc presence checks. codebase-claims lens verified all references.
 
 ## Issues & Solutions
