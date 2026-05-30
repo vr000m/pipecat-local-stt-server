@@ -13,9 +13,8 @@
 # Usage:
 #   scripts/mlx_teardown_spike.sh [--cycles N] [--audio-ms MS] [--clients N]
 #
-# Exit 0 iff every cycle meets every pass criterion documented in the
-# dev plan (docs/dev_plans/20260420-design-whisper-websocket-server.md,
-# "Preflight Follow-Ups — Tier 2").
+# Exit 0 iff every cycle meets every pass criterion for the MLX teardown
+# (bounded-window flush) preflight checks.
 
 set -euo pipefail
 

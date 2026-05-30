@@ -444,7 +444,7 @@ canonical and fall through to the alias.)
 | `PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
 
 After decode, `_decode_sync` runs a degenerate-output filter
-(`shared/text_quality.is_degenerate`) on each segment. Segments where
+(`stt_server.text_quality.is_degenerate`) on each segment. Segments where
 the dominant case-folded unigram exceeds the ratio threshold AND the
 segment has at least the minimum token count are replaced with an empty
 string (and a `mlx_whisper.degenerate_dropped` warning is logged).
@@ -465,6 +465,7 @@ legitimate high-repetition paragraphs are not flagged.
 all still honoured as deprecated backward-compat aliases (canonical wins if
 several are set). New deployments should prefer the `PIPECAT_STT_*` names.
 
-See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context,
-calibration histogram, and the cleanup-stage short-circuit + symmetric
-output guard that pair with these decode-time defences.
+These decode-time defences were calibrated against the original transcription
+corpus; a consumer's cleanup stage can pair them with a short-circuit on
+degenerate input and a symmetric output guard against same-length degenerate
+rewrites.

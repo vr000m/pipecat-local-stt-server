@@ -79,11 +79,9 @@ def _resolve_model(backend: str, model: str | None) -> str:
 
 
 def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:
-    # INVARIANT — do not flap. See the "Probe Auth Invariant" block in
-    # docs/dev_plans/20260420-design-whisper-websocket-server.md for the
-    # full history (four review cycles circled this); any change here
-    # must update that block and the regression tests in
-    # tests/test_stt_server.py.
+    # INVARIANT — do not flap. Four review cycles circled this probe-auth
+    # behaviour; any change here must keep the regression tests in
+    # tests/test_stt_server.py green.
     #
     # A plaintext --auth-token CLI flag is intentionally unsupported: any
     # local user would be able to read the token via `ps`.

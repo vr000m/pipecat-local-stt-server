@@ -4,16 +4,15 @@ Used by:
 
 - ``stt_server/backends/mlx_whisper.py`` — drops Whisper segments that came
   back as a single token repeated ``N`` times (e.g. the "subscription
-  subscription subscription" hallucination cascade observed on
-  20260430-5492e348faa29c46).
-- ``shared/transcript_cleaner.py`` — pre-cleanup short-circuit on degenerate
-  input + symmetric output guard against same-length degenerate rewrites.
+  subscription subscription" hallucination cascade).
+- a consumer's transcript-cleanup stage — pre-cleanup short-circuit on
+  degenerate input + symmetric output guard against same-length degenerate
+  rewrites.
 
-See ``docs/dev_plans/20260430-fix-whisper-hallucination.md``.
-
-Defaults are calibrated against the existing ``~/koda-data`` raw-transcript
-corpus. See ``scripts/calibrate_degenerate_threshold.py`` and the plan's
-"Final Results" section for the empirical histogram.
+Defaults are calibrated against the original raw-transcript corpus (empirical
+dominant-unigram histogram: p99 ≈ 0.36, p99.5 ≈ 0.40), so backchannels
+("yeah yeah yeah") and other legitimate high-repetition paragraphs are not
+flagged.
 
 Env vars (canonical PIPECAT_STT_* names first; the legacy KODA_* names are
 deprecated but still honoured as aliases for backward compat):
@@ -117,7 +116,7 @@ def has_degenerate_paragraph(text: str) -> bool:
     - Blank-line-separated paragraphs — matches the cleaned-markdown shape
       produced by the cleanup pipeline and the repair script.
     - Single-newline-separated lines — matches the utterance-line shape
-      produced by ``shared.classifier._build_transcript``, where each
+      produced by a one-utterance-per-line transcript builder, where each
       utterance is one line joined by ``"\\n"``. A wall-of-tokens utterance
       embedded between normal lines is diluted below the per-paragraph
       threshold when the whole transcript is one blank-line block, so the

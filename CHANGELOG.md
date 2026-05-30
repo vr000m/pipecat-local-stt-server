@@ -5,6 +5,18 @@ All notable changes to `pipecat-local-stt-server` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-05-30
+
+### Documentation
+
+- Remove dangling references to the private `koda-pipecat` monorepo that do
+  not exist in this standalone repo. Renamed the stale `shared/text_quality`
+  / `shared.classifier` module paths to their `stt_server.*` equivalents, and
+  stripped dead `docs/dev_plans/*` links, the `scripts/calibrate_degenerate_threshold.py`
+  reference, and an internal plan id from the README and the
+  `stt_server` / `scripts` docstrings and comments. Substantive guidance
+  (thresholds, rationale, calibration intent) is preserved. No code changes.
+
 ## [0.1.1] - 2026-05-30
 
 ### Changed
