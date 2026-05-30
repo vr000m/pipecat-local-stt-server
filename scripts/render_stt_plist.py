@@ -1,4 +1,4 @@
-"""Render the koda.stt-server LaunchAgent plist safely.
+"""Render the pipecat.stt-server LaunchAgent plist safely.
 
 Uses ``plistlib`` so XML escaping / quoting is handled by the stdlib instead
 of ``sed`` string substitution (which would let hostile env values break out
@@ -37,7 +37,7 @@ except ImportError:
     )
     sys.exit(1)
 
-DEFAULT_LABEL = "koda.stt-server"
+DEFAULT_LABEL = "pipecat.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
@@ -48,14 +48,23 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 def _log_basename(label: str) -> str:
     """Derive a per-agent log-file basename from the launchd label.
 
-    The legacy default label maps to the historical ``koda-stt`` basename so
-    the default-env plist stays byte-identical to the pre-multi-instance
-    render. Any other label gets a collision-free basename by replacing the
-    ``.`` separators with ``-`` (e.g. ``koda.stt-server.parakeet`` ->
-    ``koda-stt-server-parakeet``).
+    Two explicit literal branches keep the mapping stable and lockstep with
+    the shell copy in ``scripts/install_stt_agent.sh``:
+
+    * ``pipecat.stt-server`` -> ``pipecat-stt`` (the current default), and
+    * ``koda.stt-server`` -> ``koda-stt`` (a retained legacy shim so an
+      explicit legacy-label render still produces the historical basename).
+
+    The branches are matched against string literals, NOT ``DEFAULT_LABEL`` —
+    keying on the constant would silently remap the new default to the old
+    basename if the constant ever moved. Any other label gets a collision-free
+    basename by replacing the ``.`` separators with ``-`` (e.g.
+    ``pipecat.stt-server.parakeet`` -> ``pipecat-stt-server-parakeet``).
     """
-    if label == DEFAULT_LABEL:
-        return "koda-stt"
+    if label == "pipecat.stt-server":
+        return "pipecat-stt"
+    if label == "koda.stt-server":  # legacy shim, retained
+        return "koda-stt"  # legacy basename, retained
     return label.replace(".", "-")
 
 
@@ -73,9 +82,9 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
 
 
 def main() -> None:
-    # The label is optional; an unset value keeps the legacy single-agent
-    # label so the default-env render stays byte-identical to today's plist.
-    # Canonical PIPECAT_STT_LABEL wins; KODA_STT_LABEL is a deprecated alias.
+    # The label is optional; an unset value uses the default single-agent
+    # label (pipecat.stt-server). Canonical PIPECAT_STT_LABEL wins;
+    # KODA_STT_LABEL is a deprecated alias.
     label = env_first("PIPECAT_STT_LABEL", "KODA_STT_LABEL") or DEFAULT_LABEL
     if not _LABEL_RE.match(label):
         print(

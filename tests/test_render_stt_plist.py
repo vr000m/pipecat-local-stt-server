@@ -5,7 +5,7 @@ coexist — distinct label, socket path, and log files per ASR. These tests
 exercise it as a subprocess (its real entry point) and assert:
 
 * default env renders a plist **byte-for-byte** equal to the committed
-  snapshot ``tests/snapshots/koda-stt.plist`` (legacy ``koda.stt-server``);
+  snapshot ``tests/snapshots/pipecat-stt.plist`` (default ``pipecat.stt-server``);
 * a custom ``KODA_STT_LABEL`` yields a plist whose internal ``Label`` and the
   derived ``StandardOutPath`` / ``StandardErrorPath`` do **not** collide with
   the default agent's;
@@ -31,19 +31,19 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "render_stt_plist.py"
-SNAPSHOT = Path(__file__).resolve().parent / "snapshots" / "koda-stt.plist"
+SNAPSHOT = Path(__file__).resolve().parent / "snapshots" / "pipecat-stt.plist"
 
 # The fixed env the committed snapshot was captured under. Keep these values
-# in lockstep with tests/snapshots/koda-stt.plist — they are the byte-for-byte
-# baseline for the default-label render.
+# in lockstep with tests/snapshots/pipecat-stt.plist — they are the
+# byte-for-byte baseline for the default-label render.
 SNAPSHOT_ENV = {
     "PYTHON": "/usr/bin/python3",
-    "REPO_ROOT": "/Users/test/koda-pipecat",
-    "SOCKET_PATH": "/Users/test/Library/Caches/koda-stt/stt.sock",
+    "REPO_ROOT": "/Users/test/pipecat-local-stt-server",
+    "SOCKET_PATH": "/Users/test/Library/Caches/pipecat-stt/stt.sock",
     "BACKEND": "mlx",
     "MODEL": "mlx-community/whisper-large-v3-turbo",
     "HOME": "/Users/test",
-    "LOG_DIR": "/Users/test/Library/Logs/koda-stt",
+    "LOG_DIR": "/Users/test/Library/Logs/pipecat-stt",
 }
 
 _DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -86,28 +86,28 @@ def test_snapshot_fixture_exists():
 
 
 def test_default_env_renders_plist_byte_for_byte_equal_to_snapshot(tmp_path: Path):
-    """Default env (no ``KODA_STT_LABEL``) renders the legacy ``koda.stt-server``
+    """Default env (no ``KODA_STT_LABEL``) renders the default ``pipecat.stt-server``
     plist byte-for-byte identical to the committed snapshot."""
     dst = tmp_path / "rendered.plist"
     r = _run_render({}, dst)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert dst.is_file()
     assert dst.read_bytes() == SNAPSHOT.read_bytes(), (
-        "default-env render drifted from the committed snapshot — the existing "
-        "production koda.stt-server plist must be unchanged"
+        "default-env render drifted from the committed snapshot — the "
+        "default pipecat.stt-server plist must match the committed bytes"
     )
 
 
-def test_default_env_plist_has_legacy_label_and_log_paths(tmp_path: Path):
-    """Default env keeps the legacy label and ``koda-stt.log`` / ``koda-stt.err``
-    filenames so the existing production agent is undisturbed."""
+def test_default_env_plist_has_default_label_and_log_paths(tmp_path: Path):
+    """Default env uses the ``pipecat.stt-server`` label and ``pipecat-stt.log``
+    / ``pipecat-stt.err`` filenames."""
     dst = tmp_path / "rendered.plist"
     r = _run_render({}, dst)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     plist = plistlib.loads(dst.read_bytes())
-    assert plist["Label"] == "koda.stt-server"
-    assert plist["StandardOutPath"].endswith("/koda-stt.log")
-    assert plist["StandardErrorPath"].endswith("/koda-stt.err")
+    assert plist["Label"] == "pipecat.stt-server"
+    assert plist["StandardOutPath"].endswith("/pipecat-stt.log")
+    assert plist["StandardErrorPath"].endswith("/pipecat-stt.err")
 
 
 # ---------------------------------------------------------------------------
@@ -149,14 +149,14 @@ def test_custom_label_log_paths_do_not_collide_with_default(tmp_path: Path):
 
 def test_custom_label_log_paths_are_derived_from_the_label(tmp_path: Path):
     """The derived log filenames must carry the label so ``logs`` can tail the
-    correct agent — not the hardcoded ``koda-stt.log`` / ``koda-stt.err``."""
+    correct agent — not the hardcoded ``pipecat-stt.log`` / ``pipecat-stt.err``."""
     dst = tmp_path / "parakeet.plist"
-    r = _run_render({"KODA_STT_LABEL": "koda.stt-server.parakeet"}, dst)
+    r = _run_render({"KODA_STT_LABEL": "pipecat.stt-server.parakeet"}, dst)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     plist = plistlib.loads(dst.read_bytes())
-    # The label-derived filenames must not be the legacy hardcoded names.
-    assert not plist["StandardOutPath"].endswith("/koda-stt.log")
-    assert not plist["StandardErrorPath"].endswith("/koda-stt.err")
+    # The label-derived filenames must not be the default hardcoded names.
+    assert not plist["StandardOutPath"].endswith("/pipecat-stt.log")
+    assert not plist["StandardErrorPath"].endswith("/pipecat-stt.err")
     # They must be distinguishable as the parakeet agent's logs.
     assert "parakeet" in Path(plist["StandardOutPath"]).name
     assert "parakeet" in Path(plist["StandardErrorPath"]).name
@@ -167,8 +167,9 @@ def test_custom_label_log_paths_are_derived_from_the_label(tmp_path: Path):
 @pytest.mark.parametrize(
     ("label", "expected_basename"),
     [
-        (None, "koda-stt"),
-        ("koda.stt-server.parakeet", "koda-stt-server-parakeet"),
+        (None, "pipecat-stt"),
+        ("koda.stt-server", "koda-stt"),
+        ("pipecat.stt-server.parakeet", "pipecat-stt-server-parakeet"),
     ],
 )
 def test_log_basename_mapping_is_pinned(tmp_path: Path, label: str | None, expected_basename: str):
@@ -186,6 +187,24 @@ def test_log_basename_mapping_is_pinned(tmp_path: Path, label: str | None, expec
     plist = plistlib.loads(dst.read_bytes())
     assert Path(plist["StandardOutPath"]).name == f"{expected_basename}.log"
     assert Path(plist["StandardErrorPath"]).name == f"{expected_basename}.err"
+
+
+def test_explicit_legacy_label_renders_legacy_label_and_log_paths(tmp_path: Path):
+    """An explicit legacy ``KODA_STT_LABEL=koda.stt-server`` still renders the
+    legacy ``Label`` and ``koda-stt.{log,err}`` basenames at the full-render
+    level — the end-to-end analogue of the ``_log_basename`` parametrize unit.
+
+    This proves two contracts at once: the retained legacy ``_log_basename``
+    shim maps the explicit legacy label to the legacy basename, and
+    ``KODA_STT_LABEL`` still overrides the new ``pipecat.stt-server`` default.
+    """
+    dst = tmp_path / "legacy.plist"
+    r = _run_render({"KODA_STT_LABEL": "koda.stt-server"}, dst)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    plist = plistlib.loads(dst.read_bytes())
+    assert plist["Label"] == "koda.stt-server"
+    assert plist["StandardOutPath"].endswith("/koda-stt.log")
+    assert plist["StandardErrorPath"].endswith("/koda-stt.err")
 
 
 # ---------------------------------------------------------------------------
