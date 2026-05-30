@@ -27,8 +27,7 @@ logger = logging.getLogger("stt_server.backends.mlx")
 # Whisper EXCEPT condition_on_previous_text, which we disable: feeding the
 # previous chunk's emitted text back as a decoder prompt creates a
 # self-amplifying loop on hallucinated tokens (e.g. "subscription" walls
-# from YouTube outro training data). See
-# docs/dev_plans/20260430-fix-whisper-hallucination.md.
+# from YouTube outro training data).
 #
 # Resolved at call time (not import time) so tests can monkeypatch env vars.
 _BOOL_DEFAULT_CONDITION = False
@@ -150,10 +149,9 @@ class _MLXStream:
             # Post-decode degenerate-output filter. Whisper occasionally
             # emits a single segment that is one token repeated dozens of
             # times (e.g. "subscription subscription ...") even with the
-            # Phase-1 suppression knobs in place. We catch those at the
+            # decode-time suppression knobs in place. We catch those at the
             # segment level and replace the text with empty so the rest of
-            # the pipeline treats the segment as silence. See
-            # docs/dev_plans/20260430-fix-whisper-hallucination.md Phase 2.
+            # the pipeline treats the segment as silence.
             segments = result.get("segments") or []
             if segments:
                 kept: list[str] = []
@@ -278,8 +276,7 @@ class MLXWhisperBackend:
         # a decode leaves the Metal command buffer mid-commit and the
         # process exit trips `-[IOGPUMetalCommandBuffer validate]: failed
         # assertion 'commit command buffer with uncommitted encoder'` —
-        # measured on 2026-04-22, see the Tier B spike results in
-        # docs/dev_plans/20260420-design-whisper-websocket-server.md.
+        # measured on 2026-04-22.
         #
         # Waits on the in-flight counter reaching zero; the daemon thread
         # itself decrements in a finally block, so there is no race
