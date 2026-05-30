@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from stt_server.env import env_bool, env_first, env_float, env_int
+from stt_server.env import (
+    env_bool,
+    env_bool_first,
+    env_first,
+    env_float,
+    env_float_first,
+    env_int,
+    env_int_first,
+)
 
 _VAR = "KODA_TEST_ENV_HELPER"
 
@@ -86,3 +94,67 @@ def test_env_first_skips_empty(monkeypatch):
 def test_env_first_returns_default_when_none_set():
     assert env_first("A", "B", default="fallback") == "fallback"
     assert env_first("A", "B") is None
+
+
+# ---------------------------------------------------------------------------
+# Canonical-then-alias precedence helpers (PIPECAT_STT_* wins, KODA_* honoured)
+# ---------------------------------------------------------------------------
+
+_PIPECAT = "STT_ENV_FIRST_PIPECAT"
+_KODA = "STT_ENV_FIRST_KODA"
+
+
+@pytest.fixture(autouse=True)
+def _clear_first_env(monkeypatch):
+    monkeypatch.delenv(_PIPECAT, raising=False)
+    monkeypatch.delenv(_KODA, raising=False)
+
+
+def test_env_bool_first_canonical_wins(monkeypatch):
+    monkeypatch.setenv(_PIPECAT, "true")
+    monkeypatch.setenv(_KODA, "false")
+    assert env_bool_first(_PIPECAT, _KODA, default=False) is True
+
+
+def test_env_bool_first_falls_back_to_alias(monkeypatch):
+    monkeypatch.setenv(_KODA, "true")
+    assert env_bool_first(_PIPECAT, _KODA, default=False) is True
+
+
+def test_env_bool_first_unset_uses_default():
+    assert env_bool_first(_PIPECAT, _KODA, default=True) is True
+
+
+def test_env_bool_first_explicit_empty_canonical_is_false(monkeypatch):
+    # An explicit empty canonical value is *present* -> "False", not the
+    # default, and it still wins over a truthy alias.
+    monkeypatch.setenv(_PIPECAT, "")
+    monkeypatch.setenv(_KODA, "true")
+    assert env_bool_first(_PIPECAT, _KODA, default=True) is False
+
+
+def test_env_float_first_canonical_wins(monkeypatch):
+    monkeypatch.setenv(_PIPECAT, "1.5")
+    monkeypatch.setenv(_KODA, "9.9")
+    assert env_float_first(_PIPECAT, _KODA, default=0.0) == 1.5
+
+
+def test_env_float_first_falls_back_to_alias(monkeypatch):
+    monkeypatch.setenv(_KODA, "2.5")
+    assert env_float_first(_PIPECAT, _KODA, default=0.0) == 2.5
+
+
+def test_env_float_first_invalid_uses_default(monkeypatch):
+    monkeypatch.setenv(_PIPECAT, "not-a-float")
+    assert env_float_first(_PIPECAT, _KODA, default=3.0) == 3.0
+
+
+def test_env_int_first_canonical_wins(monkeypatch):
+    monkeypatch.setenv(_PIPECAT, "7")
+    monkeypatch.setenv(_KODA, "99")
+    assert env_int_first(_PIPECAT, _KODA, default=0) == 7
+
+
+def test_env_int_first_falls_back_to_alias(monkeypatch):
+    monkeypatch.setenv(_KODA, "12")
+    assert env_int_first(_PIPECAT, _KODA, default=0) == 12

@@ -732,8 +732,48 @@ def test_resolve_auth_token_serve_uses_server_token(monkeypatch):
     from stt_server.__main__ import _resolve_auth_token
 
     monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.delenv("PIPECAT_STT_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
     assert _resolve_auth_token(None, client=False) == "server-secret"
+
+
+def test_resolve_auth_token_serve_reads_pipecat_env(monkeypatch):
+    # Canonical PIPECAT_STT_AUTH_TOKEN alone authenticates the serve path.
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "pipecat-secret")
+    assert _resolve_auth_token(None, client=False) == "pipecat-secret"
+
+
+def test_resolve_auth_token_serve_pipecat_wins_over_koda(monkeypatch):
+    # When both are set, the canonical PIPECAT_STT_AUTH_TOKEN takes precedence.
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "pipecat-secret")
+    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "koda-secret")
+    assert _resolve_auth_token(None, client=False) == "pipecat-secret"
+
+
+def test_resolve_auth_token_serve_koda_alias_still_works(monkeypatch):
+    # Regression: legacy KODA_STT_AUTH_TOKEN alone still authenticates serve.
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.delenv("PIPECAT_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "koda-secret")
+    assert _resolve_auth_token(None, client=False) == "koda-secret"
+
+
+def test_resolve_auth_token_probe_ignores_pipecat_server_token(monkeypatch):
+    # The probe path reads only STT_WS_TOKEN, never the serve-side bearer.
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "pipecat-secret")
+    assert _resolve_auth_token(None, client=True) is None
 
 
 def test_resolve_auth_token_file_wins_in_client_mode(monkeypatch, tmp_path: Path):

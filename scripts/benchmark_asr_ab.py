@@ -228,7 +228,8 @@ async def _probe(endpoint: Endpoint, expected_backend: str) -> str | None:
 
     The backend-identity check is fail-closed: an A/B comparison is worthless
     if a socket is actually running a different ASR than its CLI label claims
-    (stale LaunchAgent, swapped socket path, mis-exported ``KODA_STT_*`` env).
+    (stale LaunchAgent, swapped socket path, mis-exported ``PIPECAT_STT_*``
+    env — legacy ``KODA_STT_*`` aliases are still honoured).
     A server too old to emit the ``backend`` field in ``server.hello`` reports
     ``None`` here and is correctly rejected.
     """

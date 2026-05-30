@@ -15,15 +15,20 @@ Defaults are calibrated against the existing ``~/koda-data`` raw-transcript
 corpus. See ``scripts/calibrate_degenerate_threshold.py`` and the plan's
 "Final Results" section for the empirical histogram.
 
-Env vars (canonical names; STT-prefixed aliases are accepted for backward
-compat with the original ship):
+Env vars (canonical PIPECAT_STT_* names first; the legacy KODA_* names are
+deprecated but still honoured as aliases for backward compat):
 
-- ``KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO`` (alias: ``KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO``)
-- ``KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS``  (alias: ``KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS``)
+- ``PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO`` (canonical)
+  / ``KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO`` (deprecated alias)
+  / ``KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO`` (deprecated alias)
+- ``PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS`` (canonical)
+  / ``KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS`` (deprecated alias)
+  / ``KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS`` (deprecated alias)
 
-The canonical names drop the STT-specific prefix because this module is
-imported from cleanup as well as STT — naming it after STT was a layering
-mistake. Both names are honoured; the canonical one wins if both are set.
+Precedence is canonical-first: the ``PIPECAT_STT_*`` name wins when set,
+then the legacy ``KODA_*`` names are honoured. (The older
+``KODA_TEXT_QUALITY_*`` names dropped the STT-specific prefix because this
+module is imported from cleanup as well as STT — they remain supported.)
 """
 
 from __future__ import annotations
@@ -45,10 +50,12 @@ _DEFAULT_RATIO = 0.40
 _DEFAULT_MIN_TOKENS = 10
 
 _RATIO_ENVS = (
+    "PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO",
     "KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO",
     "KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO",
 )
 _MIN_TOKENS_ENVS = (
+    "PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS",
     "KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS",
     "KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS",
 )

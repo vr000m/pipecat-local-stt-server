@@ -25,6 +25,21 @@ _BACKEND_RE = re.compile(r"^(echo|mlx|parakeet)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 
 
+def _env_first(*names: str) -> str | None:
+    """Return the first set, non-empty env var among ``names``.
+
+    Canonical-then-alias resolution: pass the canonical ``PIPECAT_STT_*`` name
+    first, the deprecated ``KODA_STT_*`` alias second. Mirrors
+    ``stt_server.env.env_first`` (not imported here — this script runs as a
+    standalone subprocess from the launchd-render path).
+    """
+    for name in names:
+        val = os.environ.get(name)
+        if val is not None and val.strip() != "":
+            return val
+    return None
+
+
 def _log_basename(label: str) -> str:
     """Derive a per-agent log-file basename from the launchd label.
 
@@ -53,12 +68,13 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
 
 
 def main() -> None:
-    # KODA_STT_LABEL is optional; an unset value keeps the legacy single-agent
+    # The label is optional; an unset value keeps the legacy single-agent
     # label so the default-env render stays byte-identical to today's plist.
-    label = os.environ.get("KODA_STT_LABEL") or DEFAULT_LABEL
+    # Canonical PIPECAT_STT_LABEL wins; KODA_STT_LABEL is a deprecated alias.
+    label = _env_first("PIPECAT_STT_LABEL", "KODA_STT_LABEL") or DEFAULT_LABEL
     if not _LABEL_RE.match(label):
         print(
-            f"error: KODA_STT_LABEL={label!r} rejected by allowlist (alphanumerics / . _ -)",
+            f"error: PIPECAT_STT_LABEL={label!r} rejected by allowlist (alphanumerics / . _ -)",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -109,15 +125,18 @@ def main() -> None:
         "StandardErrorPath": str(Path(log_dir) / f"{log_basename}.err"),
     }
 
-    auth_token = os.environ.get("KODA_STT_AUTH_TOKEN")
+    # Accept the canonical PIPECAT_STT_AUTH_TOKEN first, then the deprecated
+    # KODA_STT_AUTH_TOKEN alias. The server reads PIPECAT_STT_AUTH_TOKEN-first,
+    # so render the canonical name into the plist EnvironmentVariables block.
+    auth_token = _env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN")
     if auth_token:
         # Prefer env over --auth-token so the token never lands in `ps`.
-        plist["EnvironmentVariables"]["KODA_STT_AUTH_TOKEN"] = auth_token
+        plist["EnvironmentVariables"]["PIPECAT_STT_AUTH_TOKEN"] = auth_token
 
     out = Path(plist_dst)
     out.parent.mkdir(parents=True, exist_ok=True)
     # Write under a restrictive umask so the plist containing
-    # KODA_STT_AUTH_TOKEN is 0o600 from the start (no race where another
+    # PIPECAT_STT_AUTH_TOKEN is 0o600 from the start (no race where another
     # local user could read it between create and chmod).
     prev_umask = os.umask(0o077)
     try:

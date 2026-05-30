@@ -155,6 +155,39 @@ def test_transcribe_forwards_env_overrides(fake_mlx, monkeypatch):
     assert kw["no_speech_threshold"] == pytest.approx(0.75)
 
 
+def test_transcribe_forwards_pipecat_canonical_overrides(fake_mlx, monkeypatch):
+    # Canonical PIPECAT_STT_* names drive the decode knobs.
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", "true")
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD", "1.8")
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_LOGPROB_THRESHOLD", "-0.5")
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD", "0.75")
+
+    backend = MLXWhisperBackend(model="fake-model")
+    asyncio.run(_run_decode(backend))
+
+    kw = fake_mlx.last_kwargs
+    assert kw["condition_on_previous_text"] is True
+    assert kw["compression_ratio_threshold"] == pytest.approx(1.8)
+    assert kw["logprob_threshold"] == pytest.approx(-0.5)
+    assert kw["no_speech_threshold"] == pytest.approx(0.75)
+
+
+def test_transcribe_pipecat_wins_over_koda(fake_mlx, monkeypatch):
+    # When both names are set, the canonical PIPECAT_STT_* value wins; the
+    # legacy KODA_STT_* alias is still honoured when PIPECAT is unset.
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD", "0.75")
+    monkeypatch.setenv("KODA_STT_WHISPER_NO_SPEECH_THRESHOLD", "0.1")
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", "true")
+    monkeypatch.setenv("KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", "false")
+
+    backend = MLXWhisperBackend(model="fake-model")
+    asyncio.run(_run_decode(backend))
+
+    kw = fake_mlx.last_kwargs
+    assert kw["no_speech_threshold"] == pytest.approx(0.75)
+    assert kw["condition_on_previous_text"] is True
+
+
 @pytest.mark.parametrize("val", ["False", "false", "0", ""])
 def test_condition_env_falsey_disables_at_call_site(fake_mlx, monkeypatch, val):
     monkeypatch.setenv("KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", val)

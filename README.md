@@ -39,8 +39,9 @@ uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --b
 uv sync --extra stt-server-mlx
 uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --backend mlx
 
-# Loopback TCP (use --auth-token-file or KODA_STT_AUTH_TOKEN env; --auth-token
-# on argv is visible via `ps` and marked DEPRECATED)
+# Loopback TCP (use --auth-token-file or PIPECAT_STT_AUTH_TOKEN env — legacy
+# KODA_STT_AUTH_TOKEN still honoured; --auth-token on argv is visible via
+# `ps` and marked DEPRECATED)
 uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
 
@@ -80,8 +81,9 @@ client-side configuration.
 
 ### Two-agent install
 
-`scripts/install_stt_agent.sh` is parameterised by `KODA_STT_LABEL` /
-`KODA_STT_SOCKET` / `KODA_STT_BACKEND` so two LaunchAgents can coexist
+`scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
+`PIPECAT_STT_SOCKET` / `PIPECAT_STT_BACKEND` (the legacy `KODA_STT_*` names
+are still honoured as deprecated aliases) so two LaunchAgents can coexist
 without plist or log collisions:
 
 ```bash
@@ -94,18 +96,19 @@ scripts/install_stt_agent.sh install
 #    throttle-loop the agent before the download finishes.
 uv sync --extra stt-server-parakeet
 .venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
-KODA_STT_LABEL=koda.stt-server.parakeet \
-  KODA_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
-  KODA_STT_BACKEND=parakeet \
+PIPECAT_STT_LABEL=koda.stt-server.parakeet \
+  PIPECAT_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
+  PIPECAT_STT_BACKEND=parakeet \
   scripts/install_stt_agent.sh install
 ```
 
 The script manages exactly **one** agent per invocation, identified by
-`KODA_STT_LABEL` (+ its socket) — there is no registry or "all" mode. To run
+`PIPECAT_STT_LABEL` (+ its socket) — there is no registry or "all" mode. To run
 any subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against
-the Parakeet agent you must re-export its `KODA_STT_LABEL` and
-`KODA_STT_SOCKET`; a default-env invocation always targets the legacy
-`koda.stt-server` agent. See the recipe in the `install_stt_agent.sh` header.
+the Parakeet agent you must re-export its `PIPECAT_STT_LABEL` and
+`PIPECAT_STT_SOCKET` (legacy `KODA_STT_*` aliases still work); a default-env
+invocation always targets the legacy `koda.stt-server` agent. See the recipe
+in the `install_stt_agent.sh` header.
 
 ### A/B benchmark — Whisper vs Parakeet
 
@@ -311,10 +314,11 @@ intentionally has no notion of branches or speakers.
 For persistent operation, `./koda stt install` (which shells into
 `scripts/install_stt_agent.sh`) renders a LaunchAgent (`koda.stt-server`)
 via `scripts/render_stt_plist.py` (stdlib `plistlib` + allowlist
-validation — do not reintroduce `sed` templating). Overrides:
-`KODA_STT_SOCKET`, `KODA_STT_BACKEND`, `KODA_STT_MODEL`,
-`KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`. Use `./koda stt status` for
-a wire-level health check.
+validation — do not reintroduce `sed` templating). Overrides (canonical
+`PIPECAT_STT_*` names; legacy `KODA_STT_*` names still honoured as
+deprecated aliases): `PIPECAT_STT_SOCKET`, `PIPECAT_STT_BACKEND`,
+`PIPECAT_STT_MODEL`, `PIPECAT_STT_LOG_DIR`, `PIPECAT_STT_AUTH_TOKEN`.
+Use `./koda stt status` for a wire-level health check.
 
 ### Whisper hallucination suppression (MLX backend)
 
@@ -328,12 +332,15 @@ loop on hallucinated tokens. Bool parser accepts `1`/`true`/`yes`/`on`
 (case-insensitive); anything else — including `False`, `0`, empty, or
 unset — is `False`.
 
-| Variable | Default | Description |
+Each variable below is canonical (`PIPECAT_STT_*`); its legacy `KODA_STT_*`
+alias is still honoured (canonical wins if both are set).
+
+| Variable (canonical) | Default | Description |
 |---|---|---|
-| `KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
-| `KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
-| `KODA_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
-| `KODA_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
+| `PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
+| `PIPECAT_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
+| `PIPECAT_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
+| `PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
 
 After decode, `_decode_sync` runs a degenerate-output filter
 (`shared/text_quality.is_degenerate`) on each segment. Segments where
@@ -346,15 +353,16 @@ legitimate high-repetition paragraphs are not flagged.
 
 | Variable (canonical) | Default | Description |
 |---|---|---|
-| `KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
-| `KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
+| `PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
+| `PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
 
-The original `KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
-`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship
-are still honoured as backward-compat aliases (canonical wins if both
-are set). New deployments should prefer the canonical names — the
-helper is also used by the cleanup stage in `shared/text_quality.py`,
-so the STT-prefixed names misrepresent its scope.
+`PIPECAT_STT_WHISPER_DEGENERATE_*` are the canonical names. The earlier
+`KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` /
+`KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` names, and the original
+`KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
+`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship, are
+all still honoured as deprecated backward-compat aliases (canonical wins if
+several are set). New deployments should prefer the `PIPECAT_STT_*` names.
 
 See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context,
 calibration histogram, and the cleanup-stage short-circuit + symmetric

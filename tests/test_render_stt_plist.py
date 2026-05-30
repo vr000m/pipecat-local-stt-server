@@ -254,3 +254,64 @@ def test_model_rejected_when_invalid(tmp_path: Path):
     assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert "MODEL" in r.stderr
     assert not dst.exists()
+
+
+# ---------------------------------------------------------------------------
+# Auth-token env: canonical PIPECAT_STT_AUTH_TOKEN is rendered into the plist;
+# the legacy KODA_STT_AUTH_TOKEN input is still accepted. The server reads
+# PIPECAT_STT_AUTH_TOKEN-first, so the plist must carry the canonical key.
+# ---------------------------------------------------------------------------
+
+
+def test_render_writes_pipecat_auth_token_from_canonical(tmp_path: Path):
+    dst = tmp_path / "auth.plist"
+    r = _run_render({"PIPECAT_STT_AUTH_TOKEN": "pipecat-secret"}, dst)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    env = plistlib.loads(dst.read_bytes())["EnvironmentVariables"]
+    assert env.get("PIPECAT_STT_AUTH_TOKEN") == "pipecat-secret"
+    assert "KODA_STT_AUTH_TOKEN" not in env
+
+
+def test_render_accepts_legacy_koda_auth_token_input(tmp_path: Path):
+    # Legacy KODA_ input is honoured, but the rendered key is canonical.
+    dst = tmp_path / "auth-legacy.plist"
+    r = _run_render({"KODA_STT_AUTH_TOKEN": "koda-secret"}, dst)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    env = plistlib.loads(dst.read_bytes())["EnvironmentVariables"]
+    assert env.get("PIPECAT_STT_AUTH_TOKEN") == "koda-secret"
+    assert "KODA_STT_AUTH_TOKEN" not in env
+
+
+def test_render_auth_token_pipecat_wins_over_koda(tmp_path: Path):
+    dst = tmp_path / "auth-both.plist"
+    r = _run_render(
+        {
+            "PIPECAT_STT_AUTH_TOKEN": "pipecat-secret",
+            "KODA_STT_AUTH_TOKEN": "koda-secret",
+        },
+        dst,
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    env = plistlib.loads(dst.read_bytes())["EnvironmentVariables"]
+    assert env.get("PIPECAT_STT_AUTH_TOKEN") == "pipecat-secret"
+
+
+def test_render_custom_label_via_pipecat_env(tmp_path: Path):
+    dst = tmp_path / "pipecat-label.plist"
+    r = _run_render({"PIPECAT_STT_LABEL": "koda.stt-server.parakeet"}, dst)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    plist = plistlib.loads(dst.read_bytes())
+    assert plist["Label"] == "koda.stt-server.parakeet"
+
+
+def test_render_label_pipecat_wins_over_koda(tmp_path: Path):
+    dst = tmp_path / "both-label.plist"
+    r = _run_render(
+        {
+            "PIPECAT_STT_LABEL": "koda.stt-server.parakeet",
+            "KODA_STT_LABEL": "koda.stt-server.legacy",
+        },
+        dst,
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert plistlib.loads(dst.read_bytes())["Label"] == "koda.stt-server.parakeet"

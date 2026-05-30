@@ -5,14 +5,16 @@
 # Usage:
 #   scripts/install_stt_agent.sh [install|uninstall|start|stop|restart|status|logs]
 #
-# Environment overrides:
-#   KODA_STT_LABEL    launchd label / plist filename
-#                     (default: koda.stt-server)
-#   KODA_STT_SOCKET   path to the UDS socket
-#                     (default: $HOME/Library/Caches/koda-stt/stt.sock)
-#   KODA_STT_BACKEND  backend name: echo|mlx|parakeet (default: mlx)
-#   KODA_STT_MODEL    model id (default: backend-aware — Whisper repo for
-#                     mlx/echo, mlx-community/parakeet-tdt-0.6b-v3 for parakeet)
+# Environment overrides. The canonical PIPECAT_STT_* names take precedence;
+# the legacy KODA_STT_* names (shown in parentheses) are still honoured as
+# deprecated aliases:
+#   PIPECAT_STT_LABEL   (KODA_STT_LABEL)   launchd label / plist filename
+#                       (default: koda.stt-server)
+#   PIPECAT_STT_SOCKET  (KODA_STT_SOCKET)  path to the UDS socket
+#                       (default: $HOME/Library/Caches/koda-stt/stt.sock)
+#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet (default: mlx)
+#   PIPECAT_STT_MODEL   (KODA_STT_MODEL)   model id (default: backend-aware — Whisper repo for
+#                       mlx/echo, mlx-community/parakeet-tdt-0.6b-v3 for parakeet)
 #
 # Two-agent install recipe (run Whisper and Parakeet ASR side by side):
 #
@@ -25,32 +27,34 @@
 #   #    first launch downloads it under KeepAlive + ThrottleInterval=10
 #   #    and launchd may throttle-loop the agent before the download finishes.
 #   .venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
-#   KODA_STT_LABEL=koda.stt-server.parakeet \
-#     KODA_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
-#     KODA_STT_BACKEND=parakeet \
+#   PIPECAT_STT_LABEL=koda.stt-server.parakeet \
+#     PIPECAT_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
+#     PIPECAT_STT_BACKEND=parakeet \
 #     scripts/install_stt_agent.sh install
 #
 # Operational constraint: this script manages exactly ONE agent per
-# invocation, identified by KODA_STT_LABEL (+ its socket). There is no
+# invocation, identified by PIPECAT_STT_LABEL (+ its socket). There is no
 # registry or "all" mode — to manage the Parakeet agent with any
 # subcommand (uninstall/start/stop/restart/status/logs) you MUST re-export
-# its KODA_STT_LABEL (and KODA_STT_SOCKET) env, e.g.:
-#   KODA_STT_LABEL=koda.stt-server.parakeet \
-#     KODA_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
+# its PIPECAT_STT_LABEL (and PIPECAT_STT_SOCKET) env, e.g.:
+#   PIPECAT_STT_LABEL=koda.stt-server.parakeet \
+#     PIPECAT_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
 #     scripts/install_stt_agent.sh status
 # A default-env invocation always targets the legacy koda.stt-server agent.
 set -euo pipefail
 
-LABEL="${KODA_STT_LABEL:-koda.stt-server}"
+# Canonical PIPECAT_STT_* names take precedence; the legacy KODA_STT_* names
+# are still honoured as deprecated aliases.
+LABEL="${PIPECAT_STT_LABEL:-${KODA_STT_LABEL:-koda.stt-server}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RENDER_PY="$REPO_ROOT/scripts/render_stt_plist.py"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="${KODA_STT_LOG_DIR:-$HOME/Library/Logs/koda-stt}"
+LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/koda-stt}}"
 # Default socket lives under the user's Caches dir (not /tmp, which is
 # world-writable and lets a local attacker pre-create the path to DoS
-# the agent). Override via KODA_STT_SOCKET.
-SOCKET_PATH="${KODA_STT_SOCKET:-$HOME/Library/Caches/koda-stt/stt.sock}"
-BACKEND="${KODA_STT_BACKEND:-mlx}"
+# the agent). Override via PIPECAT_STT_SOCKET (or legacy KODA_STT_SOCKET).
+SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-$HOME/Library/Caches/koda-stt/stt.sock}}"
+BACKEND="${PIPECAT_STT_BACKEND:-${KODA_STT_BACKEND:-mlx}}"
 # Backend-aware MODEL default. render_stt_plist.py validates MODEL and
 # exits when unset, so supply a sensible default per backend here: the
 # Whisper repo for mlx/echo, the Parakeet TDT model for parakeet. Must
@@ -60,7 +64,7 @@ if [[ "$BACKEND" == "parakeet" ]]; then
 else
     DEFAULT_MODEL="mlx-community/whisper-large-v3-turbo"
 fi
-MODEL="${KODA_STT_MODEL:-$DEFAULT_MODEL}"
+MODEL="${PIPECAT_STT_MODEL:-${KODA_STT_MODEL:-$DEFAULT_MODEL}}"
 
 # Derive a per-agent log basename matching render_stt_plist.py's
 # _log_basename(): the legacy label keeps the historical koda-stt names,
@@ -90,7 +94,7 @@ render_plist() {
     # substitution (which would allow <string> breakout + RCE).
     PYTHON="$PYTHON" REPO_ROOT="$REPO_ROOT" SOCKET_PATH="$SOCKET_PATH" \
         BACKEND="$BACKEND" MODEL="$MODEL" HOME="$HOME" LOG_DIR="$LOG_DIR" \
-        PLIST_DST="$PLIST_DST" KODA_STT_LABEL="$LABEL" \
+        PLIST_DST="$PLIST_DST" PIPECAT_STT_LABEL="$LABEL" \
         "$PYTHON" "$RENDER_PY"
 }
 

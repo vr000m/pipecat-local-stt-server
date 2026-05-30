@@ -60,3 +60,52 @@ def env_first(*names: str, default: str | None = None) -> str | None:
         if val is not None and val.strip() != "":
             return val
     return default
+
+
+def _first_present_name(names: tuple[str, ...]) -> str | None:
+    """Return the first env var in ``names`` that is *present* (set to any
+    value, including empty/whitespace), else ``None``.
+
+    Unlike :func:`env_first` (which skips empty values), this reports mere
+    presence so :func:`env_bool_first` can honour an explicit empty/``"0"``
+    as a meaningful "False" rather than falling through to the default.
+    """
+    for name in names:
+        if os.environ.get(name) is not None:
+            return name
+    return None
+
+
+def env_bool_first(*names: str, default: bool) -> bool:
+    """:func:`env_bool` with canonical-then-alias precedence across ``names``:
+    the first *present* name wins. Pass the canonical name first."""
+    name = _first_present_name(names)
+    if name is None:
+        return default
+    return env_bool(name, default)
+
+
+def env_float_first(*names: str, default: float) -> float:
+    """:func:`env_float` with canonical-then-alias precedence across ``names``:
+    the first *non-empty* name wins. Pass the canonical name first."""
+    val = env_first(*names)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        logger.warning("invalid float for %s=%r; using default %s", names, val, default)
+        return default
+
+
+def env_int_first(*names: str, default: int) -> int:
+    """:func:`env_int` with canonical-then-alias precedence across ``names``:
+    the first *non-empty* name wins. Pass the canonical name first."""
+    val = env_first(*names)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logger.warning("invalid int for %s=%r; using default %s", names, val, default)
+        return default
