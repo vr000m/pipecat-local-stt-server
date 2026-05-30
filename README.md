@@ -51,11 +51,12 @@ which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
 / `python -m stt_server status <flags>` — see "Checking server health"
 below for the `status` subcommand.
 
-For persistent always-on operation on macOS, the Koda wrapper exposes
-`./koda stt install|start|stop|restart|status|logs` as the primary
-control surface. It delegates to `scripts/install_stt_agent.sh` (the
-underlying LaunchAgent implementation) and layers a wire-level health
-probe on top. See the Koda integration section below.
+For persistent always-on operation on macOS, install the server as a
+LaunchAgent via `scripts/install_stt_agent.sh`
+(`install|start|stop|restart|status|logs`); pair it with
+`python -m stt_server status` for a wire-level health probe. A consumer
+may wrap these behind its own CLI — see "Reference consumer (Koda)"
+below for one such integration.
 
 ## Multi-backend operation
 
@@ -266,10 +267,13 @@ Deviations from the OpenAI Realtime transcription snapshot (2026-04-20):
 - custom events: `server.hello`, `server.status`, `session.close`,
   `session.cancel`, `session.closed`
 
-## Koda integration
+## Reference consumer (Koda)
 
-Shipped. `bot/stt/websocket_stt_service.py` is a Pipecat
-`SegmentedSTTService` subclass that:
+This section documents how one consumer — the Koda bot, for which this
+server was originally built — integrates the client. It is included as a
+worked example of the client contract, not a dependency: nothing in this
+package imports or requires Koda. `bot/stt/websocket_stt_service.py`
+(in the consumer repo) is a Pipecat `SegmentedSTTService` subclass that:
 
 - owns the WebSocket session across `start(StartFrame)` / `stop(EndFrame)` /
   `cancel(CancelFrame)` / `cleanup()`
