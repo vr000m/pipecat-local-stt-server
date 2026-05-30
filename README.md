@@ -232,6 +232,97 @@ async def run():
 
 The example `stt_server/examples/file_stream.py` streams a WAV file end to end.
 
+## Choosing a backend and model
+
+The **server** picks the ASR, pinned at launch — the client never selects it.
+A client (including the Pipecat service below) only points at an *endpoint*
+and transcribes against whatever backend that server was started with. To run
+Whisper vs Parakeet you start a *different* server (or a second one on its own
+socket — see "Multi-backend operation"); no client code changes.
+
+```bash
+# Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo
+uv sync --extra stt-server-mlx
+uv run python -m stt_server serve --backend mlx \
+    --socket-path ~/Library/Caches/pipecat-stt/stt.sock
+
+# Parakeet — default model mlx-community/parakeet-tdt-0.6b-v3
+uv sync --extra stt-server-parakeet
+uv run python -m stt_server serve --backend parakeet \
+    --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
+
+# Pick a specific model with --model (any compatible mlx-community HF repo id)
+uv run python -m stt_server serve --backend mlx \
+    --model mlx-community/whisper-small --socket-path .../stt.sock
+```
+
+`--model` is passed through verbatim; an unset value uses the backend-aware
+default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
+`parakeet`). Pointing a backend at a mismatched repo fails fast at decode.
+
+Common MLX Whisper models (smaller = faster + lower RAM, larger = more
+accurate). These are `mlx-community` Hugging Face repos; the first launch
+downloads and caches the weights.
+
+| `--backend` | `--model` | Notes |
+|---|---|---|
+| `mlx` | `mlx-community/whisper-large-v3-turbo` | **default** — best accuracy/speed balance |
+| `mlx` | `mlx-community/whisper-large-v3` | highest accuracy, slowest, most RAM |
+| `mlx` | `mlx-community/whisper-medium` | mid accuracy/speed |
+| `mlx` | `mlx-community/whisper-small` | faster, lighter |
+| `mlx` | `mlx-community/whisper-base` | fast, lower accuracy |
+| `mlx` | `mlx-community/whisper-tiny` | fastest, lowest accuracy |
+| `parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | **default** Parakeet TDT |
+
+Any `mlx-community` Whisper repo (e.g. `…-large-v3-turbo-q4` quantised
+variants, or `…-large-v3-turbo` language-specialised forks) works as a
+`--model` value — the table lists common starting points, not an allowlist.
+Verify which model a running server actually loaded with
+`python -m stt_server status` (it prints `backend: <name> (model: <repo>)`).
+
+## Pipecat integration
+
+`stt_server/examples/pipecat_stt_service.py` is a runnable
+`SegmentedSTTService` subclass (`LocalWebSocketSTTService`) that wires
+`TranscriptionClient` into a Pipecat pipeline. It is an example, not part of
+the installed package — Pipecat is not a dependency of this project. Install
+both to use it:
+
+```bash
+uv pip install "pipecat-ai" "pipecat-local-stt-server[client]"
+```
+
+Then point the service at a running server's endpoint and add it to a
+pipeline:
+
+```python
+from stt_server.examples.pipecat_stt_service import LocalWebSocketSTTService
+
+stt = LocalWebSocketSTTService(
+    socket_path="~/Library/Caches/pipecat-stt/stt.sock",
+    # or: host="127.0.0.1", port=8765, auth_token="..."
+    sample_rate=16000,  # the server's wire format is pinned to 16 kHz mono
+)
+# pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])
+```
+
+Two requirements follow from how the server works:
+
+- **VAD is supplied by your pipeline, not this service.** `SegmentedSTTService`
+  transcribes one utterance per VAD segment, so the transport/pipeline must
+  emit `VADUserStartedSpeakingFrame` / `VADUserStoppedSpeakingFrame` (e.g. a
+  Silero VAD analyzer on the transport). The service buffers between those and
+  calls the server once per segment — which matches this server's
+  commit-oriented protocol (append → commit → one final transcript).
+- **Run at 16 kHz mono.** The wire format is pinned to 16 kHz mono PCM16, so
+  configure the transport/pipeline `sample_rate=16000`; the example emits an
+  `ErrorFrame` rather than silently mis-transcribing a mismatched rate.
+
+To switch Whisper ↔ Parakeet, change *which server* the service connects to
+(its `socket_path`/`host`+`port`), not the service code. `server.hello` carries
+the backend identity, so the example logs which ASR it connected to and can
+optionally hard-assert it (see `_log_backend`).
+
 ## Protocol subset
 
 Client -> server JSON events:

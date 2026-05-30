@@ -35,6 +35,11 @@ import name `stt_server`.
 - PyPI packaging metadata: authors, `[project.urls]` (Homepage / Repository /
   Issues), trove classifiers (BSD-2-Clause, Python 3.12 / 3.13, macOS,
   speech / AI topics), and keywords.
+- `stt_server/examples/pipecat_stt_service.py` — a runnable Pipecat
+  `SegmentedSTTService` subclass (`LocalWebSocketSTTService`) wiring
+  `TranscriptionClient` into a pipeline, plus README sections on choosing a
+  backend/model (Whisper + Parakeet) and the Pipecat integration. The example
+  imports `pipecat`, which remains an optional, non-declared dependency.
 
 ### Deprecated
 
