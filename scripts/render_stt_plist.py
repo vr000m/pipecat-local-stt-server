@@ -7,6 +7,10 @@ of <string> and inject arbitrary ProgramArguments, a login-time RCE).
 Inputs are read from env vars (see ``scripts/install_stt_agent.sh``) and
 allowlist-validated before being placed in the plist. Unknown/invalid values
 fail loudly rather than silently producing a broken or malicious plist.
+
+May be run directly (not only via ``install_stt_agent.sh``); the label and
+auth token each accept the canonical ``PIPECAT_STT_*`` name or the deprecated
+``KODA_STT_*`` alias, resolved canonical-first by ``env_first``.
 """
 
 from __future__ import annotations
@@ -20,8 +24,18 @@ from pathlib import Path
 # This script is always invoked by the project venv's interpreter (see
 # ``scripts/install_stt_agent.sh``), which has ``stt_server`` installed, so the
 # canonical resolver imports cleanly regardless of CWD — no need to duplicate
-# ``env_first`` here.
-from stt_server.env import env_first
+# ``env_first`` here. Guard the import so a hand-run with the wrong interpreter
+# fails with the same actionable hint the shell guard gives, not an opaque
+# traceback.
+try:
+    from stt_server.env import env_first
+except ImportError:
+    print(
+        "error: cannot import stt_server — run this with the project venv "
+        "interpreter (.venv/bin/python after 'uv sync')",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 DEFAULT_LABEL = "koda.stt-server"
 

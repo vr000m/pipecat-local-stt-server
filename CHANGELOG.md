@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `stt_server/text_quality.py` resolves its thresholds through
   `env_float_first` / `env_int_first` (gaining the invalid-value warning that
   the prior inline parse swallowed) instead of `env_first` + inline `float()`.
+- `scripts/render_stt_plist.py` guards its `stt_server` import: a hand-run with
+  the wrong interpreter now exits with an actionable "use the project venv"
+  hint instead of an opaque `ImportError` traceback.
 
 ## [0.1.0] - 2026-05-30
 

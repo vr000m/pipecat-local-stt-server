@@ -429,7 +429,12 @@ loop on hallucinated tokens. Bool parser accepts `1`/`true`/`yes`/`on`
 unset — is `False`.
 
 Each variable below is canonical (`PIPECAT_STT_*`); its legacy `KODA_STT_*`
-alias is still honoured (canonical wins if both are set).
+alias is still honoured (canonical wins if both are set). For these numeric
+(and the boolean) knobs precedence is *presence-based*: a present-but-empty
+canonical value wins and resolves to the default rather than falling through
+to a set legacy alias — so blanking the canonical reliably overrides the
+alias. (String knobs like the LaunchAgent label instead skip an empty
+canonical and fall through to the alias.)
 
 | Variable (canonical) | Default | Description |
 |---|---|---|

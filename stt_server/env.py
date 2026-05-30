@@ -3,6 +3,22 @@
 Resolved at call time so tests / operators can monkeypatch without
 re-importing. Returning the default on parse failure (with a warning)
 lets a typo'd env value not crash a long-running process.
+
+Canonical-then-alias precedence (the ``*_first`` helpers) deliberately uses
+two different "which name wins" rules by value type, because what an empty
+value *means* differs by type:
+
+- ``env_first`` (string) picks the first **non-empty** name. An empty string
+  is not a meaningful label/token, so a blank canonical falls through to the
+  alias (then the default) — you would not want ``PIPECAT_STT_LABEL=""`` to
+  win and blank out a set ``KODA_STT_LABEL``.
+- ``env_bool_first`` / ``env_float_first`` / ``env_int_first`` (typed) pick the
+  first **present** name (via :func:`_first_present_name`). There is no
+  meaningful "empty number"/"empty bool", so a present-but-empty canonical
+  wins and resolves to the default — blanking the canonical reliably overrides
+  a set alias rather than silently deferring to it.
+
+This split is intentional; keep it in mind before unifying the resolvers.
 """
 
 from __future__ import annotations
