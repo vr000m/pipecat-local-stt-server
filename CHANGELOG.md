@@ -5,6 +5,29 @@ All notable changes to `pipecat-local-stt-server` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-30
+
+### Changed
+
+- **`env_float_first` / `env_int_first` now resolve by presence, not
+  non-emptiness** — matching `env_bool_first`. A present-but-empty canonical
+  `PIPECAT_STT_*` value now wins and resolves to the default, instead of
+  silently falling through to a set legacy `KODA_*` alias. This makes the
+  canonical-first precedence rule uniform across bool/float/int knobs. Parsing
+  is delegated to `env_float` / `env_int` so coercion is single-sourced.
+  Affects the `PIPECAT_STT_WHISPER_*` decode and degenerate-detection knobs.
+
+### Internal
+
+- `scripts/render_stt_plist.py` now imports `env_first` from `stt_server.env`
+  instead of carrying a duplicate `_env_first`; the resolver is single-sourced.
+- `stt_server/text_quality.py` resolves its thresholds through
+  `env_float_first` / `env_int_first` (gaining the invalid-value warning that
+  the prior inline parse swallowed) instead of `env_first` + inline `float()`.
+- `scripts/render_stt_plist.py` guards its `stt_server` import: a hand-run with
+  the wrong interpreter now exits with an actionable "use the project venv"
+  hint instead of an opaque `ImportError` traceback.
+
 ## [0.1.0] - 2026-05-30
 
 First public release: a standalone local WebSocket transcription (STT) server,

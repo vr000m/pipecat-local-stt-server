@@ -7,6 +7,10 @@ of <string> and inject arbitrary ProgramArguments, a login-time RCE).
 Inputs are read from env vars (see ``scripts/install_stt_agent.sh``) and
 allowlist-validated before being placed in the plist. Unknown/invalid values
 fail loudly rather than silently producing a broken or malicious plist.
+
+May be run directly (not only via ``install_stt_agent.sh``); the label and
+auth token each accept the canonical ``PIPECAT_STT_*`` name or the deprecated
+``KODA_STT_*`` alias, resolved canonical-first by ``env_first``.
 """
 
 from __future__ import annotations
@@ -17,27 +21,28 @@ import re
 import sys
 from pathlib import Path
 
+# This script is always invoked by the project venv's interpreter (see
+# ``scripts/install_stt_agent.sh``), which has ``stt_server`` installed, so the
+# canonical resolver imports cleanly regardless of CWD — no need to duplicate
+# ``env_first`` here. Guard the import so a hand-run with the wrong interpreter
+# fails with the same actionable hint the shell guard gives, not an opaque
+# traceback.
+try:
+    from stt_server.env import env_first
+except ImportError:
+    print(
+        "error: cannot import stt_server — run this with the project venv "
+        "interpreter (.venv/bin/python after 'uv sync')",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 DEFAULT_LABEL = "koda.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
 _BACKEND_RE = re.compile(r"^(echo|mlx|parakeet)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
-
-
-def _env_first(*names: str) -> str | None:
-    """Return the first set, non-empty env var among ``names``.
-
-    Canonical-then-alias resolution: pass the canonical ``PIPECAT_STT_*`` name
-    first, the deprecated ``KODA_STT_*`` alias second. Mirrors
-    ``stt_server.env.env_first`` (not imported here — this script runs as a
-    standalone subprocess from the launchd-render path).
-    """
-    for name in names:
-        val = os.environ.get(name)
-        if val is not None and val.strip() != "":
-            return val
-    return None
 
 
 def _log_basename(label: str) -> str:
@@ -71,7 +76,7 @@ def main() -> None:
     # The label is optional; an unset value keeps the legacy single-agent
     # label so the default-env render stays byte-identical to today's plist.
     # Canonical PIPECAT_STT_LABEL wins; KODA_STT_LABEL is a deprecated alias.
-    label = _env_first("PIPECAT_STT_LABEL", "KODA_STT_LABEL") or DEFAULT_LABEL
+    label = env_first("PIPECAT_STT_LABEL", "KODA_STT_LABEL") or DEFAULT_LABEL
     if not _LABEL_RE.match(label):
         print(
             f"error: PIPECAT_STT_LABEL={label!r} rejected by allowlist (alphanumerics / . _ -)",
@@ -128,7 +133,7 @@ def main() -> None:
     # Accept the canonical PIPECAT_STT_AUTH_TOKEN first, then the deprecated
     # KODA_STT_AUTH_TOKEN alias. The server reads PIPECAT_STT_AUTH_TOKEN-first,
     # so render the canonical name into the plist EnvironmentVariables block.
-    auth_token = _env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN")
+    auth_token = env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN")
     if auth_token:
         # Prefer env over --auth-token so the token never lands in `ps`.
         plist["EnvironmentVariables"]["PIPECAT_STT_AUTH_TOKEN"] = auth_token

@@ -1,6 +1,6 @@
 [project]
 name = "pipecat-local-stt-server"
-version = "0.1.0"
+version = "0.1.1"
 description = "Standalone local WebSocket transcription (STT) server, client, and pluggable ASR backends for the Pipecat ecosystem"
 readme = "README.md"
 requires-python = ">=3.12"

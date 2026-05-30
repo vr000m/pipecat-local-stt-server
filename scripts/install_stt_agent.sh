@@ -92,6 +92,13 @@ render_plist() {
     # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
     # allowlist validation handle hostile values instead of sed string
     # substitution (which would allow <string> breakout + RCE).
+    #
+    # Contract: $LABEL is already alias-resolved here, and we inject it under
+    # the *canonical* PIPECAT_STT_LABEL key. render_stt_plist.py re-resolves
+    # PIPECAT_STT_LABEL-first, so the canonical name wins over any stray
+    # KODA_STT_LABEL in the environment. The double-resolution is safe only as
+    # long as the resolved value keeps being passed under the canonical key —
+    # do not switch this to the deprecated alias key.
     PYTHON="$PYTHON" REPO_ROOT="$REPO_ROOT" SOCKET_PATH="$SOCKET_PATH" \
         BACKEND="$BACKEND" MODEL="$MODEL" HOME="$HOME" LOG_DIR="$LOG_DIR" \
         PLIST_DST="$PLIST_DST" PIPECAT_STT_LABEL="$LABEL" \

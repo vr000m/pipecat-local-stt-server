@@ -36,7 +36,8 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from stt_server.env import env_first
+from stt_server.env import env_float_first, env_int_first
+
 
 # A "word-shaped" token has at least one alphanumeric character (Unicode
 # word class). Pure-punctuation tokens like ``-``, ``--``, ``***``, ``===``,
@@ -62,23 +63,11 @@ _MIN_TOKENS_ENVS = (
 
 
 def _ratio_threshold() -> float:
-    val = env_first(*_RATIO_ENVS)
-    if val is None:
-        return _DEFAULT_RATIO
-    try:
-        return float(val)
-    except ValueError:
-        return _DEFAULT_RATIO
+    return env_float_first(*_RATIO_ENVS, default=_DEFAULT_RATIO)
 
 
 def _min_tokens() -> int:
-    val = env_first(*_MIN_TOKENS_ENVS)
-    if val is None:
-        return _DEFAULT_MIN_TOKENS
-    try:
-        return int(val)
-    except ValueError:
-        return _DEFAULT_MIN_TOKENS
+    return env_int_first(*_MIN_TOKENS_ENVS, default=_DEFAULT_MIN_TOKENS)
 
 
 def dominant_unigram_ratio(text: str) -> tuple[float, str | None, int]:
