@@ -1,7 +1,5 @@
 """Tests for the multi-instance ``scripts/render_stt_plist.py`` renderer.
 
-Phase 3 of docs/dev_plans/20260518-feature-multi-asr-parakeet-backend.md.
-
 ``render_stt_plist.py`` is parameterised so two (or more) LaunchAgents can
 coexist — distinct label, socket path, and log files per ASR. These tests
 exercise it as a subprocess (its real entry point) and assert:

@@ -1,4 +1,4 @@
-"""Tests for ``shared.env`` coercion helpers."""
+"""Tests for ``stt_server.env`` coercion helpers."""
 
 from __future__ import annotations
 

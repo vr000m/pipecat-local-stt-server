@@ -1,7 +1,5 @@
 """Unit tests for the pure helpers in ``scripts/benchmark_asr_ab.py``.
 
-Phase 5 of docs/dev_plans/20260518-feature-multi-asr-parakeet-backend.md.
-
 The A/B benchmark is an operator tool that replays a corpus against two live
 ``stt_server`` instances; that end-to-end path is *not* CI-testable. These
 tests cover only the pure, deterministic helpers:

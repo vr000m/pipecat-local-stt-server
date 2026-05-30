@@ -1,7 +1,5 @@
 """Tests for the Parakeet (NVIDIA TDT) STT backend.
 
-Phase 1 of ``docs/dev_plans/20260518-feature-multi-asr-parakeet-backend.md``.
-
 ``parakeet_mlx`` is fully stubbed via ``sys.modules`` injection so CI never
 downloads a ~1.5 GB model. These tests pin the V1 wire contract the backend
 must satisfy:

@@ -869,8 +869,7 @@ async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Parakeet backend selection wiring
-#   docs/dev_plans/20260518-feature-multi-asr-parakeet-backend.md
+# Parakeet backend selection wiring
 #
 # Two concerns:
 #   * _make_backend / _resolve_model / argparse choices accept ``parakeet``;

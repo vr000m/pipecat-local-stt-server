@@ -1,7 +1,6 @@
-"""Boundary tests for ``shared.text_quality.is_degenerate``.
+"""Boundary tests for ``stt_server.text_quality.is_degenerate``.
 
-Covers the post-decode degenerate-output filter from Phase 2 of
-``docs/dev_plans/20260430-fix-whisper-hallucination.md``. Defaults shipped:
+Covers the post-decode degenerate-output filter. Defaults shipped:
 
 - ``KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO`` = 0.40 (strictly greater-than)
 - ``KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS`` = 10
@@ -22,7 +21,7 @@ from stt_server.text_quality import dominant_unigram_ratio, is_degenerate
 
 
 # Canonical env vars under test — primary path. Keep in sync with
-# shared/text_quality.py. Aliases are exercised in the dedicated alias
+# stt_server/text_quality.py. Aliases are exercised in the dedicated alias
 # section near the bottom of this file.
 RATIO_ENV = "KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO"
 MIN_TOKENS_ENV = "KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS"
