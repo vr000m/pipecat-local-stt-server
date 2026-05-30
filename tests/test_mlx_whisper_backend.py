@@ -1,9 +1,7 @@
 """Tests for the MLX Whisper backend hallucination-suppression knobs.
 
-The implementer wired four ``KODA_STT_WHISPER_*`` env-driven kwargs into
-``mlx_whisper.transcribe()`` (see
-``docs/dev_plans/20260430-fix-whisper-hallucination.md`` Phase 1). These
-tests pin:
+Four ``KODA_STT_WHISPER_*`` env-driven kwargs are wired into
+``mlx_whisper.transcribe()``. These tests pin:
 
   * the four kwargs are forwarded with the documented defaults,
   * env-var overrides flow through to the call,

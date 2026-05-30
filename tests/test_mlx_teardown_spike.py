@@ -4,9 +4,7 @@ The hazard this file guards against is the *server-side drain
 invariant* — the thing that actually wedged us historically when MLX
 work was still in flight at interpreter exit. The MLX-specific part
 (Metal assertions, RSS growth, launchd respawn timing) needs real
-hardware and lives in ``scripts/mlx_teardown_spike.sh``; see the dev
-plan at ``docs/dev_plans/20260420-design-whisper-websocket-server.md``
-under "Preflight Follow-Ups — Tier 2".
+hardware and lives in ``scripts/mlx_teardown_spike.sh``.
 
 Every test here drives the real wire protocol through
 ``TranscriptionClient``, so a regression in the drain path surfaces as
