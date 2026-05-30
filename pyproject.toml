@@ -5,6 +5,19 @@ description = "Standalone local WebSocket transcription (STT) server, client, an
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
+authors = [{ name = "Varun Singh", email = "varun@varunsingh.net" }]
+keywords = ["stt", "transcription", "whisper", "parakeet", "mlx", "websocket", "pipecat", "asr", "speech-to-text"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     # The wire transport. The client (TranscriptionClient) and the server
     # runtime (TranscriptionServer) both depend on websockets; it is the only
@@ -29,6 +42,11 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/vr000m/pipecat-local-stt-server"
+Repository = "https://github.com/vr000m/pipecat-local-stt-server"
+Issues = "https://github.com/vr000m/pipecat-local-stt-server/issues"
 
 [build-system]
 requires = ["hatchling"]
