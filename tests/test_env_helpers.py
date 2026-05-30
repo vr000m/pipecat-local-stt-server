@@ -149,6 +149,15 @@ def test_env_float_first_invalid_uses_default(monkeypatch):
     assert env_float_first(_PIPECAT, _KODA, default=3.0) == 3.0
 
 
+def test_env_float_first_explicit_empty_canonical_uses_default(monkeypatch):
+    # Presence (not non-emptiness) picks the winner, matching env_bool_first:
+    # an explicit empty canonical is *present*, so it wins and resolves to the
+    # default rather than silently falling through to the set alias.
+    monkeypatch.setenv(_PIPECAT, "")
+    monkeypatch.setenv(_KODA, "9.9")
+    assert env_float_first(_PIPECAT, _KODA, default=1.5) == 1.5
+
+
 def test_env_int_first_canonical_wins(monkeypatch):
     monkeypatch.setenv(_PIPECAT, "7")
     monkeypatch.setenv(_KODA, "99")
@@ -158,3 +167,10 @@ def test_env_int_first_canonical_wins(monkeypatch):
 def test_env_int_first_falls_back_to_alias(monkeypatch):
     monkeypatch.setenv(_KODA, "12")
     assert env_int_first(_PIPECAT, _KODA, default=0) == 12
+
+
+def test_env_int_first_explicit_empty_canonical_uses_default(monkeypatch):
+    # Presence-based winner, matching env_bool_first / env_float_first.
+    monkeypatch.setenv(_PIPECAT, "")
+    monkeypatch.setenv(_KODA, "99")
+    assert env_int_first(_PIPECAT, _KODA, default=5) == 5

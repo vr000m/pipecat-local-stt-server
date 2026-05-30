@@ -87,25 +87,31 @@ def env_bool_first(*names: str, default: bool) -> bool:
 
 def env_float_first(*names: str, default: float) -> float:
     """:func:`env_float` with canonical-then-alias precedence across ``names``:
-    the first *non-empty* name wins. Pass the canonical name first."""
-    val = env_first(*names)
-    if val is None:
+    the first *present* name wins (same presence rule as
+    :func:`env_bool_first`). Pass the canonical name first.
+
+    Presence — not non-emptiness — decides the winner, so a present-but-empty
+    canonical resolves to ``default`` (via :func:`env_float`) and still
+    overrides a set alias. Parsing/warning is delegated to :func:`env_float`
+    so coercion stays single-sourced.
+    """
+    name = _first_present_name(names)
+    if name is None:
         return default
-    try:
-        return float(val)
-    except ValueError:
-        logger.warning("invalid float for %s=%r; using default %s", names, val, default)
-        return default
+    return env_float(name, default)
 
 
 def env_int_first(*names: str, default: int) -> int:
     """:func:`env_int` with canonical-then-alias precedence across ``names``:
-    the first *non-empty* name wins. Pass the canonical name first."""
-    val = env_first(*names)
-    if val is None:
+    the first *present* name wins (same presence rule as
+    :func:`env_bool_first`). Pass the canonical name first.
+
+    Presence — not non-emptiness — decides the winner, so a present-but-empty
+    canonical resolves to ``default`` (via :func:`env_int`) and still overrides
+    a set alias. Parsing/warning is delegated to :func:`env_int` so coercion
+    stays single-sourced.
+    """
+    name = _first_present_name(names)
+    if name is None:
         return default
-    try:
-        return int(val)
-    except ValueError:
-        logger.warning("invalid int for %s=%r; using default %s", names, val, default)
-        return default
+    return env_int(name, default)
