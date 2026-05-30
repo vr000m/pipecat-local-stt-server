@@ -14,8 +14,8 @@ from typing import AsyncGenerator
 
 import numpy as np
 
-from shared.env import env_bool, env_float
-from shared.text_quality import dominant_unigram_ratio, is_degenerate
+from stt_server.env import env_bool, env_float
+from stt_server.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
 from ._thread_util import run_in_daemon_thread

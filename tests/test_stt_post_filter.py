@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.text_quality import dominant_unigram_ratio, is_degenerate
+from stt_server.text_quality import dominant_unigram_ratio, is_degenerate
 
 
 # Canonical env vars under test — primary path. Keep in sync with
@@ -164,7 +164,7 @@ def test_env_override_min_tokens_raised_suppresses_short_walls(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-from shared.text_quality import has_degenerate_paragraph  # noqa: E402
+from stt_server.text_quality import has_degenerate_paragraph  # noqa: E402
 
 
 def test_has_degenerate_paragraph_catches_buried_wall():

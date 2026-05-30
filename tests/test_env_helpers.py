@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.env import env_bool, env_first, env_float, env_int
+from stt_server.env import env_bool, env_first, env_float, env_int
 
 _VAR = "KODA_TEST_ENV_HELPER"
 

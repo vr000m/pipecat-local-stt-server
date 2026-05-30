@@ -24,7 +24,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from shared.env import env_bool as _env_bool  # noqa: E402
+from stt_server.env import env_bool as _env_bool  # noqa: E402
 from stt_server.backends.mlx_whisper import MLXWhisperBackend  # noqa: E402
 
 

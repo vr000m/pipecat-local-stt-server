@@ -1,0 +1,52 @@
+[project]
+name = "pipecat-local-stt-server"
+version = "0.1.0"
+description = "Standalone local WebSocket transcription (STT) server, client, and pluggable ASR backends for the Pipecat ecosystem"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    # The wire transport. The client (TranscriptionClient) and the server
+    # runtime (TranscriptionServer) both depend on websockets; it is the only
+    # hard runtime dependency of the base package. Backend ASR engines live
+    # behind the [mlx] / [parakeet] extras so a client-only consumer (e.g. a
+    # bot that just talks to a running server) does not pull MLX/Whisper.
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+# Pure client deps — what a downstream consumer of `stt_server.client` needs
+# without pulling any MLX/Whisper runtime.
+client = ["websockets>=13.0"]
+# Full server install with the MLX Whisper backend.
+mlx = ["websockets>=13.0", "mlx-whisper>=0.4.0", "numpy>=1.26"]
+# Full server install with the Parakeet TDT backend (via parakeet-mlx).
+parakeet = ["websockets>=13.0", "parakeet-mlx>=0.5.1", "numpy>=1.26"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Import name stays `stt_server` so every `import stt_server` callsite, every
+# test, and the plist `python -m stt_server` invocation work without rename.
+packages = ["stt_server"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# `tests/test_benchmark_asr_ab.py` does `from scripts.benchmark_asr_ab import …`
+# and `tests/test_mlx_teardown_spike.py` imports `scripts/_mlx_spike_driver.py`,
+# so the repo root must be importable under pytest.
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

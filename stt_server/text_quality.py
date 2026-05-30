@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from shared.env import env_first
+from stt_server.env import env_first
 
 # A "word-shaped" token has at least one alphanumeric character (Unicode
 # word class). Pure-punctuation tokens like ``-``, ``--``, ``***``, ``===``,

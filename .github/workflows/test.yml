@@ -1,0 +1,56 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Base + backend extras. The MLX/Parakeet wheels are macOS/Apple-Silicon
+  # only, so the full-extras job runs on macos-14 (Apple Silicon runners).
+  test-macos:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Sync (base + mlx + parakeet)
+        run: uv sync --extra mlx --extra parakeet
+      - name: Protocol version gate
+        run: |
+          uv run python -c "from stt_server import protocol; assert protocol.PROTOCOL_VERSION == '0.1', protocol.PROTOCOL_VERSION; print('PROTOCOL_VERSION OK:', protocol.PROTOCOL_VERSION)"
+      - name: Run tests
+        run: uv run pytest -x
+
+  # Client-only install on Linux, to prove the base package (no MLX/Parakeet)
+  # resolves and the protocol/client/server surface tests pass without the
+  # Apple-Silicon-only backends. Backend-specific tests are skipped here.
+  test-linux-client:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Sync (client only)
+        run: uv sync --extra client
+      - name: Protocol version gate
+        run: |
+          uv run python -c "from stt_server import protocol; assert protocol.PROTOCOL_VERSION == '0.1', protocol.PROTOCOL_VERSION; print('PROTOCOL_VERSION OK:', protocol.PROTOCOL_VERSION)"
+      - name: Run protocol/server/client tests (skip backend-weight tests)
+        run: |
+          uv run pytest -x \
+            tests/test_stt_server.py \
+            tests/test_protocol_version.py \
+            tests/test_backend_protocol.py \
+            tests/test_wire_schema_compat.py \
+            tests/test_env_helpers.py \
+            tests/test_stt_post_filter.py \
+            tests/test_render_stt_plist.py

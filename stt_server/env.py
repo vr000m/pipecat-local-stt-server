@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 
-logger = logging.getLogger("shared.env")
+logger = logging.getLogger("stt_server.env")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
