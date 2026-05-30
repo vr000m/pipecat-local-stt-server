@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "render_stt_plist.py"
+INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_stt_agent.sh"
 SNAPSHOT = Path(__file__).resolve().parent / "snapshots" / "pipecat-stt.plist"
 
 # The fixed env the committed snapshot was captured under. Keep these values
@@ -187,6 +189,44 @@ def test_log_basename_mapping_is_pinned(tmp_path: Path, label: str | None, expec
     plist = plistlib.loads(dst.read_bytes())
     assert Path(plist["StandardOutPath"]).name == f"{expected_basename}.log"
     assert Path(plist["StandardErrorPath"]).name == f"{expected_basename}.err"
+
+
+def _installer_log_basename(label: str) -> str:
+    """Drive the installer's ACTUAL ``LOG_BASENAME`` derivation for ``label``.
+
+    Extracts the real ``if/elif/else`` block from ``install_stt_agent.sh`` and
+    evals it under bash, rather than re-implementing it here — a hand-copied
+    replica could itself drift from the script and silently pass. Returns the
+    basename the installer's ``logs`` subcommand would tail.
+    """
+    src = INSTALL_SCRIPT.read_text()
+    start = src.index('if [[ "$LABEL" == "pipecat.stt-server" ]]; then')
+    end = src.index("\nfi\n", start) + len("\nfi\n")
+    block = src[start:end]
+    snippet = f"LABEL={shlex.quote(label)}\n{block}\nprintf '%s' \"$LOG_BASENAME\""
+    r = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True, check=True)
+    return r.stdout
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["pipecat.stt-server", "koda.stt-server", "pipecat.stt-server.parakeet", "a.b.c.d"],
+)
+def test_installer_log_basename_matches_renderer(tmp_path: Path, label: str):
+    """Mechanically enforce the Python<->shell ``_log_basename`` lockstep that
+    ``test_log_basename_mapping_is_pinned`` only asks for in prose.
+
+    The installer's ``logs`` subcommand hardcodes its own copy of the mapping
+    (it never calls the renderer). If the two copies diverge, ``logs`` tails a
+    file the agent never writes. This drives the installer's real derivation
+    block and asserts it equals the basename the renderer writes into the
+    plist's ``StandardErrorPath`` for the same label.
+    """
+    dst = tmp_path / "agent.plist"
+    r = _run_render({"PIPECAT_STT_LABEL": label}, dst)
+    assert r.returncode == 0, r.stderr
+    renderer_basename = Path(plistlib.loads(dst.read_bytes())["StandardErrorPath"]).stem
+    assert _installer_log_basename(label) == renderer_basename
 
 
 def test_explicit_legacy_label_renders_legacy_label_and_log_paths(tmp_path: Path):
