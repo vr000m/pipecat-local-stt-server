@@ -133,4 +133,6 @@ import name `stt_server`.
   and `server.status` shapes are stable.
 
 [0.2.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.2.0
+[0.1.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.2
+[0.1.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.0
