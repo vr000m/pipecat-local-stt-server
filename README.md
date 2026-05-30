@@ -1,11 +1,12 @@
-# stt_server
+# pipecat-local-stt-server
 
-Standalone local WebSocket transcription server plus minimal Python client.
+Standalone local WebSocket transcription (STT) server, minimal Python client,
+and pluggable ASR backends for the Pipecat ecosystem.
 
-Lives in-tree under `stt_server/` with a repo-neutral name so it can be
-extracted into its own OSS repo once the V1 protocol and Pipecat integration
-have stabilized. See `docs/dev_plans/20260420-design-whisper-websocket-server.md`
-for the full design.
+Distributed as `pipecat-local-stt-server` (PyPI); the import name is
+`stt_server` (every `import stt_server` / `python -m stt_server` invocation
+keeps working). Extracted, history-preserving, from the private `koda-pipecat`
+monorepo. BSD-2-Clause.
 
 ## V1 scope
 
