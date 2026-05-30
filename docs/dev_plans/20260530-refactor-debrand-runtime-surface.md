@@ -158,8 +158,8 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 ## Final Results
 
 [Fill when complete]
+<!-- reviewed: 2026-05-30 @ 1c5917b5d6440634bedf8382aa794f19afe9a173 -->
 
-<!-- reviewed: 2026-05-30 @ ce00ffc9fee21fa6c627a8b34d9c371872b4f9a5 -->
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
 ## Progress
