@@ -76,9 +76,9 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 **Validation cmd:** `bash -n scripts/install_stt_agent.sh && shellcheck scripts/install_stt_agent.sh`
 
 - `install_stt_agent.sh`: LABEL default (l.48) → `pipecat.stt-server`; LOG_DIR default (l.52) → `…/Logs/pipecat-stt`; SOCKET_PATH default (l.56) → `…/Caches/pipecat-stt/stt.sock`; shell `_log_basename` (l.72-75) gains the new-default literal + retains the legacy `koda.stt-server → koda-stt` branch; usage comments (l.2,12,14,30,31,40,43,70).
-- Migration block, inserted **immediately after `render_plist` and before the existing `bootout "$LABEL"`** (so the new agent is never retired), guarded by `if [[ "$LABEL" != koda.stt-server* ]]`: for each legacy label in `koda.stt-server` and `koda.stt-server.parakeet`, run `launchctl bootout "gui/$(id -u)/<legacy>" 2>/dev/null || true` and `rm -f "$HOME/Library/LaunchAgents/<legacy>.plist"`. Emit a one-line notice when a legacy agent/plist was retired.
+- Migration block, inserted **immediately after `render_plist` and before the existing `bootout "$LABEL"`** (so the new agent is never retired), guarded by `if [[ "$LABEL" == "pipecat.stt-server" ]]`: for each legacy label in `koda.stt-server` and `koda.stt-server.parakeet`, run `launchctl bootout "gui/$(id -u)/<legacy>" 2>/dev/null || true` and `rm -f "$HOME/Library/LaunchAgents/<legacy>.plist"`. Emit a one-line notice when a legacy agent/plist was retired. Do **not** retire legacy agents during arbitrary custom-label installs; this script's established contract is one selected agent per invocation, and only the renamed default install is the upgrade path for retiring old defaults.
 - Document (comment + README) that the old socket (`~/Library/Caches/koda-stt/`) and logs are left in place (harmless; new agent uses new paths) and that consumers pinned to the old socket must set `STT_WS_SOCKET`.
-- **`tests/test_install_migration.py`** (new): put a stub `launchctl` and `id` on `PATH` (record argv to a temp file), run `install_stt_agent.sh install` against a temp `HOME`, and assert: (1) bootout invoked for `gui/<uid>/koda.stt-server` *and* `gui/<uid>/koda.stt-server.parakeet` when `LABEL` is the new default; (2) exit-0 no-op when no legacy plist exists; (3) the new label is never passed to bootout before bootstrap; (4) `KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` set in the env override the new `pipecat-stt` defaults (covers the shell-only alias-resolution requirement). Skip/guard cleanly if `launchctl` stubbing is not feasible on the CI runner, but keep at least the alias-override assertions runnable.
+- **`tests/test_install_migration.py`** (new): put a stub `launchctl` and `id` on `PATH` (record argv to a temp file), run `install_stt_agent.sh install` against a temp `HOME`, and assert: (1) bootout invoked for `gui/<uid>/koda.stt-server` *and* `gui/<uid>/koda.stt-server.parakeet` when `LABEL` is the new default; (2) exit-0 no-op when no legacy plist exists; (3) the new label is never passed to bootout before bootstrap; (4) a non-default custom label such as `PIPECAT_STT_LABEL=pipecat.stt-server.test` does **not** bootout either legacy label; (5) `KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` set in the env override the new `pipecat-stt` defaults (covers the shell-only alias-resolution requirement). Skip/guard cleanly if `launchctl` stubbing is not feasible on the CI runner, but keep at least the alias-override assertions runnable.
 
 ### Phase 3: Docs, version bump, and upgrade note
 
@@ -111,7 +111,7 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 ### Architecture Decisions
 - **Preserve the legacy basename mapping as an indefinitely-retained shim.** `_log_basename` keeps an explicit `koda.stt-server → koda-stt` branch (in *both* `render_stt_plist.py` and `install_stt_agent.sh`) alongside the new `pipecat.stt-server → pipecat-stt`. This is a deliberate compat shim — **do not "clean it up"**; it is removable only in the same release that drops the `KODA_STT_*` env-var aliases. Pinned by `test_log_basename_mapping_is_pinned`.
 - **`_log_basename` must use literals, not `DEFAULT_LABEL`.** Keying the legacy branch on `DEFAULT_LABEL` would silently map the *new* default to `koda-stt` once the constant moves; the two branches are explicit string literals, matching the shell copy.
-- **Migrate by retiring both legacy agents, not relocating data.** On `install`, bootout + rm the legacy `koda.stt-server` and `koda.stt-server.parakeet` agents/plists; leave old socket/log files in place (orphaned, harmless). Rationale: launchd double-running is the real hazard; copying/symlinking data dirs adds risk for no benefit.
+- **Migrate by retiring both legacy agents only during the renamed-default install, not relocating data.** On `install` with `LABEL=pipecat.stt-server`, bootout + rm the legacy `koda.stt-server` and `koda.stt-server.parakeet` agents/plists; leave old socket/log files in place (orphaned, harmless). Custom-label installs continue to manage only their selected label and must not retire unrelated legacy agents. Rationale: launchd double-running is the upgrade hazard for the new default; copying/symlinking data dirs adds risk for no benefit.
 - **`STT_WS_DEFAULT_SOCKET` is document-only, not fixed here.** The koda-pipecat `./koda stt` wrapper that exports the old socket path lives in another repo; this plan documents the break in the upgrade note (re-point or use `STT_WS_SOCKET`) rather than reaching across repos.
 - **Names vs values stay decoupled.** `KODA_STT_*` env-var *names* are untouched; only default *values* change. The package never reads `*_STT_SOCKET`/`*_STT_LABEL` names (it receives `--socket-path`), so the blast radius is `scripts/` + `tests/` + docs only.
 
@@ -125,7 +125,7 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 | Resolved label → renderer | `install_stt_agent.sh` (l.97-105, injects `PIPECAT_STT_LABEL="$LABEL"`) | `render_stt_plist.py` (l.79, `env_first(...) or DEFAULT_LABEL`) | Shell pre-resolves the label and passes it under the canonical key; renderer's `DEFAULT_LABEL` only applies on direct invocation. Both defaults must be `pipecat.stt-server`. |
 | `_log_basename` duplication | `render_stt_plist.py:48-59` | `install_stt_agent.sh:72-75` | Identical two-literal mapping in two languages; pinned by `test_log_basename_mapping_is_pinned`. Update both with new-default + legacy literal branches. |
 | Default values → snapshot | renderer defaults + `SNAPSHOT_ENV` | `tests/snapshots/pipecat-stt.plist` | Snapshot is the byte-exact render of the default env; regenerate from the renderer, never hand-edit. REPO_ROOT fixture de-brand is part of the expected byte change. |
-| Legacy agents → migration | prior install (`koda.stt-server`, `koda.stt-server.parakeet`) | `install_stt_agent.sh install` | New install must bootout + rm BOTH legacy agents/plists idempotently before bootstrapping the renamed one; never bootout the new label. Tested via stubbed `launchctl`. |
+| Legacy agents → migration | prior install (`koda.stt-server`, `koda.stt-server.parakeet`) | `install_stt_agent.sh install` with `LABEL=pipecat.stt-server` | Renamed-default install must bootout + rm BOTH legacy agents/plists idempotently before bootstrapping the renamed one; never bootout the new label or retire legacy agents for arbitrary custom-label installs. Tested via stubbed `launchctl`. |
 | Old socket path → external wrapper | this rename | koda-pipecat `./koda stt` wrapper (`STT_WS_DEFAULT_SOCKET`, README:392) | Cross-repo; NOT fixed here. Upgrade note instructs re-pointing `STT_WS_DEFAULT_SOCKET` or setting `STT_WS_SOCKET`. |
 
 ## Testing Notes
@@ -134,7 +134,7 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 - [ ] Phase 1 byte-for-byte snapshot regenerated and passing; whole-file audit of `test_render_stt_plist.py` for residual koda default expectations.
 - [ ] `_log_basename` parametrize covers new default + legacy `koda.stt-server` + multi-instance (parakeet, now pipecat).
 - [ ] Full-plist explicit-legacy-label test: `KODA_STT_LABEL=koda.stt-server` → `Label==koda.stt-server`, log paths `/koda-stt.{log,err}`.
-- [ ] `tests/test_install_migration.py`: stubbed-`launchctl` assertions for dual-agent bootout, fresh-machine no-op, new-label-never-booted-out, and `KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` override.
+- [ ] `tests/test_install_migration.py`: stubbed-`launchctl` assertions for dual-agent bootout during renamed-default install, fresh-machine no-op, new-label-never-booted-out, custom-label install does not retire legacy agents, and `KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` override.
 - [ ] `install_stt_agent.sh` passes `bash -n` and `shellcheck`.
 - [ ] README/CHANGELOG presence checks (Phase 3 Validation cmd) pass; grep shows zero residual `koda` value-paths in README except `:8`.
 - [ ] Full suite (`uv run python -m pytest -q`) green; `ruff format` + `ruff check` clean.
@@ -148,7 +148,7 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 ## Acceptance Criteria
 
 - Default label/socket/log are `pipecat`-namespaced everywhere they are *values*; no `koda` default value remains in `scripts/` or `tests/` except the deliberately-retained legacy `_log_basename` literal branches and their pinned tests.
-- Re-running `install_stt_agent.sh install` on a v0.1.x machine retires the legacy `koda.stt-server` **and** `koda.stt-server.parakeet` agents and runs only the renamed agent; verified by `tests/test_install_migration.py`.
+- Re-running default `install_stt_agent.sh install` on a v0.1.x machine retires the legacy `koda.stt-server` **and** `koda.stt-server.parakeet` agents and runs only the renamed agent; custom-label installs do not retire unrelated legacy agents; verified by `tests/test_install_migration.py`.
 - `KODA_STT_LABEL`/`KODA_STT_SOCKET`/`KODA_STT_LOG_DIR` still override the new defaults; explicit `koda.stt-server` label renders `koda-stt` basenames (full-plist test).
 - `koda-pipecat` provenance (`README.md:8`) and wire-compat source path (`test_wire_schema_compat.py:54`) unchanged; no `KODA_STT_*` env-var *name* removed.
 - Snapshot regenerated from the renderer; README grep shows zero residual `koda` value-paths except `:8`; all tests pass; ruff clean.
@@ -159,7 +159,7 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 
 [Fill when complete]
 
-<!-- reviewed: 2026-05-30 @ 19b5e494859a04f96c1f035f2123d9358000e095 -->
+<!-- reviewed: 2026-05-30 @ ce00ffc9fee21fa6c627a8b34d9c371872b4f9a5 -->
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
 ## Progress
