@@ -716,7 +716,7 @@ def test_resolve_auth_token_client_ignores_server_token(monkeypatch):
     from stt_server.__main__ import _resolve_auth_token
 
     monkeypatch.delenv("STT_WS_TOKEN", raising=False)
-    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "server-secret")
     assert _resolve_auth_token(None, client=True) is None
 
 
@@ -724,17 +724,8 @@ def test_resolve_auth_token_client_prefers_stt_ws_token_over_server(monkeypatch)
     from stt_server.__main__ import _resolve_auth_token
 
     monkeypatch.setenv("STT_WS_TOKEN", "client-secret")
-    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "server-secret")
     assert _resolve_auth_token(None, client=True) == "client-secret"
-
-
-def test_resolve_auth_token_serve_uses_server_token(monkeypatch):
-    from stt_server.__main__ import _resolve_auth_token
-
-    monkeypatch.delenv("STT_WS_TOKEN", raising=False)
-    monkeypatch.delenv("PIPECAT_STT_AUTH_TOKEN", raising=False)
-    monkeypatch.setenv("KODA_STT_AUTH_TOKEN", "server-secret")
-    assert _resolve_auth_token(None, client=False) == "server-secret"
 
 
 def test_resolve_auth_token_serve_reads_pipecat_env(monkeypatch):

@@ -32,7 +32,7 @@ from stt_server.backends.mlx_whisper import MLXWhisperBackend  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-_VAR = "KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT"
+_VAR = "PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT"
 
 
 @pytest.mark.parametrize("val", ["False", "false", "0", ""])
@@ -43,7 +43,7 @@ def test_env_bool_falsey_strings_disable(monkeypatch, val):
 
 def test_env_bool_unset_uses_default(monkeypatch):
     monkeypatch.delenv(_VAR, raising=False)
-    # Default is False per the plan — and unset must mean "use default".
+    # Default is False — and unset must mean "use default".
     assert _env_bool(_VAR, default=False) is False
     assert _env_bool(_VAR, default=True) is True
 
@@ -115,9 +115,9 @@ async def _run_decode(backend: MLXWhisperBackend) -> str:
 
 
 def test_transcribe_forwards_default_suppression_kwargs(fake_mlx, monkeypatch):
-    # Disable Phase-2 post-decode degenerate filter for this kwargs-only check
+    # Disable the post-decode degenerate filter for this kwargs-only check
     # so the synthetic loop signal round-trips and proves the mock was hit.
-    monkeypatch.setenv("KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO", "1.1")
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO", "1.1")
     backend = MLXWhisperBackend(model="fake-model")
     result = asyncio.run(_run_decode(backend))
 
@@ -137,7 +137,11 @@ def test_transcribe_forwards_default_suppression_kwargs(fake_mlx, monkeypatch):
     assert kw["verbose"] is False
 
 
-def test_transcribe_forwards_env_overrides(fake_mlx, monkeypatch):
+def test_transcribe_forwards_koda_alias_overrides(fake_mlx, monkeypatch):
+    # Deprecated KODA_STT_WHISPER_* aliases still drive the decode knobs when
+    # the canonical PIPECAT_STT_* names are unset (backward compat). The
+    # canonical path is covered by
+    # test_transcribe_forwards_pipecat_canonical_overrides.
     monkeypatch.setenv("KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", "true")
     monkeypatch.setenv("KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD", "1.8")
     monkeypatch.setenv("KODA_STT_WHISPER_LOGPROB_THRESHOLD", "-0.5")
@@ -188,7 +192,7 @@ def test_transcribe_pipecat_wins_over_koda(fake_mlx, monkeypatch):
 
 @pytest.mark.parametrize("val", ["False", "false", "0", ""])
 def test_condition_env_falsey_disables_at_call_site(fake_mlx, monkeypatch, val):
-    monkeypatch.setenv("KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", val)
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", val)
     backend = MLXWhisperBackend(model="fake-model")
     asyncio.run(_run_decode(backend))
     assert fake_mlx.last_kwargs["condition_on_previous_text"] is False
@@ -196,13 +200,15 @@ def test_condition_env_falsey_disables_at_call_site(fake_mlx, monkeypatch, val):
 
 @pytest.mark.parametrize("val", ["true", "True", "1"])
 def test_condition_env_truthy_enables_at_call_site(fake_mlx, monkeypatch, val):
-    monkeypatch.setenv("KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", val)
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", val)
     backend = MLXWhisperBackend(model="fake-model")
     asyncio.run(_run_decode(backend))
     assert fake_mlx.last_kwargs["condition_on_previous_text"] is True
 
 
 def test_condition_unset_defaults_to_false(fake_mlx, monkeypatch):
+    # Unset means *both* the canonical and the deprecated alias are absent.
+    monkeypatch.delenv("PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", raising=False)
     monkeypatch.delenv("KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT", raising=False)
     backend = MLXWhisperBackend(model="fake-model")
     asyncio.run(_run_decode(backend))
