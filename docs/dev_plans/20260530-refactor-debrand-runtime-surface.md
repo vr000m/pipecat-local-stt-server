@@ -164,9 +164,9 @@ This phase is **one commit** because flipping `DEFAULT_LABEL` immediately redden
 
 ## Progress
 
-- [ ] Phase 1: Rename defaults + regenerate snapshot + update all tests (ATOMIC)
-- [ ] Phase 2: Install-time migration of legacy agents (with an executable test)
-- [ ] Phase 3: Docs, version bump, and upgrade note
+- [x] Phase 1: Rename defaults + regenerate snapshot + update all tests (ATOMIC)
+- [x] Phase 2: Install-time migration of legacy agents (with an executable test)
+- [x] Phase 3: Docs, version bump, and upgrade note
 
 ## Findings
 
