@@ -22,8 +22,8 @@ Usage:
 
     # Explicit endpoints (UDS).
     uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
-        --whisper-socket ~/Library/Caches/koda-stt/stt.sock \\
-        --parakeet-socket ~/Library/Caches/koda-stt/parakeet.sock
+        --whisper-socket ~/Library/Caches/pipecat-stt/stt.sock \\
+        --parakeet-socket ~/Library/Caches/pipecat-stt/parakeet.sock
 
     # Loopback TCP instead of a socket (per ASR).
     uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
@@ -487,12 +487,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--whisper-socket",
-        default=os.path.expanduser("~/Library/Caches/koda-stt/stt.sock"),
-        help="UDS path for the Whisper (mlx) server (default: the legacy stt.sock).",
+        default=os.path.expanduser("~/Library/Caches/pipecat-stt/stt.sock"),
+        help="UDS path for the Whisper (mlx) server (default: the default stt.sock).",
     )
     parser.add_argument(
         "--parakeet-socket",
-        default=os.path.expanduser("~/Library/Caches/koda-stt/parakeet.sock"),
+        default=os.path.expanduser("~/Library/Caches/pipecat-stt/parakeet.sock"),
         help="UDS path for the Parakeet server (default: parakeet.sock).",
     )
     parser.add_argument(

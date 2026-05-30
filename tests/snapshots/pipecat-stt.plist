@@ -12,14 +12,14 @@
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>koda.stt-server</string>
+	<string>pipecat.stt-server</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/bin/python3</string>
 		<string>-m</string>
 		<string>stt_server</string>
 		<string>--socket-path</string>
-		<string>/Users/test/Library/Caches/koda-stt/stt.sock</string>
+		<string>/Users/test/Library/Caches/pipecat-stt/stt.sock</string>
 		<string>--backend</string>
 		<string>mlx</string>
 		<string>--model</string>
@@ -30,12 +30,12 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/test/Library/Logs/koda-stt/koda-stt.err</string>
+	<string>/Users/test/Library/Logs/pipecat-stt/pipecat-stt.err</string>
 	<key>StandardOutPath</key>
-	<string>/Users/test/Library/Logs/koda-stt/koda-stt.log</string>
+	<string>/Users/test/Library/Logs/pipecat-stt/pipecat-stt.log</string>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/test/koda-pipecat</string>
+	<string>/Users/test/pipecat-local-stt-server</string>
 </dict>
 </plist>

@@ -111,7 +111,7 @@ class TranscriptionClient:
         if uri is None and socket_path is None and (host is None or port is None):
             raise ValueError("Provide uri=, socket_path=, or host+port")
         # Expand ~ so documented defaults like
-        # STT_WS_SOCKET=~/Library/Caches/koda-stt/stt.sock actually work.
+        # STT_WS_SOCKET=~/Library/Caches/pipecat-stt/stt.sock actually work.
         self._socket_path = os.path.expanduser(socket_path) if socket_path else None
         self._host = host
         self._port = port

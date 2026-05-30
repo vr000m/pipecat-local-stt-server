@@ -38,9 +38,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # even when the agent is healthy. Anchor here so the harness is
 # location-independent.
 cd "$REPO_ROOT"
-LABEL="koda.stt-server"
-SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-$HOME/Library/Caches/koda-stt/stt.sock}}"
-LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/koda-stt}}"
+LABEL="pipecat.stt-server"
+SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-$HOME/Library/Caches/pipecat-stt/stt.sock}}"
+LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/pipecat-stt}}"
 PYTHON="$REPO_ROOT/.venv/bin/python"
 OUT_DIR="${MLX_SPIKE_OUT:-/tmp/mlx-spike-$(date +%s)}"
 SPIKE_LOG="$OUT_DIR/spike-log.txt"
@@ -86,23 +86,23 @@ _wait_for_respond() {
 }
 
 _err_log_line_count() {
-    [[ -f "$LOG_DIR/koda-stt.err" ]] || { echo 0; return; }
-    wc -l < "$LOG_DIR/koda-stt.err" | tr -d ' '
+    [[ -f "$LOG_DIR/pipecat-stt.err" ]] || { echo 0; return; }
+    wc -l < "$LOG_DIR/pipecat-stt.err" | tr -d ' '
 }
 
 _scan_launchd_stderr_range() {
     # Count hazard-pattern lines in the range [start_line..end_line] of
-    # koda-stt.err. Scoping by line number (not timestamp) works even for
+    # pipecat-stt.err. Scoping by line number (not timestamp) works even for
     # Metal assertions and libc++ aborts which print without timestamps —
     # those were silently missed by the prior timestamp-based filter.
     local start_line="$1"
     local end_line="$2"
-    [[ -f "$LOG_DIR/koda-stt.err" ]] || { echo 0; return; }
+    [[ -f "$LOG_DIR/pipecat-stt.err" ]] || { echo 0; return; }
     awk -v s="$start_line" -v e="$end_line" '
         NR >= s && NR <= e &&
         $0 ~ /Metal|failed assertion|libc\+\+abi|terminating due to|mutex lock failed|abort|panic|segmentation fault/ { c++ }
         END { print c+0 }
-    ' "$LOG_DIR/koda-stt.err"
+    ' "$LOG_DIR/pipecat-stt.err"
 }
 
 _wait_for_first_ok_commit() {
