@@ -14,7 +14,7 @@ from typing import AsyncGenerator
 
 import numpy as np
 
-from stt_server.env import env_bool, env_float
+from stt_server.env import env_bool_first, env_float_first
 from stt_server.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
@@ -114,21 +114,27 @@ class _MLXStream:
                 # pass sample_rate — it's not a valid DecodingOptions kwarg.
                 # Resolve suppression knobs at call time so tests / operators
                 # can monkeypatch env vars without re-importing the module.
-                condition_on_previous_text = env_bool(
+                # Canonical PIPECAT_STT_* name wins; the legacy KODA_STT_*
+                # name is still honoured as a deprecated alias.
+                condition_on_previous_text = env_bool_first(
+                    "PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
                     "KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
-                    _BOOL_DEFAULT_CONDITION,
+                    default=_BOOL_DEFAULT_CONDITION,
                 )
-                compression_ratio_threshold = env_float(
+                compression_ratio_threshold = env_float_first(
+                    "PIPECAT_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD",
                     "KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD",
-                    _FLOAT_DEFAULT_COMPRESSION,
+                    default=_FLOAT_DEFAULT_COMPRESSION,
                 )
-                logprob_threshold = env_float(
+                logprob_threshold = env_float_first(
+                    "PIPECAT_STT_WHISPER_LOGPROB_THRESHOLD",
                     "KODA_STT_WHISPER_LOGPROB_THRESHOLD",
-                    _FLOAT_DEFAULT_LOGPROB,
+                    default=_FLOAT_DEFAULT_LOGPROB,
                 )
-                no_speech_threshold = env_float(
+                no_speech_threshold = env_float_first(
+                    "PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD",
                     "KODA_STT_WHISPER_NO_SPEECH_THRESHOLD",
-                    _FLOAT_DEFAULT_NO_SPEECH,
+                    default=_FLOAT_DEFAULT_NO_SPEECH,
                 )
                 result = mlx_whisper.transcribe(
                     audio,

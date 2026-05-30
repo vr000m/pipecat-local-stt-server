@@ -184,7 +184,8 @@ class TranscriptionServer:
             logger.warning(
                 "stt_server: TCP listener is running without --auth-token; "
                 "any local process that can reach %s:%s can connect. "
-                "Configure KODA_STT_AUTH_TOKEN (or --auth-token-file) for "
+                "Configure PIPECAT_STT_AUTH_TOKEN (or the deprecated "
+                "KODA_STT_AUTH_TOKEN, or --auth-token-file) for "
                 "any non-experimental deployment.",
                 self._config.host,
                 self._config.port,

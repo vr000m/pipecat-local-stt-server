@@ -1,11 +1,12 @@
-# stt_server
+# pipecat-local-stt-server
 
-Standalone local WebSocket transcription server plus minimal Python client.
+Standalone local WebSocket transcription (STT) server, minimal Python client,
+and pluggable ASR backends for the Pipecat ecosystem.
 
-Lives in-tree under `stt_server/` with a repo-neutral name so it can be
-extracted into its own OSS repo once the V1 protocol and Pipecat integration
-have stabilized. See `docs/dev_plans/20260420-design-whisper-websocket-server.md`
-for the full design.
+Distributed as `pipecat-local-stt-server` (PyPI); the import name is
+`stt_server` (every `import stt_server` / `python -m stt_server` invocation
+keeps working). Extracted, history-preserving, from the private `koda-pipecat`
+monorepo. BSD-2-Clause.
 
 ## V1 scope
 
@@ -39,8 +40,9 @@ uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --b
 uv sync --extra stt-server-mlx
 uv run python -m stt_server --socket-path ~/Library/Caches/koda-stt/stt.sock --backend mlx
 
-# Loopback TCP (use --auth-token-file or KODA_STT_AUTH_TOKEN env; --auth-token
-# on argv is visible via `ps` and marked DEPRECATED)
+# Loopback TCP (use --auth-token-file or PIPECAT_STT_AUTH_TOKEN env — legacy
+# KODA_STT_AUTH_TOKEN still honoured; --auth-token on argv is visible via
+# `ps` and marked DEPRECATED)
 uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
 
@@ -49,11 +51,12 @@ which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
 / `python -m stt_server status <flags>` — see "Checking server health"
 below for the `status` subcommand.
 
-For persistent always-on operation on macOS, the Koda wrapper exposes
-`./koda stt install|start|stop|restart|status|logs` as the primary
-control surface. It delegates to `scripts/install_stt_agent.sh` (the
-underlying LaunchAgent implementation) and layers a wire-level health
-probe on top. See the Koda integration section below.
+For persistent always-on operation on macOS, install the server as a
+LaunchAgent via `scripts/install_stt_agent.sh`
+(`install|start|stop|restart|status|logs`); pair it with
+`python -m stt_server status` for a wire-level health probe. A consumer
+may wrap these behind its own CLI — see "Reference consumer (Koda)"
+below for one such integration.
 
 ## Multi-backend operation
 
@@ -80,8 +83,9 @@ client-side configuration.
 
 ### Two-agent install
 
-`scripts/install_stt_agent.sh` is parameterised by `KODA_STT_LABEL` /
-`KODA_STT_SOCKET` / `KODA_STT_BACKEND` so two LaunchAgents can coexist
+`scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
+`PIPECAT_STT_SOCKET` / `PIPECAT_STT_BACKEND` (the legacy `KODA_STT_*` names
+are still honoured as deprecated aliases) so two LaunchAgents can coexist
 without plist or log collisions:
 
 ```bash
@@ -94,18 +98,19 @@ scripts/install_stt_agent.sh install
 #    throttle-loop the agent before the download finishes.
 uv sync --extra stt-server-parakeet
 .venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
-KODA_STT_LABEL=koda.stt-server.parakeet \
-  KODA_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
-  KODA_STT_BACKEND=parakeet \
+PIPECAT_STT_LABEL=koda.stt-server.parakeet \
+  PIPECAT_STT_SOCKET="$HOME/Library/Caches/koda-stt/parakeet.sock" \
+  PIPECAT_STT_BACKEND=parakeet \
   scripts/install_stt_agent.sh install
 ```
 
 The script manages exactly **one** agent per invocation, identified by
-`KODA_STT_LABEL` (+ its socket) — there is no registry or "all" mode. To run
+`PIPECAT_STT_LABEL` (+ its socket) — there is no registry or "all" mode. To run
 any subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against
-the Parakeet agent you must re-export its `KODA_STT_LABEL` and
-`KODA_STT_SOCKET`; a default-env invocation always targets the legacy
-`koda.stt-server` agent. See the recipe in the `install_stt_agent.sh` header.
+the Parakeet agent you must re-export its `PIPECAT_STT_LABEL` and
+`PIPECAT_STT_SOCKET` (legacy `KODA_STT_*` aliases still work); a default-env
+invocation always targets the legacy `koda.stt-server` agent. See the recipe
+in the `install_stt_agent.sh` header.
 
 ### A/B benchmark — Whisper vs Parakeet
 
@@ -227,6 +232,97 @@ async def run():
 
 The example `stt_server/examples/file_stream.py` streams a WAV file end to end.
 
+## Choosing a backend and model
+
+The **server** picks the ASR, pinned at launch — the client never selects it.
+A client (including the Pipecat service below) only points at an *endpoint*
+and transcribes against whatever backend that server was started with. To run
+Whisper vs Parakeet you start a *different* server (or a second one on its own
+socket — see "Multi-backend operation"); no client code changes.
+
+```bash
+# Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo
+uv sync --extra stt-server-mlx
+uv run python -m stt_server serve --backend mlx \
+    --socket-path ~/Library/Caches/pipecat-stt/stt.sock
+
+# Parakeet — default model mlx-community/parakeet-tdt-0.6b-v3
+uv sync --extra stt-server-parakeet
+uv run python -m stt_server serve --backend parakeet \
+    --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
+
+# Pick a specific model with --model (any compatible mlx-community HF repo id)
+uv run python -m stt_server serve --backend mlx \
+    --model mlx-community/whisper-small --socket-path .../stt.sock
+```
+
+`--model` is passed through verbatim; an unset value uses the backend-aware
+default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
+`parakeet`). Pointing a backend at a mismatched repo fails fast at decode.
+
+Common MLX Whisper models (smaller = faster + lower RAM, larger = more
+accurate). These are `mlx-community` Hugging Face repos; the first launch
+downloads and caches the weights.
+
+| `--backend` | `--model` | Notes |
+|---|---|---|
+| `mlx` | `mlx-community/whisper-large-v3-turbo` | **default** — best accuracy/speed balance |
+| `mlx` | `mlx-community/whisper-large-v3` | highest accuracy, slowest, most RAM |
+| `mlx` | `mlx-community/whisper-medium` | mid accuracy/speed |
+| `mlx` | `mlx-community/whisper-small` | faster, lighter |
+| `mlx` | `mlx-community/whisper-base` | fast, lower accuracy |
+| `mlx` | `mlx-community/whisper-tiny` | fastest, lowest accuracy |
+| `parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | **default** Parakeet TDT |
+
+Any `mlx-community` Whisper repo (e.g. `…-large-v3-turbo-q4` quantised
+variants, or `…-large-v3-turbo` language-specialised forks) works as a
+`--model` value — the table lists common starting points, not an allowlist.
+Verify which model a running server actually loaded with
+`python -m stt_server status` (it prints `backend: <name> (model: <repo>)`).
+
+## Pipecat integration
+
+`stt_server/examples/pipecat_stt_service.py` is a runnable
+`SegmentedSTTService` subclass (`LocalWebSocketSTTService`) that wires
+`TranscriptionClient` into a Pipecat pipeline. It is an example, not part of
+the installed package — Pipecat is not a dependency of this project. Install
+both to use it:
+
+```bash
+uv pip install "pipecat-ai" "pipecat-local-stt-server[client]"
+```
+
+Then point the service at a running server's endpoint and add it to a
+pipeline:
+
+```python
+from stt_server.examples.pipecat_stt_service import LocalWebSocketSTTService
+
+stt = LocalWebSocketSTTService(
+    socket_path="~/Library/Caches/pipecat-stt/stt.sock",
+    # or: host="127.0.0.1", port=8765, auth_token="..."
+    sample_rate=16000,  # the server's wire format is pinned to 16 kHz mono
+)
+# pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])
+```
+
+Two requirements follow from how the server works:
+
+- **VAD is supplied by your pipeline, not this service.** `SegmentedSTTService`
+  transcribes one utterance per VAD segment, so the transport/pipeline must
+  emit `VADUserStartedSpeakingFrame` / `VADUserStoppedSpeakingFrame` (e.g. a
+  Silero VAD analyzer on the transport). The service buffers between those and
+  calls the server once per segment — which matches this server's
+  commit-oriented protocol (append → commit → one final transcript).
+- **Run at 16 kHz mono.** The wire format is pinned to 16 kHz mono PCM16, so
+  configure the transport/pipeline `sample_rate=16000`; the example emits an
+  `ErrorFrame` rather than silently mis-transcribing a mismatched rate.
+
+To switch Whisper ↔ Parakeet, change *which server* the service connects to
+(its `socket_path`/`host`+`port`), not the service code. `server.hello` carries
+the backend identity, so the example logs which ASR it connected to and can
+optionally hard-assert it (see `_log_backend`).
+
 ## Protocol subset
 
 Client -> server JSON events:
@@ -262,10 +358,13 @@ Deviations from the OpenAI Realtime transcription snapshot (2026-04-20):
 - custom events: `server.hello`, `server.status`, `session.close`,
   `session.cancel`, `session.closed`
 
-## Koda integration
+## Reference consumer (Koda)
 
-Shipped. `bot/stt/websocket_stt_service.py` is a Pipecat
-`SegmentedSTTService` subclass that:
+This section documents how one consumer — the Koda bot, for which this
+server was originally built — integrates the client. It is included as a
+worked example of the client contract, not a dependency: nothing in this
+package imports or requires Koda. `bot/stt/websocket_stt_service.py`
+(in the consumer repo) is a Pipecat `SegmentedSTTService` subclass that:
 
 - owns the WebSocket session across `start(StartFrame)` / `stop(EndFrame)` /
   `cancel(CancelFrame)` / `cleanup()`
@@ -311,10 +410,11 @@ intentionally has no notion of branches or speakers.
 For persistent operation, `./koda stt install` (which shells into
 `scripts/install_stt_agent.sh`) renders a LaunchAgent (`koda.stt-server`)
 via `scripts/render_stt_plist.py` (stdlib `plistlib` + allowlist
-validation — do not reintroduce `sed` templating). Overrides:
-`KODA_STT_SOCKET`, `KODA_STT_BACKEND`, `KODA_STT_MODEL`,
-`KODA_STT_LOG_DIR`, `KODA_STT_AUTH_TOKEN`. Use `./koda stt status` for
-a wire-level health check.
+validation — do not reintroduce `sed` templating). Overrides (canonical
+`PIPECAT_STT_*` names; legacy `KODA_STT_*` names still honoured as
+deprecated aliases): `PIPECAT_STT_SOCKET`, `PIPECAT_STT_BACKEND`,
+`PIPECAT_STT_MODEL`, `PIPECAT_STT_LOG_DIR`, `PIPECAT_STT_AUTH_TOKEN`.
+Use `./koda stt status` for a wire-level health check.
 
 ### Whisper hallucination suppression (MLX backend)
 
@@ -328,12 +428,15 @@ loop on hallucinated tokens. Bool parser accepts `1`/`true`/`yes`/`on`
 (case-insensitive); anything else — including `False`, `0`, empty, or
 unset — is `False`.
 
-| Variable | Default | Description |
+Each variable below is canonical (`PIPECAT_STT_*`); its legacy `KODA_STT_*`
+alias is still honoured (canonical wins if both are set).
+
+| Variable (canonical) | Default | Description |
 |---|---|---|
-| `KODA_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
-| `KODA_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
-| `KODA_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
-| `KODA_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
+| `PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
+| `PIPECAT_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
+| `PIPECAT_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
+| `PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
 
 After decode, `_decode_sync` runs a degenerate-output filter
 (`shared/text_quality.is_degenerate`) on each segment. Segments where
@@ -346,15 +449,16 @@ legitimate high-repetition paragraphs are not flagged.
 
 | Variable (canonical) | Default | Description |
 |---|---|---|
-| `KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
-| `KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
+| `PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
+| `PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
 
-The original `KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
-`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship
-are still honoured as backward-compat aliases (canonical wins if both
-are set). New deployments should prefer the canonical names — the
-helper is also used by the cleanup stage in `shared/text_quality.py`,
-so the STT-prefixed names misrepresent its scope.
+`PIPECAT_STT_WHISPER_DEGENERATE_*` are the canonical names. The earlier
+`KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` /
+`KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` names, and the original
+`KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
+`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship, are
+all still honoured as deprecated backward-compat aliases (canonical wins if
+several are set). New deployments should prefer the `PIPECAT_STT_*` names.
 
 See `docs/dev_plans/20260430-fix-whisper-hallucination.md` for context,
 calibration histogram, and the cleanup-stage short-circuit + symmetric

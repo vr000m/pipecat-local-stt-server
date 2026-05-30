@@ -205,7 +205,7 @@ class ParakeetBackend:
         # never written to the world-listable system temp dir and an orphaned
         # WAV (SIGKILL between mkstemp and unlink) stays unreadable by other
         # local users. Removed in ``close()``.
-        self._tmpdir = tempfile.mkdtemp(prefix="koda-parakeet-")
+        self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-parakeet-")
 
     def _mark_inflight_start(self) -> None:
         with self._inflight_cond:

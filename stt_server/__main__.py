@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from .backend import EchoBackend
+from .env import env_first
 from .server import serve
 
 # ``TranscriptionClient`` and ``protocol`` are imported lazily inside the
@@ -87,27 +88,32 @@ def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str 
     # A plaintext --auth-token CLI flag is intentionally unsupported: any
     # local user would be able to read the token via `ps`.
     #
-    # Serve path (client=False): --auth-token-file > KODA_STT_AUTH_TOKEN.
+    # Serve path (client=False): --auth-token-file > PIPECAT_STT_AUTH_TOKEN
+    #   (canonical), then KODA_STT_AUTH_TOKEN (deprecated alias).
     # Probe path (client=True):  --auth-token-file > STT_WS_TOKEN only.
     #
     # STT_WS_TOKEN is the client-side bearer a consumer (e.g. the bot)
-    # reads to authenticate against the stt_server. KODA_STT_AUTH_TOKEN
-    # is the server-side bearer the launchd-run server expects. The probe
-    # MUST see exactly what the bot sees — never the server-side secret —
-    # for two reasons:
-    #   1. If the probe fell back to KODA_STT_AUTH_TOKEN it could report
+    # reads to authenticate against the stt_server. PIPECAT_STT_AUTH_TOKEN
+    # (legacy alias KODA_STT_AUTH_TOKEN) is the server-side bearer the
+    # launchd-run server expects. The probe MUST see exactly what the bot
+    # sees — never the server-side secret — for two reasons:
+    #   1. If the probe fell back to the server-side token it could report
     #      "ok" against a local server while the bot still 401s at
     #      startup, masking the misconfiguration we built this preflight
     #      to catch.
     #   2. If STT_WS_URI points at a remote host, that fallback would
     #      transmit the local LaunchAgent's server-side secret to the
     #      remote endpoint.
+    #
+    # Server-side name resolution is canonical-first via env_first:
+    # PIPECAT_STT_AUTH_TOKEN wins, KODA_STT_AUTH_TOKEN is still honoured.
+    # The two paths stay strictly separate — never read STT_WS_TOKEN here.
     if token_file:
         return Path(token_file).read_text(encoding="utf-8").strip() or None
     if client:
         client_val = (os.environ.get("STT_WS_TOKEN") or "").strip()
         return client_val or None
-    env_val = (os.environ.get("KODA_STT_AUTH_TOKEN") or "").strip()
+    env_val = (env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN") or "").strip()
     return env_val or None
 
 

@@ -41,6 +41,10 @@ def _clear_env(monkeypatch):
     monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)
     monkeypatch.delenv(ALIAS_RATIO_ENV, raising=False)
     monkeypatch.delenv(ALIAS_MIN_TOKENS_ENV, raising=False)
+    # Canonical PIPECAT_STT_* names too — leakage from either path would
+    # otherwise mask boundary-case regressions.
+    monkeypatch.delenv("PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO", raising=False)
+    monkeypatch.delenv("PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS", raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -272,4 +276,40 @@ def test_canonical_wins_over_alias(monkeypatch):
 def test_alias_still_honoured_when_canonical_unset(monkeypatch):
     monkeypatch.setenv(ALIAS_RATIO_ENV, "1.5")  # alias only — relax
     text = "x x x x x a b c d e f"
+    assert is_degenerate(text) is False
+
+
+# ---------------------------------------------------------------------------
+# PIPECAT_STT_* canonical names take precedence over BOTH legacy KODA_ names.
+# ---------------------------------------------------------------------------
+
+PIPECAT_RATIO_ENV = "PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO"
+PIPECAT_MIN_TOKENS_ENV = "PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS"
+
+
+def test_pipecat_canonical_ratio_relaxes_filter(monkeypatch):
+    # 5/11 ≈ 0.45 is degenerate under default 0.40; a PIPECAT value of 1.5
+    # (never reachable) relaxes it.
+    text = "x x x x x a b c d e f"
+    assert is_degenerate(text) is True
+    monkeypatch.setenv(PIPECAT_RATIO_ENV, "1.5")
+    assert is_degenerate(text) is False
+
+
+def test_pipecat_canonical_wins_over_both_koda_names(monkeypatch):
+    # PIPECAT relaxes (1.5); both legacy KODA names say default-strict (0.40).
+    # If a KODA name had won, 5/11 ≈ 0.45 would be flagged degenerate.
+    monkeypatch.setenv(PIPECAT_RATIO_ENV, "1.5")
+    monkeypatch.setenv(RATIO_ENV, "0.40")
+    monkeypatch.setenv(ALIAS_RATIO_ENV, "0.40")
+    text = "x x x x x a b c d e f"
+    assert is_degenerate(text) is False
+
+
+def test_pipecat_canonical_min_tokens(monkeypatch):
+    # 11-token wall is degenerate by default; raising min-tokens to 20 via the
+    # canonical PIPECAT name suppresses it.
+    text = "x x x x x a b c d e f"
+    assert is_degenerate(text) is True
+    monkeypatch.setenv(PIPECAT_MIN_TOKENS_ENV, "20")
     assert is_degenerate(text) is False
