@@ -5,6 +5,45 @@ All notable changes to `pipecat-local-stt-server` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-05-30
+
+### Changed (BREAKING)
+
+- **The default runtime surface is renamed from the legacy `koda`-prefixed
+  namespace to a `pipecat`-namespaced default.** A fresh install now uses the
+  LaunchAgent label `koda.stt-server` → `pipecat.stt-server` (and the
+  two-agent variant `koda.stt-server.parakeet` → `pipecat.stt-server.parakeet`),
+  the default socket `~/Library/Caches/koda-stt/stt.sock` →
+  `~/Library/Caches/pipecat-stt/stt.sock`, the default log dir
+  `~/Library/Logs/koda-stt/` → `~/Library/Logs/pipecat-stt/`, and the log
+  basenames `koda-stt.{log,err}` → `pipecat-stt.{log,err}`. These were
+  *live, correct defaults*, so this is a genuine breaking change for any
+  existing v0.1.x install.
+- **`scripts/install_stt_agent.sh install` now migrates v0.1.x installs.**
+  When run with the default label, it boots out and removes **both** legacy
+  agents (`koda.stt-server` and `koda.stt-server.parakeet`) before
+  bootstrapping the renamed `pipecat.stt-server` agent, so a v0.1.x machine is
+  not left double-running an old and a new agent. The migration is idempotent
+  (a no-op on a fresh machine), never retires the new agent, and does not touch
+  unrelated custom-label installs. The old socket and log directories are left
+  in place (orphaned, harmless).
+- Consumers pinned to the old socket path must re-point to the new
+  `~/Library/Caches/pipecat-stt/stt.sock` — set `STT_WS_SOCKET` (or re-point a
+  wrapper's `STT_WS_DEFAULT_SOCKET` fallback). The rename does not reach across
+  to the external koda-pipecat `./koda stt` wrapper. See the "Upgrading from
+  0.1.x to 0.2.0" section in the README.
+
+### Notes
+
+- The deprecated `KODA_STT_*` environment-variable **names** are untouched and
+  remain honoured aliases: `KODA_STT_LABEL` / `KODA_STT_SOCKET` /
+  `KODA_STT_LOG_DIR` still override the new `pipecat`-namespaced defaults. Only
+  the default *values* changed; the names-vs-values distinction is unchanged.
+- The `koda.stt-server → koda-stt` log-basename mapping is retained as an
+  explicit backward-compat shim alongside the new
+  `pipecat.stt-server → pipecat-stt` mapping, so an explicit legacy-label
+  render still produces the legacy basenames.
+
 ## [0.1.2] - 2026-05-30
 
 ### Documentation
@@ -93,4 +132,5 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.2.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.2.0
 [0.1.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.0
