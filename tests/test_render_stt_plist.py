@@ -30,6 +30,12 @@ from pathlib import Path
 
 import pytest
 
+# Import the Nemotron default model from its single source of truth rather than
+# re-hardcoding the literal: a model-id rename in the backend must fail this
+# renderer regression instead of passing against a stale copy. nemotron.py
+# imports mlx_audio only lazily, so this does not pull the optional package.
+from stt_server.backends.nemotron import DEFAULT_NEMOTRON_MODEL as _DEFAULT_NEMOTRON_MODEL
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "render_stt_plist.py"
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_stt_agent.sh"
@@ -49,7 +55,6 @@ SNAPSHOT_ENV = {
 }
 
 _DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
-_DEFAULT_NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
 
 
 def _run_render(env_overrides: dict[str, str], dst: Path) -> subprocess.CompletedProcess:

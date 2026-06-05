@@ -211,7 +211,8 @@ def test_backend_exposes_identity(nemotron_mod):
 
 def test_no_failed_event_kind_defined(nemotron_mod):
     """The backend must not invent a ``failed`` TranscriptEvent kind."""
-    src = "".join(open(nemotron_mod.__file__, encoding="utf-8").readlines())
+    with open(nemotron_mod.__file__, encoding="utf-8") as f:
+        src = f.read()
     # A literal "failed" kind would be a protocol violation; decode failure
     # is signalled by raising.
     assert 'kind="failed"' not in src

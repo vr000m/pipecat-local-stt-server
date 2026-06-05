@@ -1114,13 +1114,13 @@ parakeet = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "numpy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
 nemotron = [
     { name = "mlx-audio" },
-    { name = "numpy" },
 ]
 
 [package.metadata]
@@ -1138,14 +1138,12 @@ provides-extras = ["client", "mlx", "parakeet"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "ruff", specifier = ">=0.8.0" },
 ]
-nemotron = [
-    { name = "mlx-audio", git = "https://github.com/Blaizzy/mlx-audio.git?rev=14add666b5313cadff94a231ee11979f6ac1adf7" },
-    { name = "numpy", specifier = ">=1.26" },
-]
+nemotron = [{ name = "mlx-audio", git = "https://github.com/Blaizzy/mlx-audio.git?rev=14add666b5313cadff94a231ee11979f6ac1adf7" }]
 
 [[package]]
 name = "platformdirs"

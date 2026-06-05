@@ -41,6 +41,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
+    # Test infrastructure: backend tests synthesise PCM16LE audio with numpy.
+    # Lives in the always-synced dev group (not per-backend groups/extras) so
+    # the suite runs without an ASR runtime extra installed.
+    "numpy>=1.26",
 ]
 # Nemotron 3.5 ASR backend runtime, git-pinned to the PR #774 merge commit
 # (Blaizzy/mlx-audio#774, merged 2026-06-05) because no PyPI mlx-audio release
@@ -53,8 +57,9 @@ dev = [
 # PyPI-installable. Promote to a clean ``nemotron`` extra with a version pin once
 # mlx-audio publishes a release containing #774 (tracked follow-up).
 nemotron = [
+    # numpy is pulled transitively by mlx-audio at runtime; it is declared in
+    # the dev group for the test suite, so it is intentionally not repeated here.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git@14add666b5313cadff94a231ee11979f6ac1adf7",
-    "numpy>=1.26",
 ]
 
 [project.urls]

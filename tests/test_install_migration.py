@@ -36,6 +36,13 @@ from pathlib import Path
 
 import pytest
 
+# Import the Nemotron default from its single source of truth: the installer's
+# DEFAULT_MODEL nemotron arm must agree with this constant, and pinning the
+# expected value to the literal here would let a backend rename pass both the
+# script and this regression against a stale id. nemotron.py imports mlx_audio
+# only lazily, so this top-level import does not pull the optional package.
+from stt_server.backends.nemotron import DEFAULT_NEMOTRON_MODEL as NEMOTRON_MODEL
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "install_stt_agent.sh"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -411,7 +418,6 @@ def test_koda_socket_and_log_dir_env_override_new_defaults(tmp_path: Path):
 #     never the Whisper default
 # ---------------------------------------------------------------------------
 
-NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 
 
