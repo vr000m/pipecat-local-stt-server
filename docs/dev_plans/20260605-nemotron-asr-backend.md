@@ -468,9 +468,9 @@ clean.
 ## Progress
 
 - [x] Phase 0: Dependency pin + real mlx-audio API verification
-- [ ] Phase 1: NemotronBackend + tests (stubbed mlx_audio)
-- [ ] Phase 2: CLI wiring + choice-enumeration tests
-- [ ] Phase 3: Packaging + docs
+- [x] Phase 1: NemotronBackend + tests (stubbed mlx_audio)
+- [x] Phase 2: CLI wiring + choice-enumeration tests
+- [x] Phase 3: Packaging + docs
 
 ## Findings
 
