@@ -464,3 +464,53 @@ clean.
 - **Promote the `nemotron` dev group to a published extra** once `mlx-audio`
   releases a version containing PR #774 (clean version pin, see Dependency reality).
 <!-- reviewed: 2026-06-05 @ e0593b7cb82365782de90dc37f2c3bc3041eedd3 -->
+
+## Progress
+
+- [x] Phase 0: Dependency pin + real mlx-audio API verification
+- [ ] Phase 1: NemotronBackend + tests (stubbed mlx_audio)
+- [ ] Phase 2: CLI wiring + choice-enumeration tests
+- [ ] Phase 3: Packaging + docs
+
+## Findings
+
+### Phase 0 — integration probe (settled 2026-06-05, real post-#774 package)
+
+External facts re-verified:
+
+- **PR #774 MERGED**, merge commit `14add666b5313cadff94a231ee11979f6ac1adf7`
+  (merged 2026-06-05T17:11Z). Pinned in the `[dependency-groups]` `nemotron`
+  group.
+- **PyPI `mlx-audio` latest is 0.4.3** (uploaded 2026-04-28) — predates #774, so
+  no released version carries Nemotron STT. Git-SHA pin (Option 1) is required;
+  no PyPI release to switch to.
+
+API verified against the **installed** package source (authoritative) and a real
+load + synthetic decode on this machine:
+
+- Entry point `from mlx_audio.stt import load` works; `load(model_id)` returns
+  `mlx_audio.stt.models.nemotron_asr.nemotron_asr.Model`.
+- `Model.generate(audio, *, language=None, att_context_size=None, dtype=float32,
+  verbose=False, **kwargs) -> AlignedResult`. The kwarg is **`language`** (NOT
+  `target_lang`). `audio` accepts a **file path** (`str`/`Path`); `load_audio`
+  runs internally — same shape as parakeet, unlike `mlx_whisper`'s array input.
+- Return is `AlignedResult` (the *same* dataclass `parakeet-mlx` returns, from
+  `mlx_audio.stt.models.parakeet.alignment`); `.text` is present. The defensive
+  `getattr(result, "text", "") or ""` read carries over unchanged.
+- **Language vocabulary**: `prompt_dictionary` has 121 keys including
+  `"auto"` (→101), `"en"`/`"en-US"` (→0), `"es-ES"` (→2), …
+  `default_language = "auto"`. `_resolve_prompt_index` falls back to
+  `default_language` then index 0 for unknown values — a wrong/unsupported
+  language string degrades gracefully, never raises.
+- **No `strip_lang_tags` flag** exists on `generate`/`decode` — that integration
+  concern is closed (nothing to wire).
+- **`DEFAULT_NEMOTRON_LANGUAGE = "auto"`** — decided. `"auto"` is a verified
+  accepted prompt key AND the model's own `default_language`; it is the headline
+  40-locale LID mode advertised for this multilingual local server. The backend
+  forwards a client-supplied `language` and falls back to this constant when the
+  client sends `None`. One-line-swappable to `"en-US"` (also verified accepted)
+  if LID proves unreliable in practice.
+- **End-to-end smoke**: `load(...).generate(<temp WAV>, language="auto")`
+  returned `AlignedResult` with `.text == ""` for a 1 s 16 kHz sine tone —
+  exercising the empty-decode (`completed`-only) path. Full load + decode runs
+  on this machine; no partial-completion caveat needed.
