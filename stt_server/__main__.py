@@ -56,6 +56,16 @@ def _make_backend(name: str, model: str):
         from .backends.parakeet import ParakeetBackend
 
         return ParakeetBackend(model=model)
+    if name == "nemotron":
+        # Lazy import so a base install without the ``nemotron`` extra still
+        # constructs ``echo``/``mlx`` backends. ``nemotron.py`` imports
+        # ``mlx_audio`` only inside ``start()`` / ``_get_model``, never at
+        # module load, so this import does NOT transitively pull ``mlx_audio``
+        # — the missing-extra failure surfaces fast in ``start()``, not here at
+        # construction.
+        from .backends.nemotron import NemotronBackend
+
+        return NemotronBackend(model=model)
     raise SystemExit(f"unknown backend: {name}")
 
 
@@ -67,7 +77,8 @@ def _resolve_model(backend: str, model: str | None) -> str:
     mismatched repo id fails fast in ``start()``/decode, and classifying a
     repo id as "whisper" vs "parakeet" would need a brittle string heuristic).
     When ``--model`` is unset the default is backend-aware: ``parakeet`` uses
-    ``DEFAULT_PARAKEET_MODEL`` rather than the Whisper repo.
+    ``DEFAULT_PARAKEET_MODEL`` and ``nemotron`` uses ``DEFAULT_NEMOTRON_MODEL``
+    rather than the Whisper repo.
     """
     if model is not None:
         return model
@@ -75,6 +86,10 @@ def _resolve_model(backend: str, model: str | None) -> str:
         from .backends.parakeet import DEFAULT_PARAKEET_MODEL
 
         return DEFAULT_PARAKEET_MODEL
+    if backend == "nemotron":
+        from .backends.nemotron import DEFAULT_NEMOTRON_MODEL
+
+        return DEFAULT_NEMOTRON_MODEL
     return _DEFAULT_MLX_MODEL
 
 
@@ -347,10 +362,13 @@ def main() -> None:
 
     p_serve = subparsers.add_parser("serve", help="run the server (default)")
     _add_endpoint_flags(p_serve)
-    p_serve.add_argument("--backend", choices=("echo", "mlx", "parakeet"), default="echo")
+    p_serve.add_argument(
+        "--backend", choices=("echo", "mlx", "parakeet", "nemotron"), default="echo"
+    )
     # Default is None so ``_resolve_model`` can apply a backend-aware fallback
-    # (Whisper repo for ``mlx``, ``DEFAULT_PARAKEET_MODEL`` for ``parakeet``).
-    # An explicit value always wins and is passed through verbatim.
+    # (Whisper repo for ``mlx``, ``DEFAULT_PARAKEET_MODEL`` for ``parakeet``,
+    # ``DEFAULT_NEMOTRON_MODEL`` for ``nemotron``). An explicit value always
+    # wins and is passed through verbatim.
     p_serve.add_argument("--model", default=None)
     p_serve.add_argument("--log-level", default="INFO")
 
