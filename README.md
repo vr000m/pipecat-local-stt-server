@@ -23,9 +23,9 @@ monorepo. BSD-2-Clause.
 - backend interface (`TranscriptionBackend`) so MLX can be swapped later
 - `EchoBackend` reference implementation for tests and smoke-checks
 - `MLXWhisperBackend` shipped in `stt_server/backends/mlx_whisper.py` (requires
-  the `stt-server-mlx` extra)
+  the `mlx` extra)
 - `ParakeetBackend` shipped in `stt_server/backends/parakeet.py` (requires the
-  `stt-server-parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`).
+  `parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`).
   Parakeet decodes from a temp WAV; that WAV holds raw utterance audio (PII) and
   is written to a per-process private `0o700` directory (created at backend
   start, removed on `close()`), never the world-listable system temp dir.
@@ -37,7 +37,7 @@ monorepo. BSD-2-Clause.
 uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend echo
 
 # MLX Whisper over UDS
-uv sync --extra stt-server-mlx
+uv sync --extra mlx
 uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend mlx
 
 # Loopback TCP (use --auth-token-file or PIPECAT_STT_AUTH_TOKEN env — legacy
@@ -96,7 +96,7 @@ scripts/install_stt_agent.sh install
 #    Warm the ~1.5 GB Hugging Face model cache FIRST: a cold first launch
 #    downloads it under KeepAlive + ThrottleInterval=10 and launchd may
 #    throttle-loop the agent before the download finishes.
-uv sync --extra stt-server-parakeet
+uv sync --extra parakeet
 .venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
 PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
   PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
@@ -244,9 +244,8 @@ from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 Only `TranscriptionClient` (plus `protocol`, `backend` interfaces, and
 `EchoBackend`) is re-exported from the package root — server runtime
 (`TranscriptionServer`, `ServerConfig`, `serve`) lives under
-`stt_server.server`. This lets a client-only install (`stt-server-client`
-extra) skip the `websockets.asyncio.server` dependency once the package is
-extracted.
+`stt_server.server`. This lets a client-only install (`client` extra)
+skip the `websockets.asyncio.server` dependency.
 
 ```python
 from stt_server import TranscriptionClient
@@ -284,12 +283,12 @@ socket — see "Multi-backend operation"); no client code changes.
 
 ```bash
 # Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo
-uv sync --extra stt-server-mlx
+uv sync --extra mlx
 uv run python -m stt_server serve --backend mlx \
     --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 
 # Parakeet — default model mlx-community/parakeet-tdt-0.6b-v3
-uv sync --extra stt-server-parakeet
+uv sync --extra parakeet
 uv run python -m stt_server serve --backend parakeet \
     --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
 

@@ -974,7 +974,7 @@ def test_make_backend_parakeet_arm_does_not_import_parakeet_mlx():
     """Lean-base invariant: importing/constructing the ``parakeet`` arm of
     ``_make_backend`` must not transitively import ``parakeet_mlx``.
 
-    Run in a clean subprocess with the ``stt-server-parakeet`` extra assumed
+    Run in a clean subprocess with the ``parakeet`` extra assumed
     absent — ``parakeet_mlx`` is removed from ``sys.modules`` and import is
     blocked, so a transitive pull would raise. The base install must still
     construct the backend; the missing-extra failure belongs in ``start()``.

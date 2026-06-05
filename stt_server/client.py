@@ -26,9 +26,9 @@ from . import protocol as P
 
 logger = logging.getLogger("stt_server.client")
 
-# Public surface of this module. Declared so the extraction-time
-# `stt-server-client` extra has a machine-readable signal for what
-# callers outside the package may rely on — consistent with the
+# Public surface of this module. Declared so the `client` extra has a
+# machine-readable signal for what callers outside the package may rely
+# on — consistent with the
 # `__all__` in ``stt_server/__init__.py``.
 __all__ = [
     "TranscriptionClient",

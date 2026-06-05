@@ -2,8 +2,7 @@
 
 Repo-neutral package intended for later extraction into its own OSS repo.
 
-Import layout reflects the planned ``stt-server-client`` vs
-``stt-server-mlx`` extras split once extracted:
+Import layout reflects the ``client`` vs ``mlx`` extras split:
 
 - protocol / client / backend interfaces are re-exported here, so a
   client-only install (no MLX, no asyncio server runtime) can

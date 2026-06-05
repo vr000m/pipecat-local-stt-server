@@ -47,7 +47,7 @@ def _make_backend(name: str, model: str):
 
         return MLXWhisperBackend(model=model)
     if name == "parakeet":
-        # Lazy import so a base install without the ``stt-server-parakeet``
+        # Lazy import so a base install without the ``parakeet``
         # extra still constructs ``echo``/``mlx`` backends. ``parakeet.py``
         # imports ``parakeet_mlx`` only inside ``start()`` / ``_get_model``,
         # never at module load, so this import does NOT transitively pull
