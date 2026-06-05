@@ -1,6 +1,6 @@
 # Task: Add NVIDIA Nemotron 3.5 ASR streaming backend (0.3.0)
 
-**Status**: Review findings addressed in plan — ready for re-review
+**Status**: Reviewed — ready for implementation (`/review-plan` marker written 2026-06-05)
 **Component**: ASR Backends
 **Assigned to**: Claude
 **Priority**: Medium
@@ -463,3 +463,4 @@ clean.
   is the right cleanup — a tracked decision, not silent 3× copy-paste drift.
 - **Promote the `nemotron` dev group to a published extra** once `mlx-audio`
   releases a version containing PR #774 (clean version pin, see Dependency reality).
+<!-- reviewed: 2026-06-05 @ e0593b7cb82365782de90dc37f2c3bc3041eedd3 -->
