@@ -17,13 +17,18 @@ Three-way ``language`` contract across backends:
   * ``parakeet`` accepts-and-ignores ``language`` (``parakeet.py:62-68``) —
     its TDT models are language-pinned by model id and ``transcribe`` exposes
     no per-call language kwarg;
-  * ``mlx_whisper`` forwards ``language`` to its decoder
-    (``mlx_whisper.py:141``);
+  * ``mlx_whisper`` forwards ``language`` to its decoder, but first recasts the
+    cross-backend ``"auto"``/blank sentinel to ``None`` (Whisper's own
+    auto-detect; it has no ``"auto"`` token and would raise on one) — see
+    ``mlx_whisper._normalize_language``;
   * ``nemotron`` (this module) forwards ``language`` to ``generate()`` and,
     when the client sends ``None``, falls back to ``DEFAULT_NEMOTRON_LANGUAGE``
-    (``"auto"`` — the model's own LID-over-40-locales default).
+    (``"auto"`` — the model's own LID-over-40-locales default), so a client
+    ``"auto"`` and a client ``None`` both reach the model's LID mode here.
 There is deliberately no shared abstraction/registry — the per-call kwarg plus
-the named ``DEFAULT_NEMOTRON_LANGUAGE`` constant is the minimal call.
+the named ``DEFAULT_NEMOTRON_LANGUAGE`` constant is the minimal call. The net
+effect across all three is that a uniform client ``"auto"`` (or ``None``) means
+"auto-detect" everywhere, without the client needing to know the backend.
 """
 
 from __future__ import annotations

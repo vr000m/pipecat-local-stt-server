@@ -36,6 +36,28 @@ _FLOAT_DEFAULT_LOGPROB = -1.0
 _FLOAT_DEFAULT_NO_SPEECH = 0.6
 
 
+def _normalize_language(language: str | None) -> str | None:
+    """Recast the cross-backend ``"auto"`` sentinel (and blank) to ``None``.
+
+    Clients connect to a *socket* and don't know which backend is behind it,
+    so a uniform ``"auto"`` is the natural "detect the language" request. But
+    Whisper has no ``"auto"`` token: ``mlx_whisper.transcribe(language="auto")``
+    raises ``ValueError: Unsupported language: auto`` in its tokenizer (which
+    accepts only real codes/names), and ``language=None`` is how Whisper itself
+    asks for auto-detection. We translate here — server-side, in the one
+    backend that needs it — rather than pushing the quirk onto every client.
+    A real code (``"en"``, ``"es"``) passes through unchanged.
+
+    The sibling backends need no such translation: ``parakeet`` ignores
+    ``language`` entirely, and ``nemotron`` accepts ``"auto"`` as a first-class
+    prompt key — so the sentinel is recast only here, not generically, to avoid
+    coupling it to those backends' own defaults.
+    """
+    if language is None:
+        return None
+    return None if language.strip().lower() in ("", "auto") else language
+
+
 class _MLXStream:
     def __init__(
         self,
@@ -138,7 +160,9 @@ class _MLXStream:
                 result = mlx_whisper.transcribe(
                     audio,
                     path_or_hf_repo=self._model,
-                    language=self._language,
+                    # "auto"/blank -> None so Whisper auto-detects instead of
+                    # raising on an unknown language token (see _normalize_language).
+                    language=_normalize_language(self._language),
                     fp16=True,
                     verbose=False,
                     condition_on_previous_text=condition_on_previous_text,
