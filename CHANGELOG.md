@@ -5,6 +5,22 @@ All notable changes to `pipecat-local-stt-server` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-06
+
+### Fixed
+
+- **`--backend mlx` (Whisper) now accepts `language="auto"`.** A client
+  `language` of `"auto"` (or blank) is recast to `None` server-side in the
+  whisper backend (`mlx_whisper._normalize_language`) so Whisper performs its
+  own auto-detection, instead of raising `ValueError: Unsupported language:
+  auto` and surfacing a `transcript.failed`. This makes `"auto"` a uniform
+  "auto-detect" sentinel across all backends — whisper auto-detects, parakeet
+  ignores `language` (model is language-pinned), and nemotron treats `"auto"`
+  as its language-ID prompt. The recast is localized to the whisper backend
+  (not server-generic) to avoid coupling the sentinel to nemotron's
+  `DEFAULT_NEMOTRON_LANGUAGE`. Real language codes (`"en"`, `"es-ES"`) pass
+  through unchanged.
+
 ## [0.3.0] - 2026-06-05
 
 ### Added
@@ -157,6 +173,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.3.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.1
 [0.3.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.2.0
 [0.1.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.2

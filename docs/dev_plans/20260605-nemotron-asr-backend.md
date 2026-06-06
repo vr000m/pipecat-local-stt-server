@@ -529,5 +529,5 @@ not server-generic, to avoid coupling the sentinel to `DEFAULT_NEMOTRON_LANGUAGE
 Net: a uniform client `"auto"` (or `None`) means auto-detect on all three
 backends (whisper auto-detects / parakeet ignores / nemotron → its `"auto"`
 default). So the contract line should now read "mlx_whisper normalises
-`"auto"`/blank → `None`, then forwards". CHANGELOG entry deferred to the next
-patch release (0.3.x).
+`"auto"`/blank → `None`, then forwards". Shipped in **0.3.1** (CHANGELOG
+"Fixed"); the git tag `v0.3.1` + GitHub release are cut after PR #8 merges.
