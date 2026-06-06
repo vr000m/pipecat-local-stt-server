@@ -3,6 +3,13 @@
 V1 is commit-oriented: we accumulate PCM16LE audio until ``end()`` is called,
 then run a single decode and emit one ``delta`` plus one ``completed`` event.
 True streaming partials are deferred to future backends.
+
+Language handling: this backend recasts the cross-backend ``"auto"``/blank
+sentinel to ``None`` (Whisper's own auto-detect; it has no ``"auto"`` token and
+would raise on one) via ``_normalize_language``, then forwards. This is one arm
+of the three-way ``language`` contract across backends — see the module
+docstring of ``stt_server/backends/nemotron.py`` for the full table (parakeet
+ignores / mlx_whisper recasts-then-forwards / nemotron forwards-with-default).
 """
 
 from __future__ import annotations

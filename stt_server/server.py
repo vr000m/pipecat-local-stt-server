@@ -606,6 +606,13 @@ class TranscriptionServer:
     ) -> None:
         stream: BackendStream | None = None
         try:
+            # The client ``language`` is passed through verbatim; each backend
+            # translates it into its own idiom. Accepted values: ``None`` /
+            # ``"auto"`` (detect) or an ISO/BCP-47 code. Per-backend handling:
+            # mlx_whisper recasts ``"auto"``/blank -> ``None`` (auto-detect),
+            # parakeet ignores it (model is language-pinned), nemotron forwards
+            # it (``"auto"`` is a real LID prompt key; ``None`` -> its ``"auto"``
+            # default). A new backend MUST decide how it maps ``"auto"``.
             stream = await self._backend.open_stream(language=state.config.get("language"))
             state.current_stream = stream
             await stream.feed(audio)
