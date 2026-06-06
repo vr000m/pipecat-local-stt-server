@@ -1,6 +1,6 @@
 # Task: Add NVIDIA Nemotron 3.5 ASR streaming backend (0.3.0)
 
-**Status**: Reviewed — ready for implementation (`/review-plan` marker written 2026-06-05)
+**Status**: Implemented — PR #7 open / in review (all phases 0-3 complete 2026-06-05)
 **Component**: ASR Backends
 **Assigned to**: Claude
 **Priority**: Medium
