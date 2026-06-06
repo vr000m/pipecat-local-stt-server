@@ -137,6 +137,37 @@ def test_transcribe_forwards_default_suppression_kwargs(fake_mlx, monkeypatch):
     assert kw["verbose"] is False
 
 
+@pytest.mark.parametrize(
+    "client_language, expected_kwarg",
+    [
+        ("en", "en"),
+        ("es-ES", "es-ES"),
+        ("auto", None),
+        ("AUTO", None),
+        ("  auto  ", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_auto_and_blank_language_recast_to_none(
+    fake_mlx, monkeypatch, client_language, expected_kwarg
+):
+    """The backend recasts the cross-backend ``"auto"``/blank sentinel to
+    ``None`` (Whisper's auto-detect) so a client need not know which backend is
+    behind the socket; Whisper would otherwise raise on an ``"auto"`` token.
+    Real language codes pass through unchanged."""
+    monkeypatch.setenv("PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO", "1.1")
+    backend = MLXWhisperBackend(model="fake-model")
+
+    async def run() -> None:
+        stream = await backend.open_stream(language=client_language)
+        await stream.feed(_pcm_nonempty())
+        await stream.end()
+
+    asyncio.run(run())
+    assert fake_mlx.last_kwargs["language"] == expected_kwarg
+
+
 def test_transcribe_forwards_koda_alias_overrides(fake_mlx, monkeypatch):
     # Deprecated KODA_STT_WHISPER_* aliases still drive the decode knobs when
     # the canonical PIPECAT_STT_* names are unset (backward compat). The
