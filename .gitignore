@@ -11,5 +11,6 @@ __pycache__/
 # OS
 .DS_Store
 
-# conduct skill state
+# conduct / deep-review skill state (local, run-specific)
 .conduct/
+.deep-review/
