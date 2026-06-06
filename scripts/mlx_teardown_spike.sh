@@ -7,7 +7,7 @@
 #
 # Prereqs:
 #   - Apple Silicon
-#   - ``uv sync --extra stt-server-mlx`` has run
+#   - ``uv sync --extra mlx`` has run
 #   - ``scripts/install_stt_agent.sh install`` has been run at least once
 #
 # Usage:

@@ -36,6 +36,13 @@ from pathlib import Path
 
 import pytest
 
+# Import the Nemotron default from its single source of truth: the installer's
+# DEFAULT_MODEL nemotron arm must agree with this constant, and pinning the
+# expected value to the literal here would let a backend rename pass both the
+# script and this regression against a stale id. nemotron.py imports mlx_audio
+# only lazily, so this top-level import does not pull the optional package.
+from stt_server.backends.nemotron import DEFAULT_NEMOTRON_MODEL as NEMOTRON_MODEL
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "install_stt_agent.sh"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
@@ -403,6 +410,49 @@ def test_koda_socket_and_log_dir_env_override_new_defaults(tmp_path: Path):
     plist = plistlib.loads(rendered.read_bytes())
     assert str(override_socket) in plist["ProgramArguments"], (
         f"rendered plist must use the KODA_STT_SOCKET override; args={plist['ProgramArguments']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (6) Backend-aware DEFAULT_MODEL: nemotron installs the Nemotron repo id,
+#     never the Whisper default
+# ---------------------------------------------------------------------------
+
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+
+def test_nemotron_backend_install_uses_nemotron_default_model(tmp_path: Path):
+    """With ``PIPECAT_STT_BACKEND=nemotron`` and ``PIPECAT_STT_MODEL`` unset,
+    the installer's backend-aware ``DEFAULT_MODEL`` must resolve to the Nemotron
+    repo id — NOT the Whisper default that the ``else`` arm would yield.
+
+    Proof: the install renders the plist into ``HOME`` via the real renderer;
+    the rendered ``ProgramArguments`` must carry the Nemotron model after the
+    ``--model`` flag.
+    """
+    import plistlib
+
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_BACKEND": "nemotron"},
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+
+    rendered = home / "Library" / "LaunchAgents" / f"{NEW_LABEL}.plist"
+    assert rendered.is_file(), f"expected rendered plist at {rendered}"
+    args = plistlib.loads(rendered.read_bytes())["ProgramArguments"]
+
+    assert "nemotron" in args, f"backend should be nemotron; args={args}"
+    assert args[args.index("--model") + 1] == NEMOTRON_MODEL, (
+        f"nemotron install must use the Nemotron default model, not Whisper; args={args}"
+    )
+    assert WHISPER_MODEL not in args, (
+        f"nemotron install must NOT fall back to the Whisper default; args={args}"
     )
 
 

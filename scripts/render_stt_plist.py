@@ -41,7 +41,7 @@ DEFAULT_LABEL = "pipecat.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
-_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet)$")
+_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 
 
@@ -99,7 +99,9 @@ def main() -> None:
     socket_path = _require(
         "SOCKET_PATH", os.environ.get("SOCKET_PATH"), _ABSPATH_RE, "absolute path"
     )
-    backend = _require("BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet")
+    backend = _require(
+        "BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet|nemotron"
+    )
     model = _require(
         "MODEL",
         os.environ.get("MODEL"),

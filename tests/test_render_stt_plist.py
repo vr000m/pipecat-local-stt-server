@@ -30,6 +30,12 @@ from pathlib import Path
 
 import pytest
 
+# Import the Nemotron default model from its single source of truth rather than
+# re-hardcoding the literal: a model-id rename in the backend must fail this
+# renderer regression instead of passing against a stale copy. nemotron.py
+# imports mlx_audio only lazily, so this does not pull the optional package.
+from stt_server.backends.nemotron import DEFAULT_NEMOTRON_MODEL as _DEFAULT_NEMOTRON_MODEL
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "render_stt_plist.py"
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_stt_agent.sh"
@@ -252,14 +258,17 @@ def test_explicit_legacy_label_renders_legacy_label_and_log_paths(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", ["echo", "mlx", "parakeet"])
+@pytest.mark.parametrize("backend", ["echo", "mlx", "parakeet", "nemotron"])
 def test_backend_allowlist_accepts_supported_backends(tmp_path: Path, backend: str):
-    """``_BACKEND_RE`` must accept ``echo``, ``mlx``, and the new ``parakeet``."""
+    """``_BACKEND_RE`` must accept ``echo``, ``mlx``, ``parakeet``, and the new
+    ``nemotron``."""
     dst = tmp_path / f"{backend}.plist"
-    # parakeet needs a model id its regex accepts; supply one explicitly.
+    # parakeet/nemotron need a model id their regex accepts; supply one explicitly.
     overrides = {"BACKEND": backend}
     if backend == "parakeet":
         overrides["MODEL"] = _DEFAULT_PARAKEET_MODEL
+    elif backend == "nemotron":
+        overrides["MODEL"] = _DEFAULT_NEMOTRON_MODEL
     r = _run_render(overrides, dst)
     assert r.returncode == 0, f"backend={backend}: stdout={r.stdout!r} stderr={r.stderr!r}"
     plist = plistlib.loads(dst.read_bytes())
@@ -285,6 +294,7 @@ def test_backend_allowlist_rejects_bogus_backend(tmp_path: Path):
     [
         ("mlx", "mlx-community/whisper-large-v3-turbo"),
         ("parakeet", _DEFAULT_PARAKEET_MODEL),
+        ("nemotron", _DEFAULT_NEMOTRON_MODEL),
     ],
 )
 def test_backend_aware_model_default_passes_model_regex(tmp_path: Path, backend: str, model: str):

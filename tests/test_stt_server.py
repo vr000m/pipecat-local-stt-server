@@ -900,6 +900,32 @@ def fake_parakeet_mlx(monkeypatch):
     return fake
 
 
+@pytest.fixture
+def fake_mlx_audio(monkeypatch):
+    """Install a permissive fake ``mlx_audio`` so the real ``nemotron`` backend
+    module can be imported/constructed in CI without a model download.
+
+    Mirrors ``fake_parakeet_mlx``: ``nemotron.py``'s own ``import mlx_audio``
+    lives inside ``start()``/decode, so for pure construction tests the stub is
+    not strictly needed — but installing it keeps the tests robust if the import
+    discipline ever regresses.
+    """
+    import types as _types
+
+    fake = _types.ModuleType("mlx_audio")
+    fake_stt = _types.ModuleType("mlx_audio.stt")
+
+    def _load(model_id, *a, **kw):  # pragma: no cover - not driven here
+        raise AssertionError("real model load attempted in a wiring test")
+
+    fake_stt.load = _load
+    fake.stt = fake_stt
+    monkeypatch.setitem(sys.modules, "mlx_audio", fake)
+    monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+    monkeypatch.delitem(sys.modules, "stt_server.backends.nemotron", raising=False)
+    return fake
+
+
 # --- _make_backend / _resolve_model / argparse choices --------------------
 
 
@@ -974,7 +1000,7 @@ def test_make_backend_parakeet_arm_does_not_import_parakeet_mlx():
     """Lean-base invariant: importing/constructing the ``parakeet`` arm of
     ``_make_backend`` must not transitively import ``parakeet_mlx``.
 
-    Run in a clean subprocess with the ``stt-server-parakeet`` extra assumed
+    Run in a clean subprocess with the ``parakeet`` extra assumed
     absent — ``parakeet_mlx`` is removed from ``sys.modules`` and import is
     blocked, so a transitive pull would raise. The base install must still
     construct the backend; the missing-extra failure belongs in ``start()``.
@@ -992,6 +1018,85 @@ def test_make_backend_parakeet_arm_does_not_import_parakeet_mlx():
         "b = _make_backend('parakeet', 'fake-model')\n"
         "assert type(b).__name__ == 'ParakeetBackend'\n"
         "assert 'parakeet_mlx' not in sys.modules\n"
+        "print('OK')\n"
+    )
+    env = dict(os.environ)
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join([repo_root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "OK" in r.stdout
+
+
+def test_make_backend_nemotron_constructs_nemotron_backend(fake_mlx_audio):
+    from stt_server.__main__ import _make_backend
+    from stt_server.backends.nemotron import NemotronBackend
+
+    backend = _make_backend("nemotron", "fake-nemotron-model")
+    assert isinstance(backend, NemotronBackend)
+
+
+def test_argparse_backend_choices_include_nemotron():
+    """``--backend nemotron`` must be an accepted argparse choice."""
+    r = _run_module("serve", "--help")
+    assert r.returncode == 0, r.stderr
+    # argparse renders the choice tuple in the --backend metavar/help.
+    assert "nemotron" in r.stdout
+
+
+def test_argparse_rejects_unknown_backend_with_nemotron_present():
+    """A backend outside the choice tuple must still exit non-zero now that
+    ``nemotron`` is an accepted choice — parity with the parakeet reject test."""
+    r = _run_module("serve", "--backend", "bogus")
+    assert r.returncode != 0
+    assert "nemotron" in r.stderr or "invalid choice" in r.stderr
+
+
+def test_resolve_model_nemotron_unset_uses_default_nemotron_model(fake_mlx_audio):
+    from stt_server.__main__ import _resolve_model
+    from stt_server.backends.nemotron import DEFAULT_NEMOTRON_MODEL
+
+    assert _resolve_model("nemotron", None) == DEFAULT_NEMOTRON_MODEL
+
+
+def test_resolve_model_explicit_override_wins_for_nemotron(fake_mlx_audio):
+    from stt_server.__main__ import _resolve_model
+
+    assert _resolve_model("nemotron", "my-org/custom-nemotron") == "my-org/custom-nemotron"
+
+
+def test_make_backend_and_resolve_model_nemotron_do_not_import_mlx_audio():
+    """Lean-base invariant: the ``nemotron`` arm of ``_make_backend`` AND
+    ``_resolve_model`` must not transitively import ``mlx_audio``.
+
+    Run in a clean subprocess with the ``nemotron`` extra assumed absent —
+    ``mlx_audio`` is removed from ``sys.modules`` and import is blocked, so a
+    transitive pull would raise. The base install must still construct the
+    backend and resolve the default model; the missing-extra failure belongs in
+    ``start()``.
+    """
+    code = (
+        "import sys, builtins\n"
+        "sys.modules.pop('mlx_audio', None)\n"
+        "_real_import = builtins.__import__\n"
+        "def _blocked(name, *a, **k):\n"
+        "    if name == 'mlx_audio' or name.startswith('mlx_audio.'):\n"
+        "        raise AssertionError('mlx_audio imported at nemotron seam')\n"
+        "    return _real_import(name, *a, **k)\n"
+        "builtins.__import__ = _blocked\n"
+        "from stt_server.__main__ import _make_backend, _resolve_model\n"
+        "from stt_server.backends.nemotron import DEFAULT_NEMOTRON_MODEL\n"
+        "m = _resolve_model('nemotron', None)\n"
+        "assert m == DEFAULT_NEMOTRON_MODEL, m\n"
+        "b = _make_backend('nemotron', m)\n"
+        "assert type(b).__name__ == 'NemotronBackend'\n"
+        "assert 'mlx_audio' not in sys.modules\n"
         "print('OK')\n"
     )
     env = dict(os.environ)

@@ -12,9 +12,10 @@
 #                       (default: pipecat.stt-server)
 #   PIPECAT_STT_SOCKET  (KODA_STT_SOCKET)  path to the UDS socket
 #                       (default: $HOME/Library/Caches/pipecat-stt/stt.sock)
-#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet (default: mlx)
+#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron (default: mlx)
 #   PIPECAT_STT_MODEL   (KODA_STT_MODEL)   model id (default: backend-aware — Whisper repo for
-#                       mlx/echo, mlx-community/parakeet-tdt-0.6b-v3 for parakeet)
+#                       mlx/echo, mlx-community/parakeet-tdt-0.6b-v3 for parakeet,
+#                       mlx-community/nemotron-3.5-asr-streaming-0.6b for nemotron)
 #
 # Two-agent install recipe (run Whisper and Parakeet ASR side by side):
 #
@@ -57,10 +58,16 @@ SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-$HOME/Library/Caches/pipec
 BACKEND="${PIPECAT_STT_BACKEND:-${KODA_STT_BACKEND:-mlx}}"
 # Backend-aware MODEL default. render_stt_plist.py validates MODEL and
 # exits when unset, so supply a sensible default per backend here: the
-# Whisper repo for mlx/echo, the Parakeet TDT model for parakeet. Must
-# agree with DEFAULT_PARAKEET_MODEL in stt_server/backends/parakeet.py.
+# Whisper repo for mlx/echo, the Parakeet TDT model for parakeet, the
+# Nemotron 3.5 ASR model for nemotron. The parakeet default must agree with
+# DEFAULT_PARAKEET_MODEL in stt_server/backends/parakeet.py; the nemotron
+# default must agree with DEFAULT_NEMOTRON_MODEL in
+# stt_server/backends/nemotron.py. Without the nemotron arm, BACKEND=nemotron
+# would fall to the else and silently install the Whisper repo id.
 if [[ "$BACKEND" == "parakeet" ]]; then
     DEFAULT_MODEL="mlx-community/parakeet-tdt-0.6b-v3"
+elif [[ "$BACKEND" == "nemotron" ]]; then
+    DEFAULT_MODEL="mlx-community/nemotron-3.5-asr-streaming-0.6b"
 else
     DEFAULT_MODEL="mlx-community/whisper-large-v3-turbo"
 fi

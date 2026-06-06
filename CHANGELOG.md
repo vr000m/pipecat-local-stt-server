@@ -5,6 +5,31 @@ All notable changes to `pipecat-local-stt-server` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-05
+
+### Added
+
+- **Nemotron 3.5 ASR backend** (`stt_server/backends/nemotron.py`), selected
+  via `--backend nemotron` and installed with `uv sync --group nemotron`.
+  Default model `mlx-community/nemotron-3.5-asr-streaming-0.6b`. Like Parakeet,
+  it decodes from a temp WAV holding raw utterance audio (PII), written to a
+  per-process private `0o700` directory and unlinked after decode.
+
+### Notes
+
+- **Packaging — Option 1 landed: a git-pinned `[dependency-groups]` dev group,
+  not a published extra.** The backend requires Nemotron STT support from
+  `mlx-audio`, which only merged in PR #774 and is not yet in any published
+  `mlx-audio` PyPI release. A direct-URL (`@ git+…`) dependency is forbidden in
+  a published wheel's `Requires-Dist` (PyPI rejects direct-URL deps in extra
+  metadata), so shipping a `nemotron` *extra* would block 0.3.0 from PyPI
+  entirely. PEP 735 dependency groups are never emitted into wheel/sdist
+  metadata, so `uv sync --group nemotron` installs the git-pinned backend
+  locally while the published 0.3.0 stays PyPI-installable. PyPI-installability
+  was verified by confirming the built wheel's `METADATA` carries **no**
+  `mlx-audio` direct-URL in `Requires-Dist`. Promote to a versioned `nemotron`
+  extra once `mlx-audio` publishes a release containing #774.
+
 ## [0.2.0] - 2026-05-30
 
 ### Changed (BREAKING)
@@ -132,6 +157,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.3.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.2.0
 [0.1.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.2
 [0.1.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.1.1

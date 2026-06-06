@@ -241,7 +241,7 @@ class ParakeetBackend:
             return self._model
 
     async def start(self) -> None:
-        # Eager import; fail fast if the ``stt-server-parakeet`` extra is not
+        # Eager import; fail fast if the ``parakeet`` extra is not
         # installed. The model itself is NOT loaded here — see ``_get_model``.
         import parakeet_mlx  # type: ignore # noqa: F401
 

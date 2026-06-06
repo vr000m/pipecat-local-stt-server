@@ -23,12 +23,18 @@ monorepo. BSD-2-Clause.
 - backend interface (`TranscriptionBackend`) so MLX can be swapped later
 - `EchoBackend` reference implementation for tests and smoke-checks
 - `MLXWhisperBackend` shipped in `stt_server/backends/mlx_whisper.py` (requires
-  the `stt-server-mlx` extra)
+  the `mlx` extra)
 - `ParakeetBackend` shipped in `stt_server/backends/parakeet.py` (requires the
-  `stt-server-parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`).
+  `parakeet` extra; default model `mlx-community/parakeet-tdt-0.6b-v3`).
   Parakeet decodes from a temp WAV; that WAV holds raw utterance audio (PII) and
   is written to a per-process private `0o700` directory (created at backend
   start, removed on `close()`), never the world-listable system temp dir.
+- `NemotronBackend` shipped in `stt_server/backends/nemotron.py` (requires the
+  `nemotron` dev group — `uv sync --group nemotron`, not an extra; default model
+  `mlx-community/nemotron-3.5-asr-streaming-0.6b`). Nemotron decodes
+  from a temp WAV; that WAV holds raw utterance audio (PII) and is written to a
+  per-process private `0o700` directory (created at backend start, removed on
+  `close()`), never the world-listable system temp dir.
 
 ## Running the server
 
@@ -37,7 +43,7 @@ monorepo. BSD-2-Clause.
 uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend echo
 
 # MLX Whisper over UDS
-uv sync --extra stt-server-mlx
+uv sync --extra mlx
 uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend mlx
 
 # Loopback TCP (use --auth-token-file or PIPECAT_STT_AUTH_TOKEN env — legacy
@@ -61,7 +67,7 @@ below for one such integration.
 ## Multi-backend operation
 
 Each server process loads exactly **one** backend, pinned at launch via
-`--backend {echo,mlx,parakeet}`. To run more than one ASR — for example to
+`--backend {echo,mlx,parakeet,nemotron}`. To run more than one ASR — for example to
 A/B-benchmark Parakeet against Whisper — start a second server process on a
 **separate socket**. The V1 wire protocol is unchanged; the only difference
 between two ASRs from the bot's perspective is which socket it connects to.
@@ -72,6 +78,7 @@ between two ASRs from the bot's perspective is which socket it connects to.
 |---|---|---|---|
 | whisper (`mlx`) | `pipecat.stt-server` | `~/Library/Caches/pipecat-stt/stt.sock` | leave `STT_WS_SOCKET` unset |
 | parakeet | `pipecat.stt-server.parakeet` | `~/Library/Caches/pipecat-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
+| nemotron | `pipecat.stt-server.nemotron` | `~/Library/Caches/pipecat-stt/nemotron.sock` | set `STT_WS_SOCKET` to the nemotron socket |
 
 Whisper uses the default label and socket, so a bot-side default of
 `~/Library/Caches/pipecat-stt/stt.sock` resolves to it with no `.env`
@@ -96,7 +103,7 @@ scripts/install_stt_agent.sh install
 #    Warm the ~1.5 GB Hugging Face model cache FIRST: a cold first launch
 #    downloads it under KeepAlive + ThrottleInterval=10 and launchd may
 #    throttle-loop the agent before the download finishes.
-uv sync --extra stt-server-parakeet
+uv sync --extra parakeet
 .venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
 PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
   PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
@@ -244,9 +251,8 @@ from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 Only `TranscriptionClient` (plus `protocol`, `backend` interfaces, and
 `EchoBackend`) is re-exported from the package root — server runtime
 (`TranscriptionServer`, `ServerConfig`, `serve`) lives under
-`stt_server.server`. This lets a client-only install (`stt-server-client`
-extra) skip the `websockets.asyncio.server` dependency once the package is
-extracted.
+`stt_server.server`. This lets a client-only install (`client` extra)
+skip the `websockets.asyncio.server` dependency.
 
 ```python
 from stt_server import TranscriptionClient
@@ -284,14 +290,21 @@ socket — see "Multi-backend operation"); no client code changes.
 
 ```bash
 # Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo
-uv sync --extra stt-server-mlx
+uv sync --extra mlx
 uv run python -m stt_server serve --backend mlx \
     --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 
 # Parakeet — default model mlx-community/parakeet-tdt-0.6b-v3
-uv sync --extra stt-server-parakeet
+uv sync --extra parakeet
 uv run python -m stt_server serve --backend parakeet \
     --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
+
+# Nemotron 3.5 — default model mlx-community/nemotron-3.5-asr-streaming-0.6b.
+# NOTE: installed via a dev GROUP, not an extra: `uv sync --group nemotron`
+# (there is intentionally no `--extra nemotron`).
+uv sync --group nemotron
+uv run python -m stt_server serve --backend nemotron \
+    --socket-path ~/Library/Caches/pipecat-stt/nemotron.sock
 
 # Pick a specific model with --model (any compatible mlx-community HF repo id)
 uv run python -m stt_server serve --backend mlx \
@@ -300,7 +313,27 @@ uv run python -m stt_server serve --backend mlx \
 
 `--model` is passed through verbatim; an unset value uses the backend-aware
 default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
-`parakeet`). Pointing a backend at a mismatched repo fails fast at decode.
+`parakeet`, `nemotron-3.5-asr-streaming-0.6b` for `nemotron`). Pointing a
+backend at a mismatched repo fails fast at decode.
+
+Nemotron ships behind a `[dependency-groups]` **dev group** rather than a
+PyPI extra (`uv sync --group nemotron`, not `--extra nemotron`). The backend
+needs Nemotron STT support from `mlx-audio`, which only landed in PR #774 —
+not yet in any published `mlx-audio` release. A dev group therefore git-pins
+the dependency directly:
+
+```bash
+# Equivalent direct install of the git-pinned mlx-audio one-liner:
+uv pip install "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio"
+```
+
+It is a dev group on purpose: a direct-URL (`@ git+…`) dependency cannot be
+emitted into a published wheel's `Requires-Dist` (PyPI rejects direct-URL
+deps in published extra metadata), whereas PEP 735 dependency groups are
+never written into wheel/sdist metadata at all. Keeping Nemotron in a dev
+group lets `uv sync --group nemotron` install it locally while 0.3.0 stays
+PyPI-clean. Once `mlx-audio` cuts a PyPI release containing #774, this can
+be promoted to a versioned `nemotron` extra.
 
 Common MLX Whisper models (smaller = faster + lower RAM, larger = more
 accurate). These are `mlx-community` Hugging Face repos; the first launch
@@ -315,6 +348,7 @@ downloads and caches the weights.
 | `mlx` | `mlx-community/whisper-base` | fast, lower accuracy |
 | `mlx` | `mlx-community/whisper-tiny` | fastest, lowest accuracy |
 | `parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | **default** Parakeet TDT |
+| `nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | **default** Nemotron 3.5 ASR (dev group — `uv sync --group nemotron`) |
 
 Any `mlx-community` Whisper repo (e.g. `…-large-v3-turbo-q4` quantised
 variants, or `…-large-v3-turbo` language-specialised forks) works as a
