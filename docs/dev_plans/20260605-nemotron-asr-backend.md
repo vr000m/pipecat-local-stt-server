@@ -514,3 +514,20 @@ load + synthetic decode on this machine:
   returned `AlignedResult` with `.text == ""` for a 1 s 16 kHz sine tone —
   exercising the empty-decode (`completed`-only) path. Full load + decode runs
   on this machine; no partial-completion caveat needed.
+
+### Post-ship — language-contract follow-up (PR #8, after 0.3.0)
+
+The three-way language contract above (Requirements / Review Focus, "mlx_whisper
+forwards") was refined after integration. A client connects to a *socket* and
+can't know which backend is behind it, so `"auto"` is the natural cross-backend
+"detect the language" value — but `mlx_whisper.transcribe` raises
+`ValueError: Unsupported language: auto` (its tokenizer accepts only real
+codes/names; `None` is Whisper's auto-detect request). Fixed **server-side** in
+the whisper backend (`mlx_whisper._normalize_language`, PR #8 / branch
+`fix/whisper-auto-language`): `"auto"`/blank → `None`. Localized to that backend,
+not server-generic, to avoid coupling the sentinel to `DEFAULT_NEMOTRON_LANGUAGE`.
+Net: a uniform client `"auto"` (or `None`) means auto-detect on all three
+backends (whisper auto-detects / parakeet ignores / nemotron → its `"auto"`
+default). So the contract line should now read "mlx_whisper normalises
+`"auto"`/blank → `None`, then forwards". CHANGELOG entry deferred to the next
+patch release (0.3.x).
