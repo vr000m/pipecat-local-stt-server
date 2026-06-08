@@ -119,6 +119,40 @@ the Parakeet agent you must re-export its `PIPECAT_STT_LABEL` and
 invocation always targets the default `pipecat.stt-server` agent. See the recipe
 in the `install_stt_agent.sh` header.
 
+### Managing agents with `just`
+
+`install_stt_agent.sh` manages exactly one agent per invocation, so once you run
+two or three ASRs side by side there is no single command to see them or stop the
+idle ones. The repo-root `justfile` is a thin operator layer over `launchctl`
+(macOS only) that fills that gap. Run recipes from the repo root:
+
+```bash
+just                       # list available recipes
+just stt-list              # every pipecat.stt-server* agent: state, pid, live backend
+just stt-status nemotron   # wire health probe for one backend
+just stt-disable whisper   # stop until next login (keeps the plist)
+just stt-enable whisper    # re-load it from the existing plist
+just stt-install parakeet  # delegates to install_stt_agent.sh
+just stt-uninstall parakeet
+```
+
+`<backend>` is one of `whisper` / `parakeet` / `nemotron`, mapped to the labels
+and sockets in the [per-ASR table](#per-asr-socket-convention) above (the
+justfile map is a checked mirror of that table — a test fails CI on drift).
+
+**`stt-disable` vs `stt-uninstall`.** The LaunchAgent plist sets `RunAtLoad` +
+`KeepAlive`, so `install_stt_agent.sh stop` (a plain `SIGTERM`) is respawned
+immediately. `stt-disable` instead does `launchctl bootout`, which takes the
+agent down **until the next login** — the plist stays on disk and launchd
+reloads it when you log back in. `stt-uninstall` removes the plist, so the agent
+stays gone. For cross-login suppression without removing the plist, use
+`launchctl disable gui/$(id -u)/<label>`.
+
+`stt-list` sweeps the `pipecat.stt-server*` label prefix, so a custom-labelled
+agent still shows up (without a live-backend line, since its socket is not
+derivable from its label). Legacy `koda.stt-server*` agents are **not** covered —
+check those manually during migration with `launchctl list | grep koda`.
+
 ### A/B benchmark — Whisper vs Parakeet
 
 With both agents installed and socket-live, `scripts/benchmark_asr_ab.py`
