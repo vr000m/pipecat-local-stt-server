@@ -316,38 +316,60 @@ reimplemented) means there is no drift in the plist rendering Koda depends on.
 
 ## Issues & Solutions
 
-_(to be filled during implementation)_
+Surfaced by post-implementation review (deep-review + adversarial review):
+
+- **Command injection via `{{backend}}`.** `just` interpolated the recipe arg as
+  raw shell text, so `just stt-status '$(touch X)'` executed the payload.
+  *Solution:* shell-escape with `just`'s `quote()` at every call site and inside
+  `_resolve`; the `case` arms remain the allowlist. Regression covered by an
+  injection probe in review.
+- **Spaced socket paths mis-split.** `_resolve` emitted a single space-separated
+  line parsed with `read -r label sock bk`, which would split a socket path
+  containing spaces. *Solution:* emit one field per line and parse with three
+  sequential `read`s (bash-3.2-safe — macOS system bash has no `mapfile`, a
+  regression the test suite caught immediately).
+- **`launchctl` failures masked by the success echo.** `set -uo pipefail` does
+  **not** abort on a failed simple command, so a failed `bootout`/`bootstrap`/
+  `kickstart` in `stt-disable`/`stt-enable` was overwritten by the later success
+  `echo` (exit 0 while the agent was still running or never started).
+  *Solution:* guard each state change with `if ! launchctl …; then echo … >&2;
+  exit 1; fi`; `stt-enable` skips `kickstart` once `bootstrap` fails. Covered by
+  new failed-`bootout`/`bootstrap`/`kickstart` tests.
+- **Tests coupled to the private `_resolve` helper.** *Solution:* drive the
+  resolution + README-mirror tests through the public `stt-install` recipe; make
+  the `uv` stub dispatch argv-position-aware; anchor the README-table parser on
+  its header before indexing columns.
 
 ## Acceptance Criteria
 
-- [ ] `justfile` exists at repo root with `set shell := ["bash", "-uc"]`;
+- [x] `justfile` exists at repo root with `set shell := ["bash", "-uc"]`;
       `just --list` shows `stt-list`, `stt-status`, `stt-disable`, `stt-enable`,
       `stt-install`, `stt-uninstall`.
-- [ ] `stt-list` reports all `pipecat.stt-server*` agents (prefix sweep,
+- [x] `stt-list` reports all `pipecat.stt-server*` agents (prefix sweep,
       including a custom-labelled one) with loaded/running + pid, and live
       backend/model for canonical sockets; a stopped/absent socket renders
       "stopped/unreachable" and the recipe still exits 0.
-- [ ] `stt-disable <backend>` takes the agent down for the session and
+- [x] `stt-disable <backend>` takes the agent down for the session and
       **preserves** the plist (asserted in CI via the stub harness: `bootout`
       fired, plist file survives); README states it lasts until next login.
-- [ ] `stt-enable <backend>` restores from the existing plist without a
+- [x] `stt-enable <backend>` restores from the existing plist without a
       re-render (manual acceptance).
-- [ ] Probe always passes `--socket-path` (asserted via argv shim; bogus
+- [x] Probe always passes `--socket-path` (asserted via argv shim; bogus
       `STT_WS_SOCKET` ignored).
-- [ ] `install`/`uninstall` recipes delegate with the exact `PIPECAT_STT_*`
+- [x] `install`/`uninstall` recipes delegate with the exact `PIPECAT_STT_*`
       triple per backend (asserted for a non-default backend); the script is
       unmodified.
-- [ ] justfile map equals the README per-ASR table (asserted in CI).
-- [ ] Unknown backend name fails fast (non-zero) and the error names all three
+- [x] justfile map equals the README per-ASR table (asserted in CI).
+- [x] Unknown backend name fails fast (non-zero) and the error names all three
       valid backends.
-- [ ] `stt_server/__main__.py`, the wire protocol, and
+- [x] `stt_server/__main__.py`, the wire protocol, and
       `scripts/install_stt_agent.sh`'s existing subcommands are unmodified — and
       a CI test asserts the branch diff is a subset of
       `{justfile, tests/test_justfile_recipes.py, README.md, the plan}` (no Koda
       pin bump needed).
-- [ ] README documents `just` + the recipes + the disable-vs-uninstall
+- [x] README documents `just` + the recipes + the disable-vs-uninstall
       distinction + the legacy-koda manual-check note, matching house style.
-- [ ] `uv run pytest` green; `ruff format` + `ruff check` clean.
+- [x] `uv run pytest` green; `ruff format` + `ruff check` clean.
 
 ## Review Focus
 
@@ -394,11 +416,15 @@ Delivered all three phases:
 - **README** — "Managing agents with `just`" section + the per-ASR socket table
   the mirror test parses.
 
-Post-review hardening (deep-review findings): `{{backend}}` is shell-escaped via
-`just`'s `quote()` at every call site (closes a command-injection vector);
-`_resolve` emits one field per line so spaced socket paths parse correctly; the
+Post-review hardening (deep-review + adversarial review findings): `{{backend}}`
+is shell-escaped via `just`'s `quote()` at every call site (closes a
+command-injection vector); `_resolve` emits one field per line so spaced socket
+paths parse correctly; `stt-disable`/`stt-enable` now guard each `launchctl`
+state change (`bootout`/`bootstrap`/`kickstart`) and propagate failures with a
+non-zero exit instead of masking them behind the success echo; the
 resolution/mirror tests drive the public `stt-install` recipe instead of the
 private `_resolve`; the `uv` stub dispatch is argv-position-aware; and the
-README-table parser anchors on the header before indexing columns.
+README-table parser anchors on the header before indexing columns. See
+Issues & Solutions for the full list.
 
 <!-- reviewed: 2026-06-07 @ f144271594d3cf4660fb40d36db9ac4637b4e1e8 -->

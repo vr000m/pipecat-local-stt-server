@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   login); `stt-uninstall` removes the plist durably. Install/uninstall delegate
   to `scripts/install_stt_agent.sh` rather than reimplementing plist rendering.
 
+### Fixed
+
+- **`just stt-disable` / `stt-enable` now propagate `launchctl` failures.** A
+  failed `launchctl bootout` / `bootstrap` / `kickstart` was previously masked by
+  the recipe's success `echo` (exit 0 reported while the agent was still running
+  or never started). Each state change is now guarded and surfaces a non-zero
+  exit with an error on stderr; `stt-enable` skips `kickstart` once `bootstrap`
+  fails.
+
 ## [0.3.1] - 2026-06-06
 
 ### Fixed
