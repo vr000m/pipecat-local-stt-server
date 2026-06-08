@@ -275,6 +275,27 @@ def test_stt_list_surfaces_custom_labelled_agent(tmp_path):
     assert custom_line.startswith("running")
 
 
+def test_stt_list_prints_socket_in_tilde_form(tmp_path):
+    # The socket line must match the ~-form onoats config.toml's `ws_socket`
+    # uses, so an operator can correlate a config line with an agent. Whisper's
+    # socket is stt.sock (not whisper.sock) — the case the nomenclature trap hits.
+    stub_dir, _ = _make_stub_dir(tmp_path, print_loaded=True, status_exit=0)
+    home = _home_with_agents(tmp_path, ["pipecat.stt-server"])
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "socket: ~/Library/Caches/pipecat-stt/stt.sock" in res.stdout
+    # No absolute $HOME path should leak — it must be rendered as ~.
+    assert str(home) not in res.stdout
+
+
+def test_stt_list_custom_label_has_no_canonical_socket(tmp_path):
+    stub_dir, _ = _make_stub_dir(tmp_path, print_loaded=True, status_exit=0)
+    home = _home_with_agents(tmp_path, ["pipecat.stt-server.custom"])
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "custom label" in res.stdout
+
+
 def test_stt_list_tolerates_stopped_socket(tmp_path):
     # Agent loaded, but its status probe exits 1 (stopped/unreachable socket).
     stub_dir, _ = _make_stub_dir(tmp_path, print_loaded=True, status_exit=1)

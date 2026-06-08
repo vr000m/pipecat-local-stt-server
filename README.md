@@ -140,6 +140,11 @@ just stt-uninstall parakeet
 and sockets in the [per-ASR table](#per-asr-socket-convention) above (the
 justfile map is a checked mirror of that table — a test fails CI on drift).
 
+`stt-list` prints each agent's `socket:` line in the same `~`-form a consumer's
+config uses for its endpoint (e.g. onoats' `config.toml` `[stt] ws_socket`), so
+you can match a config line to a running agent directly. Note whisper's socket is
+`stt.sock`, not `whisper.sock` — the socket line removes that guesswork.
+
 **`stt-disable` vs `stt-uninstall`.** The LaunchAgent plist sets `RunAtLoad` +
 `KeepAlive`, so `install_stt_agent.sh stop` (a plain `SIGTERM`) is respawned
 immediately. `stt-disable` instead does `launchctl bootout`, which takes the

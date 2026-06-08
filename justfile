@@ -59,7 +59,7 @@ stt-list:
         printf 'stopped  %-32s (plist present, not loaded)\n' "$label"
       fi
       # Live backend probe — canonical sockets only (a custom label's socket is
-      # not derivable from its label, so it gets no live line by design).
+      # not derivable from its label, so it gets no socket/live line by design).
       sock=""
       case "$label" in
         pipecat.stt-server)          sock="{{cache_dir}}/stt.sock" ;;
@@ -67,6 +67,10 @@ stt-list:
         pipecat.stt-server.nemotron) sock="{{cache_dir}}/nemotron.sock" ;;
       esac
       if [[ -n "$sock" ]]; then
+        # Print the socket in the same ~-form onoats config.toml's `ws_socket`
+        # uses, so an operator can match a config line to an agent directly
+        # (note whisper's socket is `stt.sock`, not `whisper.sock`).
+        printf '         socket: %s\n' "${sock/#$HOME/~}"
         # status raises SystemExit(1) on a stopped/absent socket and never prints
         # "stopped"/"unreachable" itself, so the recipe owns that display.
         if live=$(uv run python -m stt_server status --socket-path "$sock" 2>/dev/null); then
@@ -75,6 +79,8 @@ stt-list:
         else
           printf '         live: stopped/unreachable\n'
         fi
+      else
+        printf '         socket: (custom label — not in the canonical map)\n'
       fi
     done
     if [[ "$found" -eq 0 ]]; then
