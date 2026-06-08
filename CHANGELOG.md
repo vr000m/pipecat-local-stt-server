@@ -5,6 +5,30 @@ All notable changes to `pipecat-local-stt-server` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`justfile` operator recipes for managing the STT LaunchAgents.** New macOS
+  recipes — `just stt-list`, `stt-status <backend>`, `stt-enable <backend>`,
+  `stt-disable <backend>`, `stt-install <backend>`, `stt-uninstall <backend>` —
+  give a cross-agent "operate the listed servers" surface that
+  `scripts/install_stt_agent.sh` (one agent per invocation) structurally lacks.
+  Backends are `whisper` / `parakeet` / `nemotron`, mapped to the labels and
+  sockets in the README per-ASR table (a test asserts the map mirrors the
+  table). `stt-disable` boots the agent out but keeps the plist (reloads at next
+  login); `stt-uninstall` removes the plist durably. Install/uninstall delegate
+  to `scripts/install_stt_agent.sh` rather than reimplementing plist rendering.
+
+### Fixed
+
+- **`just stt-disable` / `stt-enable` now propagate `launchctl` failures.** A
+  failed `launchctl bootout` / `bootstrap` / `kickstart` was previously masked by
+  the recipe's success `echo` (exit 0 reported while the agent was still running
+  or never started). Each state change is now guarded and surfaces a non-zero
+  exit with an error on stderr; `stt-enable` skips `kickstart` once `bootstrap`
+  fails.
+
 ## [0.3.1] - 2026-06-06
 
 ### Fixed
