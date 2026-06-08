@@ -55,18 +55,23 @@ def _make_stub_dir(
     *,
     print_loaded: bool = False,
     status_exit: int = 0,
+    fail_actions: tuple[str, ...] = (),
 ) -> tuple[Path, Path]:
     """Stub ``launchctl`` / ``id`` / ``uv`` that log argv to ``argv.log``.
 
     ``print_loaded`` controls ``launchctl print``'s exit code (0 == agent
     loaded). ``status_exit`` controls the exit code of the stubbed
     ``uv run python -m stt_server status`` probe (non-zero == stopped socket).
+    ``fail_actions`` names ``launchctl`` subcommands (e.g. ``bootout``,
+    ``bootstrap``, ``kickstart``) that should exit non-zero, so recipe
+    error-handling on a failed state change can be exercised.
     """
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir()
     argv_log = tmp_path / "argv.log"
 
     print_rc = 0 if print_loaded else 1
+    fail_set = " ".join(fail_actions)
     _write_executable(
         stub_dir / "launchctl",
         f"""#!/usr/bin/env bash
@@ -77,6 +82,10 @@ if [[ "$1" == "print" ]]; then
     fi
     exit {print_rc}
 fi
+FAIL_ACTIONS="{fail_set}"
+for a in $FAIL_ACTIONS; do
+    [[ "$1" == "$a" ]] && exit 1
+done
 exit 0
 """,
     )
@@ -375,6 +384,18 @@ def test_stt_disable_idempotent_when_not_loaded(tmp_path):
     assert not any(ln.startswith("launchctl bootout") for ln in _argv_lines(argv_log))
 
 
+def test_stt_disable_fails_when_bootout_fails(tmp_path):
+    # Agent is loaded but `launchctl bootout` returns non-zero. The recipe must
+    # surface the failure (non-zero exit, no success line) rather than masking
+    # it behind the success echo — set -uo pipefail alone does NOT abort here.
+    stub_dir, _ = _make_stub_dir(tmp_path, print_loaded=True, fail_actions=("bootout",))
+    home = _home_with_agents(tmp_path, ["pipecat.stt-server"])
+    res = _run_just(["stt-disable", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode != 0, "bootout failure must propagate"
+    assert "booted out" not in res.stdout
+    assert "bootout failed" in res.stderr
+
+
 # --------------------------------------------------------------------------- #
 # stt-enable: actionable error when plist is absent
 # --------------------------------------------------------------------------- #
@@ -386,6 +407,30 @@ def test_stt_enable_missing_plist_errors(tmp_path):
     res = _run_just(["stt-enable", "whisper"], home=home, stub_dir=stub_dir)
     assert res.returncode != 0
     assert "stt-install" in res.stderr
+
+
+def test_stt_enable_fails_when_bootstrap_fails(tmp_path):
+    # plist present, but `launchctl bootstrap` fails — the recipe must exit
+    # non-zero, skip kickstart, and not print the success line.
+    stub_dir, argv_log = _make_stub_dir(tmp_path, fail_actions=("bootstrap",))
+    home = _home_with_agents(tmp_path, ["pipecat.stt-server"])
+    res = _run_just(["stt-enable", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode != 0, "bootstrap failure must propagate"
+    assert "bootstrapped + kickstarted" not in res.stdout
+    assert "bootstrap failed" in res.stderr
+    # kickstart must not run once bootstrap failed.
+    assert not any(ln.startswith("launchctl kickstart") for ln in _argv_lines(argv_log))
+
+
+def test_stt_enable_fails_when_kickstart_fails(tmp_path):
+    # bootstrap succeeds, but `launchctl kickstart` fails — still non-zero and
+    # no success line (the agent was loaded but never started).
+    stub_dir, _ = _make_stub_dir(tmp_path, fail_actions=("kickstart",))
+    home = _home_with_agents(tmp_path, ["pipecat.stt-server"])
+    res = _run_just(["stt-enable", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode != 0, "kickstart failure must propagate"
+    assert "bootstrapped + kickstarted" not in res.stdout
+    assert "kickstart failed" in res.stderr
 
 
 # --------------------------------------------------------------------------- #

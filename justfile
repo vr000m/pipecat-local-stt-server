@@ -126,7 +126,13 @@ stt-disable backend:
       echo "stt-disable: $label not loaded — nothing to do"
       exit 0
     fi
-    launchctl bootout "gui/$uid/$label"
+    # Guard explicitly: set -uo pipefail does NOT abort on a failed simple
+    # command, so without this the success echo below would mask a bootout
+    # failure and report exit 0 while the agent is still running.
+    if ! launchctl bootout "gui/$uid/$label"; then
+      echo "stt-disable: launchctl bootout failed for $label" >&2
+      exit 1
+    fi
     echo "stt-disable: booted out $label (plist kept; reloads at next login)."
     echo "             Use 'just stt-uninstall $backend' to remove it durably."
 
@@ -145,8 +151,17 @@ stt-enable backend:
       echo "stt-enable: no plist at $plist — run 'just stt-install $backend' first" >&2
       exit 1
     fi
-    launchctl bootstrap "gui/$uid" "$plist"
-    launchctl kickstart "gui/$uid/$label"
+    # Guard each state change: set -uo pipefail does NOT abort on a failed
+    # simple command, so an unguarded failure would be masked by the success
+    # echo (exit 0 while the agent never started).
+    if ! launchctl bootstrap "gui/$uid" "$plist"; then
+      echo "stt-enable: launchctl bootstrap failed for $label" >&2
+      exit 1
+    fi
+    if ! launchctl kickstart "gui/$uid/$label"; then
+      echo "stt-enable: launchctl kickstart failed for $label" >&2
+      exit 1
+    fi
     echo "stt-enable: bootstrapped + kickstarted $label"
 
 # Install an agent — delegates to install_stt_agent.sh (no plist reimplementation).
