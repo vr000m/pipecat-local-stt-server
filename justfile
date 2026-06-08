@@ -19,6 +19,10 @@
 
 set shell := ["bash", "-uc"]
 
+# cache_dir / la_dir derive from $HOME via env_var(), which `just` evaluates when
+# the recipe runs (not at parse time) — that runtime evaluation is what lets the
+# tests point them at a temp HOME. Like `script` below, both are overridable on
+# the command line (e.g. `just la_dir=/tmp/x stt-list`).
 cache_dir := env_var('HOME') / "Library/Caches/pipecat-stt"
 la_dir := env_var('HOME') / "Library/LaunchAgents"
 # Overridable so tests can point install/uninstall delegation at a stub.
@@ -28,14 +32,19 @@ script := justfile_directory() / "scripts/install_stt_agent.sh"
 default:
     @just --list
 
-# Resolve a backend name to "LABEL SOCKET BACKEND_NAME"; fail fast on unknown.
+# Resolve a backend name to LABEL / SOCKET / BACKEND_NAME on three separate lines
+# (one field per line so a socket path containing spaces survives the read in the
+# callers); fail fast on unknown. `quote()` shell-escapes the interpolated arg so
+# it can never break out of the `case` and run as a command — the `case` arms are
+# the allowlist, everything else exits non-zero.
 _resolve backend:
     #!/usr/bin/env bash
-    case "{{backend}}" in
-      whisper)  echo "pipecat.stt-server {{cache_dir}}/stt.sock mlx" ;;
-      parakeet) echo "pipecat.stt-server.parakeet {{cache_dir}}/parakeet.sock parakeet" ;;
-      nemotron) echo "pipecat.stt-server.nemotron {{cache_dir}}/nemotron.sock nemotron" ;;
-      *) echo "error: unknown backend '{{backend}}' (valid: whisper, parakeet, nemotron)" >&2; exit 1 ;;
+    backend={{quote(backend)}}
+    case "$backend" in
+      whisper)  printf '%s\n' "pipecat.stt-server" "{{cache_dir}}/stt.sock" "mlx" ;;
+      parakeet) printf '%s\n' "pipecat.stt-server.parakeet" "{{cache_dir}}/parakeet.sock" "parakeet" ;;
+      nemotron) printf '%s\n' "pipecat.stt-server.nemotron" "{{cache_dir}}/nemotron.sock" "nemotron" ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron)" >&2; exit 1 ;;
     esac
 
 # List every pipecat.stt-server* agent with state, pid, and live backend.
@@ -86,22 +95,32 @@ stt-list:
     if [[ "$found" -eq 0 ]]; then
       echo "no pipecat.stt-server* agents found in {{la_dir}}"
     fi
+    # Deliberate: this recipe is a read-only status sweep. Per-agent probe
+    # failures (stopped socket, unloaded agent) are already absorbed into display
+    # lines above, so the recipe as a whole always succeeds. Any new probe added
+    # below must guard its own non-zero with `|| echo …` to preserve this.
     exit 0
 
 # Wire status probe for one backend (exits with the probe's own status).
 stt-status backend:
     #!/usr/bin/env bash
     set -uo pipefail
-    resolved=$(just _resolve {{backend}}) || exit 1
-    read -r label sock bk <<<"$resolved"
+    backend={{quote(backend)}}
+    resolved=$(just _resolve "$backend") || exit 1
+    # One field per line (so a spaced socket path survives); three reads keep
+    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
+    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
     exec uv run python -m stt_server status --socket-path "$sock"
 
 # Stop an agent until next login (launchctl bootout; plist kept). Idempotent.
 stt-disable backend:
     #!/usr/bin/env bash
     set -uo pipefail
-    resolved=$(just _resolve {{backend}}) || exit 1
-    read -r label sock bk <<<"$resolved"
+    backend={{quote(backend)}}
+    resolved=$(just _resolve "$backend") || exit 1
+    # One field per line (so a spaced socket path survives); three reads keep
+    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
+    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
     uid=$(id -u)
     if ! launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
       echo "stt-disable: $label not loaded — nothing to do"
@@ -109,18 +128,21 @@ stt-disable backend:
     fi
     launchctl bootout "gui/$uid/$label"
     echo "stt-disable: booted out $label (plist kept; reloads at next login)."
-    echo "             Use 'just stt-uninstall {{backend}}' to remove it durably."
+    echo "             Use 'just stt-uninstall $backend' to remove it durably."
 
 # Re-load + start an agent from its existing plist (no re-render).
 stt-enable backend:
     #!/usr/bin/env bash
     set -uo pipefail
-    resolved=$(just _resolve {{backend}}) || exit 1
-    read -r label sock bk <<<"$resolved"
+    backend={{quote(backend)}}
+    resolved=$(just _resolve "$backend") || exit 1
+    # One field per line (so a spaced socket path survives); three reads keep
+    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
+    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
     uid=$(id -u)
     plist="{{la_dir}}/$label.plist"
     if [[ ! -e "$plist" ]]; then
-      echo "stt-enable: no plist at $plist — run 'just stt-install {{backend}}' first" >&2
+      echo "stt-enable: no plist at $plist — run 'just stt-install $backend' first" >&2
       exit 1
     fi
     launchctl bootstrap "gui/$uid" "$plist"
@@ -131,8 +153,11 @@ stt-enable backend:
 stt-install backend:
     #!/usr/bin/env bash
     set -uo pipefail
-    resolved=$(just _resolve {{backend}}) || exit 1
-    read -r label sock bk <<<"$resolved"
+    backend={{quote(backend)}}
+    resolved=$(just _resolve "$backend") || exit 1
+    # One field per line (so a spaced socket path survives); three reads keep
+    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
+    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
     PIPECAT_STT_LABEL="$label" PIPECAT_STT_SOCKET="$sock" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" install
 
@@ -140,7 +165,10 @@ stt-install backend:
 stt-uninstall backend:
     #!/usr/bin/env bash
     set -uo pipefail
-    resolved=$(just _resolve {{backend}}) || exit 1
-    read -r label sock bk <<<"$resolved"
+    backend={{quote(backend)}}
+    resolved=$(just _resolve "$backend") || exit 1
+    # One field per line (so a spaced socket path survives); three reads keep
+    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
+    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
     PIPECAT_STT_LABEL="$label" PIPECAT_STT_SOCKET="$sock" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" uninstall

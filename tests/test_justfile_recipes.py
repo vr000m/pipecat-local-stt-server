@@ -94,12 +94,14 @@ exec /usr/bin/id "$@"
     )
 
     # uv stub: log argv; for `uv run python -m stt_server status ...` emit a
-    # status-shaped line and exit `status_exit`.
+    # status-shaped line and exit `status_exit`. Dispatch is argv-position-aware
+    # (run / -m stt_server / status), not a substring match on the whole arg
+    # string, so it fails loud if the `uv run … status` invocation shape changes.
     _write_executable(
         stub_dir / "uv",
         f"""#!/usr/bin/env bash
 printf 'uv %s\\n' "$*" >> {argv_log!s}
-if [[ "$*" == *"stt_server status"* ]]; then
+if [[ "$1" == "run" && "$4" == "stt_server" && "$5" == "status" ]]; then
     if [[ {status_exit} -eq 0 ]]; then
         printf 'stt_server: ok\\n  backend: nemotron (model: x)\\n'
     fi
@@ -182,14 +184,22 @@ def test_just_list_exposes_public_recipes(tmp_path):
     ],
 )
 def test_resolve_maps_each_backend(tmp_path, backend, label, sock_name, bk):
+    # Drive resolution through the public `stt-install` recipe — its delegation
+    # stub captures LABEL/SOCKET/BACKEND — rather than invoking the private
+    # `_resolve` helper directly, so this survives a future `_resolve` refactor.
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
-    res = _run_just(["_resolve", backend], home=home, stub_dir=stub_dir)
+    fake_script, env_log = _delegation_stub(tmp_path)
+    res = _run_just(
+        [f"script={fake_script}", "stt-install", backend],
+        home=home,
+        stub_dir=stub_dir,
+    )
     assert res.returncode == 0, res.stderr
-    out_label, out_sock, out_bk = res.stdout.split()
-    assert out_label == label
-    assert out_sock == f"{home}/Library/Caches/pipecat-stt/{sock_name}"
-    assert out_bk == bk
+    logged = env_log.read_text()
+    assert f"LABEL={label}" in logged
+    assert f"SOCKET={home}/Library/Caches/pipecat-stt/{sock_name}" in logged
+    assert f"BACKEND={bk}" in logged
 
 
 def test_unknown_backend_fails_fast_and_lists_valid(tmp_path):
@@ -207,33 +217,59 @@ def test_unknown_backend_fails_fast_and_lists_valid(tmp_path):
 
 
 def _readme_map() -> dict[str, tuple[str, str]]:
-    """Parse the README per-ASR table into {backend: (label, socket)}."""
-    text = README.read_text()
-    # Non-capturing group so findall returns the whole row, not just the name.
-    rows = re.findall(r"^\|[ ]*(?:whisper|parakeet|nemotron)\b.*$", text, re.MULTILINE)
+    """Parse the README per-ASR table into {backend: (label, socket)}.
+
+    Anchors on the table header and asserts its column order before indexing
+    cells by position, so a future column insertion/reorder in the README fails
+    loudly here instead of silently mis-mapping label/socket.
+    """
+    lines = README.read_text().splitlines()
+    header_idx = next(
+        (
+            i
+            for i, ln in enumerate(lines)
+            if ln.startswith("|") and "LaunchAgent label" in ln and "Socket" in ln
+        ),
+        None,
+    )
+    assert header_idx is not None, "README per-ASR table header not found"
+    header = [c.strip() for c in lines[header_idx].split("|")[1:-1]]
+    assert header[:3] == ["ASR", "LaunchAgent label", "Socket"], (
+        f"README per-ASR table column order changed: {header}"
+    )
     out: dict[str, tuple[str, str]] = {}
-    for row in rows:
-        cells = [c.strip() for c in row.split("|")[1:-1]]
-        backend = re.match(r"(whisper|parakeet|nemotron)", cells[0]).group(1)
-        label = cells[1].strip("`")
-        socket = cells[2].strip("`")
-        out[backend] = (label, socket)
+    for ln in lines[header_idx + 2 :]:  # skip the header row + `|---|` separator
+        if not ln.startswith("|"):
+            break  # table ends at the first non-row line
+        cells = [c.strip() for c in ln.split("|")[1:-1]]
+        m = re.match(r"(whisper|parakeet|nemotron)\b", cells[0])
+        if not m:
+            continue
+        assert len(cells) == 4, f"unexpected column count in per-ASR row: {cells}"
+        out[m.group(1)] = (cells[1].strip("`"), cells[2].strip("`"))
     return out
 
 
 def test_justfile_map_mirrors_readme(tmp_path):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
+    fake_script, env_log = _delegation_stub(tmp_path)
     readme = _readme_map()
     assert set(readme) == set(BACKENDS), f"README table backends: {set(readme)}"
     for backend, (label, socket) in readme.items():
-        res = _run_just(["_resolve", backend], home=home, stub_dir=stub_dir)
+        # Resolve via the public `stt-install` recipe (delegation stub), not the
+        # private `_resolve` helper — same mirror invariant, public interface.
+        res = _run_just(
+            [f"script={fake_script}", "stt-install", backend],
+            home=home,
+            stub_dir=stub_dir,
+        )
         assert res.returncode == 0, res.stderr
-        out_label, out_sock, _ = res.stdout.split()
-        assert out_label == label, f"{backend}: label drift"
+        logged = env_log.read_text()
+        assert f"LABEL={label}" in logged, f"{backend}: label drift"
         # README uses ~ ; justfile uses $HOME — compare after expansion.
         expanded = socket.replace("~", str(home), 1)
-        assert out_sock == expanded, f"{backend}: socket drift {out_sock} != {expanded}"
+        assert f"SOCKET={expanded}" in logged, f"{backend}: socket drift"
 
 
 # --------------------------------------------------------------------------- #

@@ -1,6 +1,6 @@
 # Task: justfile operator layer for managing the STT LaunchAgents
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: Install & Packaging
 **Assigned to**: Claude
 **Priority**: Medium
@@ -380,6 +380,25 @@ _(to be filled during implementation)_
 
 ## Final Results
 
-_(to be filled on completion)_
+Delivered all three phases:
+
+- **`justfile`** — read-only recipes (`stt-list`, `stt-status`) and lifecycle
+  recipes (`stt-disable`, `stt-enable`, `stt-install`, `stt-uninstall`), with a
+  private `_resolve` helper holding the backend → (label, socket, backend-name)
+  map. Install/uninstall delegate to `scripts/install_stt_agent.sh` (no plist
+  reimplementation); `stt-list` prefix-sweeps `pipecat.stt-server*` so custom
+  labels surface. `stt-disable` ≠ `stt-uninstall` (bootout keeps the plist).
+- **`tests/test_justfile_recipes.py`** — hermetic recipe tests (stub
+  `launchctl`/`id`/`uv`, temp `HOME`), a README↔justfile map mirror test, and a
+  Koda-safety negative-contract test.
+- **README** — "Managing agents with `just`" section + the per-ASR socket table
+  the mirror test parses.
+
+Post-review hardening (deep-review findings): `{{backend}}` is shell-escaped via
+`just`'s `quote()` at every call site (closes a command-injection vector);
+`_resolve` emits one field per line so spaced socket paths parse correctly; the
+resolution/mirror tests drive the public `stt-install` recipe instead of the
+private `_resolve`; the `uv` stub dispatch is argv-position-aware; and the
+README-table parser anchors on the header before indexing columns.
 
 <!-- reviewed: 2026-06-07 @ f144271594d3cf4660fb40d36db9ac4637b4e1e8 -->
