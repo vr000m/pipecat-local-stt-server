@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Document running the server on loopback TCP (`localhost:port`).** Added a
+  `uv run` prerequisite note to the "Running the server" section (bare `python -m
+  stt_server` fails with `ModuleNotFoundError: No module named 'websockets'`), a
+  minimal no-token loopback-TCP example (auth is warn-only on loopback), and a
+  "Ports" note: there is no default port (`--port` is required; `--port 0`
+  lets the OS assign one), and V1 rejects non-loopback binds. No code changes.
+
 ### Added
 
 - **`justfile` operator recipes for managing the STT LaunchAgents.** New macOS
