@@ -1,6 +1,6 @@
 # Task: Add NVIDIA Nemotron 3.5 ASR streaming backend (0.3.0)
 
-**Status**: Implemented — PR #7 open / in review (all phases 0-3 complete 2026-06-05)
+**Status**: Shipped — PR #7 merged 2026-06-06 (all phases 0-3 complete 2026-06-05). Dependency-packaging follow-up done 2026-06-08: `nemotron` promoted from git-pinned dev group to a published `mlx-audio>=0.4.4` extra (v0.3.2).
 **Component**: ASR Backends
 **Assigned to**: Claude
 **Priority**: Medium
@@ -461,8 +461,12 @@ clean.
   and only `_thread_util` is shared today), but once the three copies land and are
   confirmed byte-identical, a single `_MetalDecodeBackend`-style consolidation pass
   is the right cleanup — a tracked decision, not silent 3× copy-paste drift.
-- **Promote the `nemotron` dev group to a published extra** once `mlx-audio`
-  releases a version containing PR #774 (clean version pin, see Dependency reality).
+- ~~**Promote the `nemotron` dev group to a published extra** once `mlx-audio`
+  releases a version containing PR #774 (clean version pin, see Dependency reality).~~
+  **DONE 2026-06-08 (v0.3.2):** `mlx-audio 0.4.4` (first PyPI release carrying
+  #774) is now pinned as `mlx-audio>=0.4.4` in a `[project.optional-dependencies]`
+  `nemotron` extra; the git-pinned dev group is removed. `from mlx_audio.stt import
+  load` verified against 0.4.4.
 <!-- reviewed: 2026-06-05 @ e0593b7cb82365782de90dc37f2c3bc3041eedd3 -->
 
 ## Progress

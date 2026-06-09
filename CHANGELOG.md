@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-08
+
+### Changed
+
+- **Nemotron is now a clean PyPI extra (`uv sync --extra nemotron`), no longer a
+  git-pinned dev group.** `mlx-audio>=0.4.4` is the first published release
+  carrying Nemotron STT support ([Blaizzy/mlx-audio#774](https://github.com/Blaizzy/mlx-audio/pull/774),
+  merged 2026-06-05), so the backend's dependency moved from a `[dependency-groups]`
+  git-pin (a direct-URL dep PyPI forbids in published extras) to a versioned
+  `[project.optional-dependencies]` entry alongside `mlx` and `parakeet`. Install
+  with `uv sync --extra nemotron` (the old `--group nemotron` no longer exists);
+  `pip install "pipecat-local-stt-server[nemotron]"` now resolves from PyPI.
+
 ### Documentation
 
 - **Document running the server on loopback TCP (`localhost:port`).** Added a

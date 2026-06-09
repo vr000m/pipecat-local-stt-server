@@ -1,6 +1,6 @@
 [project]
 name = "pipecat-local-stt-server"
-version = "0.3.1"
+version = "0.3.2"
 description = "Standalone local WebSocket transcription (STT) server, client, and pluggable ASR backends for the Pipecat ecosystem"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -35,6 +35,11 @@ client = ["websockets>=13.0"]
 mlx = ["websockets>=13.0", "mlx-whisper>=0.4.0", "numpy>=1.26"]
 # Full server install with the Parakeet TDT backend (via parakeet-mlx).
 parakeet = ["websockets>=13.0", "parakeet-mlx>=0.5.1", "numpy>=1.26"]
+# Full server install with the Nemotron 3.5 ASR backend (via mlx-audio).
+# mlx-audio>=0.4.4 is the first PyPI release carrying Nemotron STT support
+# (Blaizzy/mlx-audio#774, merged 2026-06-05); earlier releases lacked it, which
+# previously forced a git-pinned dev group. Now a clean, PyPI-installable extra.
+nemotron = ["websockets>=13.0", "mlx-audio>=0.4.4", "numpy>=1.26"]
 
 [dependency-groups]
 dev = [
@@ -45,21 +50,6 @@ dev = [
     # Lives in the always-synced dev group (not per-backend groups/extras) so
     # the suite runs without an ASR runtime extra installed.
     "numpy>=1.26",
-]
-# Nemotron 3.5 ASR backend runtime, git-pinned to the PR #774 merge commit
-# (Blaizzy/mlx-audio#774, merged 2026-06-05) because no PyPI mlx-audio release
-# yet contains Nemotron STT support — the latest, 0.4.3, was cut 2026-04-28,
-# before #774 landed. This lives in a [dependency-groups] dev group rather than
-# [project.optional-dependencies] on purpose: PEP 735 groups are NOT emitted
-# into wheel/sdist Requires-Dist, whereas a direct-URL (PEP 508 ``@ <url>``)
-# dependency in a published extra is rejected by PyPI. Keeping it here lets
-# `uv sync --group nemotron` install the backend locally while 0.3.0 stays
-# PyPI-installable. Promote to a clean ``nemotron`` extra with a version pin once
-# mlx-audio publishes a release containing #774 (tracked follow-up).
-nemotron = [
-    # numpy is pulled transitively by mlx-audio at runtime; it is declared in
-    # the dev group for the test suite, so it is intentionally not repeated here.
-    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git@14add666b5313cadff94a231ee11979f6ac1adf7",
 ]
 
 [project.urls]

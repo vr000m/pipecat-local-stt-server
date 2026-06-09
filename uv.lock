@@ -690,8 +690,8 @@ wheels = [
 
 [[package]]
 name = "mlx-audio"
-version = "0.4.3"
-source = { git = "https://github.com/Blaizzy/mlx-audio.git?rev=14add666b5313cadff94a231ee11979f6ac1adf7#14add666b5313cadff94a231ee11979f6ac1adf7" }
+version = "0.4.4"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "miniaudio" },
@@ -702,6 +702,10 @@ dependencies = [
     { name = "sounddevice" },
     { name = "tqdm" },
     { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/af/1e/f712c9f7997e5051c4da3b658f38162203bb703c750741984c8358c8b897/mlx_audio-0.4.4.tar.gz", hash = "sha256:d751e5f477517e4e7f04de5567318e2fe91b4606af5d7e4b2973603c4777814a", size = 1386491, upload-time = "2026-06-06T15:32:03.504Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/4d/93ac0e0526591c856a1ea2cd00a41f31530d9e021cc95bc9400550926d51/mlx_audio-0.4.4-py3-none-any.whl", hash = "sha256:39fe81b03e2b1354be70de82dc8bf01dd6e75efcb464150afef89f18f734d0d5", size = 1669932, upload-time = "2026-06-06T15:32:01.807Z" },
 ]
 
 [[package]]
@@ -1091,7 +1095,7 @@ wheels = [
 
 [[package]]
 name = "pipecat-local-stt-server"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "websockets" },
@@ -1103,6 +1107,11 @@ client = [
 ]
 mlx = [
     { name = "mlx-whisper" },
+    { name = "numpy" },
+    { name = "websockets" },
+]
+nemotron = [
+    { name = "mlx-audio" },
     { name = "numpy" },
     { name = "websockets" },
 ]
@@ -1119,22 +1128,22 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
-nemotron = [
-    { name = "mlx-audio" },
-]
 
 [package.metadata]
 requires-dist = [
+    { name = "mlx-audio", marker = "extra == 'nemotron'", specifier = ">=0.4.4" },
     { name = "mlx-whisper", marker = "extra == 'mlx'", specifier = ">=0.4.0" },
     { name = "numpy", marker = "extra == 'mlx'", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'nemotron'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'parakeet'", specifier = ">=1.26" },
     { name = "parakeet-mlx", marker = "extra == 'parakeet'", specifier = ">=0.5.1" },
     { name = "websockets", specifier = ">=13.0" },
     { name = "websockets", marker = "extra == 'client'", specifier = ">=13.0" },
     { name = "websockets", marker = "extra == 'mlx'", specifier = ">=13.0" },
+    { name = "websockets", marker = "extra == 'nemotron'", specifier = ">=13.0" },
     { name = "websockets", marker = "extra == 'parakeet'", specifier = ">=13.0" },
 ]
-provides-extras = ["client", "mlx", "parakeet"]
+provides-extras = ["client", "mlx", "parakeet", "nemotron"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1143,7 +1152,6 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
     { name = "ruff", specifier = ">=0.8.0" },
 ]
-nemotron = [{ name = "mlx-audio", git = "https://github.com/Blaizzy/mlx-audio.git?rev=14add666b5313cadff94a231ee11979f6ac1adf7" }]
 
 [[package]]
 name = "platformdirs"
