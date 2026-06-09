@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Split the 593-line README into a focused top page + `docs/`.** The README now
+  keeps the preamble, V1 scope, running the server, the `just` operator recipes,
+  and backend/model selection; the rest moved verbatim to
+  [`docs/operations.md`](docs/operations.md) (multi-backend operation, two-agent
+  install, A/B benchmark, health checks, Whisper hallucination knobs),
+  [`docs/integration.md`](docs/integration.md) (client usage, Pipecat integration,
+  Koda reference consumer), [`docs/protocol.md`](docs/protocol.md) (wire protocol),
+  and [`docs/migration.md`](docs/migration.md) (0.1.x → 0.2.0 upgrade). A
+  Documentation index links them; all cross-references were repointed. No content
+  was dropped.
+
 ## [0.3.2] - 2026-06-08
 
 ### Changed
