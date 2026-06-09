@@ -30,7 +30,7 @@ monorepo. BSD-2-Clause.
   is written to a per-process private `0o700` directory (created at backend
   start, removed on `close()`), never the world-listable system temp dir.
 - `NemotronBackend` shipped in `stt_server/backends/nemotron.py` (requires the
-  `nemotron` dev group — `uv sync --group nemotron`, not an extra; default model
+  `nemotron` extra — `uv sync --extra nemotron`; default model
   `mlx-community/nemotron-3.5-asr-streaming-0.6b`). Nemotron decodes
   from a temp WAV; that WAV holds raw utterance audio (PII) and is written to a
   per-process private `0o700` directory (created at backend start, removed on
@@ -68,10 +68,9 @@ uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path
 > (`127.0.0.1`/`::1`/`localhost`); a non-loopback `--host` is rejected.
 
 > **Backends need their own install.** Every `--backend` above except `echo`
-> requires a `uv sync` extra/group first — `mlx`/`parakeet` are extras
-> (`uv sync --extra mlx`), `nemotron` is a dev group (`uv sync --group
-> nemotron`). Without it you get e.g. `ModuleNotFoundError: No module named
-> 'mlx_whisper'`. See [Choosing a backend and model](#choosing-a-backend-and-model)
+> requires a `uv sync` extra first — `mlx`/`parakeet`/`nemotron` (e.g.
+> `uv sync --extra mlx`). Without it you get e.g. `ModuleNotFoundError: No module
+> named 'mlx_whisper'`. See [Choosing a backend and model](#choosing-a-backend-and-model)
 > for each backend's install command and `--model` defaults.
 
 The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,
@@ -360,10 +359,8 @@ uv sync --extra parakeet
 uv run python -m stt_server serve --backend parakeet \
     --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
 
-# Nemotron 3.5 — default model mlx-community/nemotron-3.5-asr-streaming-0.6b.
-# NOTE: installed via a dev GROUP, not an extra: `uv sync --group nemotron`
-# (there is intentionally no `--extra nemotron`).
-uv sync --group nemotron
+# Nemotron 3.5 — default model mlx-community/nemotron-3.5-asr-streaming-0.6b
+uv sync --extra nemotron
 uv run python -m stt_server serve --backend nemotron \
     --socket-path ~/Library/Caches/pipecat-stt/nemotron.sock
 
@@ -377,24 +374,12 @@ default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
 `parakeet`, `nemotron-3.5-asr-streaming-0.6b` for `nemotron`). Pointing a
 backend at a mismatched repo fails fast at decode.
 
-Nemotron ships behind a `[dependency-groups]` **dev group** rather than a
-PyPI extra (`uv sync --group nemotron`, not `--extra nemotron`). The backend
-needs Nemotron STT support from `mlx-audio`, which only landed in PR #774 —
-not yet in any published `mlx-audio` release. A dev group therefore git-pins
-the dependency directly:
-
-```bash
-# Equivalent direct install of the git-pinned mlx-audio one-liner:
-uv pip install "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio"
-```
-
-It is a dev group on purpose: a direct-URL (`@ git+…`) dependency cannot be
-emitted into a published wheel's `Requires-Dist` (PyPI rejects direct-URL
-deps in published extra metadata), whereas PEP 735 dependency groups are
-never written into wheel/sdist metadata at all. Keeping Nemotron in a dev
-group lets `uv sync --group nemotron` install it locally while 0.3.0 stays
-PyPI-clean. Once `mlx-audio` cuts a PyPI release containing #774, this can
-be promoted to a versioned `nemotron` extra.
+Nemotron's runtime dependency is `mlx-audio>=0.4.4` — the first PyPI release
+carrying Nemotron STT support ([Blaizzy/mlx-audio#774](https://github.com/Blaizzy/mlx-audio/pull/774),
+merged 2026-06-05). Before 0.4.4 this backend had to git-pin `mlx-audio` in a
+`[dependency-groups]` dev group (a direct-URL dependency PyPI rejects in a
+published extra); since 0.3.2 it is a clean, PyPI-installable `nemotron` extra
+like `mlx` and `parakeet`.
 
 Common MLX Whisper models (smaller = faster + lower RAM, larger = more
 accurate). These are `mlx-community` Hugging Face repos; the first launch
@@ -409,7 +394,7 @@ downloads and caches the weights.
 | `mlx` | `mlx-community/whisper-base` | fast, lower accuracy |
 | `mlx` | `mlx-community/whisper-tiny` | fastest, lowest accuracy |
 | `parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | **default** Parakeet TDT |
-| `nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | **default** Nemotron 3.5 ASR (dev group — `uv sync --group nemotron`) |
+| `nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | **default** Nemotron 3.5 ASR (`uv sync --extra nemotron`) |
 
 Any `mlx-community` Whisper repo (e.g. `…-large-v3-turbo-q4` quantised
 variants, or `…-large-v3-turbo` language-specialised forks) works as a
