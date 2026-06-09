@@ -38,6 +38,11 @@ monorepo. BSD-2-Clause.
 
 ## Running the server
 
+> **Prerequisite:** install deps with `uv sync` first, and run every command
+> through `uv run` (or `source .venv/bin/activate` once per shell). Bare
+> `python -m stt_server …` uses the system interpreter and fails with
+> `ModuleNotFoundError: No module named 'websockets'`.
+
 ```bash
 # UDS (recommended for local use — no port, no bearer token)
 uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend echo
