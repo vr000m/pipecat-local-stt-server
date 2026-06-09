@@ -67,6 +67,13 @@ uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path
 > Use `--port 0` to let the OS pick a free one. V1 only permits loopback binds
 > (`127.0.0.1`/`::1`/`localhost`); a non-loopback `--host` is rejected.
 
+> **Backends need their own install.** Every `--backend` above except `echo`
+> requires a `uv sync` extra/group first — `mlx`/`parakeet` are extras
+> (`uv sync --extra mlx`), `nemotron` is a dev group (`uv sync --group
+> nemotron`). Without it you get e.g. `ModuleNotFoundError: No module named
+> 'mlx_whisper'`. See [Choosing a backend and model](#choosing-a-backend-and-model)
+> for each backend's install command and `--model` defaults.
+
 The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,
 which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
 / `python -m stt_server status <flags>` — see "Checking server health"
