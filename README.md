@@ -51,11 +51,21 @@ uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock 
 uv sync --extra mlx
 uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend mlx
 
-# Loopback TCP (use --auth-token-file or PIPECAT_STT_AUTH_TOKEN env — legacy
-# KODA_STT_AUTH_TOKEN still honoured; --auth-token on argv is visible via
-# `ps` and marked DEPRECATED)
+# Loopback TCP — minimal form. Pick any free port; there is no default port,
+# so --host and --port are both required for TCP. On loopback an auth token is
+# optional (the server logs a warning and serves anyway — fine for local
+# experiments). The listener comes up on 127.0.0.1:<port>.
+uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
+
+# Loopback TCP with auth (recommended for anything non-experimental — use
+# --auth-token-file or PIPECAT_STT_AUTH_TOKEN env; legacy KODA_STT_AUTH_TOKEN
+# still honoured; --auth-token on argv is visible via `ps` and marked DEPRECATED)
 uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
+
+> **Ports:** there is no baked-in default port — you choose it (`--port 9900`).
+> Use `--port 0` to let the OS pick a free one. V1 only permits loopback binds
+> (`127.0.0.1`/`::1`/`localhost`); a non-loopback `--host` is rejected.
 
 The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,
 which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
