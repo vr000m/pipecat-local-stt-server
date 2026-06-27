@@ -143,6 +143,95 @@ from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 `--port`/`--auth-token-file` endpoint flags work for both `serve` and
 `status` subcommands.
 
+## Trust model and socket security (same-host UDS)
+
+The Unix-domain-socket transport is hardened on the server side by two
+independent measures. They are layered, not redundant:
+
+1. **Primary filesystem boundary — owner-only ancestor chain.** Before bind,
+   the server walks every directory from the socket's parent up to and
+   including the trusted root (`$HOME`) and **refuses to start** unless each
+   component is owned by the running uid and is not group/other-writable
+   (sticky-bit directories excepted). This makes the socket *un-plantable*: an
+   attacker cannot `unlink()` our socket and `bind()` their own, because they
+   have no write access on any directory that could replace it. On stock macOS
+   the chain (`~/Library/Caches/pipecat-stt` → `~/Library/Caches` → `~/Library`
+   → `~`) already satisfies this once the socket dir is `0700`. A foreign uid
+   cannot even *traverse* to the socket (no `+x` → `connect()` fails `EACCES`
+   at path resolution), so this layer alone closes the same-host foreign-uid
+   vector at the filesystem layer.
+2. **Kernel-authoritative backstop — peer-credential auth.** On every UDS
+   connection the server reads the peer's uid from the kernel
+   (`SO_PEERCRED` on Linux, `getpeereid(2)` on macOS) and rejects any peer
+   whose `uid != server uid` with a pre-handshake `403` before the WebSocket
+   handshake completes. The uid is kernel-supplied and unforgeable, so this
+   holds even if the filesystem perms are ever looser than intended. It is
+   *defense-in-depth behind* the filesystem boundary — not a strictly-stronger
+   replacement for it. Every failure path (resolver returns `None`, resolver
+   raises, missing transport socket, unsupported platform) **fails closed**
+   (rejects), logging one warning.
+3. **Bearer token — TCP/remote only.** For UDS the token is redundant (the
+   filesystem boundary + peer-cred both dominate it), so it is kept but not
+   relied on. For TCP/remote — which has neither a file-permission boundary nor
+   peer credentials — the bearer token remains the trust mechanism, alongside
+   the Origin check. This change does not weaken the TCP path.
+
+**Same-uid precondition.** Peer-cred auth assumes the client and server run as
+the **same uid** (the per-user LaunchAgent deployment satisfies this). A uid
+mismatch is treated as **reject**, not warn-and-allow. A future deployment that
+runs the server as a daemon user and the client as the logged-in user would be
+correctly rejected and would need coordination — but still no client code
+change.
+
+### Socket directory permissions (`0700`) — upgrade note
+
+`scripts/install_stt_agent.sh` creates the socket's parent directory `0700`
+from birth (`mkdir -m 700`) and also `chmod 700`s it, which **self-heals** a
+pre-existing `0755` directory left by an older install. Because the new startup
+check refuses to bind against a group/other-writable ancestor:
+
+- **Upgrading an existing host:** re-run `install_stt_agent.sh` (it repairs the
+  dir in place), or manually `chmod 700 ~/Library/Caches/pipecat-stt`.
+- **Custom socket paths:** a `PIPECAT_STT_SOCKET` / `KODA_STT_SOCKET` /
+  `STT_WS_SOCKET` pointing outside `$HOME` (e.g. `/tmp`, `/var`, a shared dir)
+  now makes the server **refuse to start** with
+  `socket directory <path> is not under the trusted root <home>`. Keep custom
+  socket paths under `$HOME`.
+
+If the server refuses to start, the error is printed as `stt_server: <message>`
+on stderr (exit 1) — grep the agent's `.err` log for
+`is not under the trusted root` or `is group/other-writable`.
+
+### Cross-repo note (Koda)
+
+Koda consumes this repo two ways: it pins the **Python client** at an immutable
+git SHA, and it runs the **server** from this repo's working **checkout at
+HEAD** (not a tagged/PyPI release). Consequences for this hardening:
+
+- **No version bump gates it, and no client pin bump is needed.** The client
+  library and wire protocol are unchanged, so Koda's pinned client stays valid
+  (a pin bump is only required when the imported client/protocol surface
+  changes). PyPI releases are irrelevant to Koda's coupling.
+- **The trigger is the checkout update, not the merge.** The hardening lands on
+  a Koda host the moment its server checkout is updated — decoupled from
+  merging to `main` (which touches no machine until something pulls). Fold the
+  coordination into that window: **re-run `install_stt_agent.sh`** so the socket
+  dir is `0700`, and confirm `KODA_STT_SOCKET` (if set) stays under `$HOME`.
+- Because the startup check is **fail-closed**, the "runtime change takes effect
+  on checkout update" property is now a startup risk if perms/path are not
+  squared away in the same step — that is the entire content of the
+  coordination.
+
+### Maintainer note — macOS `getpeereid` via `ctypes`
+
+macOS has no `socket.SO_PEERCRED`, so the resolver in `stt_server/_peercred.py`
+calls `getpeereid(2)` through `ctypes`. Two details are load-bearing and must
+not be dropped: `uid_t`/`gid_t` are `c_uint32` on Darwin, and the libc function
+must have explicit `argtypes`/`restype` set (a wrong width or signature can fail
+*open* by comparing equal). libc is loaded with `use_errno=True`. The
+`socketpair()` unit test asserting `peer_uid() == os.geteuid()` is the gate that
+catches a width/signature regression — keep it.
+
 ## Whisper hallucination suppression (MLX backend)
 
 The MLX Whisper backend forwards four decode-time knobs to

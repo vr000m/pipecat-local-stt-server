@@ -1,6 +1,6 @@
 # Feature: UDS server-side trust-boundary hardening
 
-**Status:** Reviewed (2026-06-26) — ready to implement
+**Status:** Implemented (2026-06-26) on `feature/uds-trust-boundary-hardening` (phases 1–5) — pending Koda checkout coordination + merge
 **Component:** Server Transport
 **Assignee:** unassigned
 **Priority:** High (security; trust boundary)
@@ -464,20 +464,79 @@ sequenceDiagram
 
 ## Progress
 
-- [ ] Phase 1: Parent-directory enforcement
-- [ ] Phase 2: Peer-credential resolver
-- [ ] Phase 3: Wire peer-cred into the handshake
-- [ ] Phase 4: Local end-to-end smoke (multi-connection + cross-uid)
-- [ ] Phase 5: Docs + plan/README sync
+- [x] Phase 1: Parent-directory enforcement
+- [x] Phase 2: Peer-credential resolver
+- [x] Phase 3: Wire peer-cred into the handshake
+- [x] Phase 4: Local end-to-end smoke (multi-connection + cross-uid)
+- [x] Phase 5: Docs + plan/README sync
 
 ## Findings
 
 - (append findings here as work proceeds)
+- **Phase 1 (839e718):** trusted root chosen as `Path.home()` (the default socket
+  lives under `~/Library/Caches/pipecat-stt`; all install paths are under `$HOME`).
+  Consequence: any test/deployment binding a real UDS under a non-home dir (`/tmp`)
+  is correctly rejected by R1. Pre-existing UDS integration tests in
+  `tests/test_stt_server.py` and `tests/test_mlx_teardown_spike.py` were updated to
+  opt out of enforcement via the plan-sanctioned monkeypatch seam
+  (`monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", ...)`),
+  not by changing the implementation.
+- **Pre-existing failure (not this feature):**
+  `tests/test_justfile_recipes.py::test_justfile_map_mirrors_readme` fails on the
+  clean base commit too ("README per-ASR table header not found") — unrelated to
+  UDS hardening; left untouched. Suite is otherwise green.
+- **Plan gap to resolve in Phase 3:** the `websockets>=16,<17` pin (acceptance
+  criterion + Files-to-modify table) is not assigned to any phase's `Impl files`
+  slot. Folding it into Phase 3 (whose peer-cred wiring depends on the websockets
+  16 handshake API), touching `pyproject.toml` + `uv.lock` as a noted deviation.
 
 ## Issues & Solutions
 
-_(to be filled during implementation)_
+- **R1 breaks `/tmp`-bound tests (expected).** Enforcing the owner-only ancestor
+  chain with `trusted_root=Path.home()` means any test binding a real UDS server
+  under `/tmp` (root-owned) is correctly rejected. Resolved by opting those tests
+  out of enforcement via the plan-sanctioned monkeypatch seam
+  (`monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", ...)`) in
+  `tests/test_stt_server.py` and `tests/test_mlx_teardown_spike.py` — the
+  implementation was not weakened.
+- **`websockets` pin had no phase home.** The `>=16,<17` pin (acceptance criterion
+  + Files-to-modify table) was not assigned to any phase's `Impl files` slot.
+  Folded into Phase 3 (whose peer-cred wiring depends on the websockets 16
+  handshake API); `pyproject.toml` + `uv.lock` updated as a noted deviation.
+- **`test_branch_diff_does_not_touch_koda_surface` (sibling-feature guard) is red
+  by design.** This guard (from the agents-justfile feature) forbids any change
+  under `stt_server/` or to `install_stt_agent.sh`. This security feature
+  intentionally hardens exactly that surface. Per the cross-repo contract the
+  guard's *intent* is to protect the imported client + wire protocol (neither of
+  which this branch touches). Left UNCHANGED per user decision (out of this plan's
+  file scope). One-line fix if narrowing to the contract's actual pin-bump trigger
+  is desired: scope the `forbidden` filter to `stt_server/client.py` +
+  `stt_server/protocol.py` instead of the whole `stt_server/` prefix.
+- **`test_justfile_map_mirrors_readme` failure is pre-existing**, unrelated to this
+  feature (fails on the clean base commit too — "README per-ASR table header not
+  found"). Not addressed here.
 
 ## Final Results
 
-[Fill this section when the work is complete]
+Phases 1–5 implemented on `feature/uds-trust-boundary-hardening`:
+
+| Phase | Commit | Outcome |
+|---|---|---|
+| 1 — Parent-directory enforcement | `839e718` | `_enforce_socket_dir_secure` (owner-only ancestor walk to `$HOME`, creates `0700`), wired into `start()`; `_cmd_serve` turns startup errors into `stt_server: <msg>` + exit 1; `install_stt_agent.sh` creates the socket dir `0700`. |
+| 2 — Peer-credential resolver | `49b34dc` | `stt_server/_peercred.py` — `peer_uid(sock)` (Linux `SO_PEERCRED` / macOS `getpeereid` ctypes), fail-closed; verified on host (`peer_uid == os.geteuid()`). |
+| 3 — Wire peer-cred into handshake | `7773c79` | UDS-only fail-closed `403` gate in `_process_request`, independent of the bearer-token branch; TCP untouched; `websockets` pinned `>=16,<17`. |
+| 4 — Local end-to-end smoke | `35de5ec` | `scripts/smoke_peercred.py` + `just smoke-peercred` + multi-connection pytest; same-uid concurrency PASS, cross-uid leg skips cleanly without a second uid. |
+| 5 — Docs + plan/README sync | (this commit) | Trust-model + socket-security + Koda coordination notes in `operations.md`; pre-handshake reject table in `protocol.md`; status rows updated. |
+
+**Verification:** each phase's `Test command:` passed; full suite green except the
+two documented non-feature reds above. `ruff check` + `ruff format --check` clean.
+
+**Open items (owner: maintainer):**
+- Koda checkout-update coordination (re-run `install_stt_agent.sh` for the
+  `0755→0700` socket-dir upgrade; confirm `KODA_STT_SOCKET` stays under `$HOME`).
+  No version/pin bump required — see `docs/operations.md` → "Cross-repo note (Koda)".
+- Decide the fate of the `test_branch_diff_does_not_touch_koda_surface` guard
+  (leave as documented known-failure, or narrow per the one-liner above).
+- The cross-uid `403` smoke leg is unverified in single-uid CI/dev; run
+  `just smoke-peercred` on a host with a second uid / passwordless `sudo` to
+  exercise it for real.
