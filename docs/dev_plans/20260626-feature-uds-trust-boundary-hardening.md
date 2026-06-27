@@ -8,7 +8,7 @@
 **Created:** 2026-06-26
 **Objective:** Close the two remaining same-host UDS trust-boundary gaps in
 `stt_server` entirely on the server side — (1) make the socket un-plantable by
-enforcing an owner-only, owner-owned parent directory before bind, and (2)
+enforcing an owner-only, owner-owned socket directory chain before bind, and (2)
 authenticate the connecting client by kernel-supplied peer credentials so a
 foreign local uid cannot connect even if it reaches the socket.
 
@@ -24,7 +24,7 @@ sides. Three server-side measures were proposed; one is already shipped:
 
 | # | Measure | State |
 |---|---|---|
-| 1 | Un-plantable socket: `0700`, owner-owned parent dir, refuse to start otherwise | **Missing** — this plan |
+| 1 | Un-plantable socket: owner-owned, non-writable ancestor chain through the trusted root, refuse to start otherwise | **Missing** — this plan |
 | 2 | `umask`-at-bind so the socket inode is `0600` from birth | **Already done** — `server.py:152` wraps `ws_unix_serve` in `os.umask(0o077)` + `finally` restore, then `chmod 0o600` at `server.py:162-166`. Out of scope. |
 | 3 | Peer-credential auth: reject any peer whose `uid != server uid` | **Missing** — this plan |
 
@@ -32,17 +32,19 @@ Why #1 is highest-leverage: the `0600` mode on the socket *inode* stops a
 foreign uid from `connect()`-ing, but does **not** stop the plant/swap attack.
 An attacker with write on the parent directory `unlink()`s our inode and
 `bind()`s their own; the client then connects to the attacker's socket. The
-only defense is denying others write on the parent — i.e. a `0700`,
-owner-owned parent dir, verified at startup. On stock macOS `~/Library/Caches`
-is `0700`, but the `pipecat-stt/` subdir we `mkdir` inherits the process umask
+only defense is denying others write on the path that can replace the socket —
+i.e. every ancestor from the socket's bind directory through the trusted root is
+owner-owned and not group/other-writable (sticky-bit directories excepted),
+verified at startup. On stock macOS `~/Library/Caches` is `0700`, but the
+`pipecat-stt/` subdir we `mkdir` inherits the process umask
 (commonly `0755`), and a custom `STT_WS_SOCKET` pointing at a world-writable
 location defeats everything. Enforcing at startup makes it robust regardless of
 where the path points.
 
 Why #3 is **defense-in-depth, not the primary boundary** for the same-host case:
-once #1 enforces a `0700` owner-owned parent dir, a foreign uid already cannot
-even *traverse* to the socket (no `+x` on the dir → `connect()` fails `EACCES`
-at path resolution, before the socket mode or any handshake). So #1 alone closes
+once #1 enforces the owner-only ancestor chain, a foreign uid already cannot even
+*traverse* to the socket (no `+x` on the relevant directory → `connect()` fails
+`EACCES` at path resolution, before the socket mode or any handshake). So #1 alone closes
 the same-host foreign-uid vector at the filesystem layer. #3 still earns its
 place because the uid it checks is **kernel-supplied and unforgeable**, so it
 holds even when the filesystem perms are looser than intended (a misconfigured
@@ -74,14 +76,16 @@ still not a client code change. This precondition is written into Requirements.
 
 ## Requirements
 
-1. **R1 — Parent-dir enforcement (blocking, fatal).** Before bind, the server
-   MUST verify the socket's parent directory is owned by the running uid
-   (`st_uid == os.geteuid()`) and has mode `0700` (no group/other bits:
-   `st_mode & 0o077 == 0`). If the server creates the directory it MUST create
-   it `0700`. If the directory exists but fails either check, the server MUST
-   refuse to start with an actionable error naming the path and the offending
-   condition. It MUST NOT silently `chmod`/`chown` a pre-existing directory it
-   does not own.
+1. **R1 — Socket-dir ancestor enforcement (blocking, fatal).** Before bind, the
+   server MUST walk every directory component from the socket's bind directory
+   up to and including the trusted root directory. Every component in that walk
+   MUST be owned by the running uid (`st_uid == os.geteuid()`) and MUST NOT be
+   group-writable or other-writable (`st_mode & 0o022 == 0`), except sticky-bit
+   directories. If the server creates missing socket directories, it MUST create
+   them `0700` and then re-`stat` the full walk. If any component fails either
+   check, the server MUST refuse to start with an actionable error naming the
+   path and offending condition. It MUST NOT silently `chmod`/`chown` a
+   pre-existing directory it does not own.
 2. **R2 — Peer-cred auth (UDS only).** On the UDS transport, the server MUST
    reject any connection whose peer uid `!= os.geteuid()` before the WebSocket
    handshake completes, returning a `403`. TCP connections are unaffected (no
@@ -99,8 +103,9 @@ still not a client code change. This precondition is written into Requirements.
    UDS-token-is-now-redundant observation is documented but the token plumbing
    is NOT ripped out in this change (keeps the diff minimal and reversible).
 6. **R6 — Tests.** Cross-platform tests including the macOS `ctypes getpeereid`
-   path; same-uid connections succeed, the directory-mode failure refuses to
-   start, and the peer-cred resolver is unit-tested in isolation.
+   path; same-uid connections succeed, directory-mode/owner failures anywhere in
+   the ancestor walk refuse to start, `peer_uid` exceptions return `403`, and the
+   peer-cred resolver is unit-tested in isolation.
 
 ---
 
@@ -112,16 +117,18 @@ still not a client code change. This precondition is written into Requirements.
 **Test files:** `tests/test_stt_server.py`
 **Test command:** `uv run pytest tests/test_stt_server.py -k "parent_dir or socket_dir or 0700 or owner" -q`
 
-- [ ] Add a private helper (e.g. `_enforce_socket_dir_secure(path: Path)`) that:
-  creates the parent `0700` when absent (`mkdir(mode=0o700)`, then re-`stat` and
-  verify — `mkdir` mode is umask-masked, so verify rather than trust); on an
-  existing dir, `stat` and require `st_uid == os.geteuid()` and
-  `st_mode & 0o077 == 0`; raise a clear exception otherwise.
+- [ ] Add a private helper (e.g. `_enforce_socket_dir_secure(path: Path,
+  trusted_root: Path)`) that creates missing socket directories `0700`
+  (`mkdir(mode=0o700)`, then re-`stat` and verify — `mkdir` mode is umask-masked,
+  so verify rather than trust), then walks every component from the socket's bind
+  directory up to and including `trusted_root`. Each component must have
+  `st_uid == os.geteuid()` and no group/other write bits (`st_mode & 0o022 == 0`);
+  sticky-bit directories are allowed. Raise a clear exception naming the failing
+  component and condition otherwise.
 - [ ] Call it in `start()` immediately before the `os.umask(0o077)` block
   (replacing the bare `socket_path.parent.mkdir(parents=True, exist_ok=True)`
-  at `server.py:148-149`). Parents above the immediate dir: create with
-  `parents=True` but only assert mode/ownership on the immediate parent of the
-  socket (the bind dir) — document this boundary.
+  at `server.py:148-149`). Resolve and document the trusted root, then verify the
+  full ancestor walk rather than only the immediate parent of the socket.
 - [ ] **Failure surface — wrap the serve path, not the status probe.** Raise a
   `ValueError`/dedicated exception from the helper. The serve entrypoint
   `_cmd_serve` (`__main__.py:210-224`) runs `asyncio.run(serve(...))` with **no**
@@ -146,11 +153,17 @@ still not a client code change. This precondition is written into Requirements.
 **Test command:** `uv run pytest tests/test_peercred.py -q`
 
 - [ ] New module `stt_server/_peercred.py` exposing
-  `peer_uid(sock: socket.socket) -> int | None`:
+  `peer_uid(sock: PeerCredSocket) -> int | None`, where `PeerCredSocket` is a
+  minimal structural `Protocol` containing only the members used by the resolver
+  (`family`, `fileno()`, `getsockopt()`), rather than `socket.socket` directly.
+  This decouples the resolver from the concrete socket class and keeps mock
+  testing simple.
   - Linux: `sock.getsockopt(SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))`,
     unpack `(pid, uid, gid)`, return uid.
   - macOS: `getpeereid(2)` via `ctypes` — `libc.getpeereid(fd, byref(uid_t),
-    byref(gid_t))`, `uid_t`/`gid_t` are `c_uint32`; return uid on success.
+    byref(gid_t))`, `uid_t`/`gid_t` are `c_uint32`; set `argtypes` and `restype`
+    explicitly on the libc function and load libc with `use_errno=True` for
+    safety, portability, and correct errno propagation; return uid on success.
   - Unknown platform / call failure: return `None` (caller fails closed).
 - [ ] Keep this module import-light and side-effect-free so it is unit-testable
   without binding a server (mirror the existing single `sys.platform == "darwin"`
@@ -178,11 +191,14 @@ still not a client code change. This precondition is written into Requirements.
   socket is `None`, return `connection.respond(403, "peer not permitted\n")` and
   warn — do NOT call `peer_uid(None)` (it would raise `AttributeError` on
   `.getsockopt`/`.fileno`, an uncaught exception, not a guaranteed reject).
-- [ ] Call `peer_uid(sock)`; if it returns `None` or `!= os.geteuid()`, return
-  `connection.respond(403, "peer not permitted\n")`. Order it before/independent
-  of the bearer-token branch so UDS rejects foreign uids regardless of token.
-- [ ] Log a single warning on the fail-closed `None` path (resolver `None` *or*
-  missing socket) so an unsupported platform / unexpected transport is loud.
+- [ ] Wrap `peer_uid(sock)` in `try/except Exception`; if it raises, log the
+  exception and return `connection.respond(403, "peer not permitted\n")`. If it
+  returns `None` or `!= os.geteuid()`, return the same `403`. Order it
+  before/independent of the bearer-token branch so UDS rejects foreign uids
+  regardless of token.
+- [ ] Log a single warning on each fail-closed path (resolver `None`, resolver
+  exception, or missing socket) so an unsupported platform / unexpected transport
+  is loud.
 
 ### Phase 4 — Local end-to-end smoke (multi-connection + cross-uid)
 
@@ -195,25 +211,24 @@ Reuse the established `scripts/smoke_test_parakeet.py` pattern (real server on a
 temp UDS, driven through `stt_server.client.TranscriptionClient`). The script
 exercises two things a single-uid CI run cannot.
 
-**Why a test-only dir bypass is required.** To reach `_process_request` (where
+**Why a test-only dir seam is required.** To reach `_process_request` (where
 peer-cred runs), a foreign uid must defeat **both** filesystem layers: traverse
 the parent dir (needs `+x`) **and** open the socket (needs the socket mode). R1
-enforces the parent dir at `0700`, which blocks traversal — so relaxing only the
-socket mode to `0o666` is **not enough**; the foreign uid still fails `EACCES` at
-the directory before peer-cred is consulted. Since R1's `_enforce_socket_dir_secure`
-*refuses to start* on any dir with group/other bits, the smoke must bind into a
-deliberately-traversable dir (e.g. `0711`) with dir-enforcement bypassed for that
-one path. Add a **narrow, explicit test-only escape hatch** — an internal
-parameter/flag (e.g. `ServerConfig(_skip_socket_dir_enforcement=True)`, clearly
-named and undocumented in the public CLI) that the smoke sets. This bypasses #1
-*for the harness only* so #3 can be observed in isolation; production paths never
-set it.
+enforces the ancestor chain, which blocks traversal — so relaxing only the socket
+mode to `0o666` is **not enough**; the foreign uid still fails `EACCES` at path
+resolution before peer-cred is consulted. Since R1's `_enforce_socket_dir_secure`
+*refuses to start* on any group/other-writable component, the smoke must bind
+into a deliberately-traversable dir (e.g. `0711`) while replacing the enforcement
+helper through a test-only mechanism that is not reachable from `serve()` or
+normal `TranscriptionServer` construction (for example, a local subclass or
+monkeypatch of `_enforce_socket_dir_secure`). Do not add a `ServerConfig` field
+or equivalent public/API-reachable bypass flag.
 
 - [ ] **Cross-uid rejection (local-only, the real test).** Build
   `TranscriptionServer`/`ServerConfig` **directly** (the public `serve()` does
   not expose `unix_socket_mode` — `server.py:900` — so the smoke cannot use it)
-  with `unix_socket_mode=0o666`, the test-only dir-enforcement bypass set, and a
-  `0711` temp parent dir. Connect the example client under a second uid
+  with `unix_socket_mode=0o666`, a test-only replacement for the dir-enforcement
+  helper, and a `0711` temp parent dir. Connect the example client under a second uid
   (`sudo -u <user>` / a CI-absent dev user) and assert peer-cred (#3) rejects.
   Assert the reject as the existing 401 test does: catch
   `websockets.exceptions.InvalidStatus` and check `status_code == 403` and the
@@ -240,9 +255,9 @@ set it.
 **Test files:** n/a
 **Test command:** `uv run ruff check && uv run ruff format --check`
 
-- [ ] Document the same-host UDS trust model: parent-dir `0700` is the primary
-  filesystem boundary; peer-cred is the kernel-authoritative defense-in-depth
-  backstop; bearer token retained for TCP only.
+- [ ] Document the same-host UDS trust model: the owner-only ancestor chain is the
+  primary filesystem boundary; peer-cred is the kernel-authoritative
+  defense-in-depth backstop; bearer token retained for TCP only.
 - [ ] Note macOS `getpeereid`-via-`ctypes` wrinkle for future maintainers.
 - [ ] If the accept-path test is to assert against `docs/protocol.md` rather than
   `server.py`, add the `server.hello` field table (`protocol_version`,
@@ -259,14 +274,14 @@ set it.
 
 | File | Change |
 |---|---|
-| `stt_server/server.py:148-149` | Replace bare `mkdir` with `_enforce_socket_dir_secure()`; add the helper. |
-| `stt_server/server.py` `ServerConfig` (`:88-108`) | Add narrow test-only `_skip_socket_dir_enforcement` field (default `False`) for the Phase 4 smoke. |
-| `stt_server/server.py:261-275` | Add UDS-only peer-cred gate in `_process_request` (incl. `sock is None → 403`). |
-| `stt_server/_peercred.py` (new) | Cross-platform `peer_uid(sock)` resolver. |
+| `stt_server/server.py:148-149` | Replace bare `mkdir` with `_enforce_socket_dir_secure()`; add the full ancestor-walk helper. |
+| `stt_server/server.py:261-275` | Add UDS-only peer-cred gate in `_process_request` (incl. `sock is None` and `peer_uid` exception → `403`). |
+| `stt_server/_peercred.py` (new) | Cross-platform `peer_uid(sock)` resolver typed against a minimal structural `Protocol`. |
 | `stt_server/__main__.py` `_cmd_serve` (`:210-224`) | Wrap `asyncio.run(serve(...))` in `try/except (ValueError, OSError)` → `stt_server: <msg>` + `SystemExit(1)`. NOT the `_cmd_status` handler at `:298-300`. |
 | `scripts/install_stt_agent.sh:100` | `mkdir -m 700` the socket dir; upgrade note for existing `0755` dirs. |
+| `pyproject.toml`, `uv.lock` | Pin `websockets>=16,<17` to keep handshake API assumptions stable across major versions. |
 | `tests/test_peercred.py` (new) | Unit tests for the resolver incl. macOS ctypes path + forced `sys.platform` branch selection. |
-| `tests/test_stt_server.py:516+` | Dir-enforcement (incl. foreign-owner branch), `sock is None`, and UDS peer-cred integration tests. |
+| `tests/test_stt_server.py:516+` | Dir-enforcement (incl. foreign-owner ancestor branch), `sock is None`, `peer_uid` raises, and UDS peer-cred integration tests. |
 | `scripts/smoke_peercred.py` (new), `justfile` | Local cross-uid + multi-connection smoke; `just smoke-peercred` recipe. |
 | `docs/…` security notes, `docs/protocol.md`, `docs/dev_plans/README.md` | Trust-model docs + (optional) hello field table + status row. |
 
@@ -294,16 +309,19 @@ in Phase 2/3 via the `socketpair()` unit test before wiring in):**
 - **`getpeereid(2)` semantics:** `int getpeereid(int fd, uid_t *euid, gid_t
   *egid)`; returns 0 on success; yields the connecting peer's effective uid,
   captured at `connect()` time. `uid_t`/`gid_t` = `c_uint32` on Darwin (a wrong
-  width could fail *open* by comparing equal) — the `socketpair()` test returning
-  `os.geteuid()` is the gate against a width/signature mistake.
+  width could fail *open* by comparing equal). Set `argtypes`/`restype` on the
+  `ctypes` function and load libc with `use_errno=True`; the `socketpair()` test
+  returning `os.geteuid()` is the gate against a width/signature mistake.
 - **`SO_PEERCRED` (Linux):** `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`,
   unpack `"3i"`. Untestable on the macOS primary platform — must run on a Linux
   CI runner, or be marked "Linux-CI-only, unverified on dev host."
 
 ### Dependency facts
 
-- `websockets>=13.0` (pyproject.toml:27); installed 16.0. `process_request`
-  async/sync both accepted.
+- Pin `websockets>=16,<17` (replacing `websockets>=13.0` in pyproject.toml:27);
+  installed 16.0. Rationale: `_process_request` depends on the websockets 16
+  handshake/transport API, and major-version drift must not silently change that
+  contract.
 - `requires-python = ">=3.12"` (pyproject.toml:6).
 - `pytest>=8.0.0`, `pytest-asyncio>=0.24.0`, `asyncio_mode = "auto"`
   (pyproject.toml:46-47,70) — `async def test_*` needs no marker.
@@ -315,8 +333,8 @@ in Phase 2/3 via the `socketpair()` unit test before wiring in):**
 
 | Seam | Contract | Verified by |
 |---|---|---|
-| `start()` → dir enforcement | Refuse to bind unless parent is `0700` + owner-owned | Phase 1 tests |
-| `_process_request` → `peer_uid()` | UDS only; `None` or uid mismatch → `403` before handshake | Phase 3 tests |
+| `start()` → dir enforcement | Refuse to bind unless every ancestor through the trusted root is owner-owned and not group/other-writable, except sticky-bit dirs | Phase 1 tests |
+| `_process_request` → `peer_uid()` | UDS only; `None`, exception, or uid mismatch → `403` before handshake | Phase 3 tests |
 | `peer_uid()` → OS | macOS `getpeereid` / Linux `SO_PEERCRED`; unknown → `None` (fail closed) | Phase 2 unit tests |
 | TCP path | Unchanged: Origin + bearer token only | existing tests stay green |
 
@@ -330,20 +348,20 @@ sequenceDiagram
     participant C as Client (same uid)
     participant K as Kernel
     participant S as stt_server (_process_request)
-    Note over S: start(): enforce parent dir 0700 + owner — else refuse to start
+    Note over S: start(): enforce owner-only ancestor chain — else refuse to start
     C->>S: connect() over UDS, then WS upgrade
     S->>K: get_extra_info("socket") → getpeereid/SO_PEERCRED
     K-->>S: peer uid
     alt uid == server uid
         S-->>C: None (allow) → handshake completes
-    else uid != server uid OR resolver None
+    else uid != server uid OR resolver None/raises
         S-->>C: respond(403) → transport.abort()
     end
 ```
 
 | Step | Trigger | Enters context | Cleared/persisted | Turn boundary |
 |---|---|---|---|---|
-| Bind | `start()` | socket_path, parent dir stat | dir verified once at start | startup |
+| Bind | `start()` | socket_path, trusted root, ancestor stats | ancestor chain verified once at start | startup |
 | Accept | client connect | peer uid from kernel | per-connection, not stored | per connection |
 | Reject | uid mismatch | 403 response | connection aborted | per connection |
 
@@ -360,76 +378,87 @@ sequenceDiagram
   monkeypatching `sys.platform`** (even if the off-host syscall is mocked), so
   dispatch logic is covered regardless of CI host. Test the fail-closed `None`
   branch (unknown platform / call failure) by monkeypatching.
-- **Dir enforcement** (`tests/test_stt_server.py`): (a) server creates parent
-  `0700` when absent and starts; (b) pre-existing `0755` parent → start refuses
-  with actionable error (assert the `stt_server: <msg>` + exit-1 surface, not a
-  bare traceback); (c) verify the created dir's mode after start; (d)
-  **foreign-owner branch:** monkeypatch `os.stat` to return a foreign `st_uid`
-  and assert the helper raises **without** calling `os.chmod`/`os.chown` (the
-  "must not chmod/chown what it does not own" invariant — hard to do with a real
+- **Dir enforcement** (`tests/test_stt_server.py`): (a) server creates missing
+  socket directories `0700` when absent and starts; (b) pre-existing `0755`
+  component in the ancestor walk → start refuses with actionable error (assert
+  the `stt_server: <msg>` + exit-1 surface, not a bare traceback); (c) verify
+  created directory modes after start; (d) **foreign-owner ancestor branch:**
+  monkeypatch `os.stat` so a grandparent directory reports a foreign `st_uid` and
+  assert the helper rejects **without** calling `os.chmod`/`os.chown` (the "must
+  not chmod/chown what it does not own" invariant — hard to do with a real
   foreign-owned dir on single-uid CI).
 - **UDS peer-cred — two layers:**
   - *CI (seam):* monkeypatch `peer_uid` → `euid+1`, expect `403`; force
     `get_extra_info("socket") → None` and assert `403` (not an exception/allow);
-    plus a same-uid multi-connection regression case that resolves the **real**
-    peer uid == `os.geteuid()` (so a silently-`None` transport is caught).
+    monkeypatch `peer_uid` to raise `OSError` and assert `_process_request`
+    returns `403` rather than leaking the exception; plus a same-uid
+    multi-connection regression case that resolves the **real** peer uid ==
+    `os.geteuid()` (so a silently-`None` transport is caught).
   - *Local (real, Phase 4):* `scripts/smoke_peercred.py` / `just smoke-peercred`
     runs the example client under a second uid against a server built directly
-    with `unix_socket_mode=0o666`, a `0711` parent dir, and the test-only
-    dir-enforcement bypass — defeating **both** filesystem layers so peer-cred is
-    what rejects. Asserts a real `403` via `InvalidStatus.status_code` + the
+    with `unix_socket_mode=0o666`, a `0711` parent dir, and a test-only helper
+    replacement — defeating **both** filesystem layers so peer-cred is what
+    rejects. Asserts a real `403` via `InvalidStatus.status_code` + the
     `"peer not permitted\n"` body (a pre-handshake HTTP response, **not** a
     protocol JSON envelope). Skips cleanly when no second uid / `sudo`.
 - Full suite: `uv run pytest -q`. `uv run ruff check && uv run ruff format` before push.
 
 ## Acceptance Criteria
 
-- [ ] Server refuses to start when the socket parent dir is not `0700` +
-  owner-owned, with an actionable `stt_server: <msg>` error + `SystemExit(1)`
-  (not a bare traceback); creates it `0700` when absent. `install_stt_agent.sh`
-  creates the dir `0700` so fresh installs/upgrades do not break.
+- [ ] Server refuses to start when any non-sticky ancestor from the socket bind
+  directory through the trusted root is not owner-owned or is group/other-writable,
+  with an actionable `stt_server: <msg>` error + `SystemExit(1)` (not a bare
+  traceback); creates missing socket directories `0700` when absent. A test where
+  a grandparent dir is owned by a different uid rejects. `install_stt_agent.sh`
+  creates the socket dir `0700` so fresh installs/upgrades do not break.
 - [ ] UDS connections from a foreign uid are rejected with `403` before the
   handshake; same-uid connections succeed unchanged. Every fail-closed path
-  (resolver `None`, missing transport socket, unknown platform) rejects.
+  (resolver `None`, resolver exception such as `OSError`, missing transport
+  socket, unknown platform) rejects.
 - [ ] Local `just smoke-peercred` demonstrates a real cross-uid `403` (asserted
   via `InvalidStatus.status_code` + `"peer not permitted\n"` body) against a
   server whose `0o666` socket mode **and** `0711` parent dir both permit the peer,
-  with dir-enforcement bypassed for the harness — so peer-cred is provably what
+  using a test-only helper replacement that cannot be triggered through `serve()`
+  or normal `TranscriptionServer` construction — so peer-cred is provably what
   rejects. N concurrent same-uid sessions all succeed.
 - [ ] `peer_uid()` resolves on macOS (ctypes `getpeereid`) and Linux
-  (`SO_PEERCRED`); branch selection is covered on any host; unknown platforms
+  (`SO_PEERCRED`); the ctypes binding sets `argtypes`, `restype`, and
+  `use_errno=True`; branch selection is covered on any host; unknown platforms
   fail closed.
+- [ ] `websockets` is pinned to `>=16,<17` and the lockfile reflects the pin.
 - [ ] No client-side change required; existing client connects unmodified.
 - [ ] TCP path and bearer-token behavior unchanged.
-- [ ] The test-only dir-enforcement bypass is never settable from the public CLI
-  / `serve()` entrypoint.
+- [ ] Any test-only dir-enforcement seam is implemented by subclassing or
+  monkeypatching the helper, not by a `ServerConfig` field or other public/API-
+  reachable flag.
 - [ ] `uv run pytest -q` green; `ruff check` + `ruff format` clean.
 - [ ] Docs describe the same-host trust model and the same-uid precondition.
 
 ## Review Focus
 
-- **Fail-closed posture:** confirm every error path (resolver `None`, ctypes
-  failure, unknown platform, missing transport socket) results in *reject*, never
-  *allow*.
+- **Fail-closed posture:** confirm every error path (resolver `None`, resolver
+  exception, ctypes failure, unknown platform, missing transport socket) results
+  in *reject*, never *allow*.
 - **TOCTOU on the dir check:** the stat-then-bind is itself a small window;
-  confirm `0700`-owner-owned makes the window unexploitable (no other uid can
-  win the race without write on the parent).
+  confirm the owner-owned, non-writable ancestor walk through the trusted root
+  makes the window unexploitable (no other uid can win the race without write on
+  an ancestor component; sticky-bit dirs remain the explicit exception).
 - **websockets 16 contract:** verify `connection.transport` is reliably set when
   `_process_request` runs and `get_extra_info("socket")` returns the AF_UNIX
   socket (not `None`).
 - **UDS-vs-TCP gating:** ensure peer-cred runs only for UDS and TCP is untouched.
 - **Same-uid precondition (R4):** confirm the deployment assumption is documented
   and that uid mismatch rejects rather than warn-allows.
-- **Test-only bypass containment:** the `_skip_socket_dir_enforcement` escape
-  hatch (Phase 4) must be unreachable from the public CLI / `serve()` — it exists
-  solely so the smoke can observe peer-cred in isolation. Verify no production
-  path can set it.
-- **Defense-in-depth framing:** confirm the docs present `0700` dir as the primary
-  same-host boundary and peer-cred as the kernel-authoritative backstop — not as a
-  strictly-stronger replacement (since #1 alone already blocks the same-host
-  foreign-uid vector at the filesystem layer).
+- **Test-only seam containment:** the Phase 4 helper replacement must be local to
+  tests/smoke code and unreachable from the public CLI, `serve()`, or normal
+  `TranscriptionServer` construction. Verify no production path can trigger it.
+- **Defense-in-depth framing:** confirm the docs present the owner-only ancestor
+  chain as the primary same-host boundary and peer-cred as the
+  kernel-authoritative backstop — not as a strictly-stronger replacement (since
+  #1 alone already blocks the same-host foreign-uid vector at the filesystem
+  layer).
 
-<!-- reviewed: 2026-06-26 @ 287f00fc215fd8be539a66c589fc3985dfd72d39 -->
+<!-- reviewed: 2026-06-26 @ a59fa3dffeccf922425aebcafd47d5aad6ef649e -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
