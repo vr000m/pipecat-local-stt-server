@@ -513,9 +513,13 @@ async def test_bearer_auth_requires_token():
         await srv.shutdown()
 
 
-async def test_unix_socket_has_owner_only_permissions():
+async def test_unix_socket_has_owner_only_permissions(monkeypatch):
     import stat
 
+    # Binds under /tmp (root-owned), which R1 dir-enforcement rejects. This
+    # test exercises UDS perms, not ancestor-dir enforcement, so neutralise the
+    # check via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -528,7 +532,15 @@ async def test_unix_socket_has_owner_only_permissions():
             await srv.shutdown()
 
 
-async def test_unix_socket_start_creates_parent_directory():
+async def test_unix_socket_start_creates_parent_directory(monkeypatch):
+    # Binds under /tmp (root-owned), which R1 ownership enforcement rejects.
+    # This test exercises parent-dir *creation*, so the stub keeps the mkdir
+    # behaviour but drops the ancestor ownership/perms check (the part /tmp
+    # trips). Sanctioned by the Phase-4 test-only seam.
+    monkeypatch.setattr(
+        "stt_server.server._enforce_socket_dir_secure",
+        lambda path, trusted_root: path.parent.mkdir(mode=0o700, parents=True, exist_ok=True),
+    )
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "nested" / "path" / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -540,8 +552,12 @@ async def test_unix_socket_start_creates_parent_directory():
             await srv.shutdown()
 
 
-async def test_unix_socket_transport():
+async def test_unix_socket_transport(monkeypatch):
     # AF_UNIX paths on macOS cap at ~104 bytes; use a short /tmp path.
+    # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
+    # UDS transport, not ancestor-dir enforcement, so neutralise the check via
+    # the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(
@@ -605,8 +621,12 @@ async def test_tcp_without_token_emits_startup_warning(caplog):
         await srv.shutdown()
 
 
-async def test_uds_without_token_does_not_warn(caplog):
+async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
     caplog.set_level("WARNING", logger="stt_server.server")
+    # Binds under a system temp dir (root-owned ancestor) which R1 rejects;
+    # this test exercises the UDS-vs-TCP token warning, not ancestor-dir
+    # enforcement, so neutralise the check via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
     with tempfile.TemporaryDirectory() as tmp:
         sock = str(Path(tmp) / "stt.sock")
         srv = TranscriptionServer(
@@ -812,8 +832,12 @@ def test_resolve_probe_endpoint_loads_dotenv_even_with_explicit_socket(monkeypat
     assert _resolve_auth_token(None, client=True) == "from-dotenv"
 
 
-async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path: Path):
+async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path: Path, monkeypatch):
     pytest.importorskip("dotenv")
+    # Binds the in-process server's socket directly under /tmp (root-owned),
+    # which R1 dir-enforcement rejects; this test exercises the CLI token-probe
+    # path, not ancestor-dir enforcement, so neutralise via the Phase-4 seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
     sock = Path("/tmp") / f"stt-preflight-{os.getpid()}.sock"
     sock.unlink(missing_ok=True)
     srv = TranscriptionServer(
@@ -1346,10 +1370,15 @@ async def test_parakeet_24_to_300s_utterance_reaches_backend_intact():
         await srv.shutdown()
 
 
-async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path):
+async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path, monkeypatch):
     """P1 regression at the CLI boundary: KODA_STT_AUTH_TOKEN alone must
     not authenticate the probe — otherwise a health check can report ok
     while the bot (which only reads STT_WS_TOKEN) still 401s."""
+    # Binds the in-process server's socket directly under /tmp (root-owned),
+    # which R1 dir-enforcement rejects; this test exercises the client-vs-server
+    # token contract, not ancestor-dir enforcement, so neutralise via the
+    # Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
     sock = Path("/tmp") / f"stt-preflight-p1-{os.getpid()}.sock"
     sock.unlink(missing_ok=True)
     srv = TranscriptionServer(
@@ -1385,3 +1414,177 @@ async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path):
     finally:
         await srv.shutdown()
         sock.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Parent-directory enforcement (R1).
+#
+# Pins the contract of the private helper
+#   _enforce_socket_dir_secure(path: Path, trusted_root: Path)
+# which walks every directory component from the socket's bind directory up to
+# and including ``trusted_root`` requiring ``st_uid == os.geteuid()`` and no
+# group/other write bits (sticky-bit dirs excepted), creating any missing
+# socket directories ``0700`` (then re-stat-verifying, since mkdir's mode is
+# umask-masked). On any failure it raises a clear exception naming the offending
+# component; it MUST NOT chmod/chown a pre-existing directory it does not own.
+#
+# These call the helper directly (no event loop / bind needed). ``tempfile``
+# creates the trusted root via ``mkdtemp`` which is reliably ``0700``, so the
+# root itself passes the walk on single-uid CI.
+# ---------------------------------------------------------------------------
+
+
+def _make_trusted_root() -> Path:
+    """A 0700, owner-owned temp dir suitable as the trusted root of the walk."""
+    return Path(tempfile.mkdtemp(prefix="stt-dirsec."))
+
+
+def test_enforce_socket_dir_creates_missing_socket_dir_0700():
+    # (a)+(c): an absent socket bind directory is created 0700 and the helper
+    # succeeds (no exception). The walk through the trusted root must pass.
+    import shutil
+    import stat as _stat
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    try:
+        bind_dir = root / "pipecat-stt"
+        sock = bind_dir / "s"
+        assert not bind_dir.exists()
+
+        _enforce_socket_dir_secure(sock, root)  # must not raise
+
+        assert bind_dir.is_dir(), "helper must create the missing socket directory"
+        mode = _stat.S_IMODE(bind_dir.stat().st_mode)
+        assert mode == 0o700, f"socket dir created as {oct(mode)}, expected 0o700"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_created_modes_are_0700_under_loose_umask():
+    # (c): even under a permissive process umask the created dirs end up 0700
+    # (the helper must verify/repair, not trust the umask-masked mkdir mode).
+    import shutil
+    import stat as _stat
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    prior = os.umask(0o022)
+    try:
+        bind_dir = root / "nested"
+        sock = bind_dir / "s"
+
+        _enforce_socket_dir_secure(sock, root)
+
+        mode = _stat.S_IMODE(bind_dir.stat().st_mode)
+        assert mode == 0o700, f"created dir is {oct(mode)} under umask 0o022, expected 0o700"
+    finally:
+        os.umask(prior)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_refuses_group_writable_parent_dir():
+    # (b): a pre-existing group/other-writable ancestor in the walk must make
+    # the helper refuse with an actionable error naming the offending path.
+    #
+    # NOTE on the fixture mode: R1 / the Acceptance Criteria define the failure
+    # as "group/other-writable" (st_mode & 0o022 != 0). A plain 0o755 dir is
+    # NOT group/other-writable, so we use 0o775 (group-writable) which refuses
+    # under both the literal `& 0o022` rule and any stricter `& 0o077` reading.
+    import shutil
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    try:
+        loose = root / "loose"
+        loose.mkdir()
+        os.chmod(loose, 0o775)  # group-writable: defeats the trust boundary
+        sock = loose / "s"
+
+        with pytest.raises((ValueError, OSError)) as exc:
+            _enforce_socket_dir_secure(sock, root)
+
+        msg = str(exc.value)
+        assert str(loose) in msg, f"error must name the offending path; got: {msg!r}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_cli_serve_refuses_group_writable_socket_dir_with_exit1():
+    # (b) CLI surface: a group-writable socket parent dir must surface as
+    # "stt_server: <msg>" on stderr + exit code 1, not a bare traceback.
+    # Uses the echo backend so `serve` does not load a heavy model and fails
+    # fast at the dir-enforcement check before binding.
+    import shutil
+
+    root = Path(tempfile.mkdtemp(prefix="stt-cli-dirsec."))
+    try:
+        loose = root / "loose"
+        loose.mkdir()
+        os.chmod(loose, 0o777)  # world+group-writable parent
+        sock = loose / "s.sock"
+
+        r = _run_module(
+            "serve",
+            "--backend",
+            "echo",
+            "--socket-path",
+            str(sock),
+        )
+        assert r.returncode == 1, f"expected exit 1; stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "stt_server:" in r.stderr, f"expected actionable error, got: {r.stderr!r}"
+        assert "Traceback" not in r.stderr, f"must not leak a bare traceback: {r.stderr!r}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_foreign_owner_ancestor_rejects_without_chmod_chown(monkeypatch):
+    # (d): a grandparent dir reporting a foreign st_uid must be rejected, and
+    # the helper MUST NOT attempt to chmod/chown a directory it does not own.
+    import shutil
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    try:
+        # Pre-create a fully valid 0700 chain so no mkdir happens; the only
+        # failure is the monkeypatched foreign ownership of `child`.
+        child = root / "child"
+        child.mkdir(mode=0o700)
+        bind_dir = child / "gc"
+        bind_dir.mkdir(mode=0o700)
+        sock = bind_dir / "s"
+
+        real_stat = os.stat
+        foreign_uid = os.geteuid() + 1
+
+        def fake_stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            try:
+                target = os.path.realpath(os.fspath(path))
+            except TypeError:
+                return st  # fd-based stat: leave untouched
+            if target == os.path.realpath(child):
+                fields = list(st)  # the 10 canonical stat fields
+                fields[4] = foreign_uid  # st_uid
+                return os.stat_result(fields)
+            return st
+
+        chmod_calls: list = []
+        chown_calls: list = []
+        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "chmod", lambda *a, **k: chmod_calls.append(a))
+        monkeypatch.setattr(os, "chown", lambda *a, **k: chown_calls.append(a))
+
+        with pytest.raises((ValueError, OSError)):
+            _enforce_socket_dir_secure(sock, root)
+
+        # Invariant: never touch ownership/mode of a dir we do not own.
+        assert chmod_calls == [], f"helper chmod'd an unowned dir: {chmod_calls!r}"
+        assert chown_calls == [], f"helper chown'd an unowned dir: {chown_calls!r}"
+    finally:
+        monkeypatch.undo()
+        shutil.rmtree(root, ignore_errors=True)

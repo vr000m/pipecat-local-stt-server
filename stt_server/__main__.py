@@ -213,15 +213,22 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     backend = _make_backend(args.backend, _resolve_model(args.backend, args.model))
-    asyncio.run(
-        serve(
-            backend,
-            socket_path=args.socket_path,
-            host=args.host,
-            port=args.port,
-            auth_token=_resolve_auth_token(args.auth_token_file),
+    try:
+        asyncio.run(
+            serve(
+                backend,
+                socket_path=args.socket_path,
+                host=args.host,
+                port=args.port,
+                auth_token=_resolve_auth_token(args.auth_token_file),
+            )
         )
-    )
+    except (ValueError, OSError) as exc:
+        # Surface startup failures (socket-dir enforcement refusing to bind,
+        # the ServerConfig.__post_init__ ValueError, bind OSErrors) as an
+        # actionable one-line message + exit 1 rather than a bare traceback.
+        print(f"stt_server: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 async def _probe_status(args: argparse.Namespace) -> dict:

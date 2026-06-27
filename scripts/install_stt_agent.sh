@@ -97,9 +97,19 @@ fi
 cmd="${1:-install}"
 
 render_plist() {
-    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")" "$(dirname "$SOCKET_PATH")"
-    # Lock the socket's parent directory so another local user can't
-    # pre-create a socket at the same path under a permissive umask.
+    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
+    # Create the socket's parent directory owner-only (0700) from birth so
+    # there is no window under a permissive umask (commonly 0755) in which
+    # another local user could pre-create a socket at the same path. The server
+    # now *refuses to start* (see _enforce_socket_dir_secure in
+    # stt_server/server.py) if any ancestor through the trusted root is
+    # group/other-writable, so 0700 here is load-bearing, not just hygiene.
+    #
+    # Upgrade note: installs predating this change created the dir at the
+    # install shell umask (commonly 0755). The trailing `chmod 700` repairs such
+    # a pre-existing dir in place so upgrades do not trip the new startup check;
+    # `mkdir -m 700` covers the fresh-install path with no race window.
+    mkdir -m 700 -p "$(dirname "$SOCKET_PATH")"
     chmod 700 "$(dirname "$SOCKET_PATH")"
     # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
     # allowlist validation handle hostile values instead of sed string
