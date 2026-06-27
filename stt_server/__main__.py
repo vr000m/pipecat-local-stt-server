@@ -223,10 +223,11 @@ def _cmd_serve(args: argparse.Namespace) -> None:
                 auth_token=_resolve_auth_token(args.auth_token_file),
             )
         )
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, ModuleNotFoundError) as exc:
         # Surface startup failures (socket-dir enforcement refusing to bind,
-        # the ServerConfig.__post_init__ ValueError, bind OSErrors) as an
-        # actionable one-line message + exit 1 rather than a bare traceback.
+        # the ServerConfig.__post_init__ ValueError, bind OSErrors, and a
+        # missing backend extra re-raised by backend.start()) as an actionable
+        # one-line message + exit 1 rather than a bare traceback.
         print(f"stt_server: {exc}", file=sys.stderr)
         raise SystemExit(1)
 

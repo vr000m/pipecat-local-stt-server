@@ -243,7 +243,17 @@ class ParakeetBackend:
     async def start(self) -> None:
         # Eager import; fail fast if the ``parakeet`` extra is not
         # installed. The model itself is NOT loaded here — see ``_get_model``.
-        import parakeet_mlx  # type: ignore # noqa: F401
+        # Re-raise a missing module as an actionable message (a bare
+        # ModuleNotFoundError is otherwise a cryptic LaunchAgent crash-loop);
+        # _cmd_serve turns this into ``stt_server: <msg>`` + exit 1, and
+        # ``just stt-install parakeet`` self-heals it via _ensure-extra.
+        try:
+            import parakeet_mlx  # type: ignore # noqa: F401
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                f"the 'parakeet' extra is not installed (missing module: {exc.name}) "
+                "— run: uv sync --extra parakeet --inexact"
+            ) from exc
 
     async def open_stream(self, *, language: str | None = None) -> "_ParakeetStream":
         return _ParakeetStream(language, self._decode_lock, self._thread_lock, self)
