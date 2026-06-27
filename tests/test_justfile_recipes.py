@@ -34,7 +34,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JUSTFILE = REPO_ROOT / "justfile"
-README = REPO_ROOT / "README.md"
+# The canonical per-ASR socket table moved from README.md to docs/operations.md
+# when the README was split (PR #12); the justfile map mirrors it from there.
+PER_ASR_DOC = REPO_ROOT / "docs" / "operations.md"
 
 FAKE_UID = "501"
 BACKENDS = ("whisper", "parakeet", "nemotron")
@@ -232,13 +234,14 @@ def test_unknown_backend_fails_fast_and_lists_valid(tmp_path):
 
 
 def _readme_map() -> dict[str, tuple[str, str]]:
-    """Parse the README per-ASR table into {backend: (label, socket)}.
+    """Parse the canonical per-ASR table (docs/operations.md) into
+    {backend: (label, socket)}.
 
     Anchors on the table header and asserts its column order before indexing
-    cells by position, so a future column insertion/reorder in the README fails
+    cells by position, so a future column insertion/reorder in the doc fails
     loudly here instead of silently mis-mapping label/socket.
     """
-    lines = README.read_text().splitlines()
+    lines = PER_ASR_DOC.read_text().splitlines()
     header_idx = next(
         (
             i
@@ -247,10 +250,10 @@ def _readme_map() -> dict[str, tuple[str, str]]:
         ),
         None,
     )
-    assert header_idx is not None, "README per-ASR table header not found"
+    assert header_idx is not None, "per-ASR table header not found in docs/operations.md"
     header = [c.strip() for c in lines[header_idx].split("|")[1:-1]]
     assert header[:3] == ["ASR", "LaunchAgent label", "Socket"], (
-        f"README per-ASR table column order changed: {header}"
+        f"per-ASR table column order changed: {header}"
     )
     out: dict[str, tuple[str, str]] = {}
     for ln in lines[header_idx + 2 :]:  # skip the header row + `|---|` separator
@@ -526,13 +529,26 @@ def test_stt_install_invokes_ensure_extra_then_delegates(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+# The Koda-consumed *imported* surface: the modules Koda pins at a SHA and
+# imports as a library. Per the cross-repo contract, a pin bump is required only
+# when these change — the client entrypoints (``TranscriptionClient``,
+# ``resolve_endpoint_from_env``, ``is_cleartext_remote``) and the wire-protocol
+# module (``PROTOCOL_VERSION`` + event constants). The rest of ``stt_server/``
+# (the server runtime, backends, ``__main__``) and ``scripts/install_stt_agent.sh``
+# are the *runtime* Koda runs from a HEAD checkout — server-side changes there are
+# coordinated at checkout-update time, NOT via the pinned import, so they are not
+# gated here. A ``server.hello`` / ``server.status`` payload change is still
+# caught because it must bump ``PROTOCOL_VERSION`` in ``protocol.py``.
+KODA_IMPORT_SURFACE = frozenset({"stt_server/client.py", "stt_server/protocol.py"})
+
+
 def test_branch_diff_does_not_touch_koda_surface():
     """No-pin-bump invariant (per the cross-repo contract): this work must not
-    modify the Koda-consumed surface — anything under ``stt_server/`` (the
-    imported client + the wire protocol) or ``scripts/install_stt_agent.sh``.
-    Additive files (justfile, these tests, README, dev-plan docs) are fine; an
-    unrelated docs-only commit does NOT void Koda safety, so this asserts the
-    *negative* contract rather than an exact file allowlist."""
+    modify the Koda-consumed *imported* surface — ``stt_server/client.py`` or
+    ``stt_server/protocol.py`` — without a coordinated client pin bump. Changes to
+    the server runtime / install script (run from a HEAD checkout) and additive
+    files (justfile, these tests, README, dev-plan docs) are fine; this asserts
+    the *negative* contract rather than an exact file allowlist."""
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("not a git checkout")
     merge_base = subprocess.run(
@@ -551,9 +567,8 @@ def test_branch_diff_does_not_touch_koda_surface():
         cwd=str(REPO_ROOT),
     )
     changed = {ln for ln in diff.stdout.splitlines() if ln.strip()}
-    forbidden = sorted(
-        c for c in changed if c.startswith("stt_server/") or c == "scripts/install_stt_agent.sh"
-    )
+    forbidden = sorted(c for c in changed if c in KODA_IMPORT_SURFACE)
     assert not forbidden, (
-        f"branch modifies the Koda-consumed surface (would require a pin bump): {forbidden}"
+        f"branch modifies the Koda-consumed IMPORTED surface (would require a "
+        f"coordinated client pin bump): {forbidden}"
     )
