@@ -193,12 +193,15 @@ _ensure-extra backend:
     set -uo pipefail
     backend={{quote(backend)}}
     # extra == the install backend-name (the 3rd field of `_resolve`); only the
-    # import-probe name differs from it. Validate before the skip check so an
-    # unknown backend always errors regardless of PIPECAT_STT_SKIP_DEP_SYNC.
+    # import probe differs. The probe MUST match what backend.start() imports
+    # (nemotron does `from mlx_audio.stt import load`, not `import mlx_audio`) —
+    # a coarser `import mlx_audio` would pass for a partially-installed package
+    # while the agent still crash-loops. Validate the backend before the skip
+    # check so an unknown backend always errors regardless of the skip env.
     case "$backend" in
-      whisper)  extra="mlx";      probe="mlx_whisper" ;;
-      parakeet) extra="parakeet"; probe="parakeet_mlx" ;;
-      nemotron) extra="nemotron"; probe="mlx_audio" ;;
+      whisper)  extra="mlx";      probe="import mlx_whisper" ;;
+      parakeet) extra="parakeet"; probe="import parakeet_mlx" ;;
+      nemotron) extra="nemotron"; probe="from mlx_audio.stt import load" ;;
       *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron)" >&2; exit 1 ;;
     esac
     if [[ -n "${PIPECAT_STT_SKIP_DEP_SYNC:-}" ]]; then
@@ -206,11 +209,11 @@ _ensure-extra backend:
       exit 0
     fi
     py="{{justfile_directory()}}/.venv/bin/python"
-    if [[ -x "$py" ]] && "$py" -c "import $probe" >/dev/null 2>&1; then
-      echo "_ensure-extra: '$extra' extra already present ($probe importable)"
+    if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
+      echo "_ensure-extra: '$extra' extra already present ($probe)"
       exit 0
     fi
-    echo "_ensure-extra: '$probe' missing — installing the '$extra' extra (uv sync --extra $extra --inexact)…"
+    echo "_ensure-extra: '$extra' import check failed ($probe) — installing (uv sync --extra $extra --inexact)…"
     if ! uv sync --extra "$extra" --inexact; then
       echo "_ensure-extra: 'uv sync --extra $extra --inexact' failed; install the '$extra' extra manually" >&2
       exit 1

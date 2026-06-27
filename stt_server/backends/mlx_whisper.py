@@ -302,10 +302,14 @@ class MLXWhisperBackend:
         # self-heals it via _ensure-extra.
         try:
             import mlx_whisper  # type: ignore # noqa: F401
-        except ModuleNotFoundError as exc:
+        except ImportError as exc:
+            # ImportError (not just ModuleNotFoundError) so a present-but-broken
+            # mlx_whisper (e.g. its own transitive import fails) also surfaces as
+            # an actionable message rather than escaping _cmd_serve as a traceback.
+            missing = getattr(exc, "name", None) or "mlx_whisper"
             raise ModuleNotFoundError(
-                f"the 'mlx' extra is not installed (missing module: {exc.name}) "
-                "— run: uv sync --extra mlx --inexact"
+                f"the 'mlx' extra is not installed or failed to import "
+                f"({missing}) — run: uv sync --extra mlx --inexact"
             ) from exc
 
     async def open_stream(self, *, language: str | None = None) -> "_MLXStream":

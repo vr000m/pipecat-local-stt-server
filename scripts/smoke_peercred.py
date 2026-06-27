@@ -42,6 +42,7 @@ import asyncio
 import contextlib
 import os
 import pwd
+import shutil
 import socket
 import subprocess
 import sys
@@ -212,11 +213,10 @@ def _find_second_uid() -> tuple[str, int] | None:
 
 
 def _have(cmd: str) -> bool:
-    return subprocess.run(
-        ["command", "-v", cmd],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0 or os.path.exists(f"/usr/bin/{cmd}")
+    # shutil.which does a proper PATH lookup; the old `subprocess.run(["command",
+    # …])` relied on a `command` *binary* existing (it is normally a shell
+    # builtin) and would raise FileNotFoundError on a host without one.
+    return shutil.which(cmd) is not None
 
 
 def _assert_chain_traversable(sock: str) -> None:

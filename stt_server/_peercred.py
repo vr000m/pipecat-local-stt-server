@@ -16,7 +16,7 @@ failure mode than an explicit ``None``.
 Platform notes:
 
 - **Linux** uses ``SO_PEERCRED``: ``getsockopt`` returns a ``struct ucred {
-  pid_t pid; uid_t uid; gid_t gid; }``, unpacked as ``"3i"``.
+  pid_t pid; uid_t uid; gid_t gid; }``, unpacked as ``"3I"`` (unsigned).
 - **macOS** has no ``SO_PEERCRED``; we call ``getpeereid(2)`` through
   ``ctypes``. The wrinkle worth flagging for future maintainers: ``uid_t`` and
   ``gid_t`` are ``c_uint32`` on Darwin, and we set ``argtypes``/``restype`` on
@@ -38,6 +38,7 @@ server (mirrors the existing single ``sys.platform == "darwin"`` precedent in
 
 from __future__ import annotations
 
+import functools
 import logging
 import socket
 import struct
@@ -88,29 +89,42 @@ def peer_uid(sock: PeerCredSocket) -> int | None:
 
 def _peer_uid_linux(sock: PeerCredSocket) -> int | None:
     """Resolve the peer uid via ``SO_PEERCRED`` (``struct ucred``)."""
-    buf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-    _pid, uid, _gid = struct.unpack("3i", buf)
+    # "3I": pid_t/uid_t/gid_t are unsigned in ``struct ucred``. Unpacking as
+    # signed ("3i") would turn a uid >= 2**31 negative, so it would never equal
+    # os.geteuid() and a legitimate same-uid peer would be wrongly rejected.
+    buf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3I"))
+    _pid, uid, _gid = struct.unpack("3I", buf)
     return uid
 
 
-def _peer_uid_darwin(sock: PeerCredSocket) -> int | None:
-    """Resolve the peer uid via ``getpeereid(2)`` through ``ctypes``.
+@functools.lru_cache(maxsize=1)
+def _darwin_getpeereid():
+    """Load libc and pin the ``getpeereid`` binding ONCE per process.
 
-    ``uid_t``/``gid_t`` are ``c_uint32`` on Darwin; ``argtypes``/``restype`` are
-    set explicitly and libc is loaded with ``use_errno=True`` (see module
-    docstring for why the binding must be pinned).
+    ``_process_request`` runs per UDS connection; re-doing ``CDLL(None)`` (a libc
+    re-dlopen) plus re-resolving the symbol and re-setting ``argtypes``/``restype``
+    on every call is wasted work. The configured callable never changes between
+    calls, so build it once and cache it. ``uid_t``/``gid_t`` are ``c_uint32`` on
+    Darwin; libc is loaded with ``use_errno=True`` (see module docstring).
     """
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)
-    getpeereid = libc.getpeereid
-    getpeereid.argtypes = [
+    fn = libc.getpeereid
+    fn.argtypes = [
         ctypes.c_int,
         ctypes.POINTER(ctypes.c_uint32),
         ctypes.POINTER(ctypes.c_uint32),
     ]
-    getpeereid.restype = ctypes.c_int
+    fn.restype = ctypes.c_int
+    return fn
 
+
+def _peer_uid_darwin(sock: PeerCredSocket) -> int | None:
+    """Resolve the peer uid via ``getpeereid(2)`` through ``ctypes``."""
+    import ctypes
+
+    getpeereid = _darwin_getpeereid()
     uid = ctypes.c_uint32()
     gid = ctypes.c_uint32()
     rc = getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid))

@@ -249,10 +249,14 @@ class ParakeetBackend:
         # ``just stt-install parakeet`` self-heals it via _ensure-extra.
         try:
             import parakeet_mlx  # type: ignore # noqa: F401
-        except ModuleNotFoundError as exc:
+        except ImportError as exc:
+            # ImportError (not just ModuleNotFoundError) so a present-but-broken
+            # parakeet_mlx also surfaces as an actionable message rather than
+            # escaping _cmd_serve as a traceback.
+            missing = getattr(exc, "name", None) or "parakeet_mlx"
             raise ModuleNotFoundError(
-                f"the 'parakeet' extra is not installed (missing module: {exc.name}) "
-                "— run: uv sync --extra parakeet --inexact"
+                f"the 'parakeet' extra is not installed or failed to import "
+                f"({missing}) — run: uv sync --extra parakeet --inexact"
             ) from exc
 
     async def open_stream(self, *, language: str | None = None) -> "_ParakeetStream":
