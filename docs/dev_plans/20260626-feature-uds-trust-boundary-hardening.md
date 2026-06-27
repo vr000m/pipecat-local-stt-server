@@ -537,6 +537,12 @@ two documented non-feature reds above. `ruff check` + `ruff format --check` clea
   No version/pin bump required — see `docs/operations.md` → "Cross-repo note (Koda)".
 - Decide the fate of the `test_branch_diff_does_not_touch_koda_surface` guard
   (leave as documented known-failure, or narrow per the one-liner above).
-- The cross-uid `403` smoke leg is unverified in single-uid CI/dev; run
-  `just smoke-peercred` on a host with a second uid / passwordless `sudo` to
-  exercise it for real.
+- **Cross-uid `403` — VERIFIED (2026-06-27) on real hardware.** Ran
+  `scripts/verify_peercred_crossuid.py`: against one permissive socket
+  (`0o666` / `0711` parent under `/tmp`), the owning uid (501) completed the
+  handshake (`101`) while `nobody` (uid 4294967294) was rejected (`403 peer not
+  permitted`). Server logged `stt_server: rejecting UDS peer uid 4294967294
+  (expected 501)`. Same socket + perms, only the uid differs → peer-cred (not
+  the filesystem) is provably the discriminator. Closes the adversarial-review
+  NO-SHIP finding. (`just smoke-peercred`'s cross-uid leg still skips without
+  passwordless `sudo`; this verifier uses `nobody` + a stdlib probe instead.)
