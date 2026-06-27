@@ -133,6 +133,11 @@ def _run_just(
     env = {
         "HOME": str(home),
         "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        # stt-install / stt-enable call `_ensure-extra`, which would otherwise
+        # shell out to a real `uv sync` for backends whose extra is absent from
+        # the dev/CI venv. Skip that side effect by default; a dedicated test
+        # overrides this via extra_env to exercise the skip-message path.
+        "PIPECAT_STT_SKIP_DEP_SYNC": "1",
     }
     if extra_env:
         env.update(extra_env)
@@ -180,8 +185,9 @@ def test_just_list_exposes_public_recipes(tmp_path):
         "stt-uninstall",
     ):
         assert recipe in res.stdout
-    # `_resolve` is private (underscore) — not advertised.
+    # Private (underscore) helpers are not advertised in --list.
     assert "_resolve" not in res.stdout
+    assert "_ensure-extra" not in res.stdout
 
 
 @pytest.mark.parametrize(
@@ -471,6 +477,48 @@ def test_install_uninstall_delegate_exact_env(tmp_path, recipe, cmd):
     assert "LABEL=pipecat.stt-server.parakeet" in logged
     assert f"SOCKET={home}/Library/Caches/pipecat-stt/parakeet.sock" in logged
     assert "BACKEND=parakeet" in logged
+
+
+# --------------------------------------------------------------------------- #
+# _ensure-extra: backend -> Python extra onboarding
+# --------------------------------------------------------------------------- #
+
+
+def test_ensure_extra_skips_under_env_flag(tmp_path):
+    # With PIPECAT_STT_SKIP_DEP_SYNC set (the harness default), the helper must
+    # short-circuit BEFORE probing or shelling out to `uv sync`.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["_ensure-extra", "nemotron"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "skipping" in res.stdout.lower()
+
+
+def test_ensure_extra_unknown_backend_errors_even_when_skipped(tmp_path):
+    # Backend validation happens before the skip check, so an unknown backend
+    # errors regardless of PIPECAT_STT_SKIP_DEP_SYNC.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["_ensure-extra", "bogus"], home=home, stub_dir=stub_dir)
+    assert res.returncode != 0
+    assert "unknown backend" in res.stderr
+
+
+def test_stt_install_invokes_ensure_extra_then_delegates(tmp_path):
+    # stt-install must run the dep-ensure step AND still delegate to the install
+    # script. Under the skip flag the ensure step is a no-op message, so we can
+    # assert both the skip line (proving the wiring) and the delegation.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    res = _run_just(
+        [f"script={fake_script}", "stt-install", "nemotron"],
+        home=home,
+        stub_dir=stub_dir,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "skipping" in res.stdout.lower()  # _ensure-extra ran
+    assert "CMD=install" in env_log.read_text()  # delegation still happened
 
 
 # --------------------------------------------------------------------------- #
