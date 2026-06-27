@@ -1137,11 +1137,11 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'nemotron'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'parakeet'", specifier = ">=1.26" },
     { name = "parakeet-mlx", marker = "extra == 'parakeet'", specifier = ">=0.5.1" },
-    { name = "websockets", specifier = ">=13.0" },
-    { name = "websockets", marker = "extra == 'client'", specifier = ">=13.0" },
-    { name = "websockets", marker = "extra == 'mlx'", specifier = ">=13.0" },
-    { name = "websockets", marker = "extra == 'nemotron'", specifier = ">=13.0" },
-    { name = "websockets", marker = "extra == 'parakeet'", specifier = ">=13.0" },
+    { name = "websockets", specifier = ">=16,<17" },
+    { name = "websockets", marker = "extra == 'client'", specifier = ">=16,<17" },
+    { name = "websockets", marker = "extra == 'mlx'", specifier = ">=16,<17" },
+    { name = "websockets", marker = "extra == 'nemotron'", specifier = ">=16,<17" },
+    { name = "websockets", marker = "extra == 'parakeet'", specifier = ">=16,<17" },
 ]
 provides-extras = ["client", "mlx", "parakeet", "nemotron"]
 

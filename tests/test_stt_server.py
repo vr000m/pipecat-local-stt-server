@@ -1588,3 +1588,164 @@ def test_enforce_socket_dir_foreign_owner_ancestor_rejects_without_chmod_chown(m
     finally:
         monkeypatch.undo()
         shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — UDS peer-credential gate in _process_request (CI seam)
+#
+# The server authenticates a UDS peer by its kernel-supplied uid before the
+# WebSocket handshake completes (R2). Every fail-closed path — missing
+# transport socket, resolver returning None, resolver raising, or a uid that
+# mismatches os.geteuid() — must return ``connection.respond(403, "peer not
+# permitted\n")`` rather than allow or leak an exception. A same-uid peer
+# (the only legitimate case under the same-uid deployment precondition) must
+# pass the gate untouched.
+#
+# Two layers, per the plan's Testing Notes:
+#   * integration: bind a real UDS server (dir-enforcement neutralised via the
+#     sanctioned seam so it can bind under /tmp) and connect with the client;
+#   * unit: drive ``_process_request`` directly with fakes for the cases that
+#     cannot be staged with a real same-uid socket (None transport socket,
+#     resolver raising).
+# ---------------------------------------------------------------------------
+
+
+class _FakeTransport:
+    """Minimal asyncio-transport stand-in exposing only get_extra_info."""
+
+    def __init__(self, sock):
+        self._sock = sock
+
+    def get_extra_info(self, name, default=None):
+        if name == "socket":
+            return self._sock
+        return default
+
+
+class _FakeConnection:
+    """Minimal ``ServerConnection`` stand-in for _process_request unit tests.
+
+    ``respond(status, body)`` records the call and returns a sentinel so the
+    test can assert _process_request returned the reject response (the
+    websockets contract: returning a respond() result rejects the handshake).
+    """
+
+    def __init__(self, sock):
+        self.transport = _FakeTransport(sock)
+        self.responses: list[tuple[int, str]] = []
+
+    def respond(self, status, body):
+        self.responses.append((status, body))
+        return ("RESPOND", status, body)
+
+
+class _FakeRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+def _uds_server_for_unit_test() -> TranscriptionServer:
+    """A TranscriptionServer in UDS mode WITHOUT binding.
+
+    ``_process_request`` only reads ``self._config.socket_path`` to decide the
+    gate runs, so a config with any socket_path is enough — no start() needed.
+    """
+    return TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(socket_path="/tmp/peercred-unit-test.sock"),
+    )
+
+
+async def test_uds_auth_foreign_uid_rejected_with_403(monkeypatch):
+    """A UDS peer whose resolved uid != os.geteuid() is rejected pre-handshake.
+
+    Bind a real UDS server (dir-enforcement neutralised via the sanctioned
+    seam so it can bind under /tmp), force the resolver to report a foreign
+    uid, and assert the client connect raises InvalidStatus(403). Mirrors the
+    existing 401 bearer-auth test's InvalidStatus handling.
+    """
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    # Foreign uid: resolver claims the peer is someone other than us.
+    monkeypatch.setattr("stt_server.server.peer_uid", lambda sock: os.geteuid() + 1)
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+            c = TranscriptionClient(socket_path=str(sock))
+            with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+                await c.connect()
+            assert exc.value.response.status_code == 403
+            # Body assertion is best-effort: InvalidStatus exposes the response,
+            # whose body may be bytes or absent depending on websockets version.
+            # status_code == 403 is the load-bearing assertion (per the plan).
+            body = getattr(exc.value.response, "body", None)
+            if body:
+                body_bytes = body if isinstance(body, (bytes, bytearray)) else body.encode()
+                assert b"peer not permitted" in bytes(body_bytes)
+        finally:
+            await srv.shutdown()
+
+
+async def test_uds_auth_peercred_missing_transport_socket_rejects_with_403():
+    """A UDS handshake whose transport has no underlying socket must 403.
+
+    Unit-drives _process_request with a fake connection whose
+    ``transport.get_extra_info("socket")`` returns None. The gate must return
+    the 403 respond() result (fail closed) and NOT raise (it must not call
+    peer_uid(None), which would AttributeError).
+    """
+    srv = _uds_server_for_unit_test()
+    conn = _FakeConnection(sock=None)
+    result = await srv._process_request(conn, _FakeRequest())
+    assert conn.responses == [(403, "peer not permitted\n")]
+    assert result == ("RESPOND", 403, "peer not permitted\n")
+
+
+async def test_uds_auth_peer_uid_resolver_raises_rejects_with_403(monkeypatch):
+    """If the peer_uid resolver raises (e.g. OSError), the gate must 403, not
+    leak the exception. Provide a non-None AF_UNIX socket so the gate reaches
+    the resolver call, then force the resolver to raise.
+    """
+    import socket as _socket
+
+    def _raise(_sock):
+        raise OSError("getpeereid failed")
+
+    monkeypatch.setattr("stt_server.server.peer_uid", _raise)
+    srv = _uds_server_for_unit_test()
+
+    class _FakeUnixSock:
+        family = _socket.AF_UNIX
+
+    conn = _FakeConnection(sock=_FakeUnixSock())
+    result = await srv._process_request(conn, _FakeRequest())
+    assert conn.responses == [(403, "peer not permitted\n")]
+    assert result == ("RESPOND", 403, "peer not permitted\n")
+
+
+async def test_uds_auth_peer_uid_same_uid_real_resolver_completes_handshake(monkeypatch):
+    """Same-uid regression with the REAL resolver (no peer_uid stub).
+
+    Bind a real UDS server (dir-enforcement neutralised) and connect as the
+    owning uid. The handshake must complete and a normal session work — this
+    catches a silently-None transport socket that would otherwise fail closed.
+    Kept to a single connection; the N-concurrent case is Phase 4.
+    """
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+            c = TranscriptionClient(socket_path=str(sock))
+            hello = await c.connect()
+            assert hello["type"] == P.EVT_SERVER_HELLO
+            # A real session works end-to-end through the gate.
+            await c.send_audio(_pcm(800))
+            await c.commit()
+            completed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_COMPLETED})
+            assert completed["transcript"] == "echo:1600"
+            await c.close()
+        finally:
+            await srv.shutdown()

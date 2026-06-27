@@ -26,6 +26,7 @@ import logging
 import os
 import resource
 import signal
+import socket
 import sys
 import time
 import uuid
@@ -42,6 +43,7 @@ from websockets.asyncio.server import (
 )
 
 from . import protocol as P
+from ._peercred import peer_uid
 from .backend import BackendStream, EchoBackend, TranscriptionBackend
 
 # OpenAI Realtime groups errors into a coarse "type" field (e.g.
@@ -346,6 +348,36 @@ class TranscriptionServer:
 
     # --- connection handling ---
     async def _process_request(self, connection, request):
+        # On a Unix-domain socket the only legitimate peer is a process owned
+        # by the same effective uid as this server. Enforce that BEFORE (and
+        # independently of) bearer auth so a foreign uid is rejected even when
+        # no token is configured. Fail closed: any inability to resolve the
+        # peer's uid is a 403, not a pass. TCP listeners cannot answer
+        # SO_PEERCRED-style queries, so this gate is UDS-only.
+        if self._config.socket_path is not None:
+            sock = connection.transport.get_extra_info("socket")
+            if sock is None:
+                logger.warning("stt_server: UDS connection has no underlying socket; rejecting")
+                return connection.respond(403, "peer not permitted\n")
+            if sock.family != socket.AF_UNIX:
+                logger.warning(
+                    "stt_server: UDS connection on unexpected socket family %r; rejecting",
+                    sock.family,
+                )
+                return connection.respond(403, "peer not permitted\n")
+            try:
+                uid = peer_uid(sock)
+            except Exception as exc:
+                logger.warning("stt_server: peer uid resolution failed (%s); rejecting", exc)
+                return connection.respond(403, "peer not permitted\n")
+            if uid is None or uid != os.geteuid():
+                logger.warning(
+                    "stt_server: rejecting UDS peer uid %r (expected %d)",
+                    uid,
+                    os.geteuid(),
+                )
+                return connection.respond(403, "peer not permitted\n")
+
         # Reject unexpected browser Origin headers for non-browser-focused V1,
         # and enforce optional bearer auth in one place.
         headers = request.headers
