@@ -164,6 +164,17 @@ stt-enable backend:
     fi
     echo "stt-enable: bootstrapped + kickstarted $label"
 
+# Local UDS peer-cred smoke: same-uid multi-connection + cross-uid 403.
+# Runs an in-process server with both filesystem layers deliberately permissive
+# (0711 parent + 0o666 socket) via a test-only helper replacement, so peer-cred
+# is provably what rejects a foreign uid. The cross-uid leg needs a second local
+# uid reachable via passwordless `sudo`; it skips cleanly (exit 0) when absent,
+# while the same-uid leg still runs.
+smoke-peercred:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    exec uv run python "{{justfile_directory()}}/scripts/smoke_peercred.py"
+
 # Install an agent — delegates to install_stt_agent.sh (no plist reimplementation).
 stt-install backend:
     #!/usr/bin/env bash

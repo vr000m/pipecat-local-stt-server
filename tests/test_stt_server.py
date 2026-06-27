@@ -1749,3 +1749,66 @@ async def test_uds_auth_peer_uid_same_uid_real_resolver_completes_handshake(monk
             await c.close()
         finally:
             await srv.shutdown()
+
+
+async def test_uds_multi_connection_same_uid_all_handshake(monkeypatch):
+    """Phase 4 CI-safe mirror: N concurrent same-uid sessions all pass the gate.
+
+    Opens N concurrent ``TranscriptionClient`` sessions as the owning uid against
+    a single real UDS server (dir-enforcement neutralised via the sanctioned seam
+    so it binds under /tmp). All N must complete the handshake (``server.hello``)
+    and stream a normal echo exchange — a regression guard that the peer-cred gate
+    (Phase 3) did not break the normal path under concurrency.
+
+    The REAL resolver runs: ``peer_uid`` is deliberately NOT stubbed, so each
+    accepted connection had its uid resolved by the kernel-backed resolver and
+    compared equal to ``os.geteuid()``; a silently-``None`` transport would fail
+    closed (403) and the handshake would raise rather than succeed. To pin the
+    "real resolver == geteuid()" invariant directly (not just transitively via a
+    successful handshake), we also assert ``peer_uid`` on a live AF_UNIX
+    ``socketpair()`` end returns ``os.geteuid()`` — the same assertion the
+    resolver unit test uses, exercised here against the production import path.
+    """
+    import socket as _socket
+
+    from stt_server.server import peer_uid as _server_peer_uid
+
+    # Direct real-resolver assertion on a connected AF_UNIX socketpair (both ends
+    # are this process -> same uid). Catches a width/signature regression or a
+    # silently-None resolver before we even look at the server.
+    a, b = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        assert _server_peer_uid(a) == os.geteuid()
+        assert _server_peer_uid(b) == os.geteuid()
+    finally:
+        a.close()
+        b.close()
+
+    # Bind one real UDS server; do NOT stub peer_uid so the real gate runs for
+    # every connection.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    n = 4
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+
+            async def _one_session(idx: int) -> None:
+                c = TranscriptionClient(socket_path=str(sock))
+                hello = await c.connect()
+                assert hello["type"] == P.EVT_SERVER_HELLO
+                assert hello["protocol_version"] == P.PROTOCOL_VERSION
+                try:
+                    # A full echo exchange proves the session works post-handshake.
+                    await c.send_audio(_pcm(800))
+                    await c.commit()
+                    completed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_COMPLETED})
+                    assert completed["transcript"] == "echo:1600"
+                finally:
+                    await c.close()
+
+            # All N concurrently — surfaces any per-connection gate races.
+            await asyncio.gather(*(_one_session(i) for i in range(n)))
+        finally:
+            await srv.shutdown()
