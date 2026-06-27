@@ -219,6 +219,31 @@ def _have(cmd: str) -> bool:
     ).returncode == 0 or os.path.exists(f"/usr/bin/{cmd}")
 
 
+def _assert_chain_traversable(sock: str) -> None:
+    """Every directory from the socket's parent up to ``/`` must be
+    other-traversable (mode & 0o001). Otherwise a foreign uid fails at PATH
+    RESOLUTION before reaching ``_process_request``, and the cross-uid result
+    would reflect the filesystem boundary rather than the peer-cred gate — the
+    exact masking Codex flagged. Raise a targeted setup error if the chain is
+    not traversable (rather than producing a meaningless cross-uid verdict)."""
+    import stat as _stat
+
+    d = os.path.dirname(os.path.realpath(sock))
+    while True:
+        mode = _stat.S_IMODE(os.stat(d).st_mode)
+        if not (mode & 0o001):
+            raise SystemExit(
+                f"socket ancestor {d} is not other-traversable (mode={oct(mode)}): a "
+                "foreign uid would fail at path resolution BEFORE the peer-cred gate, "
+                "so the cross-uid result would be meaningless. Bind the smoke socket "
+                "under a world-traversable root (e.g. /tmp)."
+            )
+        parent = os.path.dirname(d)
+        if parent == d:  # reached '/'
+            break
+        d = parent
+
+
 async def _run_cross_uid(sock: str) -> bool:
     """Drive the example client under a second uid; assert peer-cred rejects.
 
@@ -232,6 +257,10 @@ async def _run_cross_uid(sock: str) -> bool:
 
     username, uid = second
     print(f"\n=== cross-uid rejection (peer uid {uid} / {username}) ===")
+    # Guard the invariant the whole cross-uid test depends on: the peer must be
+    # able to traverse to the socket so peer-cred (not the filesystem) is what
+    # rejects. Fails with a targeted diagnostic if not.
+    _assert_chain_traversable(sock)
     # Re-invoke THIS file under the second uid in its connect-as-peer role.
     cmd = [
         "sudo",
@@ -251,13 +280,25 @@ async def _run_cross_uid(sock: str) -> bool:
     if err:
         print(f"  child stderr: {err}")
     print(f"  child stdout: {out}")
-    if CHILD_REJECTED not in out:
+    if CHILD_REJECTED in out:
+        print("  cross-uid connection rejected with 403 'peer not permitted' — peer-cred OK")
+        return True
+    if CHILD_ACCEPTED in out:
         raise SystemExit(
-            f"cross-uid connect was NOT rejected with 403 '{REJECT_BODY.strip()}' "
-            f"(rc={proc.returncode}, stdout={out!r}) — peer-cred boundary FAILED"
+            "cross-uid connection was ACCEPTED — peer-cred did NOT reject a foreign "
+            f"uid (rc={proc.returncode}, stdout={out!r}). SECURITY FAILURE."
         )
-    print("  cross-uid connection rejected with 403 'peer not permitted' — peer-cred OK")
-    return True
+    # CHILD_OTHER / no token: the child never produced a clean 403-or-accept
+    # verdict — almost always an OS path-resolution or socket-open error, i.e. it
+    # failed at the FILESYSTEM boundary before reaching peer-cred. That is an
+    # INCONCLUSIVE setup failure, not proof the gate is broken — keep it distinct
+    # from both a pass and a real peer-cred failure.
+    raise SystemExit(
+        "cross-uid result INCONCLUSIVE: the child did not reach the peer-cred gate "
+        f"(rc={proc.returncode}, stdout={out!r}; see child stderr above). The connect "
+        "likely failed at path resolution / socket open (filesystem boundary), not "
+        "peer-cred. Ensure the socket parent chain is world-traversable (under /tmp)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +319,14 @@ async def _running_server():
     original_enforce = server_module._enforce_socket_dir_secure
     server_module._enforce_socket_dir_secure = lambda *a, **k: None
 
-    tmpdir = tempfile.mkdtemp(prefix="peercred-smoke-")
+    # Bind under a WORLD-TRAVERSABLE root (/tmp, mode 1777) — NOT tempfile's
+    # default ($TMPDIR, which on macOS is a per-user /var/folders/.../T whose
+    # ancestors are 0700). Under the default root a foreign uid fails at PATH
+    # RESOLUTION before the peer-cred gate, so the cross-uid result would reflect
+    # the filesystem boundary instead of peer-cred and could never go green on
+    # macOS (Codex adversarial-review finding). _assert_chain_traversable() below
+    # enforces this invariant before the cross-uid child runs.
+    tmpdir = tempfile.mkdtemp(prefix="peercred-smoke-", dir="/tmp")
     # Make the parent dir traversable by *other* uids (0711): +x for group/other
     # lets a foreign uid path-resolve to the socket. R1 would normally refuse
     # this; the monkeypatch above is why it binds.
