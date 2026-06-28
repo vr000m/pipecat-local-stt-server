@@ -69,9 +69,11 @@ def test_linux_branch_unpacks_so_peercred_uid(monkeypatch):
             return -1
 
         def getsockopt(self, level, optname, buflen):
-            # SO_PEERCRED returns struct ucred { pid_t; uid_t; gid_t } == "3i".
-            assert buflen == struct.calcsize("3i")
-            return struct.pack("3i", pid, uid, gid)
+            # SO_PEERCRED returns struct ucred { pid_t; uid_t; gid_t }. The
+            # implementation reads it as unsigned ("3I") so a uid >= 2**31 stays
+            # positive; mirror that exact format here rather than signed "3i".
+            assert buflen == struct.calcsize("3I")
+            return struct.pack("3I", pid, uid, gid)
 
     assert peer_uid(FakeSocket()) == uid
 
