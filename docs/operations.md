@@ -28,6 +28,16 @@ client-side configuration.
 
 ### Two-agent install
 
+> **Backend dependencies.** A backend imports its ASR library lazily at startup,
+> and a bare `uv run` / `uv sync` prunes the optional extras, so an installed
+> agent can crash-loop on `ModuleNotFoundError`. `just stt-install <backend>` /
+> `just stt-enable <backend>` ensure the matching extra is present
+> (`uv sync --extra <backend> --inexact`, additive — it won't prune other
+> backends); set `PIPECAT_STT_SKIP_DEP_SYNC=1` to manage extras yourself. If an
+> agent does crash on a missing import, the server now exits with an actionable
+> `stt_server: the '<extra>' extra is not installed … run: uv sync --extra
+> <extra> --inexact` instead of a bare traceback.
+
 `scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
 `PIPECAT_STT_SOCKET` / `PIPECAT_STT_BACKEND` (the legacy `KODA_STT_*` names
 are still honoured as deprecated aliases) so two LaunchAgents can coexist
@@ -231,6 +241,23 @@ must have explicit `argtypes`/`restype` set (a wrong width or signature can fail
 *open* by comparing equal). libc is loaded with `use_errno=True`. The
 `socketpair()` unit test asserting `peer_uid() == os.geteuid()` is the gate that
 catches a width/signature regression — keep it.
+
+### Verifying the boundary locally
+
+Two local checks exercise what single-uid CI cannot:
+
+- `just smoke-peercred` (`scripts/smoke_peercred.py`) — opens N concurrent
+  same-uid sessions (regression guard) and, when a second local uid is reachable
+  via passwordless `sudo`, drives a foreign-uid connection that must be rejected
+  `403`. The cross-uid leg skips cleanly when no second uid is available.
+- `scripts/verify_peercred_crossuid.py` — a stdlib-only verifier (no venv /
+  `websockets`) that drives a probe as **both** the owning uid (expect `101`) and
+  `nobody` (expect `403`) against one permissive socket. Same socket + perms,
+  only the uid differs, so a `101`-vs-`403` split proves peer-cred — not the
+  filesystem — is the discriminator. Run with `sudo -v && uv run python
+  scripts/verify_peercred_crossuid.py`. It binds under `/tmp` (world-traversable)
+  and asserts every ancestor is traversable, so a filesystem-boundary failure is
+  reported as inconclusive rather than masquerading as a peer-cred result.
 
 ## Whisper hallucination suppression (MLX backend)
 

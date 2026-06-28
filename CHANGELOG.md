@@ -32,6 +32,11 @@ features; clients connect unchanged (no protocol or client-API change).
 - `scripts/smoke_peercred.py` + `just smoke-peercred`: a local cross-uid /
   multi-connection peer-cred smoke (cross-uid leg skips cleanly without a second
   local uid).
+- `scripts/verify_peercred_crossuid.py`: a stdlib-only cross-uid verifier that
+  drives a probe as both the owning uid and `nobody` against one permissive
+  socket — proving peer-cred (not the filesystem) is the discriminator. Needs no
+  venv/`websockets`, so it works with `nobody` where the smoke's `sudo` path
+  can't.
 
 ### Changed
 

@@ -117,7 +117,7 @@ still not a client code change. This precondition is written into Requirements.
 **Test files:** `tests/test_stt_server.py`
 **Test command:** `uv run pytest tests/test_stt_server.py -k "parent_dir or socket_dir or 0700 or owner" -q`
 
-- [ ] Add a private helper (e.g. `_enforce_socket_dir_secure(path: Path,
+- [x] Add a private helper (e.g. `_enforce_socket_dir_secure(path: Path,
   trusted_root: Path)`) that creates missing socket directories `0700`
   (`mkdir(mode=0o700)`, then re-`stat` and verify — `mkdir` mode is umask-masked,
   so verify rather than trust), then walks every component from the socket's bind
@@ -125,11 +125,11 @@ still not a client code change. This precondition is written into Requirements.
   `st_uid == os.geteuid()` and no group/other write bits (`st_mode & 0o022 == 0`);
   sticky-bit directories are allowed. Raise a clear exception naming the failing
   component and condition otherwise.
-- [ ] Call it in `start()` immediately before the `os.umask(0o077)` block
+- [x] Call it in `start()` immediately before the `os.umask(0o077)` block
   (replacing the bare `socket_path.parent.mkdir(parents=True, exist_ok=True)`
   at `server.py:148-149`). Resolve and document the trusted root, then verify the
   full ancestor walk rather than only the immediate parent of the socket.
-- [ ] **Failure surface — wrap the serve path, not the status probe.** Raise a
+- [x] **Failure surface — wrap the serve path, not the status probe.** Raise a
   `ValueError`/dedicated exception from the helper. The serve entrypoint
   `_cmd_serve` (`__main__.py:210-224`) runs `asyncio.run(serve(...))` with **no**
   try/except today, so the exception would propagate as a bare traceback (the
@@ -138,7 +138,7 @@ still not a client code change. This precondition is written into Requirements.
   print(f"stt_server: {exc}", file=sys.stderr); raise SystemExit(1)` around the
   serve call. This also fixes the latent unguarded `ServerConfig.__post_init__`
   `ValueError` on the serve path. Confirm no stack-trace-only failure.
-- [ ] **Co-requisite: install script must create the dir `0700` (lands with this
+- [x] **Co-requisite: install script must create the dir `0700` (lands with this
   phase).** `scripts/install_stt_agent.sh:100` does `mkdir -p "$(dirname
   "$SOCKET_PATH")"` at the install shell umask (commonly `0755`); after this phase
   the server would *refuse to start* against that existing `0755` dir. Change to
@@ -152,7 +152,7 @@ still not a client code change. This precondition is written into Requirements.
 **Test files:** `tests/test_peercred.py` (new)
 **Test command:** `uv run pytest tests/test_peercred.py -q`
 
-- [ ] New module `stt_server/_peercred.py` exposing
+- [x] New module `stt_server/_peercred.py` exposing
   `peer_uid(sock: PeerCredSocket) -> int | None`, where `PeerCredSocket` is a
   minimal structural `Protocol` containing only the members used by the resolver
   (`family`, `fileno()`, `getsockopt()`), rather than `socket.socket` directly.
@@ -165,7 +165,7 @@ still not a client code change. This precondition is written into Requirements.
     explicitly on the libc function and load libc with `use_errno=True` for
     safety, portability, and correct errno propagation; return uid on success.
   - Unknown platform / call failure: return `None` (caller fails closed).
-- [ ] Keep this module import-light and side-effect-free so it is unit-testable
+- [x] Keep this module import-light and side-effect-free so it is unit-testable
   without binding a server (mirror the existing single `sys.platform == "darwin"`
   precedent at `server.py:75-77`; no new abstraction framework).
 
@@ -175,7 +175,7 @@ still not a client code change. This precondition is written into Requirements.
 **Test files:** `tests/test_stt_server.py`
 **Test command:** `uv run pytest tests/test_stt_server.py -k "peercred or peer_uid or uds_auth" -q`
 
-- [ ] In `_process_request` (`server.py:261`), gate on UDS only
+- [x] In `_process_request` (`server.py:261`), gate on UDS only
   (`self._config.socket_path is not None`). Obtain the raw socket via
   `connection.transport.get_extra_info("socket")`. **Verified:**
   `connection.transport` is set before `_process_request` runs (confirmed in the
@@ -187,16 +187,16 @@ still not a client code change. This precondition is written into Requirements.
   `_pending_write_bytes`, a *post-handshake* call site, so it is not precedent
   for the handshake-time return). Assert `sock is not None and sock.family ==
   AF_UNIX` in the implementation.
-- [ ] **Fail-closed guard (do this before calling the resolver):** if the raw
+- [x] **Fail-closed guard (do this before calling the resolver):** if the raw
   socket is `None`, return `connection.respond(403, "peer not permitted\n")` and
   warn — do NOT call `peer_uid(None)` (it would raise `AttributeError` on
   `.getsockopt`/`.fileno`, an uncaught exception, not a guaranteed reject).
-- [ ] Wrap `peer_uid(sock)` in `try/except Exception`; if it raises, log the
+- [x] Wrap `peer_uid(sock)` in `try/except Exception`; if it raises, log the
   exception and return `connection.respond(403, "peer not permitted\n")`. If it
   returns `None` or `!= os.geteuid()`, return the same `403`. Order it
   before/independent of the bearer-token branch so UDS rejects foreign uids
   regardless of token.
-- [ ] Log a single warning on each fail-closed path (resolver `None`, resolver
+- [x] Log a single warning on each fail-closed path (resolver `None`, resolver
   exception, or missing socket) so an unsupported platform / unexpected transport
   is loud.
 
@@ -224,7 +224,7 @@ normal `TranscriptionServer` construction (for example, a local subclass or
 monkeypatch of `_enforce_socket_dir_secure`). Do not add a `ServerConfig` field
 or equivalent public/API-reachable bypass flag.
 
-- [ ] **Cross-uid rejection (local-only, the real test).** Build
+- [x] **Cross-uid rejection (local-only, the real test).** Build
   `TranscriptionServer`/`ServerConfig` **directly** (the public `serve()` does
   not expose `unix_socket_mode` — `server.py:900` — so the smoke cannot use it)
   with `unix_socket_mode=0o666`, a test-only replacement for the dir-enforcement
@@ -234,16 +234,16 @@ or equivalent public/API-reachable bypass flag.
   `websockets.exceptions.InvalidStatus` and check `status_code == 403` and the
   `"peer not permitted\n"` body (it is a **pre-handshake HTTP response, not a
   protocol JSON envelope** — `docs/protocol.md` documents no reject envelope).
-- [ ] **Same-uid multi-connection (also CI-safe).** Open N concurrent
+- [x] **Same-uid multi-connection (also CI-safe).** Open N concurrent
   `TranscriptionClient` sessions as the owning uid, assert all complete the
   handshake and stream — a regression guard that peer-cred did not break the
   normal path under concurrency. Add one assertion that the resolved peer uid
   equals `os.geteuid()` via the **real** resolver (not a stub), so a silently-
   `None` transport is caught rather than masked. Mirror this as a pytest case.
-- [ ] Gate the cross-uid path on availability of a second uid / `sudo` and
+- [x] Gate the cross-uid path on availability of a second uid / `sudo` and
   `sys.platform`; print a clear "skipped: needs a second local uid" rather than
   failing when run unprivileged. `just smoke-peercred` wraps invocation.
-- [ ] For the **accept** path, assert `server.hello` fields against the
+- [x] For the **accept** path, assert `server.hello` fields against the
   `server.py:287-307` source of truth (protocol.md lists event *names*, not the
   field schema). If protocol.md is to be the field oracle, Phase 5 must add the
   `server.hello` field table to it first.
@@ -255,16 +255,16 @@ or equivalent public/API-reachable bypass flag.
 **Test files:** n/a
 **Test command:** `uv run ruff check && uv run ruff format --check`
 
-- [ ] Document the same-host UDS trust model: the owner-only ancestor chain is the
+- [x] Document the same-host UDS trust model: the owner-only ancestor chain is the
   primary filesystem boundary; peer-cred is the kernel-authoritative
   defense-in-depth backstop; bearer token retained for TCP only.
-- [ ] Note macOS `getpeereid`-via-`ctypes` wrinkle for future maintainers.
-- [ ] If the accept-path test is to assert against `docs/protocol.md` rather than
+- [x] Note macOS `getpeereid`-via-`ctypes` wrinkle for future maintainers.
+- [x] If the accept-path test is to assert against `docs/protocol.md` rather than
   `server.py`, add the `server.hello` field table (`protocol_version`,
   `capabilities`, `audio`, `backend`) to `docs/protocol.md` so it becomes a real
   field oracle. Otherwise document that protocol.md pins event presence, not
   field shape, and the reject is a pre-handshake HTTP `403` (no JSON envelope).
-- [ ] Update `docs/dev_plans/README.md` row status on completion.
+- [x] Update `docs/dev_plans/README.md` row status on completion.
 
 ---
 
@@ -405,34 +405,34 @@ sequenceDiagram
 
 ## Acceptance Criteria
 
-- [ ] Server refuses to start when any non-sticky ancestor from the socket bind
+- [x] Server refuses to start when any non-sticky ancestor from the socket bind
   directory through the trusted root is not owner-owned or is group/other-writable,
   with an actionable `stt_server: <msg>` error + `SystemExit(1)` (not a bare
   traceback); creates missing socket directories `0700` when absent. A test where
   a grandparent dir is owned by a different uid rejects. `install_stt_agent.sh`
   creates the socket dir `0700` so fresh installs/upgrades do not break.
-- [ ] UDS connections from a foreign uid are rejected with `403` before the
+- [x] UDS connections from a foreign uid are rejected with `403` before the
   handshake; same-uid connections succeed unchanged. Every fail-closed path
   (resolver `None`, resolver exception such as `OSError`, missing transport
   socket, unknown platform) rejects.
-- [ ] Local `just smoke-peercred` demonstrates a real cross-uid `403` (asserted
+- [x] Local `just smoke-peercred` demonstrates a real cross-uid `403` (asserted
   via `InvalidStatus.status_code` + `"peer not permitted\n"` body) against a
   server whose `0o666` socket mode **and** `0711` parent dir both permit the peer,
   using a test-only helper replacement that cannot be triggered through `serve()`
   or normal `TranscriptionServer` construction — so peer-cred is provably what
   rejects. N concurrent same-uid sessions all succeed.
-- [ ] `peer_uid()` resolves on macOS (ctypes `getpeereid`) and Linux
+- [x] `peer_uid()` resolves on macOS (ctypes `getpeereid`) and Linux
   (`SO_PEERCRED`); the ctypes binding sets `argtypes`, `restype`, and
   `use_errno=True`; branch selection is covered on any host; unknown platforms
   fail closed.
-- [ ] `websockets` is pinned to `>=16,<17` and the lockfile reflects the pin.
-- [ ] No client-side change required; existing client connects unmodified.
-- [ ] TCP path and bearer-token behavior unchanged.
-- [ ] Any test-only dir-enforcement seam is implemented by subclassing or
+- [x] `websockets` is pinned to `>=16,<17` and the lockfile reflects the pin.
+- [x] No client-side change required; existing client connects unmodified.
+- [x] TCP path and bearer-token behavior unchanged.
+- [x] Any test-only dir-enforcement seam is implemented by subclassing or
   monkeypatching the helper, not by a `ServerConfig` field or other public/API-
   reachable flag.
-- [ ] `uv run pytest -q` green; `ruff check` + `ruff format` clean.
-- [ ] Docs describe the same-host trust model and the same-uid precondition.
+- [x] `uv run pytest -q` green; `ruff check` + `ruff format` clean.
+- [x] Docs describe the same-host trust model and the same-uid precondition.
 
 ## Review Focus
 
