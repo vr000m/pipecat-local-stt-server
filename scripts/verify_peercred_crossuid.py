@@ -29,9 +29,12 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The scripts dir itself, so the shared ``_smoke_lib`` helper resolves.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Resolve repo root robustly even when run from scratchpad: rely on `uv run`'s
 # project env for the import below.
 import stt_server.server as server_module  # noqa: E402
+from _smoke_lib import assert_chain_traversable  # noqa: E402
 from stt_server.backend import EchoBackend  # noqa: E402
 
 SYS_PY = "/usr/bin/python3"  # world-executable; reachable by nobody
@@ -113,21 +116,6 @@ async def _run_probe(sock: str, probe_path: str, as_nobody: bool) -> tuple[str, 
     return out_b.decode().strip(), err_b.decode().strip(), proc.returncode or 0
 
 
-def _assert_chain_traversable(sock: str) -> None:
-    d = os.path.dirname(os.path.realpath(sock))
-    while True:
-        mode = stat.S_IMODE(os.stat(d).st_mode)
-        if not (mode & 0o001):
-            raise SystemExit(
-                f"ancestor {d} not other-traversable (mode={oct(mode)}); "
-                "a foreign uid would fail before the peer-cred gate"
-            )
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
-
-
 async def main() -> int:
     if sys.platform != "darwin" and sys.platform != "linux":
         print(f"skipped: needs macOS/Linux, not {sys.platform}")
@@ -136,7 +124,7 @@ async def main() -> int:
         raise SystemExit(f"{SYS_PY} not found; need a system python3 reachable by nobody")
 
     original = server_module._enforce_socket_dir_secure
-    server_module._enforce_socket_dir_secure = lambda *a, **k: None
+    server_module._enforce_socket_dir_secure = lambda *a, **k: a[0]
     tmpdir = tempfile.mkdtemp(prefix="peercred-crossuid-", dir="/tmp")
     os.chmod(tmpdir, 0o711)
     sock = os.path.join(tmpdir, "p.sock")
@@ -151,7 +139,7 @@ async def main() -> int:
     srv = server_module.TranscriptionServer(EchoBackend(), config)
     await srv.start()
     try:
-        _assert_chain_traversable(sock)
+        assert_chain_traversable(sock)
         print("=== cross-uid peer-cred verification ===")
         print(f"  socket : {sock}  mode={oct(stat.S_IMODE(os.stat(sock).st_mode))}")
         print(f"  euid   : {os.geteuid()}\n")

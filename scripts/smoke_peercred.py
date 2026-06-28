@@ -51,9 +51,12 @@ import tempfile
 # Run from the repo root so ``stt_server`` imports resolve (also required when
 # this file is re-invoked under ``sudo -u`` for the foreign-uid connect role).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The scripts dir itself, so the shared ``_smoke_lib`` helper resolves.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import websockets.exceptions  # noqa: E402
 
+from _smoke_lib import assert_chain_traversable  # noqa: E402
 from stt_server import _peercred  # noqa: E402
 from stt_server.backend import EchoBackend  # noqa: E402
 from stt_server.client import TranscriptionClient  # noqa: E402
@@ -219,31 +222,6 @@ def _have(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _assert_chain_traversable(sock: str) -> None:
-    """Every directory from the socket's parent up to ``/`` must be
-    other-traversable (mode & 0o001). Otherwise a foreign uid fails at PATH
-    RESOLUTION before reaching ``_process_request``, and the cross-uid result
-    would reflect the filesystem boundary rather than the peer-cred gate — the
-    exact masking Codex flagged. Raise a targeted setup error if the chain is
-    not traversable (rather than producing a meaningless cross-uid verdict)."""
-    import stat as _stat
-
-    d = os.path.dirname(os.path.realpath(sock))
-    while True:
-        mode = _stat.S_IMODE(os.stat(d).st_mode)
-        if not (mode & 0o001):
-            raise SystemExit(
-                f"socket ancestor {d} is not other-traversable (mode={oct(mode)}): a "
-                "foreign uid would fail at path resolution BEFORE the peer-cred gate, "
-                "so the cross-uid result would be meaningless. Bind the smoke socket "
-                "under a world-traversable root (e.g. /tmp)."
-            )
-        parent = os.path.dirname(d)
-        if parent == d:  # reached '/'
-            break
-        d = parent
-
-
 async def _run_cross_uid(sock: str) -> bool:
     """Drive the example client under a second uid; assert peer-cred rejects.
 
@@ -260,7 +238,7 @@ async def _run_cross_uid(sock: str) -> bool:
     # Guard the invariant the whole cross-uid test depends on: the peer must be
     # able to traverse to the socket so peer-cred (not the filesystem) is what
     # rejects. Fails with a targeted diagnostic if not.
-    _assert_chain_traversable(sock)
+    assert_chain_traversable(sock)
     # Re-invoke THIS file under the second uid in its connect-as-peer role.
     cmd = [
         "sudo",
@@ -317,14 +295,14 @@ async def _running_server():
     # TEST-ONLY seam: defeat R1's ancestor-chain enforcement so a 0711/0o666
     # socket can be bound. NOT reachable from serve() or public construction.
     original_enforce = server_module._enforce_socket_dir_secure
-    server_module._enforce_socket_dir_secure = lambda *a, **k: None
+    server_module._enforce_socket_dir_secure = lambda *a, **k: a[0]
 
     # Bind under a WORLD-TRAVERSABLE root (/tmp, mode 1777) — NOT tempfile's
     # default ($TMPDIR, which on macOS is a per-user /var/folders/.../T whose
     # ancestors are 0700). Under the default root a foreign uid fails at PATH
     # RESOLUTION before the peer-cred gate, so the cross-uid result would reflect
     # the filesystem boundary instead of peer-cred and could never go green on
-    # macOS (Codex adversarial-review finding). _assert_chain_traversable() below
+    # macOS (Codex adversarial-review finding). assert_chain_traversable() below
     # enforces this invariant before the cross-uid child runs.
     tmpdir = tempfile.mkdtemp(prefix="peercred-smoke-", dir="/tmp")
     # Make the parent dir traversable by *other* uids (0711): +x for group/other
