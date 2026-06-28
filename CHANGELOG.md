@@ -40,8 +40,9 @@ features; clients connect unchanged (no protocol or client-API change).
 
 ### Changed
 
-- Pinned `websockets` to `>=16,<17` (the `_process_request` handshake/transport
-  contract depends on the v16 API).
+- Pinned `websockets` to `>=16,<17` (was `>=13`; the `_process_request`
+  handshake/transport contract depends on the v16 API). Applies to every extra,
+  including `client`. See Upgrade notes for the consumer-conflict caveat.
 - `scripts/install_stt_agent.sh` creates the socket directory `0700` (was the
   install-shell umask default) and self-heals a pre-existing `0755` dir.
 - Startup failures — socket-dir enforcement, the `ServerConfig` `ValueError`,
@@ -80,6 +81,13 @@ features; clients connect unchanged (no protocol or client-API change).
   (self-heals the dir to `0700`), or `chmod 700` the dir / move the socket under
   `$HOME`. Koda hosts run the server from the checkout, so fold this into the
   next checkout update; no client pin bump is needed.
+- **`websockets>=16` may conflict for library consumers.** The floor moved from
+  `>=13` to `>=16,<17` across every extra (`client` included), so an environment
+  that resolves an older `websockets` (or another package capping it `<16`) will
+  hit a dependency conflict when installing this version. The wire protocol and
+  `stt_server.client` API are unchanged — only the dependency floor moved — so
+  this is a packaging bump, not a behavioural one, and stays a patch release
+  (`0.3.3`).
 
 ## [0.3.2] - 2026-06-08
 
