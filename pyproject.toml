@@ -1,6 +1,6 @@
 [project]
 name = "pipecat-local-stt-server"
-version = "0.3.2"
+version = "0.3.3"
 description = "Standalone local WebSocket transcription (STT) server, client, and pluggable ASR backends for the Pipecat ecosystem"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,22 +24,22 @@ dependencies = [
     # hard runtime dependency of the base package. Backend ASR engines live
     # behind the [mlx] / [parakeet] extras so a client-only consumer (e.g. a
     # bot that just talks to a running server) does not pull MLX/Whisper.
-    "websockets>=13.0",
+    "websockets>=16,<17",
 ]
 
 [project.optional-dependencies]
 # Pure client deps — what a downstream consumer of `stt_server.client` needs
 # without pulling any MLX/Whisper runtime.
-client = ["websockets>=13.0"]
+client = ["websockets>=16,<17"]
 # Full server install with the MLX Whisper backend.
-mlx = ["websockets>=13.0", "mlx-whisper>=0.4.0", "numpy>=1.26"]
+mlx = ["websockets>=16,<17", "mlx-whisper>=0.4.0", "numpy>=1.26"]
 # Full server install with the Parakeet TDT backend (via parakeet-mlx).
-parakeet = ["websockets>=13.0", "parakeet-mlx>=0.5.1", "numpy>=1.26"]
+parakeet = ["websockets>=16,<17", "parakeet-mlx>=0.5.1", "numpy>=1.26"]
 # Full server install with the Nemotron 3.5 ASR backend (via mlx-audio).
 # mlx-audio>=0.4.4 is the first PyPI release carrying Nemotron STT support
 # (Blaizzy/mlx-audio#774, merged 2026-06-05); earlier releases lacked it, which
 # previously forced a git-pinned dev group. Now a clean, PyPI-installable extra.
-nemotron = ["websockets>=13.0", "mlx-audio>=0.4.4", "numpy>=1.26"]
+nemotron = ["websockets>=16,<17", "mlx-audio>=0.4.4", "numpy>=1.26"]
 
 [dependency-groups]
 dev = [

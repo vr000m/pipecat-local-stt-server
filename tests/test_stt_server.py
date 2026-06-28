@@ -513,9 +513,13 @@ async def test_bearer_auth_requires_token():
         await srv.shutdown()
 
 
-async def test_unix_socket_has_owner_only_permissions():
+async def test_unix_socket_has_owner_only_permissions(monkeypatch):
     import stat
 
+    # Binds under /tmp (root-owned), which R1 dir-enforcement rejects. This
+    # test exercises UDS perms, not ancestor-dir enforcement, so neutralise the
+    # check via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -528,7 +532,16 @@ async def test_unix_socket_has_owner_only_permissions():
             await srv.shutdown()
 
 
-async def test_unix_socket_start_creates_parent_directory():
+async def test_unix_socket_start_creates_parent_directory(monkeypatch):
+    # Binds under /tmp (root-owned), which R1 ownership enforcement rejects.
+    # This test exercises parent-dir *creation*, so the stub keeps the mkdir
+    # behaviour but drops the ancestor ownership/perms check (the part /tmp
+    # trips). Sanctioned by the Phase-4 test-only seam.
+    def _mkdir_only(path, trusted_root):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path  # mirror the real helper's bind-path return contract
+
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", _mkdir_only)
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "nested" / "path" / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -540,8 +553,12 @@ async def test_unix_socket_start_creates_parent_directory():
             await srv.shutdown()
 
 
-async def test_unix_socket_transport():
+async def test_unix_socket_transport(monkeypatch):
     # AF_UNIX paths on macOS cap at ~104 bytes; use a short /tmp path.
+    # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
+    # UDS transport, not ancestor-dir enforcement, so neutralise the check via
+    # the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(
@@ -605,8 +622,12 @@ async def test_tcp_without_token_emits_startup_warning(caplog):
         await srv.shutdown()
 
 
-async def test_uds_without_token_does_not_warn(caplog):
+async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
     caplog.set_level("WARNING", logger="stt_server.server")
+    # Binds under a system temp dir (root-owned ancestor) which R1 rejects;
+    # this test exercises the UDS-vs-TCP token warning, not ancestor-dir
+    # enforcement, so neutralise the check via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory() as tmp:
         sock = str(Path(tmp) / "stt.sock")
         srv = TranscriptionServer(
@@ -812,8 +833,12 @@ def test_resolve_probe_endpoint_loads_dotenv_even_with_explicit_socket(monkeypat
     assert _resolve_auth_token(None, client=True) == "from-dotenv"
 
 
-async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path: Path):
+async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path: Path, monkeypatch):
     pytest.importorskip("dotenv")
+    # Binds the in-process server's socket directly under /tmp (root-owned),
+    # which R1 dir-enforcement rejects; this test exercises the CLI token-probe
+    # path, not ancestor-dir enforcement, so neutralise via the Phase-4 seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     sock = Path("/tmp") / f"stt-preflight-{os.getpid()}.sock"
     sock.unlink(missing_ok=True)
     srv = TranscriptionServer(
@@ -1346,10 +1371,15 @@ async def test_parakeet_24_to_300s_utterance_reaches_backend_intact():
         await srv.shutdown()
 
 
-async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path):
+async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path, monkeypatch):
     """P1 regression at the CLI boundary: KODA_STT_AUTH_TOKEN alone must
     not authenticate the probe — otherwise a health check can report ok
     while the bot (which only reads STT_WS_TOKEN) still 401s."""
+    # Binds the in-process server's socket directly under /tmp (root-owned),
+    # which R1 dir-enforcement rejects; this test exercises the client-vs-server
+    # token contract, not ancestor-dir enforcement, so neutralise via the
+    # Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     sock = Path("/tmp") / f"stt-preflight-p1-{os.getpid()}.sock"
     sock.unlink(missing_ok=True)
     srv = TranscriptionServer(
@@ -1385,3 +1415,443 @@ async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path):
     finally:
         await srv.shutdown()
         sock.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Parent-directory enforcement (R1).
+#
+# Pins the contract of the private helper
+#   _enforce_socket_dir_secure(path: Path, trusted_root: Path)
+# which walks every directory component from the socket's bind directory up to
+# and including ``trusted_root`` requiring ``st_uid == os.geteuid()`` and no
+# group/other write bits (sticky-bit dirs excepted), creating any missing
+# socket directories ``0700`` (then re-stat-verifying, since mkdir's mode is
+# umask-masked). On any failure it raises a clear exception naming the offending
+# component; it MUST NOT chmod/chown a pre-existing directory it does not own.
+#
+# These call the helper directly (no event loop / bind needed). ``tempfile``
+# creates the trusted root via ``mkdtemp`` which is reliably ``0700``, so the
+# root itself passes the walk on single-uid CI.
+# ---------------------------------------------------------------------------
+
+
+def _make_trusted_root() -> Path:
+    """A 0700, owner-owned temp dir suitable as the trusted root of the walk."""
+    return Path(tempfile.mkdtemp(prefix="stt-dirsec."))
+
+
+def test_enforce_socket_dir_creates_missing_socket_dir_0700():
+    # (a)+(c): an absent socket bind directory is created 0700 and the helper
+    # succeeds (no exception). The walk through the trusted root must pass.
+    import shutil
+    import stat as _stat
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    try:
+        bind_dir = root / "pipecat-stt"
+        sock = bind_dir / "s"
+        assert not bind_dir.exists()
+
+        _enforce_socket_dir_secure(sock, root)  # must not raise
+
+        assert bind_dir.is_dir(), "helper must create the missing socket directory"
+        mode = _stat.S_IMODE(bind_dir.stat().st_mode)
+        assert mode == 0o700, f"socket dir created as {oct(mode)}, expected 0o700"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_created_modes_are_0700_under_loose_umask():
+    # (c): even under a permissive process umask the created dirs end up 0700
+    # (the helper must verify/repair, not trust the umask-masked mkdir mode).
+    import shutil
+    import stat as _stat
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    prior = os.umask(0o022)
+    try:
+        bind_dir = root / "nested"
+        sock = bind_dir / "s"
+
+        _enforce_socket_dir_secure(sock, root)
+
+        mode = _stat.S_IMODE(bind_dir.stat().st_mode)
+        assert mode == 0o700, f"created dir is {oct(mode)} under umask 0o022, expected 0o700"
+    finally:
+        os.umask(prior)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_refuses_group_writable_parent_dir():
+    # (b): a pre-existing group/other-writable ancestor in the walk must make
+    # the helper refuse with an actionable error naming the offending path.
+    #
+    # NOTE on the fixture mode: R1 / the Acceptance Criteria define the failure
+    # as "group/other-writable" (st_mode & 0o022 != 0). A plain 0o755 dir is
+    # NOT group/other-writable, so we use 0o775 (group-writable) which refuses
+    # under both the literal `& 0o022` rule and any stricter `& 0o077` reading.
+    import shutil
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    try:
+        loose = root / "loose"
+        loose.mkdir()
+        os.chmod(loose, 0o775)  # group-writable: defeats the trust boundary
+        sock = loose / "s"
+
+        with pytest.raises((ValueError, OSError)) as exc:
+            _enforce_socket_dir_secure(sock, root)
+
+        msg = str(exc.value)
+        assert str(loose) in msg, f"error must name the offending path; got: {msg!r}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_cli_serve_refuses_group_writable_socket_dir_with_exit1():
+    # (b) CLI surface: a group-writable socket parent dir must surface as
+    # "stt_server: <msg>" on stderr + exit code 1, not a bare traceback.
+    # Uses the echo backend so `serve` does not load a heavy model and fails
+    # fast at the dir-enforcement check before binding.
+    import shutil
+
+    root = Path(tempfile.mkdtemp(prefix="stt-cli-dirsec."))
+    try:
+        loose = root / "loose"
+        loose.mkdir()
+        os.chmod(loose, 0o777)  # world+group-writable parent
+        sock = loose / "s.sock"
+
+        r = _run_module(
+            "serve",
+            "--backend",
+            "echo",
+            "--socket-path",
+            str(sock),
+        )
+        assert r.returncode == 1, f"expected exit 1; stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "stt_server:" in r.stderr, f"expected actionable error, got: {r.stderr!r}"
+        assert "Traceback" not in r.stderr, f"must not leak a bare traceback: {r.stderr!r}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_foreign_owner_ancestor_rejects_without_chmod_chown(monkeypatch):
+    # (d): a grandparent dir reporting a foreign st_uid must be rejected, and
+    # the helper MUST NOT attempt to chmod/chown a directory it does not own.
+    import shutil
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()
+    try:
+        # Pre-create a fully valid 0700 chain so no mkdir happens; the only
+        # failure is the monkeypatched foreign ownership of `child`.
+        child = root / "child"
+        child.mkdir(mode=0o700)
+        bind_dir = child / "gc"
+        bind_dir.mkdir(mode=0o700)
+        sock = bind_dir / "s"
+
+        # Capture the real lstat BEFORE patching: the walk reads ownership via
+        # os.lstat, and computing the match via os.path.realpath would call the
+        # (patched) os.lstat and recurse. The chain has no symlinks, so a lexical
+        # compare identifies `child` unambiguously.
+        real_lstat = os.lstat
+        foreign_uid = os.geteuid() + 1
+        child_str = os.path.normpath(str(child))
+
+        def fake_stat(path, *args, **kwargs):
+            try:
+                p = os.path.normpath(os.fspath(path))
+            except TypeError:
+                return real_lstat(path)  # fd-based: leave untouched
+            st = real_lstat(path)
+            if p == child_str:
+                fields = list(st)  # the 10 canonical stat fields
+                fields[4] = foreign_uid  # st_uid
+                return os.stat_result(fields)
+            return st
+
+        chmod_calls: list = []
+        chown_calls: list = []
+        # The ancestor walk reads ownership via ``os.lstat`` (so symlink
+        # components are detected, not followed); patch it as well as ``os.stat``
+        # so the injected foreign uid is observed.
+        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "lstat", fake_stat)
+        monkeypatch.setattr(os, "chmod", lambda *a, **k: chmod_calls.append(a))
+        monkeypatch.setattr(os, "chown", lambda *a, **k: chown_calls.append(a))
+
+        with pytest.raises((ValueError, OSError)):
+            _enforce_socket_dir_secure(sock, root)
+
+        # Invariant: never touch ownership/mode of a dir we do not own.
+        assert chmod_calls == [], f"helper chmod'd an unowned dir: {chmod_calls!r}"
+        assert chown_calls == [], f"helper chown'd an unowned dir: {chown_calls!r}"
+    finally:
+        monkeypatch.undo()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_refuses_symlinked_socket_dir_under_writable_ancestor():
+    # (e) Adversarial: the client-visible socket path runs through a symlink that
+    # lives in a group/other-writable lexical ancestor. Resolving the path would
+    # verify the symlink TARGET's chain (safe) and skip the writable ancestor,
+    # letting a foreign uid repoint the symlink after startup and hijack the
+    # path clients connect to. The helper must verify the LITERAL chain and
+    # refuse to bind on any symlink component.
+    import shutil
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()  # stands in for $HOME (0700, owner-owned)
+    try:
+        safe = root / "safe"
+        safe.mkdir(mode=0o700)  # a legitimate 0700 target
+        writable = root / "writable"
+        writable.mkdir(mode=0o700)
+        os.chmod(writable, 0o775)  # group-writable: a foreign uid can write here
+        link = writable / "link"
+        link.symlink_to(safe)  # link -> root/safe, repointable by anyone with
+        # write on `writable`
+        sock = link / "s"  # client-visible path traverses the symlink
+
+        with pytest.raises((ValueError, OSError)) as exc:
+            _enforce_socket_dir_secure(sock, root)
+
+        msg = str(exc.value)
+        assert str(link) in msg, f"error must name the symlink component; got: {msg!r}"
+        assert "symlink" in msg.lower(), f"error must explain the symlink refusal; got: {msg!r}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — UDS peer-credential gate in _process_request (CI seam)
+#
+# The server authenticates a UDS peer by its kernel-supplied uid before the
+# WebSocket handshake completes (R2). Every fail-closed path — missing
+# transport socket, resolver returning None, resolver raising, or a uid that
+# mismatches os.geteuid() — must return ``connection.respond(403, "peer not
+# permitted\n")`` rather than allow or leak an exception. A same-uid peer
+# (the only legitimate case under the same-uid deployment precondition) must
+# pass the gate untouched.
+#
+# Two layers, per the plan's Testing Notes:
+#   * integration: bind a real UDS server (dir-enforcement neutralised via the
+#     sanctioned seam so it can bind under /tmp) and connect with the client;
+#   * unit: drive ``_process_request`` directly with fakes for the cases that
+#     cannot be staged with a real same-uid socket (None transport socket,
+#     resolver raising).
+# ---------------------------------------------------------------------------
+
+
+class _FakeTransport:
+    """Minimal asyncio-transport stand-in exposing only get_extra_info."""
+
+    def __init__(self, sock):
+        self._sock = sock
+
+    def get_extra_info(self, name, default=None):
+        if name == "socket":
+            return self._sock
+        return default
+
+
+class _FakeConnection:
+    """Minimal ``ServerConnection`` stand-in for _process_request unit tests.
+
+    ``respond(status, body)`` records the call and returns a sentinel so the
+    test can assert _process_request returned the reject response (the
+    websockets contract: returning a respond() result rejects the handshake).
+    """
+
+    def __init__(self, sock):
+        self.transport = _FakeTransport(sock)
+        self.responses: list[tuple[int, str]] = []
+
+    def respond(self, status, body):
+        self.responses.append((status, body))
+        return ("RESPOND", status, body)
+
+
+class _FakeRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+def _uds_server_for_unit_test() -> TranscriptionServer:
+    """A TranscriptionServer in UDS mode WITHOUT binding.
+
+    ``_process_request`` only reads ``self._config.socket_path`` to decide the
+    gate runs, so a config with any socket_path is enough — no start() needed.
+    """
+    return TranscriptionServer(
+        EchoBackend(),
+        ServerConfig(socket_path="/tmp/peercred-unit-test.sock"),
+    )
+
+
+async def test_uds_auth_foreign_uid_rejected_with_403(monkeypatch):
+    """A UDS peer whose resolved uid != os.geteuid() is rejected pre-handshake.
+
+    Bind a real UDS server (dir-enforcement neutralised via the sanctioned
+    seam so it can bind under /tmp), force the resolver to report a foreign
+    uid, and assert the client connect raises InvalidStatus(403). Mirrors the
+    existing 401 bearer-auth test's InvalidStatus handling.
+    """
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
+    # Foreign uid: resolver claims the peer is someone other than us.
+    monkeypatch.setattr("stt_server.server.peer_uid", lambda sock: os.geteuid() + 1)
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+            c = TranscriptionClient(socket_path=str(sock))
+            with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+                await c.connect()
+            assert exc.value.response.status_code == 403
+            # Body assertion is best-effort: InvalidStatus exposes the response,
+            # whose body may be bytes or absent depending on websockets version.
+            # status_code == 403 is the load-bearing assertion (per the plan).
+            body = getattr(exc.value.response, "body", None)
+            if body:
+                body_bytes = body if isinstance(body, (bytes, bytearray)) else body.encode()
+                assert b"peer not permitted" in bytes(body_bytes)
+        finally:
+            await srv.shutdown()
+
+
+async def test_uds_auth_peercred_missing_transport_socket_rejects_with_403():
+    """A UDS handshake whose transport has no underlying socket must 403.
+
+    Unit-drives _process_request with a fake connection whose
+    ``transport.get_extra_info("socket")`` returns None. The gate must return
+    the 403 respond() result (fail closed) and NOT raise (it must not call
+    peer_uid(None), which would AttributeError).
+    """
+    srv = _uds_server_for_unit_test()
+    conn = _FakeConnection(sock=None)
+    result = await srv._process_request(conn, _FakeRequest())
+    assert conn.responses == [(403, "peer not permitted\n")]
+    assert result == ("RESPOND", 403, "peer not permitted\n")
+
+
+async def test_uds_auth_peer_uid_resolver_raises_rejects_with_403(monkeypatch):
+    """If the peer_uid resolver raises (e.g. OSError), the gate must 403, not
+    leak the exception. Provide a non-None AF_UNIX socket so the gate reaches
+    the resolver call, then force the resolver to raise.
+    """
+    import socket as _socket
+
+    def _raise(_sock):
+        raise OSError("getpeereid failed")
+
+    monkeypatch.setattr("stt_server.server.peer_uid", _raise)
+    srv = _uds_server_for_unit_test()
+
+    class _FakeUnixSock:
+        family = _socket.AF_UNIX
+
+    conn = _FakeConnection(sock=_FakeUnixSock())
+    result = await srv._process_request(conn, _FakeRequest())
+    assert conn.responses == [(403, "peer not permitted\n")]
+    assert result == ("RESPOND", 403, "peer not permitted\n")
+
+
+async def test_uds_auth_peer_uid_same_uid_real_resolver_completes_handshake(monkeypatch):
+    """Same-uid regression with the REAL resolver (no peer_uid stub).
+
+    Bind a real UDS server (dir-enforcement neutralised) and connect as the
+    owning uid. The handshake must complete and a normal session work — this
+    catches a silently-None transport socket that would otherwise fail closed.
+    Kept to a single connection; the N-concurrent case is Phase 4.
+    """
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+            c = TranscriptionClient(socket_path=str(sock))
+            hello = await c.connect()
+            assert hello["type"] == P.EVT_SERVER_HELLO
+            # A real session works end-to-end through the gate.
+            await c.send_audio(_pcm(800))
+            await c.commit()
+            completed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_COMPLETED})
+            assert completed["transcript"] == "echo:1600"
+            await c.close()
+        finally:
+            await srv.shutdown()
+
+
+async def test_uds_multi_connection_same_uid_all_handshake(monkeypatch):
+    """Phase 4 CI-safe mirror: N concurrent same-uid sessions all pass the gate.
+
+    Opens N concurrent ``TranscriptionClient`` sessions as the owning uid against
+    a single real UDS server (dir-enforcement neutralised via the sanctioned seam
+    so it binds under /tmp). All N must complete the handshake (``server.hello``)
+    and stream a normal echo exchange — a regression guard that the peer-cred gate
+    (Phase 3) did not break the normal path under concurrency.
+
+    The REAL resolver runs: ``peer_uid`` is deliberately NOT stubbed, so each
+    accepted connection had its uid resolved by the kernel-backed resolver and
+    compared equal to ``os.geteuid()``; a silently-``None`` transport would fail
+    closed (403) and the handshake would raise rather than succeed. To pin the
+    "real resolver == geteuid()" invariant directly (not just transitively via a
+    successful handshake), we also assert ``peer_uid`` on a live AF_UNIX
+    ``socketpair()`` end returns ``os.geteuid()`` — the same assertion the
+    resolver unit test uses, exercised here against the production import path.
+    """
+    import socket as _socket
+
+    from stt_server.server import peer_uid as _server_peer_uid
+
+    # Direct real-resolver assertion on a connected AF_UNIX socketpair (both ends
+    # are this process -> same uid). Catches a width/signature regression or a
+    # silently-None resolver before we even look at the server.
+    a, b = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        assert _server_peer_uid(a) == os.geteuid()
+        assert _server_peer_uid(b) == os.geteuid()
+    finally:
+        a.close()
+        b.close()
+
+    # Bind one real UDS server; do NOT stub peer_uid so the real gate runs for
+    # every connection.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
+    n = 4
+    with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
+        sock = Path(d) / "s"
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        try:
+
+            async def _one_session(idx: int) -> None:
+                c = TranscriptionClient(socket_path=str(sock))
+                hello = await c.connect()
+                assert hello["type"] == P.EVT_SERVER_HELLO
+                assert hello["protocol_version"] == P.PROTOCOL_VERSION
+                try:
+                    # A full echo exchange proves the session works post-handshake.
+                    await c.send_audio(_pcm(800))
+                    await c.commit()
+                    completed = await _next_event_of_types(c, {P.EVT_TRANSCRIPT_COMPLETED})
+                    assert completed["transcript"] == "echo:1600"
+                finally:
+                    await c.close()
+
+            # All N concurrently — surfaces any per-connection gate races.
+            await asyncio.gather(*(_one_session(i) for i in range(n)))
+        finally:
+            await srv.shutdown()

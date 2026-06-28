@@ -156,11 +156,16 @@ async def _drain_until_updated(client: TranscriptionClient) -> None:
 # --------------------------------------------------------------------------
 
 
-async def test_shutdown_drains_two_concurrent_decodes():
+async def test_shutdown_drains_two_concurrent_decodes(monkeypatch):
     """Koda's ``me`` + ``them`` shape: two clients each mid-commit against
     a backend that takes 500 ms. ``shutdown()`` must drain both inside
     the configured budget (2 s here; real default is 10 s) and call
     ``backend.close()`` exactly once afterwards."""
+    # _start_server binds under /tmp (root-owned), which R1 dir-enforcement
+    # rejects. This test exercises the drain path, not ancestor-dir enforcement,
+    # and the temp dir already exists before start(), so neutralise the check
+    # with a pure no-op via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _SlowBackend(decode_seconds=0.5)
     srv, sock = await _start_server(backend, drain=2.0)
     try:
@@ -195,10 +200,14 @@ async def test_shutdown_drains_two_concurrent_decodes():
             pass
 
 
-async def test_shutdown_force_cancels_past_drain_timeout():
+async def test_shutdown_force_cancels_past_drain_timeout(monkeypatch):
     """Backend that never completes a decode — drain budget expires, force
     cancel path runs (server.py:228-233). ``shutdown()`` must still return
     promptly instead of wedging on the stuck decode."""
+    # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
+    # the force-cancel drain path, not ancestor-dir enforcement, and the temp
+    # dir already exists before start(), so neutralise with a no-op (Phase-4 seam).
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _HangingBackend()
     srv, sock = await _start_server(backend, drain=0.5)
     try:
@@ -224,10 +233,14 @@ async def test_shutdown_force_cancels_past_drain_timeout():
             pass
 
 
-async def test_shutdown_is_idempotent_under_double_call():
+async def test_shutdown_is_idempotent_under_double_call(monkeypatch):
     """Simulates SIGTERM arriving twice mid-drain (launchctl does not
     de-duplicate). Second ``shutdown()`` must be a no-op — no double-close
     on the listener, no extra ``backend.close()`` call."""
+    # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
+    # shutdown idempotency, not ancestor-dir enforcement, and the temp dir
+    # already exists before start(), so neutralise with a no-op (Phase-4 seam).
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _SlowBackend(decode_seconds=0.1)
     srv, sock = await _start_server(backend, drain=2.0)
     try:
@@ -248,11 +261,16 @@ async def test_shutdown_is_idempotent_under_double_call():
             pass
 
 
-async def test_fresh_server_after_shutdown_accepts_new_connections():
+async def test_fresh_server_after_shutdown_accepts_new_connections(monkeypatch):
     """LaunchAgent respawn analog: start → shutdown → start a NEW
     ``TranscriptionServer`` on the same socket path → new client connects
     cleanly. Catches stale-listener / stale-socket-file regressions that
     would make ``ThrottleInterval=10`` restarts crash-loop."""
+    # Both servers bind under /tmp (root-owned), which R1 dir-enforcement
+    # rejects. This test exercises respawn-on-same-socket, not ancestor-dir
+    # enforcement, and the temp dir already exists before start(), so neutralise
+    # with a no-op via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     tmp = tempfile.mkdtemp(prefix="mlx-spike.", dir="/tmp")
     sock = Path(tmp) / "s"
 
@@ -284,10 +302,15 @@ async def test_fresh_server_after_shutdown_accepts_new_connections():
         await srv2.shutdown()
 
 
-async def test_backend_close_called_exactly_once_on_force_cancel_path():
+async def test_backend_close_called_exactly_once_on_force_cancel_path(monkeypatch):
     """Even when shutdown hits the force-cancel branch (drain timeout
     expired with pending decodes), ``backend.close()`` is called exactly
     once. Regressions here would leave MLX state leaked across respawns."""
+    # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
+    # the force-cancel close-once invariant, not ancestor-dir enforcement, and
+    # the temp dir already exists before start(), so neutralise with a no-op
+    # via the Phase-4-sanctioned seam.
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _HangingBackend()
     srv, sock = await _start_server(backend, drain=0.2)
     try:

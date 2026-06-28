@@ -9,6 +9,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [Nemotron 3.5 ASR backend (0.3.0)](20260605-nemotron-asr-backend.md) | ASR Backends | ✅ Shipped — PR #7 merged 2026-06-06; packaged as `nemotron` extra in 0.3.2 |
 | [justfile operator layer for STT LaunchAgents](20260607-feature-stt-agents-justfile.md) | Install & Packaging | ✅ Complete |
 | [STT vocabulary/prompt biasing on the wire protocol](20260607-feature-stt-prompt-biasing.md) | Wire Protocol / ASR Backends | ⬜ Not started — analysis/handoff only |
+| [UDS server-side trust-boundary hardening](20260626-feature-uds-trust-boundary-hardening.md) | Server Transport | 🟦 Implemented on `feature/uds-trust-boundary-hardening` (phases 1–5), PR #13 — pending Koda checkout coordination + merge |
 
 ## Conventions
 

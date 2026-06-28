@@ -34,7 +34,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JUSTFILE = REPO_ROOT / "justfile"
-README = REPO_ROOT / "README.md"
+# The canonical per-ASR socket table moved from README.md to docs/operations.md
+# when the README was split (PR #12); the justfile map mirrors it from there.
+PER_ASR_DOC = REPO_ROOT / "docs" / "operations.md"
 
 FAKE_UID = "501"
 BACKENDS = ("whisper", "parakeet", "nemotron")
@@ -133,6 +135,11 @@ def _run_just(
     env = {
         "HOME": str(home),
         "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        # stt-install / stt-enable call `_ensure-extra`, which would otherwise
+        # shell out to a real `uv sync` for backends whose extra is absent from
+        # the dev/CI venv. Skip that side effect by default; a dedicated test
+        # overrides this via extra_env to exercise the skip-message path.
+        "PIPECAT_STT_SKIP_DEP_SYNC": "1",
     }
     if extra_env:
         env.update(extra_env)
@@ -180,8 +187,9 @@ def test_just_list_exposes_public_recipes(tmp_path):
         "stt-uninstall",
     ):
         assert recipe in res.stdout
-    # `_resolve` is private (underscore) — not advertised.
+    # Private (underscore) helpers are not advertised in --list.
     assert "_resolve" not in res.stdout
+    assert "_ensure-extra" not in res.stdout
 
 
 @pytest.mark.parametrize(
@@ -226,13 +234,14 @@ def test_unknown_backend_fails_fast_and_lists_valid(tmp_path):
 
 
 def _readme_map() -> dict[str, tuple[str, str]]:
-    """Parse the README per-ASR table into {backend: (label, socket)}.
+    """Parse the canonical per-ASR table (docs/operations.md) into
+    {backend: (label, socket)}.
 
     Anchors on the table header and asserts its column order before indexing
-    cells by position, so a future column insertion/reorder in the README fails
+    cells by position, so a future column insertion/reorder in the doc fails
     loudly here instead of silently mis-mapping label/socket.
     """
-    lines = README.read_text().splitlines()
+    lines = PER_ASR_DOC.read_text().splitlines()
     header_idx = next(
         (
             i
@@ -241,10 +250,10 @@ def _readme_map() -> dict[str, tuple[str, str]]:
         ),
         None,
     )
-    assert header_idx is not None, "README per-ASR table header not found"
+    assert header_idx is not None, "per-ASR table header not found in docs/operations.md"
     header = [c.strip() for c in lines[header_idx].split("|")[1:-1]]
     assert header[:3] == ["ASR", "LaunchAgent label", "Socket"], (
-        f"README per-ASR table column order changed: {header}"
+        f"per-ASR table column order changed: {header}"
     )
     out: dict[str, tuple[str, str]] = {}
     for ln in lines[header_idx + 2 :]:  # skip the header row + `|---|` separator
@@ -474,17 +483,72 @@ def test_install_uninstall_delegate_exact_env(tmp_path, recipe, cmd):
 
 
 # --------------------------------------------------------------------------- #
+# _ensure-extra: backend -> Python extra onboarding
+# --------------------------------------------------------------------------- #
+
+
+def test_ensure_extra_skips_under_env_flag(tmp_path):
+    # With PIPECAT_STT_SKIP_DEP_SYNC set (the harness default), the helper must
+    # short-circuit BEFORE probing or shelling out to `uv sync`.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["_ensure-extra", "nemotron"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "skipping" in res.stdout.lower()
+
+
+def test_ensure_extra_unknown_backend_errors_even_when_skipped(tmp_path):
+    # Backend validation happens before the skip check, so an unknown backend
+    # errors regardless of PIPECAT_STT_SKIP_DEP_SYNC.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["_ensure-extra", "bogus"], home=home, stub_dir=stub_dir)
+    assert res.returncode != 0
+    assert "unknown backend" in res.stderr
+
+
+def test_stt_install_invokes_ensure_extra_then_delegates(tmp_path):
+    # stt-install must run the dep-ensure step AND still delegate to the install
+    # script. Under the skip flag the ensure step is a no-op message, so we can
+    # assert both the skip line (proving the wiring) and the delegation.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    res = _run_just(
+        [f"script={fake_script}", "stt-install", "nemotron"],
+        home=home,
+        stub_dir=stub_dir,
+    )
+    assert res.returncode == 0, res.stderr
+    assert "skipping" in res.stdout.lower()  # _ensure-extra ran
+    assert "CMD=install" in env_log.read_text()  # delegation still happened
+
+
+# --------------------------------------------------------------------------- #
 # Koda-safety: the branch diff stays within the additive file set
 # --------------------------------------------------------------------------- #
 
 
+# The Koda-consumed *imported* surface: the modules Koda pins at a SHA and
+# imports as a library. Per the cross-repo contract, a pin bump is required only
+# when these change — the client entrypoints (``TranscriptionClient``,
+# ``resolve_endpoint_from_env``, ``is_cleartext_remote``) and the wire-protocol
+# module (``PROTOCOL_VERSION`` + event constants). The rest of ``stt_server/``
+# (the server runtime, backends, ``__main__``) and ``scripts/install_stt_agent.sh``
+# are the *runtime* Koda runs from a HEAD checkout — server-side changes there are
+# coordinated at checkout-update time, NOT via the pinned import, so they are not
+# gated here. A ``server.hello`` / ``server.status`` payload change is still
+# caught because it must bump ``PROTOCOL_VERSION`` in ``protocol.py``.
+KODA_IMPORT_SURFACE = frozenset({"stt_server/client.py", "stt_server/protocol.py"})
+
+
 def test_branch_diff_does_not_touch_koda_surface():
     """No-pin-bump invariant (per the cross-repo contract): this work must not
-    modify the Koda-consumed surface — anything under ``stt_server/`` (the
-    imported client + the wire protocol) or ``scripts/install_stt_agent.sh``.
-    Additive files (justfile, these tests, README, dev-plan docs) are fine; an
-    unrelated docs-only commit does NOT void Koda safety, so this asserts the
-    *negative* contract rather than an exact file allowlist."""
+    modify the Koda-consumed *imported* surface — ``stt_server/client.py`` or
+    ``stt_server/protocol.py`` — without a coordinated client pin bump. Changes to
+    the server runtime / install script (run from a HEAD checkout) and additive
+    files (justfile, these tests, README, dev-plan docs) are fine; this asserts
+    the *negative* contract rather than an exact file allowlist."""
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("not a git checkout")
     merge_base = subprocess.run(
@@ -503,9 +567,8 @@ def test_branch_diff_does_not_touch_koda_surface():
         cwd=str(REPO_ROOT),
     )
     changed = {ln for ln in diff.stdout.splitlines() if ln.strip()}
-    forbidden = sorted(
-        c for c in changed if c.startswith("stt_server/") or c == "scripts/install_stt_agent.sh"
-    )
+    forbidden = sorted(c for c in changed if c in KODA_IMPORT_SURFACE)
     assert not forbidden, (
-        f"branch modifies the Koda-consumed surface (would require a pin bump): {forbidden}"
+        f"branch modifies the Koda-consumed IMPORTED surface (would require a "
+        f"coordinated client pin bump): {forbidden}"
     )

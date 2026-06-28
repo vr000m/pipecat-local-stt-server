@@ -295,8 +295,22 @@ class MLXWhisperBackend:
             )
 
     async def start(self) -> None:
-        # Eager import; fail fast if the extra isn't installed.
-        import mlx_whisper  # type: ignore # noqa: F401
+        # Eager import; fail fast if the extra isn't installed. Re-raise a
+        # missing module as an actionable message (a bare ModuleNotFoundError is
+        # otherwise a cryptic LaunchAgent crash-loop); _cmd_serve turns this into
+        # ``stt_server: <msg>`` + exit 1, and ``just stt-install whisper``
+        # self-heals it via _ensure-extra.
+        try:
+            import mlx_whisper  # type: ignore # noqa: F401
+        except ImportError as exc:
+            # ImportError (not just ModuleNotFoundError) so a present-but-broken
+            # mlx_whisper (e.g. its own transitive import fails) also surfaces as
+            # an actionable message rather than escaping _cmd_serve as a traceback.
+            missing = getattr(exc, "name", None) or "mlx_whisper"
+            raise ModuleNotFoundError(
+                f"the 'mlx' extra is not installed or failed to import "
+                f"({missing}) — run: uv sync --extra mlx --inexact"
+            ) from exc
 
     async def open_stream(self, *, language: str | None = None) -> "_MLXStream":
         return _MLXStream(self._model, language, self._decode_lock, self._thread_lock, self)

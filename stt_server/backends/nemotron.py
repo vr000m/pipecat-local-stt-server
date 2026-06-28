@@ -258,8 +258,23 @@ class NemotronBackend:
     async def start(self) -> None:
         # Eager import; fail fast before the socket binds if the ``mlx-audio``
         # package is not installed. The model itself is NOT loaded here — see
-        # ``_get_model``.
-        from mlx_audio.stt import load  # type: ignore # noqa: F401
+        # ``_get_model``. Re-raise a missing module as an actionable message —
+        # the bare ModuleNotFoundError is otherwise a cryptic crash-loop in the
+        # LaunchAgent log. _cmd_serve turns this into ``stt_server: <msg>`` +
+        # exit 1, and ``just stt-install nemotron`` self-heals it via _ensure-extra.
+        try:
+            from mlx_audio.stt import load  # type: ignore # noqa: F401
+        except ImportError as exc:
+            # Catch ImportError, not just ModuleNotFoundError: this is a
+            # ``from mlx_audio.stt import load``, which raises a plain ImportError
+            # (not a ModuleNotFoundError) when mlx_audio is present but the
+            # symbol/submodule is missing (version skew) — that would otherwise
+            # escape _cmd_serve and crash-loop as a bare traceback.
+            missing = getattr(exc, "name", None) or "mlx_audio"
+            raise ModuleNotFoundError(
+                f"the 'nemotron' extra is not installed or failed to import "
+                f"({missing}) — run: uv sync --extra nemotron --inexact"
+            ) from exc
 
     async def open_stream(self, *, language: str | None = None) -> "_NemotronStream":
         return _NemotronStream(language, self._decode_lock, self._thread_lock, self)

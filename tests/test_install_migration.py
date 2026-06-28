@@ -456,6 +456,80 @@ def test_nemotron_backend_install_uses_nemotron_default_model(tmp_path: Path):
     )
 
 
+# ---------------------------------------------------------------------------
+# (7) Socket-path validation runs BEFORE any filesystem mutation. A custom
+#     PIPECAT_STT_SOCKET the server would reject (outside $HOME, or with a
+#     symlinked parent) must fail the install cleanly with NO mkdir/chmod —
+#     never tighten the operator's directory to 0700 and then crash on startup.
+# ---------------------------------------------------------------------------
+
+
+def test_install_refuses_socket_outside_home_without_mutating(tmp_path: Path):
+    """A socket path outside $HOME is rejected before any filesystem change:
+    exit 1, an actionable 'not under the trusted root' error, and the operator's
+    pre-existing directory keeps its original (loose) permissions."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+
+    # An operator-owned dir OUTSIDE the hermetic HOME, deliberately 0755.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.chmod(outside, 0o755)
+    socket = outside / "stt.sock"
+
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_SOCKET": str(socket)},
+    )
+
+    assert r.returncode == 1, f"expected exit 1; stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "not under the trusted root" in r.stderr, (
+        f"expected an actionable under-$HOME error; stderr={r.stderr!r}"
+    )
+    # The load-bearing assertion: the install must NOT have chmod'd the
+    # operator's directory before refusing.
+    mode = stat.S_IMODE((tmp_path / "outside").stat().st_mode)
+    assert mode == 0o755, f"install tightened an unsupported dir to {oct(mode)}; must not mutate"
+    # The default log/cache dirs must not have been created either (validation
+    # runs first).
+    assert not (tmp_path / "home" / "Library" / "Logs" / "pipecat-stt").exists(), (
+        "install must not create the log dir before validating the socket path"
+    )
+
+
+def test_install_refuses_symlinked_socket_parent_without_mutating(tmp_path: Path):
+    """A socket whose parent is a symlink is rejected before any filesystem
+    change: exit 1, a 'symlink' error, and the symlink's target keeps its
+    original permissions (no chmod 700 fired through the link)."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
+
+    # A real dir under $HOME, deliberately 0755, and a symlink pointing at it.
+    realdir = home / "realdir"
+    realdir.mkdir()
+    os.chmod(realdir, 0o755)
+    link = home / "link"
+    link.symlink_to(realdir)
+    socket = link / "stt.sock"  # client-visible path traverses the symlink
+
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_SOCKET": str(socket)},
+    )
+
+    assert r.returncode == 1, f"expected exit 1; stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "symlink" in r.stderr.lower(), (
+        f"expected an actionable symlink-refusal error; stderr={r.stderr!r}"
+    )
+    # The symlink and its target must be untouched — the chmod 700 must not have
+    # fired through the link onto the shared target.
+    assert link.is_symlink(), "the socket-parent symlink must be left in place"
+    mode = stat.S_IMODE(realdir.stat().st_mode)
+    assert mode == 0o755, f"install chmod'd the symlink target to {oct(mode)}; must not mutate"
+
+
 def test_shutil_which_bash_available():
     """Sanity guard: the test harness needs a real ``bash`` to invoke the
     script — surface a clear failure rather than an opaque subprocess error."""

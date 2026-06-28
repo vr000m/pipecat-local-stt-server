@@ -69,8 +69,9 @@ uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path
 
 > **Backends need their own install.** Every `--backend` above except `echo`
 > requires a `uv sync` extra first — `mlx`/`parakeet`/`nemotron` (e.g.
-> `uv sync --extra mlx`). Without it you get e.g. `ModuleNotFoundError: No module
-> named 'mlx_whisper'`. See [Choosing a backend and model](#choosing-a-backend-and-model)
+> `uv sync --extra mlx`). Without it the server exits with an actionable
+> `stt_server: the '<extra>' extra is not installed … run: uv sync --extra <extra>
+> --inexact` message. See [Choosing a backend and model](#choosing-a-backend-and-model)
 > for each backend's install command and `--model` defaults.
 
 The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,
@@ -98,13 +99,19 @@ just stt-list              # every pipecat.stt-server* agent: state, pid, live b
 just stt-status nemotron   # wire health probe for one backend
 just stt-disable whisper   # stop until next login (keeps the plist)
 just stt-enable whisper    # re-load it from the existing plist
-just stt-install parakeet  # delegates to install_stt_agent.sh
+just stt-install parakeet  # delegates to install_stt_agent.sh (+ ensures the extra)
 just stt-uninstall parakeet
+just smoke-peercred        # local UDS peer-cred smoke (cross-uid leg needs a 2nd uid)
 ```
 
 `<backend>` is one of `whisper` / `parakeet` / `nemotron`, mapped to the labels
 and sockets in the [per-ASR table](docs/operations.md#per-asr-socket-convention)
 (the justfile map is a checked mirror of that table — a test fails CI on drift).
+
+`stt-install` / `stt-enable` also ensure the backend's optional Python extra is
+installed (`uv sync --extra <backend> --inexact`) so a freshly installed agent
+doesn't crash-loop on a missing import; set `PIPECAT_STT_SKIP_DEP_SYNC=1` to
+manage the extras yourself.
 
 `stt-list` prints each agent's `socket:` line in the same `~`-form a consumer's
 config uses for its endpoint (e.g. onoats' `config.toml` `[stt] ws_socket`), so

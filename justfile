@@ -151,6 +151,10 @@ stt-enable backend:
       echo "stt-enable: no plist at $plist — run 'just stt-install $backend' first" >&2
       exit 1
     fi
+    # Self-heal a pruned venv before re-loading: if a bare `uv run`/`uv sync`
+    # stripped this backend's extra since install, bootstrapping the plist would
+    # just resume the crash-loop. (Skipped under PIPECAT_STT_SKIP_DEP_SYNC.)
+    just _ensure-extra "$backend" || exit 1
     # Guard each state change: set -uo pipefail does NOT abort on a failed
     # simple command, so an unguarded failure would be masked by the success
     # echo (exit 0 while the agent never started).
@@ -164,7 +168,61 @@ stt-enable backend:
     fi
     echo "stt-enable: bootstrapped + kickstarted $label"
 
+# Local UDS peer-cred smoke: same-uid multi-connection + cross-uid 403.
+# Runs an in-process server with both filesystem layers deliberately permissive
+# (0711 parent + 0o666 socket) via a test-only helper replacement, so peer-cred
+# is provably what rejects a foreign uid. The cross-uid leg needs a second local
+# uid reachable via passwordless `sudo`; it skips cleanly (exit 0) when absent,
+# while the same-uid leg still runs.
+smoke-peercred:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    exec uv run python "{{justfile_directory()}}/scripts/smoke_peercred.py"
+
+# Ensure a backend's optional Python extra is installed in .venv, additively.
+# The server imports its backend lib lazily in backend.start(); a bare
+# `uv run`/`uv sync` prunes optional extras, so an agent can be installed yet
+# crash-loop on `ModuleNotFoundError`. `stt-install`/`stt-enable` call this so
+# onboarding is self-healing. `--inexact` is load-bearing: plain
+# `uv sync --extra X` prunes the OTHER backends' extras, breaking a multi-backend
+# host. We probe via the venv python directly — NOT `uv run`, which would itself
+# re-sync/prune before we could check. Set PIPECAT_STT_SKIP_DEP_SYNC=1 to manage
+# extras yourself (the recipe tests set it so they never shell out to `uv sync`).
+_ensure-extra backend:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    backend={{quote(backend)}}
+    # extra == the install backend-name (the 3rd field of `_resolve`); only the
+    # import probe differs. The probe MUST match what backend.start() imports
+    # (nemotron does `from mlx_audio.stt import load`, not `import mlx_audio`) —
+    # a coarser `import mlx_audio` would pass for a partially-installed package
+    # while the agent still crash-loops. Validate the backend before the skip
+    # check so an unknown backend always errors regardless of the skip env.
+    case "$backend" in
+      whisper)  extra="mlx";      probe="import mlx_whisper" ;;
+      parakeet) extra="parakeet"; probe="import parakeet_mlx" ;;
+      nemotron) extra="nemotron"; probe="from mlx_audio.stt import load" ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron)" >&2; exit 1 ;;
+    esac
+    if [[ -n "${PIPECAT_STT_SKIP_DEP_SYNC:-}" ]]; then
+      echo "_ensure-extra: PIPECAT_STT_SKIP_DEP_SYNC set — skipping '$extra' extra check"
+      exit 0
+    fi
+    py="{{justfile_directory()}}/.venv/bin/python"
+    if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
+      echo "_ensure-extra: '$extra' extra already present ($probe)"
+      exit 0
+    fi
+    echo "_ensure-extra: '$extra' import check failed ($probe) — installing (uv sync --extra $extra --inexact)…"
+    if ! uv sync --extra "$extra" --inexact; then
+      echo "_ensure-extra: 'uv sync --extra $extra --inexact' failed; install the '$extra' extra manually" >&2
+      exit 1
+    fi
+    echo "_ensure-extra: '$extra' extra ready."
+
 # Install an agent — delegates to install_stt_agent.sh (no plist reimplementation).
+# Ensures the backend's Python extra first (see _ensure-extra) so the freshly
+# installed agent doesn't immediately crash-loop on a missing backend import.
 stt-install backend:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -173,6 +231,7 @@ stt-install backend:
     # One field per line (so a spaced socket path survives); three reads keep
     # this bash-3.2-compatible — macOS system bash has no `mapfile`.
     { read -r label; read -r sock; read -r bk; } <<<"$resolved"
+    just _ensure-extra "$backend" || exit 1
     PIPECAT_STT_LABEL="$label" PIPECAT_STT_SOCKET="$sock" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" install
 

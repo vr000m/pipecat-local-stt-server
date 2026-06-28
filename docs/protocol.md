@@ -35,3 +35,24 @@ Deviations from the OpenAI Realtime transcription snapshot (2026-04-20):
 - custom events: `server.hello`, `server.status`, `session.close`,
   `session.cancel`, `session.closed`
 
+## Connection rejection (pre-handshake)
+
+This document pins the **presence** of wire events, not their field schema; the
+field shape of `server.hello`/`server.status` is defined by the server source
+(`stt_server/server.py`) and the table under
+[Checking server health](operations.md#checking-server-health).
+
+Connection-level rejections happen **before** the WebSocket handshake and are
+returned as plain HTTP responses, not protocol JSON envelopes (there is no
+`error` event for these):
+
+| Condition | Status | Body |
+|---|---|---|
+| Disallowed browser `Origin` | `403` | `origin not permitted` |
+| UDS peer uid `!=` server uid, or peer-cred fails closed | `403` | `peer not permitted` |
+| TCP bearer token missing/incorrect | `401` | `unauthorized` |
+
+The UDS peer-credential check (`403 peer not permitted`) is server-side only and
+requires no client change — see
+[Trust model and socket security](operations.md#trust-model-and-socket-security-same-host-uds).
+

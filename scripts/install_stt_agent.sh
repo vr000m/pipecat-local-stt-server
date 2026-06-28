@@ -96,10 +96,79 @@ fi
 
 cmd="${1:-install}"
 
+# Validate the literal socket path against the SAME rules the server enforces in
+# _enforce_socket_dir_secure() (stt_server/server.py) BEFORE creating or
+# chmod-ing anything. The server refuses to start unless the socket directory is
+# an absolute, ``..``-free path under $HOME whose chain contains no symlink
+# component. Mirroring that here means a custom PIPECAT_STT_SOCKET the server
+# would reject fails the install cleanly — with NO filesystem mutation — instead
+# of tightening the operator's directory to 0700 and only then crash-looping the
+# agent on startup. Keep this in lockstep with the Python rules.
+validate_socket_path() {
+    local sock="$1"
+    local dir
+    dir="$(dirname "$sock")"
+    local home="${HOME%/}"
+
+    # Absolute path required (lexical containment below assumes it).
+    case "$dir" in
+    /*) : ;;
+    *)
+        echo "error: socket directory '$dir' must be an absolute path under \$HOME ($home)" >&2
+        exit 1
+        ;;
+    esac
+
+    # No ``..`` components: without resolving symlinks, a ``..`` segment could
+    # escape the trusted root while still passing the lexical check below.
+    case "/$dir/" in
+    */../*)
+        echo "error: socket directory '$dir' must not contain '..' components" >&2
+        exit 1
+        ;;
+    esac
+
+    # Must live lexically under the trusted root ($HOME), or be $HOME itself.
+    if [[ "$dir" != "$home" && "$dir" != "$home/"* ]]; then
+        echo "error: socket directory '$dir' is not under the trusted root \$HOME ($home); point PIPECAT_STT_SOCKET (or KODA_STT_SOCKET) at a path under \$HOME" >&2
+        exit 1
+    fi
+
+    # Reject any symlink component from the socket directory up to AND INCLUDING
+    # $HOME. Only existing components can be symlinks; not-yet-created ones are
+    # made 0700 below and cannot be. Walking up means a symlink anywhere in the
+    # chain (not just the immediate parent) is caught before any mkdir/chmod.
+    local component="$dir"
+    while :; do
+        if [[ -L "$component" ]]; then
+            echo "error: socket directory component '$component' is a symlink; refusing to install (a symlinked ancestor can be repointed by another user to hijack the socket path)" >&2
+            exit 1
+        fi
+        [[ "$component" == "$home" ]] && break
+        local parent
+        parent="$(dirname "$component")"
+        [[ "$parent" == "$component" ]] && break
+        component="$parent"
+    done
+}
+
 render_plist() {
-    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")" "$(dirname "$SOCKET_PATH")"
-    # Lock the socket's parent directory so another local user can't
-    # pre-create a socket at the same path under a permissive umask.
+    # Validate (and refuse) BEFORE mutating any filesystem state — the socket
+    # dir chmod below must never tighten a directory the server will then reject.
+    validate_socket_path "$SOCKET_PATH"
+    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
+    # Create the socket's parent directory owner-only (0700) from birth so
+    # there is no window under a permissive umask (commonly 0755) in which
+    # another local user could pre-create a socket at the same path. The server
+    # now *refuses to start* (see _enforce_socket_dir_secure in
+    # stt_server/server.py) if any ancestor through the trusted root is
+    # group/other-writable, so 0700 here is load-bearing, not just hygiene.
+    #
+    # Upgrade note: installs predating this change created the dir at the
+    # install shell umask (commonly 0755). The trailing `chmod 700` repairs such
+    # a pre-existing dir in place so upgrades do not trip the new startup check;
+    # `mkdir -m 700` covers the fresh-install path with no race window.
+    mkdir -m 700 -p "$(dirname "$SOCKET_PATH")"
     chmod 700 "$(dirname "$SOCKET_PATH")"
     # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
     # allowlist validation handle hostile values instead of sed string

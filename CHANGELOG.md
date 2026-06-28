@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-28
+
+Server-side hardening of the same-host UDS trust boundary. No new user-facing
+features; clients connect unchanged (no protocol or client-API change).
+
+### Added
+
+- **Server-side UDS peer-credential authentication.** The server rejects any
+  connection whose kernel-reported peer uid `!= os.geteuid()` with a
+  pre-handshake HTTP `403` (`peer not permitted`), before the WebSocket
+  handshake. Uses macOS `getpeereid(2)` (via `ctypes`) / Linux `SO_PEERCRED`;
+  every resolver failure path fails closed (rejects). UDS only — TCP keeps the
+  Origin + bearer-token checks. No client change required.
+- **Socket-directory ancestor enforcement.** Before bind, the server walks every
+  directory from the socket's parent up to and including `$HOME` and refuses to
+  start unless each is owner-owned and not group/other-writable (sticky-bit dirs
+  excepted), creating missing dirs `0700`. The walk is over the **literal** path
+  clients traverse and **rejects any symlink component** (a symlinked, writable
+  lexical ancestor would otherwise be repointable post-startup to hijack the
+  client-visible socket). This makes the socket un-plantable (no foreign uid can
+  `unlink`+`bind` a replacement).
+- **Backend-extra onboarding.** `just stt-install` / `stt-enable` now ensure the
+  selected backend's optional extra is installed (`uv sync --extra <X>
+  --inexact`) so a freshly installed agent doesn't crash-loop on a missing
+  import; `PIPECAT_STT_SKIP_DEP_SYNC=1` opts out.
+- `scripts/smoke_peercred.py` + `just smoke-peercred`: a local cross-uid /
+  multi-connection peer-cred smoke (cross-uid leg skips cleanly without a second
+  local uid).
+- `scripts/verify_peercred_crossuid.py`: a stdlib-only cross-uid verifier that
+  drives a probe as both the owning uid and `nobody` against one permissive
+  socket — proving peer-cred (not the filesystem) is the discriminator. Needs no
+  venv/`websockets`, so it works with `nobody` where the smoke's `sudo` path
+  can't.
+
+### Changed
+
+- Pinned `websockets` to `>=16,<17` (was `>=13`; the `_process_request`
+  handshake/transport contract depends on the v16 API). Applies to every extra,
+  including `client`. See Upgrade notes for the consumer-conflict caveat.
+- `scripts/install_stt_agent.sh` creates the socket directory `0700` (was the
+  install-shell umask default) and self-heals a pre-existing `0755` dir. It now
+  validates a custom `PIPECAT_STT_SOCKET` against the same rules the server
+  enforces (absolute, under `$HOME`, no symlink component) **before** any
+  `mkdir`/`chmod`, so a path the server would reject fails the install cleanly
+  with no filesystem mutation instead of tightening the directory and then
+  crash-looping the agent.
+- Startup failures — socket-dir enforcement, the `ServerConfig` `ValueError`,
+  bind `OSError`s, and a missing backend extra — surface as
+  `stt_server: <msg>` + exit 1 instead of a bare traceback.
+
+### Security
+
+- Closes the same-host UDS plant/swap and foreign-uid-connect vectors: the
+  owner-only ancestor chain is the primary filesystem boundary and peer-cred is
+  the kernel-authoritative backstop. The bearer token is retained for TCP/remote
+  (which has neither boundary). See [`docs/operations.md`](docs/operations.md).
+
 ### Documentation
 
 - **Split the 593-line README into a focused top page + `docs/`.** The README now
@@ -19,6 +76,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and [`docs/migration.md`](docs/migration.md) (0.1.x → 0.2.0 upgrade). A
   Documentation index links them; all cross-references were repointed. No content
   was dropped.
+- Documented the same-host UDS trust model and the same-uid precondition in
+  `docs/operations.md`; added a pre-handshake connection-rejection table to
+  `docs/protocol.md`.
+
+### Upgrade notes
+
+- **May require action on existing hosts.** Because the server now refuses to
+  start against a group/other-writable socket-dir ancestor, an existing `0755`
+  socket directory — or a custom `STT_WS_SOCKET` / `KODA_STT_SOCKET` pointing
+  outside `$HOME` — will block startup. Re-run `scripts/install_stt_agent.sh`
+  (self-heals the dir to `0700`), or `chmod 700` the dir / move the socket under
+  `$HOME`. Koda hosts run the server from the checkout, so fold this into the
+  next checkout update; no client pin bump is needed.
+- **`websockets>=16` may conflict for library consumers.** The floor moved from
+  `>=13` to `>=16,<17` across every extra (`client` included), so an environment
+  that resolves an older `websockets` (or another package capping it `<16`) will
+  hit a dependency conflict when installing this version. The wire protocol and
+  `stt_server.client` API are unchanged — only the dependency floor moved — so
+  this is a packaging bump, not a behavioural one, and stays a patch release
+  (`0.3.3`).
 
 ## [0.3.2] - 2026-06-08
 
@@ -232,6 +309,8 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
+[0.3.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.2
 [0.3.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.1
 [0.3.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.2.0

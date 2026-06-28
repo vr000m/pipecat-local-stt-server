@@ -26,6 +26,8 @@ import logging
 import os
 import resource
 import signal
+import socket
+import stat as _stat
 import sys
 import time
 import uuid
@@ -42,6 +44,7 @@ from websockets.asyncio.server import (
 )
 
 from . import protocol as P
+from ._peercred import peer_uid
 from .backend import BackendStream, EchoBackend, TranscriptionBackend
 
 # OpenAI Realtime groups errors into a coarse "type" field (e.g.
@@ -83,6 +86,121 @@ def _session_id() -> str:
 
 def _item_id() -> str:
     return f"item_{uuid.uuid4().hex[:16]}"
+
+
+def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
+    """Refuse to bind unless the socket's directory chain cannot be hijacked.
+
+    The UDS file mode (``0o600``) stops a foreign uid from ``connect()``-ing,
+    but it does NOT stop a plant/swap: anyone with write on an ancestor
+    directory can ``unlink()`` our socket and ``bind()`` their own at the same
+    path, after which a client connects to the attacker's socket. The only
+    defense is denying others write on every directory that could replace the
+    socket. We therefore walk every component from the socket's bind directory
+    up to AND INCLUDING ``trusted_root`` and require each to be owned by the
+    running uid (``st_uid == os.geteuid()``) and not group/other-writable
+    (``st_mode & 0o022 == 0``); sticky-bit directories are the explicit
+    exception (the sticky bit already prevents non-owners from removing our
+    inode, which is the property we need).
+
+    Missing socket directories are created ``0o700`` and then re-``stat``-ed and
+    verified rather than trusted: the ``mkdir`` mode is masked by the process
+    umask, so we confirm the result instead of assuming it. A pre-existing
+    directory we do not own is never silently ``chmod``/``chown``-ed — we raise
+    instead, naming the offending component and condition.
+
+    Raises ``ValueError`` on any failure; the serve entrypoint turns that into
+    ``stt_server: <msg>`` + ``SystemExit(1)`` rather than a bare traceback.
+
+    Returns the verified socket path (the literal ``path``). We verify the
+    LITERAL lexical chain that clients and the LaunchAgent actually traverse —
+    NOT a ``resolve()``-d one — and reject any symlink component (``lstat``).
+    The kernel resolves the literal socket path at connect/bind time, so the
+    directories that could replace the socket are the literal lexical ancestors.
+    Resolving here would verify a *different* chain than clients use: a symlinked
+    but group/other-writable lexical ancestor would be skipped, then repointed
+    after startup to make clients connect to an attacker's socket while the
+    server stayed bound to the safe resolved target. By rejecting symlinks the
+    verified chain, the bound path, and the client-visible path are identical.
+    """
+    euid = os.geteuid()
+    bind_dir = path.parent
+
+    # Verify (and bind) the literal path, so we never resolve past a symlink the
+    # client will still traverse. An absolute, ``..``-free path is required: with
+    # no ``resolve()`` the containment check below is purely lexical, and a
+    # ``..`` segment could let a path that escapes the trusted root pass it.
+    if not bind_dir.is_absolute():
+        raise ValueError(
+            f"socket directory {bind_dir} must be an absolute path under {trusted_root}"
+        )
+    if ".." in bind_dir.parts:
+        raise ValueError(
+            f"socket directory {bind_dir} must not contain '..' components; "
+            f"point the socket at a direct path under {trusted_root}"
+        )
+
+    # The socket MUST live under the trusted root. A path outside it (e.g. a
+    # custom socket path pointing at a world-writable location) has no
+    # owner-only chain we can vouch for, and walking to the filesystem root
+    # would only verify root-owned system directories that we do not own. Refuse
+    # rather than pretend the path is safe.
+    if bind_dir != trusted_root and trusted_root not in bind_dir.parents:
+        raise ValueError(
+            f"socket directory {bind_dir} is not under the trusted root "
+            f"{trusted_root}; point the socket at a path under {trusted_root}"
+        )
+
+    # Create every missing component owner-only. Each is created with its own
+    # ``mkdir(mode=0o700)`` rather than ``parents=True``: the latter creates
+    # intermediate parents at the umask default (not ``mode``), which would
+    # leave a group/other-readable directory in the chain. ``mkdir``'s mode is
+    # itself umask-masked, but ``0o700`` carries no group/other bits for any
+    # umask to widen, and the walk below re-stats and verifies regardless.
+    to_create: list[Path] = []
+    cursor = bind_dir
+    while not cursor.exists():
+        to_create.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            break
+        cursor = parent
+    for missing in reversed(to_create):
+        missing.mkdir(mode=0o700)
+
+    component = bind_dir
+    while True:
+        # ``lstat`` (not ``stat``) so a symlinked component is detected, not
+        # silently followed. As we walk up, every component eventually becomes
+        # the final path element, so a symlink anywhere in the chain is caught.
+        st = os.lstat(component)
+        if _stat.S_ISLNK(st.st_mode):
+            raise ValueError(
+                f"socket directory component {component} is a symlink; refusing "
+                "to bind (a symlinked ancestor can be repointed by another user "
+                "to hijack the client-visible socket path)"
+            )
+        if st.st_uid != euid:
+            raise ValueError(
+                f"socket directory component {component} is owned by uid "
+                f"{st.st_uid}, not the server uid {euid}; refusing to bind "
+                "(another user could replace the socket at this path)"
+            )
+        sticky = bool(st.st_mode & 0o1000)
+        if not sticky and (st.st_mode & 0o022):
+            raise ValueError(
+                f"socket directory component {component} is group/other-writable "
+                f"(mode {oct(st.st_mode & 0o7777)}); refusing to bind "
+                "(another user could replace the socket at this path)"
+            )
+        if component == trusted_root:
+            break
+        component = component.parent
+
+    # Bind on the literal, now-verified path: the chain clients traverse is
+    # exactly the chain we vouched for (no symlinks), so verified == bound ==
+    # client-visible.
+    return path
 
 
 @dataclass
@@ -146,14 +264,25 @@ class TranscriptionServer:
         await self._backend.start()
         if self._config.socket_path:
             socket_path = Path(self._config.socket_path)
-            socket_path.parent.mkdir(parents=True, exist_ok=True)
+            # Trusted root for the ancestor walk: the user's home directory. The
+            # default socket lives under ~/Library/Caches/pipecat-stt (see
+            # scripts/install_stt_agent.sh), so on stock macOS every component
+            # from the cache dir up through home is owner-owned and 0700. Enforce
+            # an owner-only, non-group/other-writable chain from the socket
+            # directory up to and including home BEFORE bind so the socket cannot
+            # be planted/swapped by another local uid. This replaces a bare
+            # mkdir that trusted the path blindly and verifies the full ancestor
+            # walk, not just the immediate parent. The enforcement rejects any
+            # symlink component and returns the literal verified path, so the
+            # chain we vouched for is exactly the one clients traverse.
+            verified_socket = _enforce_socket_dir_secure(socket_path, Path.home())
             # Restrict the socket file to owner-only before bind so the UDS
             # trust boundary actually holds on multi-user hosts.
             prior_umask = os.umask(0o077)
             try:
                 self._server = await ws_unix_serve(
                     self._handle_connection,
-                    path=str(socket_path),
+                    path=str(verified_socket),
                     max_size=self._config.max_append_bytes,
                     process_request=self._process_request,
                 )
@@ -161,7 +290,7 @@ class TranscriptionServer:
                 os.umask(prior_umask)
             if self._config.unix_socket_mode is not None:
                 try:
-                    os.chmod(socket_path, self._config.unix_socket_mode)
+                    os.chmod(verified_socket, self._config.unix_socket_mode)
                 except OSError as exc:
                     logger.warning("stt_server: chmod on UDS failed: %s", exc)
         else:
@@ -259,6 +388,43 @@ class TranscriptionServer:
 
     # --- connection handling ---
     async def _process_request(self, connection, request):
+        # On a Unix-domain socket the only legitimate peer is a process owned
+        # by the same effective uid as this server. Enforce that BEFORE (and
+        # independently of) bearer auth so a foreign uid is rejected even when
+        # no token is configured. Fail closed: any inability to resolve the
+        # peer's uid is a 403, not a pass. TCP listeners cannot answer
+        # SO_PEERCRED-style queries, so this gate is UDS-only.
+        if self._config.socket_path is not None:
+            transport = connection.transport
+            if transport is None:
+                # websockets 16 sets ``transport`` before ``process_request``
+                # runs; guard defensively so a future/edge None fails closed
+                # rather than raising AttributeError.
+                logger.warning("stt_server: UDS connection has no transport; rejecting")
+                return connection.respond(403, "peer not permitted\n")
+            sock = transport.get_extra_info("socket")
+            if sock is None:
+                logger.warning("stt_server: UDS connection has no underlying socket; rejecting")
+                return connection.respond(403, "peer not permitted\n")
+            if sock.family != socket.AF_UNIX:
+                logger.warning(
+                    "stt_server: UDS connection on unexpected socket family %r; rejecting",
+                    sock.family,
+                )
+                return connection.respond(403, "peer not permitted\n")
+            try:
+                uid = peer_uid(sock)
+            except Exception as exc:
+                logger.warning("stt_server: peer uid resolution failed (%s); rejecting", exc)
+                return connection.respond(403, "peer not permitted\n")
+            if uid is None or uid != os.geteuid():
+                logger.warning(
+                    "stt_server: rejecting UDS peer uid %r (expected %d)",
+                    uid,
+                    os.geteuid(),
+                )
+                return connection.respond(403, "peer not permitted\n")
+
         # Reject unexpected browser Origin headers for non-browser-focused V1,
         # and enforce optional bearer auth in one place.
         headers = request.headers
