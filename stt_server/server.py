@@ -87,7 +87,7 @@ def _item_id() -> str:
     return f"item_{uuid.uuid4().hex[:16]}"
 
 
-def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> None:
+def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     """Refuse to bind unless the socket's directory chain cannot be hijacked.
 
     The UDS file mode (``0o600``) stops a foreign uid from ``connect()``-ing,
@@ -110,6 +110,13 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> None:
 
     Raises ``ValueError`` on any failure; the serve entrypoint turns that into
     ``stt_server: <msg>`` + ``SystemExit(1)`` rather than a bare traceback.
+
+    Returns the fully symlink-resolved socket path (``resolved_bind /
+    path.name``). The caller MUST bind on this returned path, not the literal
+    ``path``: the owner/mode walk verifies ``resolved_bind``, so binding the
+    unresolved path would let a symlinked ancestor outside the verified chain be
+    repointed in the stat->bind window. For the default cache path (no symlink
+    components) the resolved and literal paths are identical.
     """
     euid = os.geteuid()
     bind_dir = path.parent
@@ -134,7 +141,7 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> None:
     # itself umask-masked, but ``0o700`` carries no group/other bits for any
     # umask to widen, and the walk below re-stats and verifies regardless.
     to_create: list[Path] = []
-    cursor = bind_dir
+    cursor = resolved_bind
     while not cursor.exists():
         to_create.append(cursor)
         parent = cursor.parent
@@ -163,6 +170,10 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> None:
         if component == trusted_root:
             break
         component = component.parent
+
+    # Bind on the verified resolved path, not the literal ``path``: this is the
+    # chain the walk above vouched for.
+    return resolved_bind / path.name
 
 
 @dataclass
@@ -235,14 +246,18 @@ class TranscriptionServer:
             # be planted/swapped by another local uid. This replaces a bare
             # mkdir that trusted the path blindly and verifies the full ancestor
             # walk, not just the immediate parent.
-            _enforce_socket_dir_secure(socket_path, Path.home())
+            # Bind on the verified resolved path the enforcement returned, not
+            # the literal configured path: the owner/mode walk vouched for the
+            # resolved chain, so binding the unresolved path could let a
+            # symlinked ancestor be repointed in the stat->bind window.
+            resolved_socket = _enforce_socket_dir_secure(socket_path, Path.home())
             # Restrict the socket file to owner-only before bind so the UDS
             # trust boundary actually holds on multi-user hosts.
             prior_umask = os.umask(0o077)
             try:
                 self._server = await ws_unix_serve(
                     self._handle_connection,
-                    path=str(socket_path),
+                    path=str(resolved_socket),
                     max_size=self._config.max_append_bytes,
                     process_request=self._process_request,
                 )
@@ -250,7 +265,7 @@ class TranscriptionServer:
                 os.umask(prior_umask)
             if self._config.unix_socket_mode is not None:
                 try:
-                    os.chmod(socket_path, self._config.unix_socket_mode)
+                    os.chmod(resolved_socket, self._config.unix_socket_mode)
                 except OSError as exc:
                     logger.warning("stt_server: chmod on UDS failed: %s", exc)
         else:
@@ -355,7 +370,14 @@ class TranscriptionServer:
         # peer's uid is a 403, not a pass. TCP listeners cannot answer
         # SO_PEERCRED-style queries, so this gate is UDS-only.
         if self._config.socket_path is not None:
-            sock = connection.transport.get_extra_info("socket")
+            transport = connection.transport
+            if transport is None:
+                # websockets 16 sets ``transport`` before ``process_request``
+                # runs; guard defensively so a future/edge None fails closed
+                # rather than raising AttributeError.
+                logger.warning("stt_server: UDS connection has no transport; rejecting")
+                return connection.respond(403, "peer not permitted\n")
+            sock = transport.get_extra_info("socket")
             if sock is None:
                 logger.warning("stt_server: UDS connection has no underlying socket; rejecting")
                 return connection.respond(403, "peer not permitted\n")

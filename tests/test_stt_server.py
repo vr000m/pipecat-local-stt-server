@@ -519,7 +519,7 @@ async def test_unix_socket_has_owner_only_permissions(monkeypatch):
     # Binds under /tmp (root-owned), which R1 dir-enforcement rejects. This
     # test exercises UDS perms, not ancestor-dir enforcement, so neutralise the
     # check via the Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -537,10 +537,11 @@ async def test_unix_socket_start_creates_parent_directory(monkeypatch):
     # This test exercises parent-dir *creation*, so the stub keeps the mkdir
     # behaviour but drops the ancestor ownership/perms check (the part /tmp
     # trips). Sanctioned by the Phase-4 test-only seam.
-    monkeypatch.setattr(
-        "stt_server.server._enforce_socket_dir_secure",
-        lambda path, trusted_root: path.parent.mkdir(mode=0o700, parents=True, exist_ok=True),
-    )
+    def _mkdir_only(path, trusted_root):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path  # mirror the real helper's bind-path return contract
+
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", _mkdir_only)
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "nested" / "path" / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -557,7 +558,7 @@ async def test_unix_socket_transport(monkeypatch):
     # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
     # UDS transport, not ancestor-dir enforcement, so neutralise the check via
     # the Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(
@@ -626,7 +627,7 @@ async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
     # Binds under a system temp dir (root-owned ancestor) which R1 rejects;
     # this test exercises the UDS-vs-TCP token warning, not ancestor-dir
     # enforcement, so neutralise the check via the Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory() as tmp:
         sock = str(Path(tmp) / "stt.sock")
         srv = TranscriptionServer(
@@ -837,7 +838,7 @@ async def test_cli_status_with_explicit_socket_reads_token_from_dotenv(tmp_path:
     # Binds the in-process server's socket directly under /tmp (root-owned),
     # which R1 dir-enforcement rejects; this test exercises the CLI token-probe
     # path, not ancestor-dir enforcement, so neutralise via the Phase-4 seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     sock = Path("/tmp") / f"stt-preflight-{os.getpid()}.sock"
     sock.unlink(missing_ok=True)
     srv = TranscriptionServer(
@@ -1378,7 +1379,7 @@ async def test_cli_status_client_does_not_use_server_only_token(tmp_path: Path, 
     # which R1 dir-enforcement rejects; this test exercises the client-vs-server
     # token contract, not ancestor-dir enforcement, so neutralise via the
     # Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     sock = Path("/tmp") / f"stt-preflight-p1-{os.getpid()}.sock"
     sock.unlink(missing_ok=True)
     srv = TranscriptionServer(
@@ -1664,7 +1665,7 @@ async def test_uds_auth_foreign_uid_rejected_with_403(monkeypatch):
     uid, and assert the client connect raises InvalidStatus(403). Mirrors the
     existing 401 bearer-auth test's InvalidStatus handling.
     """
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     # Foreign uid: resolver claims the peer is someone other than us.
     monkeypatch.setattr("stt_server.server.peer_uid", lambda sock: os.geteuid() + 1)
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
@@ -1732,7 +1733,7 @@ async def test_uds_auth_peer_uid_same_uid_real_resolver_completes_handshake(monk
     catches a silently-None transport socket that would otherwise fail closed.
     Kept to a single connection; the N-concurrent case is Phase 4.
     """
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"
         srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
@@ -1786,7 +1787,7 @@ async def test_uds_multi_connection_same_uid_all_handshake(monkeypatch):
 
     # Bind one real UDS server; do NOT stub peer_uid so the real gate runs for
     # every connection.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     n = 4
     with tempfile.TemporaryDirectory(prefix="stt.", dir="/tmp") as d:
         sock = Path(d) / "s"

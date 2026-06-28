@@ -165,7 +165,7 @@ async def test_shutdown_drains_two_concurrent_decodes(monkeypatch):
     # rejects. This test exercises the drain path, not ancestor-dir enforcement,
     # and the temp dir already exists before start(), so neutralise the check
     # with a pure no-op via the Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _SlowBackend(decode_seconds=0.5)
     srv, sock = await _start_server(backend, drain=2.0)
     try:
@@ -207,7 +207,7 @@ async def test_shutdown_force_cancels_past_drain_timeout(monkeypatch):
     # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
     # the force-cancel drain path, not ancestor-dir enforcement, and the temp
     # dir already exists before start(), so neutralise with a no-op (Phase-4 seam).
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _HangingBackend()
     srv, sock = await _start_server(backend, drain=0.5)
     try:
@@ -240,7 +240,7 @@ async def test_shutdown_is_idempotent_under_double_call(monkeypatch):
     # /tmp is root-owned so R1 dir-enforcement rejects it; this test exercises
     # shutdown idempotency, not ancestor-dir enforcement, and the temp dir
     # already exists before start(), so neutralise with a no-op (Phase-4 seam).
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _SlowBackend(decode_seconds=0.1)
     srv, sock = await _start_server(backend, drain=2.0)
     try:
@@ -270,7 +270,7 @@ async def test_fresh_server_after_shutdown_accepts_new_connections(monkeypatch):
     # rejects. This test exercises respawn-on-same-socket, not ancestor-dir
     # enforcement, and the temp dir already exists before start(), so neutralise
     # with a no-op via the Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     tmp = tempfile.mkdtemp(prefix="mlx-spike.", dir="/tmp")
     sock = Path(tmp) / "s"
 
@@ -310,7 +310,7 @@ async def test_backend_close_called_exactly_once_on_force_cancel_path(monkeypatc
     # the force-cancel close-once invariant, not ancestor-dir enforcement, and
     # the temp dir already exists before start(), so neutralise with a no-op
     # via the Phase-4-sanctioned seam.
-    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: None)
+    monkeypatch.setattr("stt_server.server._enforce_socket_dir_secure", lambda *a, **k: a[0])
     backend = _HangingBackend()
     srv, sock = await _start_server(backend, drain=0.2)
     try:
