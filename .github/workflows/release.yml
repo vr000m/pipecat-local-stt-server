@@ -1,0 +1,47 @@
+name: release
+
+# Publish to PyPI via Trusted Publishing (OIDC) — no API token / ~/.pypirc
+# secret is used. Fires when a GitHub Release is published (e.g. the
+# `gh release create vX.Y.Z` step of the release flow). The job runs in the
+# `pypi` environment, whose required-reviewer protection rule pauses the run
+# for manual approval before the upload proceeds.
+#
+# PyPI trusted-publisher config must match this exactly:
+#   Owner: vr000m  Repo: pipecat-local-stt-server
+#   Workflow: release.yml  Environment: pypi
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pipecat-local-stt-server/
+    permissions:
+      id-token: write # mint the short-lived OIDC token PyPI trusts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Verify the built version matches the release tag
+        # Guard against publishing a stale/mismatched artifact: the version
+        # baked into the wheel must equal the tag the release points at
+        # (tag `vX.Y.Z` -> dist `…-X.Y.Z-…`). Fail loudly otherwise.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          if ! ls dist/pipecat_local_stt_server-"${tag}"-*.whl >/dev/null 2>&1; then
+            echo "::error::built artifacts do not match release tag ${GITHUB_REF_NAME} (expected version ${tag})"
+            ls -1 dist/
+            exit 1
+          fi
+      - name: Publish to PyPI (OIDC trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
