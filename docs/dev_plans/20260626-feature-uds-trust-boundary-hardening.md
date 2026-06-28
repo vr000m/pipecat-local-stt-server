@@ -121,10 +121,14 @@ still not a client code change. This precondition is written into Requirements.
   trusted_root: Path)`) that creates missing socket directories `0700`
   (`mkdir(mode=0o700)`, then re-`stat` and verify — `mkdir` mode is umask-masked,
   so verify rather than trust), then walks every component from the socket's bind
-  directory up to and including `trusted_root`. Each component must have
-  `st_uid == os.geteuid()` and no group/other write bits (`st_mode & 0o022 == 0`);
-  sticky-bit directories are allowed. Raise a clear exception naming the failing
-  component and condition otherwise.
+  directory up to and including `trusted_root`. The walk is over the **literal**
+  lexical path (no `resolve()`); each component is checked with `os.lstat` so a
+  symlink is detected rather than followed — a symlinked ancestor can be repointed
+  post-startup, so it is rejected outright. Each component must have
+  `st_uid == os.geteuid()`, no group/other write bits (`st_mode & 0o022 == 0`), and
+  must not be a symlink; sticky-bit directories are allowed. Returns the verified
+  literal path (the caller binds on this, not a `resolve()`d one). Raise a clear
+  exception naming the failing component and condition otherwise.
 - [x] Call it in `start()` immediately before the `os.umask(0o077)` block
   (replacing the bare `socket_path.parent.mkdir(parents=True, exist_ok=True)`
   at `server.py:148-149`). Resolve and document the trusted root, then verify the
@@ -145,6 +149,10 @@ still not a client code change. This precondition is written into Requirements.
   `mkdir -m 700` (or follow with `chmod 700`), add an upgrade note for
   pre-existing `0755` dirs, and cross-check the Koda cross-repo contract socket
   path. Without this, fresh installs and upgrades both break at the phase commit.
+  **Post-phase-5 addition (`f9f41b6`):** also added `validate_socket_path()` that
+  validates a custom `PIPECAT_STT_SOCKET` (absolute, under `$HOME`, no symlink
+  component) **before** any `mkdir`/`chmod`, so a path the server would reject fails
+  the install cleanly with no filesystem mutation.
 
 ### Phase 2 — Peer-credential resolver (cross-platform, isolated + unit-tested)
 
@@ -274,11 +282,11 @@ or equivalent public/API-reachable bypass flag.
 
 | File | Change |
 |---|---|
-| `stt_server/server.py:148-149` | Replace bare `mkdir` with `_enforce_socket_dir_secure()`; add the full ancestor-walk helper. |
+| `stt_server/server.py:148-149` | Replace bare `mkdir` with `_enforce_socket_dir_secure()`; add the full ancestor-walk helper. Walk is over the **literal** lexical path; `os.lstat` detects and rejects symlink components; returns the verified literal path for binding (no `resolve()`). |
 | `stt_server/server.py:261-275` | Add UDS-only peer-cred gate in `_process_request` (incl. `sock is None` and `peer_uid` exception → `403`). |
 | `stt_server/_peercred.py` (new) | Cross-platform `peer_uid(sock)` resolver typed against a minimal structural `Protocol`. |
-| `stt_server/__main__.py` `_cmd_serve` (`:210-224`) | Wrap `asyncio.run(serve(...))` in `try/except (ValueError, OSError)` → `stt_server: <msg>` + `SystemExit(1)`. NOT the `_cmd_status` handler at `:298-300`. |
-| `scripts/install_stt_agent.sh:100` | `mkdir -m 700` the socket dir; upgrade note for existing `0755` dirs. |
+| `stt_server/__main__.py` `_cmd_serve` | Wrap `asyncio.run(serve(...))` in `try/except (ValueError, OSError, ImportError)` → `stt_server: <msg>` + `SystemExit(1)`. `ImportError` (superset of `ModuleNotFoundError`) also surfaces missing backend extras. NOT the `_cmd_status` handler. |
+| `scripts/install_stt_agent.sh` | Add `validate_socket_path()` that validates a custom `PIPECAT_STT_SOCKET` (absolute, under `$HOME`, no symlink component) BEFORE any `mkdir`/`chmod`; then `mkdir -m 700` the socket dir and self-heal a pre-existing `0755`. |
 | `pyproject.toml`, `uv.lock` | Pin `websockets>=16,<17` to keep handshake API assumptions stable across major versions. |
 | `tests/test_peercred.py` (new) | Unit tests for the resolver incl. macOS ctypes path + forced `sys.platform` branch selection. |
 | `tests/test_stt_server.py:516+` | Dir-enforcement (incl. foreign-owner ancestor branch), `sock is None`, `peer_uid` raises, and UDS peer-cred integration tests. |
@@ -333,7 +341,7 @@ in Phase 2/3 via the `socketpair()` unit test before wiring in):**
 
 | Seam | Contract | Verified by |
 |---|---|---|
-| `start()` → dir enforcement | Refuse to bind unless every ancestor through the trusted root is owner-owned and not group/other-writable, except sticky-bit dirs | Phase 1 tests |
+| `start()` → dir enforcement | Refuse to bind unless every literal lexical ancestor through the trusted root is owner-owned, not group/other-writable, and not a symlink (`os.lstat`); sticky-bit dirs excepted; returns verified literal path | Phase 1 tests |
 | `_process_request` → `peer_uid()` | UDS only; `None`, exception, or uid mismatch → `403` before handshake | Phase 3 tests |
 | `peer_uid()` → OS | macOS `getpeereid` / Linux `SO_PEERCRED`; unknown → `None` (fail closed) | Phase 2 unit tests |
 | TCP path | Unchanged: Origin + bearer token only | existing tests stay green |
@@ -515,6 +523,18 @@ sequenceDiagram
 - **`test_justfile_map_mirrors_readme` failure is pre-existing**, unrelated to this
   feature (fails on the clean base commit too — "README per-ASR table header not
   found"). Not addressed here.
+- **Post-phase-5 code-review fixes** added after the Phase 5 doc sync (commits
+  `a50624c`, `62def0c`, `ffd921f`, `f9f41b6`): (1) `_enforce_socket_dir_secure`
+  now walks the **literal** path and rejects any symlink component using `os.lstat`
+  rather than `os.stat` — a symlinked ancestor can be repointed post-startup, so it
+  is rejected outright; the function returns the verified literal path and the caller
+  binds on it (not a `resolve()`d copy). (2) `_cmd_serve` exception handler broadened
+  from `(ValueError, OSError)` to `(ValueError, OSError, ImportError)` so a missing
+  backend extra also surfaces as a clean `stt_server: <msg>` message. (3)
+  `install_stt_agent.sh` gained `validate_socket_path()` that checks a custom
+  `PIPECAT_STT_SOCKET` against the server's own rules (absolute, under `$HOME`, no
+  symlink component) **before** any `mkdir`/`chmod`, so the install fails cleanly
+  rather than tightening the directory and then crash-looping the agent.
 
 ## Final Results
 
@@ -522,7 +542,7 @@ Phases 1–5 implemented on `feature/uds-trust-boundary-hardening`:
 
 | Phase | Commit | Outcome |
 |---|---|---|
-| 1 — Parent-directory enforcement | `839e718` | `_enforce_socket_dir_secure` (owner-only ancestor walk to `$HOME`, creates `0700`), wired into `start()`; `_cmd_serve` turns startup errors into `stt_server: <msg>` + exit 1; `install_stt_agent.sh` creates the socket dir `0700`. |
+| 1 — Parent-directory enforcement | `839e718` | `_enforce_socket_dir_secure` (owner-only **literal** ancestor walk to `$HOME`, `os.lstat` rejects symlink components, returns verified literal path, creates `0700`), wired into `start()`; `_cmd_serve` catches `(ValueError, OSError, ImportError)` → `stt_server: <msg>` + exit 1 (`62def0c` broadened from `ValueError, OSError`); `install_stt_agent.sh` creates the socket dir `0700` and now validates custom socket paths before any filesystem mutation (`f9f41b6`); symlink-chain fix landed in `a50624c`. |
 | 2 — Peer-credential resolver | `49b34dc` | `stt_server/_peercred.py` — `peer_uid(sock)` (Linux `SO_PEERCRED` / macOS `getpeereid` ctypes), fail-closed; verified on host (`peer_uid == os.geteuid()`). |
 | 3 — Wire peer-cred into handshake | `7773c79` | UDS-only fail-closed `403` gate in `_process_request`, independent of the bearer-token branch; TCP untouched; `websockets` pinned `>=16,<17`. |
 | 4 — Local end-to-end smoke | `35de5ec` | `scripts/smoke_peercred.py` + `just smoke-peercred` + multi-connection pytest; same-uid concurrency PASS, cross-uid leg skips cleanly without a second uid. |

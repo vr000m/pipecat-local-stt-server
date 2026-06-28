@@ -69,8 +69,9 @@ uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path
 
 > **Backends need their own install.** Every `--backend` above except `echo`
 > requires a `uv sync` extra first — `mlx`/`parakeet`/`nemotron` (e.g.
-> `uv sync --extra mlx`). Without it you get e.g. `ModuleNotFoundError: No module
-> named 'mlx_whisper'`. See [Choosing a backend and model](#choosing-a-backend-and-model)
+> `uv sync --extra mlx`). Without it the server exits with an actionable
+> `stt_server: the '<extra>' extra is not installed … run: uv sync --extra <extra>
+> --inexact` message. See [Choosing a backend and model](#choosing-a-backend-and-model)
 > for each backend's install command and `--model` defaults.
 
 The CLI accepts both `python -m stt_server <flags>` (the legacy flat form,

@@ -200,10 +200,13 @@ change.
 
 ### Socket directory permissions (`0700`) — upgrade note
 
-`scripts/install_stt_agent.sh` creates the socket's parent directory `0700`
-from birth (`mkdir -m 700`) and also `chmod 700`s it, which **self-heals** a
-pre-existing `0755` directory left by an older install. Because the new startup
-check refuses to bind against a group/other-writable ancestor:
+`scripts/install_stt_agent.sh` validates a custom `PIPECAT_STT_SOCKET` against
+the same rules the server enforces — absolute path, under `$HOME`, no symlink
+component — **before** any `mkdir`/`chmod`. A path the server would reject fails
+the install cleanly with no filesystem mutation. It then creates the socket's
+parent directory `0700` from birth (`mkdir -m 700`) and also `chmod 700`s it,
+which **self-heals** a pre-existing `0755` directory left by an older install.
+Because the new startup check refuses to bind against a group/other-writable ancestor:
 
 - **Upgrading an existing host:** re-run `install_stt_agent.sh` (it repairs the
   dir in place), or manually `chmod 700 ~/Library/Caches/pipecat-stt`.

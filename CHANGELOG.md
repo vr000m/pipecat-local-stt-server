@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.3] - 2026-06-27
+## [0.3.3] - 2026-06-28
 
 Server-side hardening of the same-host UDS trust boundary. No new user-facing
 features; clients connect unchanged (no protocol or client-API change).
@@ -309,6 +309,8 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
+[0.3.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.2
 [0.3.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.1
 [0.3.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.0
 [0.2.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.2.0
