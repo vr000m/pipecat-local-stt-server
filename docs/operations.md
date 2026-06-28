@@ -162,7 +162,12 @@ independent measures. They are layered, not redundant:
    the server walks every directory from the socket's parent up to and
    including the trusted root (`$HOME`) and **refuses to start** unless each
    component is owned by the running uid and is not group/other-writable
-   (sticky-bit directories excepted). This makes the socket *un-plantable*: an
+   (sticky-bit directories excepted). The walk is over the **literal** socket
+   path clients traverse — not a symlink-resolved one — and **rejects any
+   symlink component**: resolving past a symlink would verify the target's chain
+   while a foreign uid who can write a symlinked-but-writable lexical ancestor
+   could repoint it after startup and hijack the path clients connect to. This
+   makes the socket *un-plantable*: an
    attacker cannot `unlink()` our socket and `bind()` their own, because they
    have no write access on any directory that could replace it. On stock macOS
    the chain (`~/Library/Caches/pipecat-stt` → `~/Library/Caches` → `~/Library`

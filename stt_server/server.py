@@ -27,6 +27,7 @@ import os
 import resource
 import signal
 import socket
+import stat as _stat
 import sys
 import time
 import uuid
@@ -111,26 +112,42 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     Raises ``ValueError`` on any failure; the serve entrypoint turns that into
     ``stt_server: <msg>`` + ``SystemExit(1)`` rather than a bare traceback.
 
-    Returns the fully symlink-resolved socket path (``resolved_bind /
-    path.name``). The caller MUST bind on this returned path, not the literal
-    ``path``: the owner/mode walk verifies ``resolved_bind``, so binding the
-    unresolved path would let a symlinked ancestor outside the verified chain be
-    repointed in the stat->bind window. For the default cache path (no symlink
-    components) the resolved and literal paths are identical.
+    Returns the verified socket path (the literal ``path``). We verify the
+    LITERAL lexical chain that clients and the LaunchAgent actually traverse —
+    NOT a ``resolve()``-d one — and reject any symlink component (``lstat``).
+    The kernel resolves the literal socket path at connect/bind time, so the
+    directories that could replace the socket are the literal lexical ancestors.
+    Resolving here would verify a *different* chain than clients use: a symlinked
+    but group/other-writable lexical ancestor would be skipped, then repointed
+    after startup to make clients connect to an attacker's socket while the
+    server stayed bound to the safe resolved target. By rejecting symlinks the
+    verified chain, the bound path, and the client-visible path are identical.
     """
     euid = os.geteuid()
     bind_dir = path.parent
-    trusted_root = trusted_root.resolve()
-    resolved_bind = bind_dir.resolve()
+
+    # Verify (and bind) the literal path, so we never resolve past a symlink the
+    # client will still traverse. An absolute, ``..``-free path is required: with
+    # no ``resolve()`` the containment check below is purely lexical, and a
+    # ``..`` segment could let a path that escapes the trusted root pass it.
+    if not bind_dir.is_absolute():
+        raise ValueError(
+            f"socket directory {bind_dir} must be an absolute path under {trusted_root}"
+        )
+    if ".." in bind_dir.parts:
+        raise ValueError(
+            f"socket directory {bind_dir} must not contain '..' components; "
+            f"point the socket at a direct path under {trusted_root}"
+        )
 
     # The socket MUST live under the trusted root. A path outside it (e.g. a
     # custom socket path pointing at a world-writable location) has no
     # owner-only chain we can vouch for, and walking to the filesystem root
     # would only verify root-owned system directories that we do not own. Refuse
     # rather than pretend the path is safe.
-    if resolved_bind != trusted_root and trusted_root not in resolved_bind.parents:
+    if bind_dir != trusted_root and trusted_root not in bind_dir.parents:
         raise ValueError(
-            f"socket directory {resolved_bind} is not under the trusted root "
+            f"socket directory {bind_dir} is not under the trusted root "
             f"{trusted_root}; point the socket at a path under {trusted_root}"
         )
 
@@ -141,7 +158,7 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     # itself umask-masked, but ``0o700`` carries no group/other bits for any
     # umask to widen, and the walk below re-stats and verifies regardless.
     to_create: list[Path] = []
-    cursor = resolved_bind
+    cursor = bind_dir
     while not cursor.exists():
         to_create.append(cursor)
         parent = cursor.parent
@@ -151,9 +168,18 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     for missing in reversed(to_create):
         missing.mkdir(mode=0o700)
 
-    component = resolved_bind
+    component = bind_dir
     while True:
-        st = os.stat(component)
+        # ``lstat`` (not ``stat``) so a symlinked component is detected, not
+        # silently followed. As we walk up, every component eventually becomes
+        # the final path element, so a symlink anywhere in the chain is caught.
+        st = os.lstat(component)
+        if _stat.S_ISLNK(st.st_mode):
+            raise ValueError(
+                f"socket directory component {component} is a symlink; refusing "
+                "to bind (a symlinked ancestor can be repointed by another user "
+                "to hijack the client-visible socket path)"
+            )
         if st.st_uid != euid:
             raise ValueError(
                 f"socket directory component {component} is owned by uid "
@@ -171,9 +197,10 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
             break
         component = component.parent
 
-    # Bind on the verified resolved path, not the literal ``path``: this is the
-    # chain the walk above vouched for.
-    return resolved_bind / path.name
+    # Bind on the literal, now-verified path: the chain clients traverse is
+    # exactly the chain we vouched for (no symlinks), so verified == bound ==
+    # client-visible.
+    return path
 
 
 @dataclass
@@ -245,19 +272,17 @@ class TranscriptionServer:
             # directory up to and including home BEFORE bind so the socket cannot
             # be planted/swapped by another local uid. This replaces a bare
             # mkdir that trusted the path blindly and verifies the full ancestor
-            # walk, not just the immediate parent.
-            # Bind on the verified resolved path the enforcement returned, not
-            # the literal configured path: the owner/mode walk vouched for the
-            # resolved chain, so binding the unresolved path could let a
-            # symlinked ancestor be repointed in the stat->bind window.
-            resolved_socket = _enforce_socket_dir_secure(socket_path, Path.home())
+            # walk, not just the immediate parent. The enforcement rejects any
+            # symlink component and returns the literal verified path, so the
+            # chain we vouched for is exactly the one clients traverse.
+            verified_socket = _enforce_socket_dir_secure(socket_path, Path.home())
             # Restrict the socket file to owner-only before bind so the UDS
             # trust boundary actually holds on multi-user hosts.
             prior_umask = os.umask(0o077)
             try:
                 self._server = await ws_unix_serve(
                     self._handle_connection,
-                    path=str(resolved_socket),
+                    path=str(verified_socket),
                     max_size=self._config.max_append_bytes,
                     process_request=self._process_request,
                 )
@@ -265,7 +290,7 @@ class TranscriptionServer:
                 os.umask(prior_umask)
             if self._config.unix_socket_mode is not None:
                 try:
-                    os.chmod(resolved_socket, self._config.unix_socket_mode)
+                    os.chmod(verified_socket, self._config.unix_socket_mode)
                 except OSError as exc:
                     logger.warning("stt_server: chmod on UDS failed: %s", exc)
         else:

@@ -1559,16 +1559,21 @@ def test_enforce_socket_dir_foreign_owner_ancestor_rejects_without_chmod_chown(m
         bind_dir.mkdir(mode=0o700)
         sock = bind_dir / "s"
 
-        real_stat = os.stat
+        # Capture the real lstat BEFORE patching: the walk reads ownership via
+        # os.lstat, and computing the match via os.path.realpath would call the
+        # (patched) os.lstat and recurse. The chain has no symlinks, so a lexical
+        # compare identifies `child` unambiguously.
+        real_lstat = os.lstat
         foreign_uid = os.geteuid() + 1
+        child_str = os.path.normpath(str(child))
 
         def fake_stat(path, *args, **kwargs):
-            st = real_stat(path, *args, **kwargs)
             try:
-                target = os.path.realpath(os.fspath(path))
+                p = os.path.normpath(os.fspath(path))
             except TypeError:
-                return st  # fd-based stat: leave untouched
-            if target == os.path.realpath(child):
+                return real_lstat(path)  # fd-based: leave untouched
+            st = real_lstat(path)
+            if p == child_str:
                 fields = list(st)  # the 10 canonical stat fields
                 fields[4] = foreign_uid  # st_uid
                 return os.stat_result(fields)
@@ -1576,7 +1581,11 @@ def test_enforce_socket_dir_foreign_owner_ancestor_rejects_without_chmod_chown(m
 
         chmod_calls: list = []
         chown_calls: list = []
+        # The ancestor walk reads ownership via ``os.lstat`` (so symlink
+        # components are detected, not followed); patch it as well as ``os.stat``
+        # so the injected foreign uid is observed.
         monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "lstat", fake_stat)
         monkeypatch.setattr(os, "chmod", lambda *a, **k: chmod_calls.append(a))
         monkeypatch.setattr(os, "chown", lambda *a, **k: chown_calls.append(a))
 
@@ -1588,6 +1597,39 @@ def test_enforce_socket_dir_foreign_owner_ancestor_rejects_without_chmod_chown(m
         assert chown_calls == [], f"helper chown'd an unowned dir: {chown_calls!r}"
     finally:
         monkeypatch.undo()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_enforce_socket_dir_refuses_symlinked_socket_dir_under_writable_ancestor():
+    # (e) Adversarial: the client-visible socket path runs through a symlink that
+    # lives in a group/other-writable lexical ancestor. Resolving the path would
+    # verify the symlink TARGET's chain (safe) and skip the writable ancestor,
+    # letting a foreign uid repoint the symlink after startup and hijack the
+    # path clients connect to. The helper must verify the LITERAL chain and
+    # refuse to bind on any symlink component.
+    import shutil
+
+    from stt_server.server import _enforce_socket_dir_secure
+
+    root = _make_trusted_root()  # stands in for $HOME (0700, owner-owned)
+    try:
+        safe = root / "safe"
+        safe.mkdir(mode=0o700)  # a legitimate 0700 target
+        writable = root / "writable"
+        writable.mkdir(mode=0o700)
+        os.chmod(writable, 0o775)  # group-writable: a foreign uid can write here
+        link = writable / "link"
+        link.symlink_to(safe)  # link -> root/safe, repointable by anyone with
+        # write on `writable`
+        sock = link / "s"  # client-visible path traverses the symlink
+
+        with pytest.raises((ValueError, OSError)) as exc:
+            _enforce_socket_dir_secure(sock, root)
+
+        msg = str(exc.value)
+        assert str(link) in msg, f"error must name the symlink component; got: {msg!r}"
+        assert "symlink" in msg.lower(), f"error must explain the symlink refusal; got: {msg!r}"
+    finally:
         shutil.rmtree(root, ignore_errors=True)
 
 

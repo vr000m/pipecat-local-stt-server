@@ -23,8 +23,11 @@ features; clients connect unchanged (no protocol or client-API change).
 - **Socket-directory ancestor enforcement.** Before bind, the server walks every
   directory from the socket's parent up to and including `$HOME` and refuses to
   start unless each is owner-owned and not group/other-writable (sticky-bit dirs
-  excepted), creating missing dirs `0700`. This makes the socket un-plantable
-  (no foreign uid can `unlink`+`bind` a replacement).
+  excepted), creating missing dirs `0700`. The walk is over the **literal** path
+  clients traverse and **rejects any symlink component** (a symlinked, writable
+  lexical ancestor would otherwise be repointable post-startup to hijack the
+  client-visible socket). This makes the socket un-plantable (no foreign uid can
+  `unlink`+`bind` a replacement).
 - **Backend-extra onboarding.** `just stt-install` / `stt-enable` now ensure the
   selected backend's optional extra is installed (`uv sync --extra <X>
   --inexact`) so a freshly installed agent doesn't crash-loop on a missing
