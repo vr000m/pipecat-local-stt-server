@@ -96,7 +96,66 @@ fi
 
 cmd="${1:-install}"
 
+# Validate the literal socket path against the SAME rules the server enforces in
+# _enforce_socket_dir_secure() (stt_server/server.py) BEFORE creating or
+# chmod-ing anything. The server refuses to start unless the socket directory is
+# an absolute, ``..``-free path under $HOME whose chain contains no symlink
+# component. Mirroring that here means a custom PIPECAT_STT_SOCKET the server
+# would reject fails the install cleanly — with NO filesystem mutation — instead
+# of tightening the operator's directory to 0700 and only then crash-looping the
+# agent on startup. Keep this in lockstep with the Python rules.
+validate_socket_path() {
+    local sock="$1"
+    local dir
+    dir="$(dirname "$sock")"
+    local home="${HOME%/}"
+
+    # Absolute path required (lexical containment below assumes it).
+    case "$dir" in
+    /*) : ;;
+    *)
+        echo "error: socket directory '$dir' must be an absolute path under \$HOME ($home)" >&2
+        exit 1
+        ;;
+    esac
+
+    # No ``..`` components: without resolving symlinks, a ``..`` segment could
+    # escape the trusted root while still passing the lexical check below.
+    case "/$dir/" in
+    */../*)
+        echo "error: socket directory '$dir' must not contain '..' components" >&2
+        exit 1
+        ;;
+    esac
+
+    # Must live lexically under the trusted root ($HOME), or be $HOME itself.
+    if [[ "$dir" != "$home" && "$dir" != "$home/"* ]]; then
+        echo "error: socket directory '$dir' is not under the trusted root \$HOME ($home); point PIPECAT_STT_SOCKET (or KODA_STT_SOCKET) at a path under \$HOME" >&2
+        exit 1
+    fi
+
+    # Reject any symlink component from the socket directory up to AND INCLUDING
+    # $HOME. Only existing components can be symlinks; not-yet-created ones are
+    # made 0700 below and cannot be. Walking up means a symlink anywhere in the
+    # chain (not just the immediate parent) is caught before any mkdir/chmod.
+    local component="$dir"
+    while :; do
+        if [[ -L "$component" ]]; then
+            echo "error: socket directory component '$component' is a symlink; refusing to install (a symlinked ancestor can be repointed by another user to hijack the socket path)" >&2
+            exit 1
+        fi
+        [[ "$component" == "$home" ]] && break
+        local parent
+        parent="$(dirname "$component")"
+        [[ "$parent" == "$component" ]] && break
+        component="$parent"
+    done
+}
+
 render_plist() {
+    # Validate (and refuse) BEFORE mutating any filesystem state — the socket
+    # dir chmod below must never tighten a directory the server will then reject.
+    validate_socket_path "$SOCKET_PATH"
     mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
     # Create the socket's parent directory owner-only (0700) from birth so
     # there is no window under a permissive umask (commonly 0755) in which

@@ -47,7 +47,12 @@ features; clients connect unchanged (no protocol or client-API change).
   handshake/transport contract depends on the v16 API). Applies to every extra,
   including `client`. See Upgrade notes for the consumer-conflict caveat.
 - `scripts/install_stt_agent.sh` creates the socket directory `0700` (was the
-  install-shell umask default) and self-heals a pre-existing `0755` dir.
+  install-shell umask default) and self-heals a pre-existing `0755` dir. It now
+  validates a custom `PIPECAT_STT_SOCKET` against the same rules the server
+  enforces (absolute, under `$HOME`, no symlink component) **before** any
+  `mkdir`/`chmod`, so a path the server would reject fails the install cleanly
+  with no filesystem mutation instead of tightening the directory and then
+  crash-looping the agent.
 - Startup failures — socket-dir enforcement, the `ServerConfig` `ValueError`,
   bind `OSError`s, and a missing backend extra — surface as
   `stt_server: <msg>` + exit 1 instead of a bare traceback.
