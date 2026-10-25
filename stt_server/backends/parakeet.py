@@ -30,14 +30,14 @@ from ..protocol import (
     AUDIO_SAMPLE_RATE_HZ,
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
-from ._thread_util import run_in_daemon_thread
+from ..snapshot import SnapshotSpec, download_phase
+from . import DEFAULT_PARAKEET_MODEL
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.parakeet")
 
-# Default model for ``--backend parakeet``. Exported so Phase 2's
-# backend-aware ``--model`` default imports it rather than hardcoding a second
-# copy. ``parakeet-tdt-0.6b-v3`` is the package's own CLI default.
-DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# Default model for ``--backend parakeet``: defined once in the backend
+# registry (``backends/__init__.py``) and re-exported here.
 
 # Parakeet's native attention window is ~24 s. ``parakeet_mlx``'s decode path
 # implements chunk-and-concatenate (token-merge across overlapping chunks) when
@@ -92,11 +92,10 @@ class _ParakeetStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            # Mark in-flight BEFORE spawning the daemon thread so
-            # ``backend.close()`` observes it immediately; the daemon thread
-            # owns the decrement in a finally block.
-            self._backend._mark_inflight_start()
-            self._result = await run_in_daemon_thread(
+            # ``_run_guarded_decode`` marks in-flight BEFORE spawning the
+            # daemon thread so ``backend.close()`` observes it immediately; the
+            # daemon thread owns the decrement in a finally block.
+            self._result = await self._backend._run_guarded_decode(
                 self._decode_sync, thread_name="parakeet-decode"
             )
 
@@ -172,7 +171,7 @@ class _ParakeetStream:
         yield TranscriptEvent(kind="completed", text=text)
 
 
-class ParakeetBackend:
+class ParakeetBackend(DecodeGuardMixin):
     """ASR backend backed by NVIDIA Parakeet TDT models via ``parakeet-mlx``."""
 
     backend_name = "parakeet"
@@ -188,41 +187,17 @@ class ParakeetBackend:
         # load it exactly once.
         self._model = None
         self._model_lock = threading.Lock()
-        self._decode_lock = asyncio.Lock()
-        # Backend-scope thread lock — shared across every stream so concurrent
-        # sessions truly serialize on the MLX/Metal side. parakeet-mlx is not
-        # verified concurrency-safe (one cached model, Metal command buffers),
-        # so the lock pair is kept exactly as ``MLXWhisperBackend`` does.
-        self._thread_lock = threading.Lock()
-        # Backend-scope in-flight counter for the ``close()`` drain. parakeet-mlx
-        # is Metal-backed and exposed to the same SIGTERM-mid-decode Metal
-        # command-buffer assertion class as MLX Whisper, so the in-flight drain
-        # is kept, not just the locks.
-        self._inflight_count = 0
-        self._inflight_cond = threading.Condition()
+        # Decode-lock pair + in-flight counter (see ``DecodeGuardMixin``): the
+        # lock pair is shared across every stream so concurrent sessions truly
+        # serialize on the MLX/Metal side, and the in-flight counter backs the
+        # bounded ``close()`` drain.
+        self._init_decode_guards()
         # Private 0o700 temp dir for per-utterance decode WAVs. ``mkdtemp``
         # makes it owner-only-traversable, so raw utterance audio (PII) is
         # never written to the world-listable system temp dir and an orphaned
         # WAV (SIGKILL between mkstemp and unlink) stays unreadable by other
         # local users. Removed in ``close()``.
         self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-parakeet-")
-
-    def _mark_inflight_start(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count += 1
-
-    def _mark_inflight_end(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count -= 1
-            if self._inflight_count == 0:
-                self._inflight_cond.notify_all()
-
-    def _wait_inflight_drained(self, timeout_s: float) -> bool:
-        with self._inflight_cond:
-            return self._inflight_cond.wait_for(
-                lambda: self._inflight_count == 0,
-                timeout=timeout_s,
-            )
 
     def _get_model(self):
         """Lazily load the Parakeet model on first decode.
@@ -237,10 +212,17 @@ class ParakeetBackend:
             if self._model is None:
                 from parakeet_mlx import from_pretrained  # type: ignore
 
-                self._model = from_pretrained(self._model_id)
+                # Fetch-and-load only (not the decode): a bare network error
+                # here is a model download failure.
+                with download_phase():
+                    self._model = from_pretrained(self._model_id)
             return self._model
 
     async def start(self) -> None:
+        # ``abort()`` (run by the server when an earlier ``start()`` failed)
+        # removes the private temp dir; recreate it so a retried start decodes.
+        if not os.path.isdir(self._tmpdir):
+            self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-parakeet-")
         # Eager import; fail fast if the ``parakeet`` extra is not
         # installed. The model itself is NOT loaded here — see ``_get_model``.
         # Re-raise a missing module as an actionable message (a bare
@@ -262,32 +244,26 @@ class ParakeetBackend:
     async def open_stream(self, *, language: str | None = None) -> "_ParakeetStream":
         return _ParakeetStream(language, self._decode_lock, self._thread_lock, self)
 
+    def abort(self) -> None:
+        """Synchronous, non-blocking cleanup for a hard process exit (no thread
+        joins, no Metal drain): remove the private decode-WAV temp dir.
+        ``ignore_errors`` keeps it best-effort -- a leftover dir is harmless
+        (0o700, owner-only) and a fresh one is created on the next start.
+        ``close()`` calls this after its drain."""
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
     async def close(self) -> None:
         # Give any in-flight Parakeet decode a bounded window to finish
         # flushing Metal work before the process exits. Without this, SIGTERM
         # during a decode can leave a Metal command buffer mid-commit and trip
         # ``-[IOGPUMetalCommandBuffer validate]`` at process exit. Same crash
         # class and same drain as ``MLXWhisperBackend.close()``.
-        timeout_s = 3.0
-        drained = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._wait_inflight_drained(timeout_s)
-        )
-        if not drained:
-            logger.warning(
-                "parakeet: in-flight decode did not finish within %.1fs; "
-                "Metal assertion possible at process exit",
-                timeout_s,
-            )
-        # Remove the private decode-WAV temp dir. ``ignore_errors`` keeps
-        # shutdown best-effort — a leftover dir is harmless (0o700, owner-only)
-        # and a fresh one is created on the next process start.
-        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        await self._drain_inflight("parakeet", logger)
+        self.abort()
 
 
-def prefetch_specs(model: str | None) -> list:
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend parakeet`` fetches:
     the two files ``parakeet_mlx.from_pretrained`` downloads."""
-    from ..prefetch import SnapshotSpec
-
     files = ("config.json", "model.safetensors")
     return [SnapshotSpec(model or DEFAULT_PARAKEET_MODEL, allow_patterns=files, required=files)]

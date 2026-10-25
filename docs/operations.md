@@ -5,7 +5,7 @@
 ## Multi-backend operation
 
 Each server process loads exactly **one** backend, pinned at launch via
-`--backend {echo,mlx,parakeet,nemotron}`. To run more than one ASR — for example to
+`--backend {echo,mlx,parakeet,nemotron,kyutai}`. To run more than one ASR — for example to
 A/B-benchmark Parakeet against Whisper — start a second server process on a
 **separate socket**. The V1 wire protocol is unchanged; the only difference
 between two ASRs from the bot's perspective is which socket it connects to.
@@ -17,6 +17,66 @@ between two ASRs from the bot's perspective is which socket it connects to.
 | whisper (`mlx`) | `pipecat.stt-server` | `~/Library/Caches/pipecat-stt/stt.sock` | leave `STT_WS_SOCKET` unset |
 | parakeet | `pipecat.stt-server.parakeet` | `~/Library/Caches/pipecat-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
 | nemotron | `pipecat.stt-server.nemotron` | `~/Library/Caches/pipecat-stt/nemotron.sock` | set `STT_WS_SOCKET` to the nemotron socket |
+
+`kyutai` has no row on purpose: it is not wired into the LaunchAgent tooling
+(`just stt-install`, the plist renderer). Its extra conflicts with the other MLX
+extras, so it runs from its own environment; start it by hand with
+`--backend kyutai --socket-path <path>` on a socket of your choosing.
+
+### Single-server lock file
+
+Each Unix socket gets a sibling lock file, `<socket>.lock` (for example
+`~/Library/Caches/pipecat-stt/parakeet.sock.lock`). A server takes an exclusive
+`flock` on it before loading the model, so a second server for the same socket
+fails in milliseconds with `EADDRINUSE` instead of after a multi-GB load, and a
+live server whose listen backlog is full is never mistaken for a stale socket.
+
+- Mode `0600`, owned by the server user, set on the open file so the umask
+  never matters. A pre-existing lock file you own that opens read-write is set
+  to `0600` whatever its mode. One you own but cannot open read-write (e.g. mode
+  `000` or `0400`) is reported as `EACCES` with the remedy: `chmod 600` it, or
+  remove it while no server runs. One owned by another user, a symlink or a
+  non-regular file (e.g. a FIFO) makes the server refuse to start.
+- The kernel releases the lock when the server process exits for any reason
+  (including `SIGKILL` and the immediate exit on a stop during startup), so it
+  cannot go stale.
+- It is never unlinked: deleting it while a server runs, or between two
+  starters, would let two servers own one socket. Leaving it behind is
+  harmless. Clients never open it.
+- `serve --supervised` checks it before binding (a held lock is reported as
+  `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
+  a contended lock for 250 ms, so the check never makes a real start fail. It
+  opens the file non-blocking and treats anything but a plain file you own as
+  "not held" (the real start then refuses it), so a planted FIFO cannot hang it.
+- The lock stays held while the server still has work that can touch the
+  socket or the backend:
+  - **Work that outlived its grace or bound** keeps it until that work
+    finishes: a session task that ignores cancellation past the shutdown
+    grace, a decode thread still running on the GPU after its task was
+    cancelled, `backend.close()` running past its bound (the drain timeout,
+    10 s), a listener close that has not completed (a connection handler that
+    will not finish keeps it open past its grace), or a startup / readiness
+    step that ignored `serve`'s cancel (a stop, or `serve` itself being
+    cancelled). This holds also when the shutdown itself was cancelled.
+  - **A cleanup that raises** (an orphaned listener whose close failed) keeps
+    it until the process exits.
+  - **A failed start that left work running** keeps it the same way; that
+    server stays `stopping` and is single-use.
+  - **A failed start that left nothing running** releases it: the server
+    returns to `new` and may be retried.
+
+  In-process callers await `TranscriptionServer.wait_stopped()` for the lock
+  to be free: `shutdown()` returning does not guarantee it.
+  `python -m stt_server serve` exits the process at that point, which
+  releases it. A failure in flight at that exit (for example
+  `backend.close()` raising) is still printed and, under `--supervised`,
+  emitted as the `error` event, with exit status 1.
+- **Mixed versions during an upgrade.** The lock only protects against servers
+  that take it. A server started from a release before the lock existed holds
+  none, and on macOS its socket answers `ECONNREFUSED` when its listen backlog
+  is full, which the preflight reads as stale: a new server could then replace
+  that live server's socket. Stop old servers (`just stt-disable <backend>`, or unload their
+  LaunchAgents) before starting upgraded ones on the same socket path.
 
 Whisper uses the default label and socket, so a bot-side default of
 `~/Library/Caches/pipecat-stt/stt.sock` resolves to it with no `.env`
@@ -52,7 +112,7 @@ scripts/install_stt_agent.sh install
 #    downloads it under KeepAlive + ThrottleInterval=10 and launchd may
 #    throttle-loop the agent before the download finishes.
 uv sync --extra parakeet
-uv run python -m stt_server prefetch --backend parakeet
+.venv/bin/python -m stt_server prefetch --backend parakeet
 PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
   PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
   PIPECAT_STT_BACKEND=parakeet \
@@ -93,6 +153,29 @@ financials, so the script refuses a `--corpus` under those roots unless
 `--allow-pii-corpus` is passed. Use a synthetic or consented-recording corpus
 and keep it outside the repo.
 
+### Prefetch progress semantics
+
+`python -m stt_server prefetch --json` emits `progress{repo, downloaded_bytes,
+total_bytes, files_done, files_total}` events. They describe only the files this
+run still has to download (the same meaning as `tts_server prefetch`), so a
+supervisor can show `downloaded_bytes / total_bytes` directly:
+
+- `total_bytes` / `files_total`: files not already in the Hugging Face cache when
+  the fetch started (a fully cached repo reports `0` / `0`).
+- `downloaded_bytes`: bytes on disk for those files, including partial
+  `.incomplete` blobs left by an interrupted earlier run.
+- `files_done`: how many of those files have finished.
+- The last `progress` before `done` always has `downloaded_bytes == total_bytes`
+  and `files_done == files_total`.
+
+The `kyutai` backend reads its weight filenames from the repo's `config.json`,
+so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open. Each
+name must be a plain filename (no `/`, `..` or glob characters), or prefetch and
+the loader refuse it.
+
+A `prefetch` that fails with nothing network-related going wrong (an incomplete
+snapshot, a corrupt or incomplete `config.json`, a local model directory that is
+missing files) reports `code: ModelInvalidError`, not `ModelDownloadError`.
 
 ## Checking server health
 
@@ -152,6 +235,25 @@ Use this as a preflight before starting a client, in CI smoke tests, or
 from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 `--port`/`--auth-token-file` endpoint flags work for both `serve` and
 `status` subcommands.
+
+## Supervised smoke test
+
+`scripts/smoke_supervised.py` drives `serve --supervised` the way a menubar or
+other supervising app does: it spawns real server processes and checks the JSON
+`ready`/`error` events, stdin-EOF and SIGTERM stops (including during warm-up),
+a parent that dies, a second instance on a live socket, a stale socket after
+`kill -9`, concurrent clients, and a real transcription. It is opt-in (not in CI
+or pytest) and needs the backend's extra installed; run it with that
+environment's interpreter:
+
+```bash
+.venv/bin/python scripts/smoke_supervised.py --backend echo
+.venv/bin/python scripts/smoke_supervised.py --backend mlx \
+    --model mlx-community/whisper-large-v3-turbo-q4
+```
+
+It exits 0 only if every scenario passes, and 2 (running nothing) when the
+model is not cached: `prefetch` it first.
 
 ## Trust model and socket security (same-host UDS)
 

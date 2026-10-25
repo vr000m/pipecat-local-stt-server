@@ -72,7 +72,10 @@ jobs:
           python-version: "3.12"
       - name: Sync (base + kyutai)
         run: uv sync --extra kyutai
+      # `--extra kyutai` on every `uv run`: a bare `uv run` re-syncs the default
+      # (non-kyutai) fork of the lock and swaps numpy 2.2.6 for 2.4.6, so the job
+      # would stop testing the locked kyutai environment.
       - name: Import smoke
-        run: uv run python -c "import moshi_mlx, sentencepiece; from moshi_mlx import models; print('moshi_mlx OK')"
+        run: uv run --extra kyutai python -c "import moshi_mlx, sentencepiece; from moshi_mlx import models; print('moshi_mlx OK')"
       - name: Kyutai, supervised and prefetch tests
-        run: uv run pytest -x tests/test_kyutai_backend.py tests/test_supervised_cli.py tests/test_prefetch_cli.py
+        run: uv run --extra kyutai pytest -x tests/test_kyutai_backend.py tests/test_supervised_cli.py tests/test_prefetch_cli.py

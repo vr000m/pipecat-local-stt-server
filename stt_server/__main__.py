@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -29,7 +30,13 @@ import sys
 from pathlib import Path
 
 from .backend import EchoBackend
+
+# The backend registry (``backends/__init__.py``) is stdlib-only: reading it
+# imports no backend module, so the serve path stays lean at every launch.
+from .backends import BACKENDS, import_backend
+from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
 from .env import env_first
+from .errors import ConfigError
 from .server import serve
 
 # ``TranscriptionClient`` and ``protocol`` are imported lazily inside the
@@ -37,80 +44,44 @@ from .server import serve
 # doesn't pay for ``websockets.asyncio.client`` it never uses.
 
 
-# Whisper repo default for ``--backend mlx``. Kept as a module constant so the
-# backend-aware ``--model`` resolution and the "model unset" sentinel agree on
-# one value. ``parakeet``'s default lives in ``backends/parakeet.py`` and is
-# imported lazily (it would otherwise pull the parakeet module at every
-# launch, defeating the lean-base invariant).
-_DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
+def _make_backend(name: str, model: str | None):
+    """Construct the ``--backend`` named ``name`` (see ``backends.BACKENDS``).
 
-
-def _make_backend(name: str, model: str):
-    if name == "echo":
+    The backend module is imported lazily, here, so a base install without an
+    optional extra still constructs the others. No backend module imports its
+    extra at module load (``parakeet_mlx``, ``mlx_audio``, ``moshi_mlx`` are
+    imported only inside ``start()``/``_get_model``), so a missing extra
+    surfaces fast in ``start()``, not at construction.
+    """
+    try:
+        cls = import_backend(name).cls
+    except ConfigError as exc:  # unknown name: the CLI's exit message
+        raise SystemExit(str(exc)) from None
+    if cls is None:
         return EchoBackend()
-    if name == "mlx":
-        from .backends.mlx_whisper import MLXWhisperBackend
-
-        return MLXWhisperBackend(model=model)
-    if name == "parakeet":
-        # Lazy import so a base install without the ``parakeet``
-        # extra still constructs ``echo``/``mlx`` backends. ``parakeet.py``
-        # imports ``parakeet_mlx`` only inside ``start()`` / ``_get_model``,
-        # never at module load, so this import does NOT transitively pull
-        # ``parakeet_mlx`` — the missing-extra failure surfaces fast in
-        # ``start()``, not here at construction.
-        from .backends.parakeet import ParakeetBackend
-
-        return ParakeetBackend(model=model)
-    if name == "nemotron":
-        # Lazy import so a base install without the ``nemotron`` extra still
-        # constructs ``echo``/``mlx`` backends. ``nemotron.py`` imports
-        # ``mlx_audio`` only inside ``start()`` / ``_get_model``, never at
-        # module load, so this import does NOT transitively pull ``mlx_audio``
-        # — the missing-extra failure surfaces fast in ``start()``, not here at
-        # construction.
-        from .backends.nemotron import NemotronBackend
-
-        return NemotronBackend(model=model)
-    if name == "kyutai":
-        # Lazy like the others: ``kyutai.py`` imports ``moshi_mlx`` only inside
-        # ``start()``.
-        from .backends.kyutai import KyutaiBackend
-
-        return KyutaiBackend(model=model)
-    raise SystemExit(f"unknown backend: {name}")
+    return cls(model=model)
 
 
 # Every ``--backend`` name; shared by ``serve`` and ``prefetch``.
-BACKEND_CHOICES = ("echo", "mlx", "parakeet", "nemotron", "kyutai")
+BACKEND_CHOICES = tuple(BACKENDS)
 
 
-def _resolve_model(backend: str, model: str | None) -> str:
+def _resolve_model(backend: str, model: str | None) -> str | None:
     """Resolve the effective decode model id.
 
     An explicit ``--model`` always wins (it is passed through verbatim — the
     server-side ``--backend`` is the trust anchor; pointing a backend at a
     mismatched repo id fails fast in ``start()``/decode, and classifying a
     repo id as "whisper" vs "parakeet" would need a brittle string heuristic).
-    When ``--model`` is unset the default is backend-aware: ``parakeet`` uses
-    ``DEFAULT_PARAKEET_MODEL`` and ``nemotron`` uses ``DEFAULT_NEMOTRON_MODEL``
-    rather than the Whisper repo.
+    When ``--model`` is unset the default is the backend's own
+    ``BACKENDS[backend].default_model`` (e.g. ``DEFAULT_PARAKEET_MODEL`` for
+    ``parakeet``); ``None`` for a backend with no model (echo) -- the registry
+    is the only source of defaults.
     """
     if model is not None:
         return model
-    if backend == "parakeet":
-        from .backends.parakeet import DEFAULT_PARAKEET_MODEL
-
-        return DEFAULT_PARAKEET_MODEL
-    if backend == "nemotron":
-        from .backends.nemotron import DEFAULT_NEMOTRON_MODEL
-
-        return DEFAULT_NEMOTRON_MODEL
-    if backend == "kyutai":
-        from .backends.kyutai import DEFAULT_KYUTAI_MODEL
-
-        return DEFAULT_KYUTAI_MODEL
-    return _DEFAULT_MLX_MODEL
+    entry = BACKENDS.get(backend)
+    return entry.default_model if entry is not None else None
 
 
 def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:
@@ -243,13 +214,33 @@ def _preflight_listener(args: argparse.Namespace) -> None:
 
     if args.socket_path:
         path = Path(args.socket_path).expanduser()
+        from .server import socket_lock_held
+
+        # The lock is authoritative for servers that take it: connect() cannot
+        # tell a stale socket from a live one with a full backlog (macOS gives
+        # ECONNREFUSED for both).
+        if socket_lock_held(path):
+            raise OSError(errno.EADDRINUSE, f"a server is already running for {path}")
         if path.is_socket():
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                 probe.settimeout(0.5)
                 try:
                     probe.connect(str(path))
-                except OSError:
-                    return  # stale socket: start() replaces it
+                except TimeoutError as exc:
+                    raise OSError(
+                        errno.EADDRINUSE, f"a server may already be listening on {path}"
+                    ) from exc
+                except OSError as exc:
+                    if exc.errno in {errno.ECONNREFUSED, errno.ENOENT}:
+                        # No lock holder (checked above) and nothing accepting:
+                        # stale. start() takes the lock before replacing it.
+                        return
+                    if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                        raise OSError(
+                            errno.EADDRINUSE,
+                            f"a server may already be listening on {path}",
+                        ) from exc
+                    raise
             raise OSError(errno.EADDRINUSE, f"a server is already listening on {path}")
         return
     if not args.host or not args.port:
@@ -272,12 +263,22 @@ async def _warm(backend) -> None:
         pass
 
 
-async def _emit_ready(server) -> None:
-    """``ready`` callback for ``serve --supervised``: warm up, then one JSON line."""
+async def _prepare_ready(server) -> None:
+    """Warm the backend before the supervised ready event is published.
+
+    Warm-up runs the lazy model load (and so any first download) AND a decode.
+    It does not tag failures itself: each backend wraps only its fetch-and-load
+    call in ``snapshot.download_phase()``, so a decoder-origin error here is not
+    misreported as ``ModelDownloadError``.
+    """
+    await _warm(server.backend)
+
+
+def _emit_ready(server) -> None:
+    """Publish the sole supervised ready event after warm-up and a stop check."""
     from . import protocol as P
     from .supervise import emit
 
-    await _warm(server.backend)
     cfg = server.config
     emit(
         {
@@ -308,14 +309,26 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
     with supervise.json_channel():
         try:
-            _preflight_listener(args)
-            _run_serve(args, ready=_emit_ready, stop_on_stdin_eof=True)
+            try:
+                _preflight_listener(args)
+            except OSError as exc:
+                # Same one-line stderr message and exit 1 as a bind failure in
+                # ``_run_serve`` (not the "fatal error" traceback reserved for
+                # unexpected exceptions); the handler below adds the event.
+                print(f"stt_server: {exc}", file=sys.stderr)
+                raise SystemExit(1) from exc
+            _run_serve(
+                args,
+                ready=_prepare_ready,
+                publish_ready=_emit_ready,
+                stop_on_stdin_eof=True,
+            )
         except KeyboardInterrupt:
             raise
         except SystemExit as exc:
             # ``_run_serve`` already turned the failure into ``stt_server: <msg>``
             # on stderr; repeat it as an event so the supervisor can show it.
-            cause = exc.__cause__ or exc.__context__
+            cause = exc.__cause__
             if cause is not None:
                 code, message = supervise.classify_startup_error(cause)
                 supervise.emit(
@@ -345,6 +358,26 @@ def _cmd_serve(args: argparse.Namespace) -> None:
             raise SystemExit(1) from None
 
 
+def _report_fatal(exc: BaseException, *, supervised: bool) -> None:
+    """Report a serve failure the way ``_run_serve`` / ``_cmd_serve`` would:
+    the stderr line (a one-line message for the expected startup errors, a
+    traceback otherwise) and, under ``--supervised``, the ``error`` event.
+
+    ``serve`` calls it (``on_fatal``) right before its live-work ``os._exit``,
+    which skips the handlers below."""
+    if isinstance(exc, (ValueError, OSError, ImportError)):
+        print(f"stt_server: {exc}", file=sys.stderr)
+    else:
+        logging.getLogger("stt_server").error("stt_server: fatal error", exc_info=exc)
+    if supervised:
+        from . import supervise
+
+        code, message = supervise.classify_startup_error(exc)
+        supervise.emit(
+            {"event": "error", "code": code, "message": message, "exc_type": type(exc).__name__}
+        )
+
+
 def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
     backend = _make_backend(args.backend, _resolve_model(args.backend, args.model))
     try:
@@ -355,6 +388,12 @@ def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
                 host=args.host,
                 port=args.port,
                 auth_token=_resolve_auth_token(args.auth_token_file),
+                # The CLI owns the process: a stop during startup/warm-up exits
+                # at once rather than waiting on an uncancellable model load.
+                hard_exit_on_stop=True,
+                on_fatal=functools.partial(
+                    _report_fatal, supervised=getattr(args, "supervised", False)
+                ),
                 **serve_kwargs,
             )
         )
@@ -366,7 +405,9 @@ def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
         # (superset of ``ModuleNotFoundError``) also catches a partially-present
         # extra whose import fails on a missing sub-symbol.
         print(f"stt_server: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        # Explicit ``from exc``: ``_cmd_serve`` classifies the supervised error
+        # event from ``__cause__``.
+        raise SystemExit(1) from exc
 
 
 async def _probe_status(args: argparse.Namespace) -> dict:
@@ -508,10 +549,10 @@ def main() -> None:
     p_serve = subparsers.add_parser("serve", help="run the server (default)")
     _add_endpoint_flags(p_serve)
     p_serve.add_argument("--backend", choices=BACKEND_CHOICES, default="echo")
-    # Default is None so ``_resolve_model`` can apply a backend-aware fallback
-    # (Whisper repo for ``mlx``, ``DEFAULT_PARAKEET_MODEL`` for ``parakeet``,
-    # ``DEFAULT_NEMOTRON_MODEL`` for ``nemotron``). An explicit value always
-    # wins and is passed through verbatim.
+    # Default is None so ``_resolve_model`` applies the backend's own default,
+    # ``backends.BACKENDS[backend].default_model`` (the registry is the only
+    # source; ``None`` for echo). An explicit value always wins and is passed
+    # through verbatim.
     p_serve.add_argument("--model", default=None)
     p_serve.add_argument("--log-level", default="INFO")
     p_serve.add_argument(
@@ -566,7 +607,9 @@ def _cmd_prefetch(args: argparse.Namespace) -> None:
     )
     from . import prefetch
 
-    model = None if args.backend == "echo" else _resolve_model(args.backend, args.model)
+    # Echo has no default model; an explicit ``--model`` reaches prefetch,
+    # which refuses it (ConfigError) rather than reporting it cached.
+    model = _resolve_model(args.backend, args.model)
     code = prefetch.run_prefetch(args.backend, model, check=args.check, json_mode=args.json)
     if code:
         raise SystemExit(code)

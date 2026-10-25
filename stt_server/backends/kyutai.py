@@ -28,15 +28,18 @@ import asyncio
 import json
 import logging
 import threading
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import AsyncGenerator
 
 from ..backend import TranscriptEvent
-from ._thread_util import run_in_daemon_thread
+from ..snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
+from . import DEFAULT_KYUTAI_MODEL
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.kyutai")
 
-DEFAULT_KYUTAI_MODEL = "kyutai/stt-1b-en_fr-mlx"
+# ``DEFAULT_KYUTAI_MODEL`` is defined once in the backend registry
+# (``backends/__init__.py``) and re-exported here.
 
 # Model frame: 80 ms at Mimi's 24 kHz.
 _MODEL_RATE_HZ = 24_000
@@ -69,7 +72,7 @@ class _KyutaiStream:
         language: str | None,
         decode_lock: asyncio.Lock,
         thread_lock: threading.Lock,
-        backend: "KyutaiBackend",
+        backend: KyutaiBackend,
     ) -> None:
         # ``language`` is accepted for the protocol and ignored: the model
         # transcribes English and French without a language prompt.
@@ -96,8 +99,7 @@ class _KyutaiStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            self._backend._mark_inflight_start()
-            self._result = await run_in_daemon_thread(
+            self._result = await self._backend._run_guarded_decode(
                 self._decode_sync, thread_name="kyutai-decode"
             )
 
@@ -124,7 +126,7 @@ class _KyutaiStream:
         yield TranscriptEvent(kind="completed", text=text)
 
 
-class KyutaiBackend:
+class KyutaiBackend(DecodeGuardMixin):
     """ASR backend backed by Kyutai's streaming STT models via ``moshi_mlx``."""
 
     backend_name = "kyutai"
@@ -135,26 +137,11 @@ class KyutaiBackend:
         # Loaded on the first decode (a ~2.4 GB checkpoint), like parakeet.
         self._loaded: dict | None = None
         self._model_lock = threading.Lock()
-        self._decode_lock = asyncio.Lock()
-        self._thread_lock = threading.Lock()
-        self._inflight_count = 0
-        self._inflight_cond = threading.Condition()
-
-    def _mark_inflight_start(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count += 1
-
-    def _mark_inflight_end(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count -= 1
-            if self._inflight_count == 0:
-                self._inflight_cond.notify_all()
-
-    def _wait_inflight_drained(self, timeout_s: float) -> bool:
-        with self._inflight_cond:
-            return self._inflight_cond.wait_for(
-                lambda: self._inflight_count == 0, timeout=timeout_s
-            )
+        # Decode-lock pair + in-flight counter (see ``DecodeGuardMixin``): the
+        # lock pair is shared across every stream so concurrent sessions truly
+        # serialize on the MLX/Metal side, and the in-flight counter backs the
+        # bounded ``close()`` drain.
+        self._init_decode_guards()
 
     def _get_model(self) -> dict:
         """Load config, Mimi, the LM and the tokenizer once (decode thread)."""
@@ -162,15 +149,27 @@ class KyutaiBackend:
             if self._loaded is not None:
                 return self._loaded
             import mlx.core as mx  # type: ignore
-            import mlx.nn as nn  # type: ignore
             import sentencepiece  # type: ignore
             from huggingface_hub import hf_hub_download  # type: ignore
+            from mlx import nn  # type: ignore
             from moshi_mlx import models, utils  # type: ignore
 
-            raw = json.loads(Path(hf_hub_download(self._model_id, "config.json")).read_text())
-            mimi_weights = hf_hub_download(self._model_id, raw["mimi_name"])
-            lm_weights = hf_hub_download(self._model_id, raw.get("moshi_name", "model.safetensors"))
-            tokenizer = hf_hub_download(self._model_id, raw["tokenizer_name"])
+            with download_phase():
+                config_path = hf_hub_download(self._model_id, "config.json")
+            # A fetched config that does not parse or name its files is an
+            # unusable snapshot (``ModelInvalidError``), as in prefetch: neither
+            # a download failure nor a bad endpoint (a bare ValueError).
+            try:
+                raw = json.loads(Path(config_path).read_text())
+                # The same validated names prefetch fetches (``weight_files``).
+                _config, mimi_name, moshi_name, tokenizer_name = weight_files(raw)
+            except Exception as exc:
+                mark_model_invalid(exc)
+                raise
+            with download_phase():
+                mimi_weights = hf_hub_download(self._model_id, mimi_name)
+                lm_weights = hf_hub_download(self._model_id, moshi_name)
+                tokenizer = hf_hub_download(self._model_id, tokenizer_name)
 
             lm = models.Lm(models.LmConfig.from_config_dict(raw))
             lm.set_dtype(mx.bfloat16)
@@ -249,31 +248,49 @@ class KyutaiBackend:
                 f"({missing}) — run: uv sync --extra kyutai --inexact"
             ) from exc
 
-    async def open_stream(self, *, language: str | None = None) -> "_KyutaiStream":
+    async def open_stream(self, *, language: str | None = None) -> _KyutaiStream:
         return _KyutaiStream(language, self._decode_lock, self._thread_lock, self)
 
     async def close(self) -> None:
-        timeout_s = 3.0
-        drained = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._wait_inflight_drained(timeout_s)
-        )
-        if not drained:
-            logger.warning(
-                "kyutai: in-flight decode did not finish within %.1fs; "
-                "Metal assertion possible at process exit",
-                timeout_s,
-            )
+        await self._drain_inflight("kyutai", logger)
 
 
-def prefetch_specs(model: str | None) -> list:
+def weight_files(config: dict) -> tuple[str, ...]:
+    """The files ``_get_model`` loads, named by the repo's own ``config.json``.
+
+    Mirrors ``_get_model`` exactly (``moshi_name`` defaults to
+    ``model.safetensors`` and may be a ``.q4``/``.q8`` variant), so prefetch and
+    the completeness check follow quantized repos instead of assuming one name.
+
+    The names are untrusted remote input used as Hub filenames and as prefetch
+    ``allow_patterns``/``fnmatch`` patterns, so each must be a literal plain
+    filename (``ValueError`` otherwise: no ``/``, ``..`` or glob characters).
+    """
+    if not isinstance(config, dict):
+        raise ValueError("kyutai config.json is not a JSON object")
+    for key in ("mimi_name", "tokenizer_name"):
+        if key not in config:
+            raise KeyError(f"config.json has no {key!r}")
+    return check_plain_filenames(
+        (
+            "config.json",
+            config["mimi_name"],
+            config.get("moshi_name", "model.safetensors"),
+            config["tokenizer_name"],
+        ),
+        source="kyutai config.json",
+    )
+
+
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend kyutai`` fetches: the
-    config, Mimi and LM weights and the tokenizer that ``_get_model`` loads."""
-    from ..prefetch import SnapshotSpec
-
+    config, Mimi and LM weights and the tokenizer that ``_get_model`` loads. The
+    weight filenames come from ``config.json`` (see ``weight_files``)."""
     return [
         SnapshotSpec(
             model or DEFAULT_KYUTAI_MODEL,
-            allow_patterns=("*.json", "*.safetensors", "*.model"),
-            required=("config.json", "model.safetensors", "mimi*.safetensors", "*.model"),
+            allow_patterns=("config.json",),
+            required=("config.json",),
+            resolve=weight_files,
         )
     ]

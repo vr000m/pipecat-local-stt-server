@@ -2,8 +2,11 @@
 
 Used by ``serve --supervised`` and ``prefetch --json`` so an app (for example a
 macOS menu bar app managing local speech services) can drive the CLI without
-scraping log text. Mirrors ``tts_server.supervise`` in
-pipecat-local-tts-server, so one supervisor handles both servers.
+scraping log text. The channel mirrors ``tts_server.supervise`` in
+pipecat-local-tts-server, so one supervisor handles both servers; the ``code``
+vocabulary is per repo (STT adds ``ModelInvalidError``, TTS has
+``SocketPathConflict``), and a supervisor should read an unknown code as
+``BackendStartError``.
 
 - **stdout carries only JSON lines**, one compact object per line, flushed.
   While :func:`json_channel` is active ``sys.stdout`` points at stderr, so a
@@ -26,22 +29,48 @@ import errno
 import json
 import logging
 import os
+import select
 import sys
 import threading
 from collections.abc import Callable, Iterator
 from typing import Any, TextIO
 
+# The origin tags live in the stdlib-only ``stt_server.snapshot`` so the backends
+# and ``prefetch`` can set them without importing this module; re-exported here.
+# ``ConfigError`` lives in the stdlib-only ``stt_server.errors`` (the server core
+# and ``prefetch`` raise it without importing this module); re-exported here.
+from .errors import ConfigError, is_config_error
+from .snapshot import DOWNLOAD_PHASE_ATTR as _DOWNLOAD_PHASE_ATTR
+from .snapshot import MODEL_INVALID_ATTR as _MODEL_INVALID_ATTR
+from .snapshot import mark_download_phase, mark_model_invalid
+
+__all__ = [
+    "ConfigError",
+    "classify_startup_error",
+    "emit",
+    "json_channel",
+    "mark_download_phase",
+    "mark_model_invalid",
+    "watch_stdin_eof",
+]
+
 logger = logging.getLogger("stt_server")
 
-# Stable ``code`` values for ``{"event": "error"}`` lines (part of the contract).
+# Stable ``code`` values for ``{"event": "error"}`` lines (part of the contract;
+# listed in README "Error codes (per repo)").
 CODE_MODULE_NOT_FOUND = "ModuleNotFoundError"
 CODE_ADDR_IN_USE = "EADDRINUSE"
 CODE_ACCESS_DENIED = "EACCES"
 CODE_MODEL_DOWNLOAD = "ModelDownloadError"
 CODE_CONFIG = "ConfigError"
 CODE_BACKEND_START = "BackendStartError"
+#: The model snapshot is present but unusable (incomplete, corrupt or
+#: incomplete ``config.json``): re-fetching or fixing the local model is the
+#: remedy, not the network.
+CODE_MODEL_INVALID = "ModelInvalidError"
 
 _DOWNLOAD_MODULE_PREFIXES = ("huggingface_hub", "requests", "urllib3", "hf_xet", "httpx")
+
 
 _channel: TextIO | None = None
 
@@ -93,6 +122,15 @@ def watch_stdin_eof(loop: Any, on_eof: Callable[[], None]) -> None:
                 chunk = os.read(fd, 4096)
             except InterruptedError:
                 continue
+            except BlockingIOError:
+                # A non-blocking inherited pipe with nothing to read is not EOF:
+                # wait for data or hang-up rather than stopping the server.
+                try:
+                    select.select([fd], [], [])
+                except (OSError, ValueError):
+                    chunk = b""
+                else:
+                    continue
             except OSError:
                 chunk = b""
             if not chunk:
@@ -134,14 +172,24 @@ def classify_startup_error(exc: BaseException) -> tuple[str, str]:
     for e in chain:
         if isinstance(e, OSError) and e.errno == errno.EACCES:
             return CODE_ACCESS_DENIED, f"permission denied: {e}"
+    # A download failure is recognised by origin, never by errno alone: an
+    # exception from a network library, or a builtin ConnectionError/TimeoutError
+    # raised while a download phase was running (``mark_download_phase``). The
+    # same builtins from the listener preflight (e.g. a UDS probe's ECONNRESET)
+    # are NOT downloads and fall through to ``BackendStartError``.
+    for e in chain:
+        if is_config_error(e):
+            return CODE_CONFIG, message
+    in_download_phase = any(getattr(e, _DOWNLOAD_PHASE_ATTR, False) for e in chain)
     for e in chain:
         module = type(e).__module__ or ""
-        if module.startswith(_DOWNLOAD_MODULE_PREFIXES) or isinstance(
-            e, (ConnectionError, TimeoutError)
+        if module.startswith(_DOWNLOAD_MODULE_PREFIXES) or (
+            in_download_phase and isinstance(e, (ConnectionError, TimeoutError))
         ):
             return CODE_MODEL_DOWNLOAD, f"model download failed: {e}"
-    if isinstance(exc, ValueError):
-        # ServerConfig and socket-directory enforcement reject bad endpoints
-        # with ValueError before anything binds.
-        return CODE_CONFIG, message
+    if any(getattr(e, _MODEL_INVALID_ATTR, False) for e in chain):
+        return CODE_MODEL_INVALID, f"model snapshot is unusable: {message}"
+    # Anything else -- including a bare ValueError from a model library -- is a
+    # backend start failure. A supervisor should treat a code it does not know
+    # the same way.
     return CODE_BACKEND_START, message

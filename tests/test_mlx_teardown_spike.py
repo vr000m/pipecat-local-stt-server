@@ -221,7 +221,7 @@ async def test_shutdown_force_cancels_past_drain_timeout(monkeypatch):
         await asyncio.wait_for(srv.shutdown(), timeout=3.0)
         elapsed = asyncio.get_running_loop().time() - t0
 
-        # Drain budget is 0.5 s; with the force-cancel + re-gather overhead
+        # Drain budget is 0.5 s; with the force-cancel + drain wait
         # 1.5 s is a generous ceiling. A regression that skipped the
         # force-cancel would hang until the 3 s wait_for expires.
         assert elapsed < 1.5, f"shutdown took {elapsed:.2f}s with hung backend"
@@ -252,7 +252,7 @@ async def test_shutdown_is_idempotent_under_double_call(monkeypatch):
         for r in results:
             assert not isinstance(r, Exception), f"shutdown raised: {r!r}"
         # backend.close() fires from the first shutdown; the second is a
-        # no-op because ``_started`` was flipped false.
+        # no-op because the server is already stopped.
         assert backend.close_count == 1
     finally:
         try:
@@ -338,13 +338,13 @@ async def test_backend_close_called_exactly_once_on_force_cancel_path(monkeypatc
 # ---------------------------------------------------------------------------
 # MLX backend close drain — unit test at the backend level, not end-to-end.
 #
-# Covers the race Codex flagged where the previous implementation just did
-# ``_thread_lock.acquire(timeout=…)``: between ``threading.Thread.start()``
-# and the daemon thread reaching ``with self._thread_lock:``, the lock was
-# free, so ``close()`` could acquire-release-return while the decode was
-# still about to enter ``mlx_whisper.transcribe()``. The current
-# implementation uses an in-flight counter marked BEFORE thread spawn and
-# decremented inside the thread's finally, which closes that window.
+# Invariant: ``close()`` waits for a decode from the moment it is marked
+# in flight, which happens BEFORE the thread spawns (decremented in the
+# thread's finally). A bare ``_thread_lock.acquire(timeout=…)`` would leave a
+# window between ``threading.Thread.start()`` and the daemon thread reaching
+# ``with self._thread_lock:`` in which ``close()`` could acquire, release and
+# return while the decode was still about to enter
+# ``mlx_whisper.transcribe()``.
 # ---------------------------------------------------------------------------
 
 

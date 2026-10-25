@@ -49,14 +49,14 @@ from ..protocol import (
     AUDIO_SAMPLE_RATE_HZ,
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
-from ._thread_util import run_in_daemon_thread
+from ..snapshot import SnapshotSpec, download_phase
+from . import DEFAULT_NEMOTRON_MODEL
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.nemotron")
 
-# Default model for ``--backend nemotron``. Exported so Phase 2's
-# backend-aware ``--model`` default imports it rather than hardcoding a second
-# copy (single source of truth, mirrors ``DEFAULT_PARAKEET_MODEL``).
-DEFAULT_NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
+# Default model for ``--backend nemotron``: defined once in the backend
+# registry (``backends/__init__.py``) and re-exported here.
 
 # Default ``language`` forwarded to ``generate()`` when the client supplies no
 # language. ``"auto"`` is a verified accepted prompt key AND the model's own
@@ -105,11 +105,10 @@ class _NemotronStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            # Mark in-flight BEFORE spawning the daemon thread so
-            # ``backend.close()`` observes it immediately; the daemon thread
-            # owns the decrement in a finally block.
-            self._backend._mark_inflight_start()
-            self._result = await run_in_daemon_thread(
+            # ``_run_guarded_decode`` marks in-flight BEFORE spawning the
+            # daemon thread so ``backend.close()`` observes it immediately; the
+            # daemon thread owns the decrement in a finally block.
+            self._result = await self._backend._run_guarded_decode(
                 self._decode_sync, thread_name="nemotron-decode"
             )
 
@@ -185,7 +184,7 @@ class _NemotronStream:
         yield TranscriptEvent(kind="completed", text=text)
 
 
-class NemotronBackend:
+class NemotronBackend(DecodeGuardMixin):
     """ASR backend backed by NVIDIA Nemotron 3.5 ASR models via ``mlx-audio``."""
 
     backend_name = "nemotron"
@@ -201,43 +200,17 @@ class NemotronBackend:
         # exactly once.
         self._model = None
         self._model_lock = threading.Lock()
-        self._decode_lock = asyncio.Lock()
-        # Backend-scope thread lock — shared across every stream so concurrent
-        # sessions truly serialize on the MLX/Metal side. mlx-audio is not
-        # verified concurrency-safe (one cached model, Metal command buffers),
-        # so the lock pair is kept exactly as ``ParakeetBackend`` does.
-        self._thread_lock = threading.Lock()
-        # Backend-scope in-flight counter for the ``close()`` drain. The
-        # SIGTERM-mid-decode Metal command-buffer assertion class is
-        # assumed-by-analogy here: it was observed with MLX Whisper / parakeet
-        # and is plausible for mlx-audio (a different package, FastConformer-RNNT
-        # rather than TDT), not verified identical. The in-flight drain is a
-        # harmless no-op if the crash class does not in fact reach mlx-audio.
-        self._inflight_count = 0
-        self._inflight_cond = threading.Condition()
+        # Decode-lock pair + in-flight counter (see ``DecodeGuardMixin``): the
+        # lock pair is shared across every stream so concurrent sessions truly
+        # serialize on the MLX/Metal side, and the in-flight counter backs the
+        # bounded ``close()`` drain.
+        self._init_decode_guards()
         # Private 0o700 temp dir for per-utterance decode WAVs. ``mkdtemp``
         # makes it owner-only-traversable, so raw utterance audio (PII) is
         # never written to the world-listable system temp dir and an orphaned
         # WAV (SIGKILL between mkstemp and unlink) stays unreadable by other
         # local users. Removed in ``close()``.
         self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-nemotron-")
-
-    def _mark_inflight_start(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count += 1
-
-    def _mark_inflight_end(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count -= 1
-            if self._inflight_count == 0:
-                self._inflight_cond.notify_all()
-
-    def _wait_inflight_drained(self, timeout_s: float) -> bool:
-        with self._inflight_cond:
-            return self._inflight_cond.wait_for(
-                lambda: self._inflight_count == 0,
-                timeout=timeout_s,
-            )
 
     def _get_model(self):
         """Lazily load the Nemotron model on first decode.
@@ -252,10 +225,17 @@ class NemotronBackend:
             if self._model is None:
                 from mlx_audio.stt import load  # type: ignore
 
-                self._model = load(self._model_id)
+                # Fetch-and-load only (not the decode): a bare network error
+                # here is a model download failure.
+                with download_phase():
+                    self._model = load(self._model_id)
             return self._model
 
     async def start(self) -> None:
+        # ``abort()`` (run by the server when an earlier ``start()`` failed)
+        # removes the private temp dir; recreate it so a retried start decodes.
+        if not os.path.isdir(self._tmpdir):
+            self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-nemotron-")
         # Eager import; fail fast before the socket binds if the ``mlx-audio``
         # package is not installed. The model itself is NOT loaded here — see
         # ``_get_model``. Re-raise a missing module as an actionable message —
@@ -279,6 +259,14 @@ class NemotronBackend:
     async def open_stream(self, *, language: str | None = None) -> "_NemotronStream":
         return _NemotronStream(language, self._decode_lock, self._thread_lock, self)
 
+    def abort(self) -> None:
+        """Synchronous, non-blocking cleanup for a hard process exit (no thread
+        joins, no Metal drain): remove the private decode-WAV temp dir.
+        ``ignore_errors`` keeps it best-effort -- a leftover dir is harmless
+        (0o700, owner-only) and a fresh one is created on the next start.
+        ``close()`` calls this after its drain."""
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
     async def close(self) -> None:
         # Give any in-flight Nemotron decode a bounded window to finish flushing
         # Metal work before the process exits. The SIGTERM-mid-decode Metal
@@ -286,20 +274,8 @@ class NemotronBackend:
         # (observed with MLX Whisper / parakeet; plausible but not verified for
         # this package) — the drain is a harmless no-op if it never reaches
         # mlx-audio. Same bounded drain as ``ParakeetBackend.close()``.
-        timeout_s = 3.0
-        drained = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._wait_inflight_drained(timeout_s)
-        )
-        if not drained:
-            logger.warning(
-                "nemotron: in-flight decode did not finish within %.1fs; "
-                "Metal assertion possible at process exit",
-                timeout_s,
-            )
-        # Remove the private decode-WAV temp dir. ``ignore_errors`` keeps
-        # shutdown best-effort — a leftover dir is harmless (0o700, owner-only)
-        # and a fresh one is created on the next process start.
-        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        await self._drain_inflight("nemotron", logger)
+        self.abort()
 
 
 # The file patterns ``mlx_audio``'s ``load()`` downloads (``mlx_audio.utils.
@@ -319,10 +295,8 @@ _MLX_AUDIO_ALLOW_PATTERNS = (
 )
 
 
-def prefetch_specs(model: str | None) -> list:
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend nemotron`` fetches."""
-    from ..prefetch import SnapshotSpec
-
     return [
         SnapshotSpec(
             model or DEFAULT_NEMOTRON_MODEL,

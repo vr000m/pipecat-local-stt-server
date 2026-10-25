@@ -1,6 +1,6 @@
 # Feature: UDS server-side trust-boundary hardening
 
-**Status:** Implemented (2026-06-26) on `feature/uds-trust-boundary-hardening` (phases 1–5) — pending Koda checkout coordination + merge
+**Status:** Shipped — PR #13 merged 2026-06-28
 **Component:** Server Transport
 **Assignee:** unassigned
 **Priority:** High (security; trust boundary)
@@ -479,6 +479,10 @@ sequenceDiagram
 - [x] Phase 5: Docs + plan/README sync
 
 ## Findings
+
+- **2026-10-24 correction:** PR #13 merged as `6ddbe6a` on 2026-06-28. The
+  [PR #14 review-fix plan](20261024-bug-pr14-review-findings.md) preserves these
+  UDS trust-boundary checks while narrowing listener-preflight error handling.
 
 - (append findings here as work proceeds)
 - **Phase 1 (839e718):** trusted root chosen as `Path.home()` (the default socket

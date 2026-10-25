@@ -7,14 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-25
+
 ### Added
 
+- **`docs/architecture.md`**: the server lifecycle state machine, the single-server lock, stop during startup, and the supervisor contract.
+- **`scripts/smoke_supervised.py`**: an opt-in end-to-end smoke test that drives `serve --supervised` the way a menubar app does (events, stops, parent death, second instance, stale socket, concurrent clients). See `docs/operations.md`.
+- **Single-server lock for Unix sockets.** `start()` takes an `flock` on
+  `<socket>.lock` (mode `0600`, next to the socket) before the model loads, and
+  the supervised preflight treats a held lock as a live server. `connect()`
+  alone cannot tell a stale socket from a live one with a full listen backlog
+  (macOS returns `ECONNREFUSED` for both). The kernel drops the lock when the
+  process dies, so it cannot go stale; clients never touch it, so any number
+  share one server. The lock file is left in place on exit. A pre-existing lock
+  file we own that opens read-write is set to `0600` whatever its mode; one we
+  cannot open (e.g. mode `000`) is refused with `EACCES` naming the remedy
+  (`chmod 600`); one owned by another user, or not a regular file, is refused. The preflight probe takes a shared lock and a
+  starter retries a contended lock for 250 ms, so a probe never makes a
+  concurrent real start fail.
+- `ModelInvalidError` supervised/prefetch error code: the model snapshot is
+  present but unusable (incomplete, corrupt or incomplete `config.json`, an
+  incomplete local model directory), from `prefetch` and from the `kyutai`
+  loader in `serve`. The code list is per repo (`tts_server` has
+  `SocketPathConflict` and no `ModelInvalidError`); supervisors should treat an
+  unknown code as `BackendStartError`. See README "Error codes (per repo)".
+- `backends.BACKENDS` registry: CLI choices, construction and the prefetch
+  module map derive from one table. `SnapshotSpec` moved to the stdlib-only
+  `stt_server.snapshot` (still importable from `stt_server.prefetch`); the
+  optional backend hooks `abort()` (`AbortableBackend`, now exported) and
+  `idle()` (`IdleAwareBackend`) and module-level `prefetch_specs()` are
+  documented in `stt_server/backend.py`. `backends.import_backend()` is the one
+  lookup-and-import and returns the entry, module and class. README has an
+  "Adding a backend" checklist.
+- `TranscriptionServer.state` (`new`/`starting`/`running`/`stopping`/`stopped`),
+  `holds_socket_lock`, and `wait_stopped()`: waits until the lock is free and
+  no work runs (`stopped`, or `new` after a failed start). `shutdown()`
+  returning does not always mean that (from `starting`, or with leftover work
+  past its bounds); await `wait_stopped()` before starting a new server on the
+  same socket or closing the event loop.
 - **`serve --supervised`** for a managing parent process: stdout carries only
   JSON lines (`ready` once listening and warm, with the real port; or `error`
   with a stable `code` such as `EADDRINUSE`, `ModuleNotFoundError`,
   `ModelDownloadError`), a busy port or live socket is reported before the
-  model loads, and stdin EOF stops the server like SIGTERM. Same contract as
-  `tts_server serve --supervised`.
+  model loads, and stdin EOF stops the server like SIGTERM. Same channel as
+  `tts_server serve --supervised`; the `code` list is per repo (see above).
 - **`prefetch` subcommand**: downloads what a backend loads (with JSON-lines
   byte progress under `--json`), and `--check` reports whether the weights are
   cached without touching the network. Each backend module exports
@@ -24,12 +60,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kyutai/stt-1b-en_fr-mlx`, English + French, CC-BY-4.0). The extra is declared
   conflicting with `mlx` / `parakeet` / `nemotron` (moshi_mlx pins `mlx<0.27`,
   `huggingface-hub<0.29`), so the lockfile keeps their newer pins.
+- `TranscriptionServer.adopt(task, abandoned=..., label=...)`: registers a
+  task of yours as live work, keeping the single-server lock until it ends.
+- `TranscriptionServer.can_adopt`: whether `adopt()` is valid now (`starting`,
+  `running` or `stopping`); otherwise `adopt()` raises `RuntimeError`.
+- `TranscriptionServer.live_work_count`: size of the live-work ledger; the lock
+  is held while it is non-zero (read it after `shutdown()`).
+- `TranscriptionServer.live_work_reasons`: `live_work_count` by kind, for logs;
+  `(N stuck)` marks entries that outlived the bound their caller waited for.
+- `TranscriptionServer.backend` and `TranscriptionServer.config`: read-only.
+
+### Changed
+
+- `serve(..., hard_exit_on_stop=False)` is the default: a stop during
+  startup/warm-up now cancels the pending step (waiting at most the drain
+  timeout) and shuts down normally for in-process callers, which previously got
+  the immediate `os._exit`. The CLI passes `True` to keep the immediate exit.
+- `ConfigError` covers only explicit configuration rejections: a bare
+  `ValueError` (for example from a model library during warm-up) is now
+  `BackendStartError`, not `ConfigError`. `ConfigError` (a `ValueError`
+  subclass: endpoint, socket directory, unknown backend, malformed Hub repo id,
+  unsupported local model path) lives in the stdlib-only `stt_server.errors`
+  and is exported as `stt_server.ConfigError`; `supervise.ConfigError` remains
+  as a re-export.
+- `--model` defaults come only from `backends.BACKENDS[...].default_model`.
+- `TranscriptionServer` is **single-use**: after `shutdown()` (in any state,
+  including before `start()`), or once a failed start left work running
+  (`stopping`), `start()` raises `RuntimeError` naming which of the two
+  happened; build a new server to serve again. A failed or cancelled `start()` returns the server to
+  `new` and may be retried, unless work it started outlived its cleanup (a
+  session, a backend `close()`, a bind finishing after a second cancel): then
+  it stays `stopping`, holding the lock until that work ends, and is
+  single-use. `start()` while another `start()` is in flight raises
+  `RuntimeError` instead of racing it for the lock.
+- `serve(on_fatal=...)` without `hard_exit_on_stop=True` raises `ConfigError`
+  (it would never be called).
+- `stt_server.IdleAwareBackend` is exported alongside `AbortableBackend`.
+- `backends.import_backend()` raises `ConfigError` for an unknown name (was
+  `KeyError`) and returns a `LoadedBackend` (`entry`, `module`, `cls`).
 
 ### Fixed
 
+- A stop during startup or warm-up (`python -m stt_server serve`, with or without
+  `--supervised`) still exits immediately but now removes the Unix socket file it
+  bound (only that inode) and the parakeet/nemotron private temp dir, via
+  `TranscriptionServer.abort_sync()` and an optional backend `abort()` hook. The
+  single-server lock is held until the process exits.
+- A failed `start()` (lock held, socket-directory refusal, bind failure, missing
+  extra) runs the backend's `abort()`, so parakeet/nemotron no longer leak a
+  private temp dir per failed start.
+- `shutdown()` is bounded even when a session task delays or swallows
+  cancellation or `backend.close()` hangs: the drain timeout, plus two 2 s
+  cancel graces (the cancelled sessions' unwind, then the listener's
+  `wait_closed`), plus the backend `close()` bounded by the drain timeout
+  again. It releases the single-server lock even when draining or
+  `backend.close()` fails.
+- A decode thread that fails to start no longer leaves the in-flight count
+  raised (which made every later `close()` wait out its drain window).
+- `kyutai` weight filenames from `config.json` must be plain filenames (no path
+  separators, `..` or glob characters) before they are fetched or matched.
+- `prefetch --json` progress is consistent: `total_bytes` / `files_total` count
+  only files not yet cached (as in `tts_server prefetch`), `downloaded_bytes`
+  includes partial `.incomplete` blobs from an interrupted run, `files_done` is a
+  real count, and a final progress event reaches the total before `done`.
+- `kyutai` prefetch and `--check` take the weight filenames from the repo's
+  `config.json` (`mimi_name`, `moshi_name`, `tokenizer_name`), so quantized
+  (`.q4`/`.q8`) repos neither fail the completeness check nor download every
+  `*.safetensors`.
+- A listener-preflight error (e.g. `ECONNRESET`/`ECONNABORTED` from the Unix
+  socket probe) is reported as `BackendStartError`, not `ModelDownloadError`. A
+  bare `ConnectionError`/`TimeoutError` is a download failure only when raised by
+  a backend's model fetch-and-load call or a `prefetch` download, or when a
+  network library raised it (a decode during warm-up is not a download). A
+  malformed Hub repo id (`HFValidationError`) is `ConfigError`, not a download
+  failure.
+- `prefetch --check` reports a cached `config.json` that is valid JSON but not
+  an object (e.g. `null`) as `cached: false` instead of crashing.
+- `shutdown()` wins over an in-flight `start()`: once shutdown begins, a start
+  still running (e.g. one that outlived `serve`'s bounded cancel) never binds a
+  listener or marks the server started; it closes anything it bound and
+  releases the single-server lock itself. A cancel landing mid-bind no longer
+  drops a serving listener.
+- Session tasks that swallow cancellation past the shutdown grace keep the
+  single-server lock until they finish (they are live work,
+  `TranscriptionServer.live_work_count`), and the CLI exits the process
+  instead of hanging in `asyncio.run` teardown.
+  That exit no longer swallows a failure in flight (e.g. `backend.close()`
+  raising): it is printed and, under `--supervised`, emitted as the `error`
+  event, with exit status 1.
+- The start/shutdown lifecycle is one explicit state machine with the lock kept
+  on the server: a concurrent `start()` can no longer release the active
+  starter's lock; a `shutdown()` cancelled mid-drain cancels the sessions it
+  had not cancelled and keeps the lock until they finish; the lock also waits
+  for a backend decode thread that outlived its cancelled task (the `idle()`
+  hook, implemented by every Metal backend); a `shutdown()` during `start()`
+  now `close()`s a backend whose `start()` had completed; `shutdown()` removes
+  the Unix socket file it bound (only that inode).
+- The single-server lock is released in one place only (the transition to
+  `new`/`stopped`), refused while anything is still live: a bound listener, a
+  session or decode task, a start, drain or backend `close()` in flight, or a
+  backend decode thread. As a result: a failed start drains the sessions it
+  accepted before giving the lock back; a second cancel mid-bind can no longer
+  orphan a listener; `backend.close()` is bounded by the drain timeout (a hung
+  close keeps the lock as live work, so the CLI exits); a
+  cancelled `shutdown()` no longer abandons `backend.close()` and later
+  callers wait for it; and `serve` keeps a startup/readiness step that ignored
+  its cancel as live work (lock held until it ends, its failure logged).
+- The single-server lock is held while any live work remains: a bind that
+  finished after a second cancel, its listener's close, the listener's
+  `wait_closed` (which lingers past its grace instead of being cancelled), a
+  backend decode thread, and session / decode tasks from creation. An
+  orphaned listener keeps the lock until its socket has really closed. Work
+  stays live until its own cleanup has run, so other work ending in the same
+  loop tick cannot release the lock before an orphan bind's listener is
+  closed and unlinked. A failed start that returns to `new` resets every
+  per-attempt slot, so a retry closes its own backend and never acts on the
+  first attempt's socket inode.
+- The lock fails closed on every exit path: work whose own cleanup raises (an
+  orphaned listener whose `close()` failed, still serving) stays live and
+  keeps the lock, and a cleanup given for an already-finished future runs at
+  once. Cancelling `serve` itself settles a pending startup / readiness step
+  the way a stop does (cancel, bounded wait, keep one that outlives it as
+  live work) instead of leaving it running while the backend closes and the
+  lock is released. The lock and the CLI's hard exit both read
+  `live_work_count`, so live work of any kind triggers the hard exit; the
+  stuck mark in `live_work_reasons` is a diagnostic only.
+- `prefetch --check --backend mlx` counts a snapshot complete only with the
+  files `mlx_whisper` opens (`config.json` and `weights.safetensors` or
+  `weights.npz`); a `weights.*` glob accepted e.g. `weights.txt`.
+  Alternatives in `SnapshotSpec.required` are a tuple entry, not an `a|b`
+  string. A Kyutai `config.json` weight filename containing `|` (e.g.
+  `model.q8.safetensors|config.json`) is refused: `prefetch --check` reports
+  `cached: false` and a fetch fails with `ModelInvalidError` ("config.json
+  names an invalid file"), instead of passing on `config.json` alone.
+- `serve` uses only `TranscriptionServer`'s public API (`adopt()`,
+  `can_adopt`, `live_work_count`, `live_work_reasons`), so an embedder can
+  write the same loop; which signal to read is documented once, in the class
+  docstring. `adopt()` in `new` or `stopped` raises `RuntimeError` instead of
+  making `shutdown()` fail or running work after the lock is released. A
+  cancel of `serve` during a stop's bounded wait on a startup / readiness
+  step does not start a second full drain-timeout wait.
+- `serve` removes the SIGINT / SIGTERM handlers it installed on every return
+  or raise, so after a failed start the process no longer survives SIGTERM.
+- `prefetch --backend echo --model X` fails with `ConfigError` (exit 1)
+  instead of ignoring the model and reporting it cached.
+- `serve`: when `shutdown()` also fails after `serve` was already failing, the
+  first failure is raised (and handed to `on_fatal`); the shutdown failure is
+  logged instead of replacing it.
+- `prefetch --model '~user/...'` for a user with no home directory is a missing
+  local model (`cached: false`, or `ModelInvalidError` on a fetch) instead of a
+  `BackendStartError` crash.
+- `prefetch --check` reports a malformed Hub repo id as `ConfigError` (exit 1),
+  as a fetch does, instead of `cached: false`.
+- The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made
+  an unopenable mode-000 file); an unopenable existing lock reports `EACCES`
+  with the remedy. The preflight probe opens it non-blocking and reads a FIFO,
+  non-regular or foreign-owned file as "not held" instead of hanging or
+  reporting a spurious running server.
 - `TranscriptionServer.listening_port()` returns `None` for a Unix socket
-  instead of a character of its path. `TranscriptionServer` exposes read-only
-  `backend` and `config`.
+  instead of a character of its path.
+
+### Upgrade notes
+
+- Consumers that pin `pipecat-local-stt-server>=0.3.3,<0.4` (for example
+  onoats-bot) must widen the pin to take this release. They use only
+  `TranscriptionClient` and `stt_server.protocol`, which are unchanged.
+- Code that embeds `stt_server.server.serve()` or `TranscriptionServer` should
+  read the Changed section: the server is single-use after `shutdown()`,
+  `hard_exit_on_stop` defaults to `False`, and `import_backend()` raises
+  `ConfigError` for an unknown name.
+- A second `serve` for a Unix socket a live server owns now exits with
+  `EADDRINUSE` before loading a model; it never replaces the running server.
+- The `kyutai` extra conflicts with `mlx`, `parakeet` and `nemotron`: install it
+  in its own environment (`uv sync --extra kyutai`), and it needs Python 3.12.
+- See [docs/architecture.md](docs/architecture.md) for the lifecycle and the
+  supervisor contract.
 
 ## [0.3.3] - 2026-06-28
 
@@ -333,6 +538,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0
 [0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
 [0.3.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.2
 [0.3.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.1

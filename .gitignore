@@ -14,3 +14,4 @@ __pycache__/
 # conduct / deep-review skill state (local, run-specific)
 .conduct/
 .deep-review/
+/.gauntlet

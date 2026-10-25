@@ -1,6 +1,6 @@
 [project]
 name = "pipecat-local-stt-server"
-version = "0.3.3"
+version = "0.4.0"
 description = "Standalone local WebSocket transcription (STT) server, client, and pluggable ASR backends for the Pipecat ecosystem"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -45,6 +45,8 @@ nemotron = ["websockets>=16,<17", "mlx-audio>=0.4.4", "numpy>=1.26"]
 # moshi_mlx pins mlx<0.27 and huggingface-hub<0.29, which the other MLX extras
 # outgrew, so kyutai is declared conflicting below: install it on its own
 # (`uv sync --extra kyutai`), and the other extras keep their newer pins.
+# Python 3.12 only in practice: moshi_mlx pins sentencepiece==0.2.0, which has no
+# cp313 wheel (a source build needs cmake + pkg-config).
 kyutai = ["websockets>=16,<17", "moshi_mlx==0.3.0", "numpy>=1.26"]
 
 [tool.uv]
