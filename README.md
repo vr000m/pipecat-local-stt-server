@@ -35,6 +35,11 @@ monorepo. BSD-2-Clause.
   from a temp WAV; that WAV holds raw utterance audio (PII) and is written to a
   per-process private `0o700` directory (created at backend start, removed on
   `close()`), never the world-listable system temp dir.
+- `KyutaiBackend` shipped in `stt_server/backends/kyutai.py` (requires the
+  `kyutai` extra — `uv sync --extra kyutai`; default model
+  `kyutai/stt-1b-en_fr-mlx`, English and French, CC-BY-4.0). Decodes in memory
+  through `moshi_mlx`. The extra pins an older MLX stack and is declared
+  conflicting with the other MLX extras, so install it on its own.
 
 ## Running the server
 
@@ -188,12 +193,70 @@ downloads and caches the weights.
 | `mlx` | `mlx-community/whisper-tiny` | fastest, lowest accuracy |
 | `parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | **default** Parakeet TDT |
 | `nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | **default** Nemotron 3.5 ASR (`uv sync --extra nemotron`) |
+| `kyutai` | `kyutai/stt-1b-en_fr-mlx` | **default** Kyutai streaming STT, English + French (`uv sync --extra kyutai`, on its own) |
 
 Any `mlx-community` Whisper repo (e.g. `…-large-v3-turbo-q4` quantised
 variants, or `…-large-v3-turbo` language-specialised forks) works as a
 `--model` value — the table lists common starting points, not an allowlist.
 Verify which model a running server actually loaded with
 `python -m stt_server status` (it prints `backend: <name> (model: <repo>)`).
+
+## Prefetching models
+
+`mlx`, `parakeet` and `nemotron` download their checkpoint on the first decode,
+so a cold server answers its first request only after a multi-GB download.
+`prefetch` does the download up front, and `--check` answers "is it cached?"
+without touching the network:
+
+```bash
+uv run python -m stt_server prefetch --backend parakeet          # download
+uv run python -m stt_server prefetch --backend parakeet --check  # offline probe
+uv run python -m stt_server prefetch --backend mlx --model mlx-community/whisper-small --json
+```
+
+It fetches exactly what the backend loads, into the standard Hugging Face cache
+(`HF_HOME` / `HF_HUB_CACHE`). `--check` exits 0 whenever the probe ran; the
+answer is the `cached` field. With `--json` each stdout line is one event:
+
+| Event | Fields |
+|---|---|
+| `start` | `repo`, `revision`, `kind` |
+| `progress` | `repo`, `downloaded_bytes`, `total_bytes`, `files_done`, `files_total` |
+| `done` | `repo`, `path`, `size_bytes` |
+| `complete` | `backend`, `model`, `cached`, `size_bytes` |
+| `check` | `repo`, `revision`, `kind`, `required`, `cached`, `path`, `size_bytes` (with `--check`) |
+| `summary` | `backend`, `model`, `cached`, `size_bytes` (with `--check`) |
+| `error` | `code`, `message`, `repo`; exit status 1 |
+
+The schema matches `tts_server prefetch` in
+[pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server),
+so one supervisor can drive both.
+
+## Supervised mode
+
+`serve --supervised` is for a parent process that manages the server, such as a
+menu bar app. Logging on stderr is unchanged. In addition:
+
+- **stdout carries only JSON lines.** Once the listener is bound and the model
+  is warm (supervised mode decodes 1 s of silence first), the server prints one
+  `{"event":"ready","backend","model","host","port","socket_path","rate","pid"}`
+  line. With `--port 0`, `port` is the real port.
+- **A fatal error prints `{"event":"error","code","message","exc_type"}`** and
+  exits 1. Codes: `EADDRINUSE` (a busy port, or a Unix socket a live server
+  already owns, reported before the model loads), `EACCES`,
+  `ModuleNotFoundError` (backend extra missing), `ModelDownloadError`,
+  `ConfigError`, `BackendStartError`.
+- **stdin EOF stops the server** exactly like SIGTERM. The parent keeps a pipe
+  open, so the server exits when the parent closes it or dies. During startup
+  the process exits at once; interrupted downloads resume next time.
+
+```bash
+( sleep 5 ) | uv run python -m stt_server serve --backend echo \
+    --host 127.0.0.1 --port 0 --supervised
+```
+
+Skip any stdout line that does not parse as JSON: native code writing straight
+to file descriptor 1 can bypass the redirect.
 
 ## Documentation
 

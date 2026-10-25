@@ -12,6 +12,7 @@ import builtins
 
 import pytest
 
+from stt_server.backends.kyutai import KyutaiBackend
 from stt_server.backends.mlx_whisper import MLXWhisperBackend
 from stt_server.backends.nemotron import NemotronBackend
 from stt_server.backends.parakeet import ParakeetBackend
@@ -23,6 +24,7 @@ from stt_server.backends.parakeet import ParakeetBackend
         (lambda: MLXWhisperBackend(model="fake"), "mlx_whisper", "mlx"),
         (lambda: NemotronBackend(model="fake"), "mlx_audio", "nemotron"),
         (lambda: ParakeetBackend(model="fake"), "parakeet_mlx", "parakeet"),
+        (lambda: KyutaiBackend(model="fake"), "moshi_mlx", "kyutai"),
     ],
 )
 def test_backend_missing_extra_raises_actionable_error(monkeypatch, factory, missing, extra):

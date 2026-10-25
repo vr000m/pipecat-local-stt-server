@@ -300,3 +300,33 @@ class NemotronBackend:
         # shutdown best-effort — a leftover dir is harmless (0o700, owner-only)
         # and a fresh one is created on the next process start.
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+# The file patterns ``mlx_audio``'s ``load()`` downloads (``mlx_audio.utils.
+# DEFAULT_ALLOW_PATTERNS``), so prefetch fetches exactly what a decode would.
+_MLX_AUDIO_ALLOW_PATTERNS = (
+    "*.json",
+    "*.safetensors",
+    "*.py",
+    "*.model",
+    "*.tiktoken",
+    "*.txt",
+    "*.jinja",
+    "*.jsonl",
+    "*.yaml",
+    "*.npz",
+    "*.pth",
+)
+
+
+def prefetch_specs(model: str | None) -> list:
+    """Snapshots ``python -m stt_server prefetch --backend nemotron`` fetches."""
+    from ..prefetch import SnapshotSpec
+
+    return [
+        SnapshotSpec(
+            model or DEFAULT_NEMOTRON_MODEL,
+            allow_patterns=_MLX_AUDIO_ALLOW_PATTERNS,
+            required=("config.json", "*.safetensors"),
+        )
+    ]

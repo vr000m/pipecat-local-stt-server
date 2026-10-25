@@ -330,10 +330,21 @@ class TranscriptionServer:
         """For TCP mode, return the actual port (helpful with port=0)."""
         for s in self.sockets_bound:
             try:
-                return s.getsockname()[1]
+                name = s.getsockname()
             except Exception:
                 continue
+            # A Unix socket's name is a path string, not a (host, port) tuple.
+            if isinstance(name, tuple) and len(name) >= 2:
+                return name[1]
         return None
+
+    @property
+    def backend(self) -> TranscriptionBackend:
+        return self._backend
+
+    @property
+    def config(self) -> ServerConfig:
+        return self._config
 
     async def wait_closed(self) -> None:
         if self._server is not None:
@@ -1057,23 +1068,42 @@ async def serve(
     auth_token: str | None = None,
     install_signal_handlers: bool = True,
     ready: Callable[[TranscriptionServer], Awaitable[None]] | None = None,
+    stop_on_stdin_eof: bool = False,
 ) -> None:
     """Start the server, wait for shutdown signal, then drain and exit.
 
     Kept as the one public entrypoint intended for ``python -m stt_server``;
     tests drive ``TranscriptionServer`` directly.
+
+    ``stop_on_stdin_eof`` (``serve --supervised``) treats stdin EOF exactly like
+    SIGTERM once listening. If EOF arrives while the backend is still starting
+    (the supervisor quit mid-load), the process exits immediately: model loads
+    run in threads that cannot be cancelled, and Hugging Face downloads resume
+    from their ``.incomplete`` blobs next time.
     """
     cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
     server = TranscriptionServer(backend or EchoBackend(), cfg)
-    await server.start()
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
+
+    def _request_stop() -> None:
+        if not stop.done():
+            stop.set_result(None)
+
+    if stop_on_stdin_eof:
+        from .supervise import watch_stdin_eof
+
+        watch_stdin_eof(loop, _request_stop)
+        start_task = asyncio.ensure_future(server.start())
+        await asyncio.wait({start_task, stop}, return_when=asyncio.FIRST_COMPLETED)
+        if not start_task.done():
+            logger.warning("stt_server: supervisor went away during startup; exiting")
+            logging.shutdown()
+            os._exit(0)
+        await start_task
+    else:
+        await server.start()
     if install_signal_handlers:
-
-        def _request_stop() -> None:
-            if not stop.done():
-                stop.set_result(None)
-
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, _request_stop)

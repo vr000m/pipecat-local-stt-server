@@ -53,4 +53,26 @@ jobs:
             tests/test_wire_schema_compat.py \
             tests/test_env_helpers.py \
             tests/test_stt_post_filter.py \
-            tests/test_render_stt_plist.py
+            tests/test_render_stt_plist.py \
+            tests/test_supervised_cli.py \
+            tests/test_prefetch_cli.py \
+            tests/test_kyutai_backend.py
+
+  # The kyutai extra pins an older MLX stack (moshi_mlx: mlx<0.27,
+  # huggingface-hub<0.29) and is declared conflicting with the other MLX extras,
+  # so it gets its own environment. Verifies it resolves and imports on Apple
+  # Silicon; the live decode test skips without the cached ~2.4 GB weights.
+  test-macos-kyutai:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync (base + kyutai)
+        run: uv sync --extra kyutai
+      - name: Import smoke
+        run: uv run python -c "import moshi_mlx, sentencepiece; from moshi_mlx import models; print('moshi_mlx OK')"
+      - name: Kyutai, supervised and prefetch tests
+        run: uv run pytest -x tests/test_kyutai_backend.py tests/test_supervised_cli.py tests/test_prefetch_cli.py

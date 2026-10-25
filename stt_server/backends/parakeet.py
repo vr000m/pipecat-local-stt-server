@@ -282,3 +282,12 @@ class ParakeetBackend:
         # shutdown best-effort — a leftover dir is harmless (0o700, owner-only)
         # and a fresh one is created on the next process start.
         shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+
+def prefetch_specs(model: str | None) -> list:
+    """Snapshots ``python -m stt_server prefetch --backend parakeet`` fetches:
+    the two files ``parakeet_mlx.from_pretrained`` downloads."""
+    from ..prefetch import SnapshotSpec
+
+    files = ("config.json", "model.safetensors")
+    return [SnapshotSpec(model or DEFAULT_PARAKEET_MODEL, allow_patterns=files, required=files)]

@@ -337,3 +337,17 @@ class MLXWhisperBackend:
                 "Metal assertion possible at process exit",
                 timeout_s,
             )
+
+
+# The ``--backend mlx`` default (``__main__._DEFAULT_MLX_MODEL`` keeps the CLI's
+# copy; a test asserts they agree).
+DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+
+def prefetch_specs(model: str | None) -> list:
+    """Snapshots ``python -m stt_server prefetch --backend mlx`` fetches:
+    ``mlx_whisper`` loads with an unfiltered ``snapshot_download``, so the whole
+    repo (``config.json`` plus ``weights.safetensors``/``weights.npz``)."""
+    from ..prefetch import SnapshotSpec
+
+    return [SnapshotSpec(model or DEFAULT_MLX_MODEL, required=("config.json", "weights.*"))]

@@ -10,6 +10,12 @@ Subcommands:
   on success or 1 on failure. Useful as a preflight health probe for
   launchd keepalive scripts and for humans checking "is my server up?"
   without writing a client.
+- ``prefetch`` — download a backend's model weights without serving (with
+  JSON-lines progress under ``--json``), or ``--check`` offline whether they
+  are already cached.
+
+``serve --supervised`` is for a managing parent process: JSON lifecycle events
+on stdout and stop-on-stdin-EOF (see ``stt_server/supervise.py``).
 """
 
 from __future__ import annotations
@@ -66,7 +72,17 @@ def _make_backend(name: str, model: str):
         from .backends.nemotron import NemotronBackend
 
         return NemotronBackend(model=model)
+    if name == "kyutai":
+        # Lazy like the others: ``kyutai.py`` imports ``moshi_mlx`` only inside
+        # ``start()``.
+        from .backends.kyutai import KyutaiBackend
+
+        return KyutaiBackend(model=model)
     raise SystemExit(f"unknown backend: {name}")
+
+
+# Every ``--backend`` name; shared by ``serve`` and ``prefetch``.
+BACKEND_CHOICES = ("echo", "mlx", "parakeet", "nemotron", "kyutai")
 
 
 def _resolve_model(backend: str, model: str | None) -> str:
@@ -90,6 +106,10 @@ def _resolve_model(backend: str, model: str | None) -> str:
         from .backends.nemotron import DEFAULT_NEMOTRON_MODEL
 
         return DEFAULT_NEMOTRON_MODEL
+    if backend == "kyutai":
+        from .backends.kyutai import DEFAULT_KYUTAI_MODEL
+
+        return DEFAULT_KYUTAI_MODEL
     return _DEFAULT_MLX_MODEL
 
 
@@ -207,11 +227,125 @@ def _add_endpoint_flags(p: argparse.ArgumentParser, *, include_uri: bool = False
     )
 
 
+def _preflight_listener(args: argparse.Namespace) -> None:
+    """Fail in milliseconds, not after a model load, when the listener can't bind.
+
+    ``TranscriptionServer.start()`` starts the backend BEFORE binding, so a busy
+    address would otherwise surface only after a multi-GB load. For TCP this
+    mirrors the real bind (``SO_REUSEADDR``, as asyncio sets on POSIX). For a
+    Unix socket it refuses a path a live server is listening on; asyncio's
+    ``create_unix_server`` would otherwise silently replace that socket file.
+    The TOCTOU window is accepted; the real bind still reports through the same
+    error classifier.
+    """
+    import errno
+    import socket
+
+    if args.socket_path:
+        path = Path(args.socket_path).expanduser()
+        if path.is_socket():
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                try:
+                    probe.connect(str(path))
+                except OSError:
+                    return  # stale socket: start() replaces it
+            raise OSError(errno.EADDRINUSE, f"a server is already listening on {path}")
+        return
+    if not args.host or not args.port:
+        return  # missing endpoint (ServerConfig reports it) or port 0 (ephemeral)
+    for family, socktype, proto, _canon, addr in socket.getaddrinfo(
+        args.host, args.port, type=socket.SOCK_STREAM
+    ):
+        with socket.socket(family, socktype, proto) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(addr)
+
+
+async def _warm(backend) -> None:
+    """Decode 1 s of silence so the first real commit doesn't pay for a lazy
+    model load (``mlx``/``parakeet``/``nemotron`` load on first decode)."""
+    stream = await backend.open_stream(language=None)
+    await stream.feed(b"\x00\x00" * 16000)
+    await stream.end()
+    async for _ in stream.events():
+        pass
+
+
+async def _emit_ready(server) -> None:
+    """``ready`` callback for ``serve --supervised``: warm up, then one JSON line."""
+    from . import protocol as P
+    from .supervise import emit
+
+    await _warm(server.backend)
+    cfg = server.config
+    emit(
+        {
+            "event": "ready",
+            "backend": server.backend.backend_name,
+            "model": server.backend.model,
+            "host": None if cfg.socket_path else cfg.host,
+            "port": None if cfg.socket_path else (server.listening_port() or cfg.port),
+            "socket_path": cfg.socket_path,
+            "rate": P.AUDIO_SAMPLE_RATE_HZ,
+            "pid": os.getpid(),
+        }
+    )
+
+
 def _cmd_serve(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=args.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not args.supervised:
+        _run_serve(args)
+        return
+
+    # Supervised mode: stdout carries only JSON lifecycle events; logs stay on
+    # stderr; stdin EOF stops the server.
+    from . import supervise
+
+    with supervise.json_channel():
+        try:
+            _preflight_listener(args)
+            _run_serve(args, ready=_emit_ready, stop_on_stdin_eof=True)
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as exc:
+            # ``_run_serve`` already turned the failure into ``stt_server: <msg>``
+            # on stderr; repeat it as an event so the supervisor can show it.
+            cause = exc.__cause__ or exc.__context__
+            if cause is not None:
+                code, message = supervise.classify_startup_error(cause)
+                supervise.emit(
+                    {
+                        "event": "error",
+                        "code": code,
+                        "message": message,
+                        "exc_type": type(cause).__name__,
+                    }
+                )
+            elif isinstance(exc.code, str):
+                supervise.emit(
+                    {
+                        "event": "error",
+                        "code": supervise.CODE_CONFIG,
+                        "message": exc.code,
+                        "exc_type": "SystemExit",
+                    }
+                )
+            raise
+        except Exception as exc:
+            logging.getLogger("stt_server").error("stt_server: fatal error", exc_info=exc)
+            code, message = supervise.classify_startup_error(exc)
+            supervise.emit(
+                {"event": "error", "code": code, "message": message, "exc_type": type(exc).__name__}
+            )
+            raise SystemExit(1) from None
+
+
+def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
     backend = _make_backend(args.backend, _resolve_model(args.backend, args.model))
     try:
         asyncio.run(
@@ -221,6 +355,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
                 host=args.host,
                 port=args.port,
                 auth_token=_resolve_auth_token(args.auth_token_file),
+                **serve_kwargs,
             )
         )
     except (ValueError, OSError, ImportError) as exc:
@@ -360,7 +495,7 @@ def main() -> None:
     # hide the ``status`` subcommand from the help text.
     argv = sys.argv[1:]
     top_level_help = argv and argv[0] in {"-h", "--help"}
-    if argv and not argv[0].startswith("-") and argv[0] in {"serve", "status"}:
+    if argv and not argv[0].startswith("-") and argv[0] in {"serve", "status", "prefetch"}:
         sub, rest = argv[0], argv[1:]
     elif top_level_help:
         sub, rest = None, argv
@@ -372,15 +507,34 @@ def main() -> None:
 
     p_serve = subparsers.add_parser("serve", help="run the server (default)")
     _add_endpoint_flags(p_serve)
-    p_serve.add_argument(
-        "--backend", choices=("echo", "mlx", "parakeet", "nemotron"), default="echo"
-    )
+    p_serve.add_argument("--backend", choices=BACKEND_CHOICES, default="echo")
     # Default is None so ``_resolve_model`` can apply a backend-aware fallback
     # (Whisper repo for ``mlx``, ``DEFAULT_PARAKEET_MODEL`` for ``parakeet``,
     # ``DEFAULT_NEMOTRON_MODEL`` for ``nemotron``). An explicit value always
     # wins and is passed through verbatim.
     p_serve.add_argument("--model", default=None)
     p_serve.add_argument("--log-level", default="INFO")
+    p_serve.add_argument(
+        "--supervised",
+        action="store_true",
+        help=(
+            "for a supervising app: print JSON lifecycle events (ready/error) on "
+            "stdout and stop when stdin reaches EOF"
+        ),
+    )
+
+    p_prefetch = subparsers.add_parser(
+        "prefetch", help="download a backend's model weights without serving"
+    )
+    p_prefetch.add_argument("--backend", choices=BACKEND_CHOICES, required=True)
+    p_prefetch.add_argument("--model", default=None)
+    p_prefetch.add_argument(
+        "--check",
+        action="store_true",
+        help="report whether the weights are already cached (never touches the network)",
+    )
+    p_prefetch.add_argument("--json", action="store_true", help="emit JSON-lines events on stdout")
+    p_prefetch.add_argument("--log-level", default="WARNING")
 
     p_status = subparsers.add_parser(
         "status", help="probe a running server with server.status and print its reply"
@@ -398,8 +552,24 @@ def main() -> None:
     args = parser.parse_args([sub, *rest])
     if args.cmd == "status":
         _cmd_status(args)
+    elif args.cmd == "prefetch":
+        _cmd_prefetch(args)
     else:
         _cmd_serve(args)
+
+
+def _cmd_prefetch(args: argparse.Namespace) -> None:
+    """``prefetch`` subcommand: download (or ``--check``) a backend's weights."""
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    from . import prefetch
+
+    model = None if args.backend == "echo" else _resolve_model(args.backend, args.model)
+    code = prefetch.run_prefetch(args.backend, model, check=args.check, json_mode=args.json)
+    if code:
+        raise SystemExit(code)
 
 
 if __name__ == "__main__":

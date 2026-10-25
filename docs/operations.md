@@ -52,7 +52,7 @@ scripts/install_stt_agent.sh install
 #    downloads it under KeepAlive + ThrottleInterval=10 and launchd may
 #    throttle-loop the agent before the download finishes.
 uv sync --extra parakeet
-.venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
+uv run python -m stt_server prefetch --backend parakeet
 PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
   PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
   PIPECAT_STT_BACKEND=parakeet \

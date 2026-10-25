@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`serve --supervised`** for a managing parent process: stdout carries only
+  JSON lines (`ready` once listening and warm, with the real port; or `error`
+  with a stable `code` such as `EADDRINUSE`, `ModuleNotFoundError`,
+  `ModelDownloadError`), a busy port or live socket is reported before the
+  model loads, and stdin EOF stops the server like SIGTERM. Same contract as
+  `tts_server serve --supervised`.
+- **`prefetch` subcommand**: downloads what a backend loads (with JSON-lines
+  byte progress under `--json`), and `--check` reports whether the weights are
+  cached without touching the network. Each backend module exports
+  `prefetch_specs(model)`. Progress is measured on disk, so it works across
+  `huggingface_hub` versions.
+- **`kyutai` backend** (extra `kyutai`, `moshi_mlx==0.3.0`; default model
+  `kyutai/stt-1b-en_fr-mlx`, English + French, CC-BY-4.0). The extra is declared
+  conflicting with `mlx` / `parakeet` / `nemotron` (moshi_mlx pins `mlx<0.27`,
+  `huggingface-hub<0.29`), so the lockfile keeps their newer pins.
+
+### Fixed
+
+- `TranscriptionServer.listening_port()` returns `None` for a Unix socket
+  instead of a character of its path. `TranscriptionServer` exposes read-only
+  `backend` and `config`.
+
 ## [0.3.3] - 2026-06-28
 
 Server-side hardening of the same-host UDS trust boundary. No new user-facing

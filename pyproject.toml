@@ -40,6 +40,21 @@ parakeet = ["websockets>=16,<17", "parakeet-mlx>=0.5.1", "numpy>=1.26"]
 # (Blaizzy/mlx-audio#774, merged 2026-06-05); earlier releases lacked it, which
 # previously forced a git-pinned dev group. Now a clean, PyPI-installable extra.
 nemotron = ["websockets>=16,<17", "mlx-audio>=0.4.4", "numpy>=1.26"]
+# Full server install with the Kyutai streaming STT backend (via moshi_mlx;
+# default model kyutai/stt-1b-en_fr-mlx, English + French, CC-BY-4.0).
+# moshi_mlx pins mlx<0.27 and huggingface-hub<0.29, which the other MLX extras
+# outgrew, so kyutai is declared conflicting below: install it on its own
+# (`uv sync --extra kyutai`), and the other extras keep their newer pins.
+kyutai = ["websockets>=16,<17", "moshi_mlx==0.3.0", "numpy>=1.26"]
+
+[tool.uv]
+# kyutai's moshi_mlx pins (mlx<0.27, huggingface-hub<0.29) can't share an
+# environment with the other MLX extras; resolve them in separate forks.
+conflicts = [
+    [{ extra = "kyutai" }, { extra = "mlx" }],
+    [{ extra = "kyutai" }, { extra = "parakeet" }],
+    [{ extra = "kyutai" }, { extra = "nemotron" }],
+]
 
 [dependency-groups]
 dev = [
