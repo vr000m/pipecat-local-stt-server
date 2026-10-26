@@ -21,6 +21,8 @@
 #                       backend has none and requires an explicit port)
 #   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
+#                       policy below is stt_server.auth.load_token_file, which
+#                       `serve --auth-token-file` also runs at every start. The
 #                       file must be a regular file (not a symlink) owned by you,
 #                       with no group/other permission bits and no ACL allow
 #                       entry, in a directory chain (symlinks resolved) that only
@@ -30,8 +32,7 @@
 #                       bit exempts nothing, so /tmp is refused). The plist records the
 #                       resolved path, the one that was checked. Its content must be one token of
 #                       visible ASCII (UTF-8, surrounding whitespace stripped; an
-#                       empty file, internal whitespace or non-ASCII is refused,
-#                       by the server's own stt_server.auth.read_token_file).
+#                       empty file, internal whitespace or non-ASCII is refused).
 #   PIPECAT_STT_UNLOAD_WAIT  seconds (integer 0..86400, read as decimal so "08"
 #                       is 8; larger values are refused, not wrapped) to wait for
 #                       launchd to finish tearing the old job down before
@@ -264,140 +265,29 @@ installed_auth_state() {
     esac
 }
 
-# ACL rights that let a principal change a directory's entries or its metadata
-# (and so swap or re-permission the token file under it).
-ACL_WRITE_RIGHTS="write append add_file add_subdirectory delete delete_child writeattr writeextattr writesecurity chown"
-
-# Exit 0 when path $1 has an ACL allow entry granting any right in the
-# space-separated list $2 (or any right at all when $2 is "any"), 1 when it has
-# none, 2 when its ACL cannot be read. macOS `ls -lde` prints each ACL entry on
-# its own line after the listing, e.g. " 0: group:staff allow read" or
-# " 1: user:bob inherited allow add_file,delete_child"; a path with no ACL prints
-# no such line, so nothing changes there. Deny entries only narrow access.
-acl_allows() {
-    local path="$1" want="$2" out line r
-    local -a rights
-    out="$(ls -lde -- "$path" 2>/dev/null)" || return 2
-    while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*[0-9]+:[[:space:]] ]] || continue
-        [[ "$line" =~ [[:space:]]allow[[:space:]]+([A-Za-z_,]+)[[:space:]]*$ ]] || continue
-        [[ "$want" == any ]] && return 0
-        IFS=, read -ra rights <<<"${BASH_REMATCH[1]}"
-        for r in "${rights[@]}"; do
-            [[ " $want " == *" $r "* ]] && return 0
-        done
-    done <<<"$out"
-    return 1
-}
-
-# Refuse a token file the server would mis-handle, and set RESOLVED_TOKEN_FILE
-# to the path the plist must carry. File-system policy lives here: a
-# group/other-readable file leaks the bearer; a file owned by another user (or a
-# symlink) lets someone else set it; so does a parent directory someone else can
-# write to; a missing path crash-loops the agent under KeepAlive. Content policy
-# (empty = auth disabled, internal whitespace or non-ASCII = never matches a
-# header, non-UTF-8) is the server's own stt_server.auth.read_token_file, called
-# below so the two cannot drift.
+# Refuse a token file the server would refuse or mis-handle, and set
+# RESOLVED_TOKEN_FILE to the path the plist must carry. The whole policy, for the
+# file (absolute path, not a symlink, a regular file you own with no group/other
+# bits and no ACL allow entry), its resolved directory chain (owned by you or
+# root, writable by nobody else by mode or by a write-class ACL allow entry;
+# group write only on a root-owned wheel/admin directory; a sticky bit exempts
+# nothing) and its content (one visible-ASCII token), is the server's own
+# stt_server.auth.load_token_file: `serve --auth-token-file` runs the same code at
+# every start, so an agent this accepts is one the server starts, and the two
+# cannot drift. It opens the file O_NOFOLLOW and checks what it opened. The uid
+# comes from `id -u` here, as for every other check in this script.
 #
-# Validated == opened: the parent chain is resolved (symlinks followed) and the
-# checks run on that symlink-free path, which is what the plist records. A
+# Validated == opened: the policy resolves the parent chain (symlinks followed)
+# and checks that symlink-free path, which is what the plist records. A
 # symlinked directory in the path as given could be repointed after this check;
 # the resolved path has no such component left to repoint.
 validate_token_file() {
-    local f="$1" owner group mode dir me resolved base
+    local f="$1" me resolved
     me="$(id -u)"
-    # The renderer requires an absolute path; say so here, before any mkdir, and
-    # under this variable's own name rather than the renderer's AUTH_TOKEN_FILE.
-    if [[ "$f" != /* ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' must be an absolute path" >&2
-        exit 1
-    fi
-    if [[ -L "$f" ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is a symlink; point it at the real file" >&2
-        exit 1
-    fi
-    if [[ ! -f "$f" ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is not an existing regular file" >&2
-        exit 1
-    fi
-    dir="$(cd -P "$(dirname "$f")" 2>/dev/null && pwd -P)" || dir=""
-    if [[ -z "$dir" ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has an unreadable parent directory" >&2
-        exit 1
-    fi
-    base="$(basename "$f")"
-    if [[ "$dir" == "/" ]]; then resolved="/$base"; else resolved="$dir/$base"; fi
-    # Same tests again on the resolved path: it names the same file, but the
-    # plist (and the server) will open this one.
-    if [[ -L "$resolved" || ! -f "$resolved" ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' does not resolve to a regular file ($resolved)" >&2
-        exit 1
-    fi
-    owner=$(stat -f "%u" "$resolved" 2>/dev/null || echo "")
-    if [[ "$owner" != "$me" ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is not owned by the current user" >&2
-        exit 1
-    fi
-    mode=$(stat -f "%Lp" "$resolved" 2>/dev/null || echo "777")
-    if (((8#$mode & 8#077) != 0)); then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has mode $mode; it must not be group/other accessible (chmod 600 it)" >&2
-        exit 1
-    fi
-    # The mode bits are not the whole story on macOS: an ACL can grant another
-    # user read (the token leaks) or write. Any allow entry on the file is refused;
-    # a deny entry only narrows access and is fine.
-    local acl_rc=0
-    acl_allows "$resolved" any || acl_rc=$?
-    if [[ "$acl_rc" -ne 1 ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has an ACL allow entry, or its ACL cannot be read (see 'ls -le'; 'chmod -N' removes the ACL)" >&2
-        exit 1
-    fi
-    # Walk the resolved parents: each must belong to this user or root and not be
-    # writable by anyone else, else that party could swap the file or, once the
-    # name is gone (a /tmp cleaner, a delete-and-recreate rotation), create it:
-    # the server re-opens the path at every start. Group write is allowed only on
-    # a root-owned directory whose group is wheel (0) or admin (80): those members
-    # can already act as root. Any other writable group (say staff, 20) could swap
-    # the file. A sticky bit is no exception (it stops others deleting your file,
-    # not creating an absent name), so /tmp (1777) and any group-writable sticky
-    # directory outside that rule are refused; %Lp leaves the sticky bit out of
-    # $mode. An ACL allow entry carrying a write-class right is refused whatever
-    # the mode.
-    while :; do
-        owner=$(stat -f "%u" "$dir" 2>/dev/null || echo "")
-        group=$(stat -f "%g" "$dir" 2>/dev/null || echo "")
-        mode=$(stat -f "%Lp" "$dir" 2>/dev/null || echo "777")
-        if [[ "$owner" != "$me" && "$owner" != 0 ]]; then
-            echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is owned by another user" >&2
-            exit 1
-        fi
-        if (((8#$mode & 8#002) != 0)) || { (((8#$mode & 8#020) != 0)) && ! [[ "$owner" == 0 && ("$group" == 0 || "$group" == 80) ]]; }; then
-            echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is writable by others (mode $mode, gid $group)" >&2
-            exit 1
-        fi
-        acl_rc=0
-        acl_allows "$dir" "$ACL_WRITE_RIGHTS" || acl_rc=$?
-        if [[ "$acl_rc" -ne 1 ]]; then
-            echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' has an ACL entry that lets someone else write to it, or its ACL cannot be read (see 'ls -lde'; 'chmod -N' removes the ACL)" >&2
-            exit 1
-        fi
-        [[ "$dir" == "/" ]] && break
-        dir="$(dirname "$dir")"
-    done
-    if [[ ! -r "$resolved" ]]; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is unreadable" >&2
-        exit 1
-    fi
-    # The renderer enforces its plist allowlist after the directories exist; ask
-    # it now (its own --check-abspath mode, one regex) so a refused path fails
-    # before any mkdir.
-    if ! "$PYTHON" -I "$RENDER_PY" --check-abspath PIPECAT_STT_AUTH_TOKEN_FILE "$resolved"; then
-        exit 1
-    fi
-    if ! "$PYTHON" -I -c '
+    if ! resolved="$("$PYTHON" -I -c '
 import sys
 try:
-    from stt_server.auth import read_token_file
+    from stt_server.auth import load_token_file
 except ImportError:
     print(
         "error: cannot import stt_server - run with the project venv interpreter "
@@ -406,11 +296,18 @@ except ImportError:
     )
     sys.exit(1)
 try:
-    read_token_file(sys.argv[1], strict=True)
+    resolved, _token = load_token_file(sys.argv[1], uid=int(sys.argv[2]))
 except ValueError as exc:
     print(f"error: PIPECAT_STT_AUTH_TOKEN_FILE: {exc}", file=sys.stderr)
     sys.exit(1)
-' "$resolved"; then
+sys.stdout.write(resolved)
+' "$f" "$me")"; then
+        exit 1
+    fi
+    # The renderer enforces its plist allowlist after the directories exist; ask
+    # it now (its own --check-abspath mode, one regex) so a refused path fails
+    # before any mkdir.
+    if ! "$PYTHON" -I "$RENDER_PY" --check-abspath PIPECAT_STT_AUTH_TOKEN_FILE "$resolved"; then
         exit 1
     fi
     if [[ "$resolved" != "$f" ]]; then

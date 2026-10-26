@@ -801,8 +801,12 @@ def test_resolve_auth_token_serve_refuses_unusable_token_file(tmp_path: Path, co
 
     tok = tmp_path / "tok"
     tok.write_bytes(content)
-    with pytest.raises(ConfigError):
+    # 0600: serve also applies the token-file policy, which would refuse a
+    # group/other-readable file first; this test is about the content.
+    tok.chmod(0o600)
+    with pytest.raises(ConfigError) as exc:
         _resolve_auth_token(str(tok), client=False)
+    assert "fix:" not in str(exc.value), "refused by the file policy, not the content rule"
 
 
 @pytest.mark.parametrize("name", ["PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"])
@@ -843,6 +847,7 @@ def test_resolve_auth_token_serve_strips_token_file(tmp_path: Path):
 
     tok = tmp_path / "tok"
     tok.write_text("  s3cret-Token_1\n")
+    tok.chmod(0o600)  # serve refuses a group/other-readable token file
     assert _resolve_auth_token(str(tok), client=False) == "s3cret-Token_1"
 
 

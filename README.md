@@ -74,7 +74,11 @@ uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 # --auth-token-file or PIPECAT_STT_AUTH_TOKEN env; legacy KODA_STT_AUTH_TOKEN
 # still honoured; there is no --auth-token flag, since argv is visible via `ps`.
 # A token file must hold one token of visible ASCII; an empty or malformed one
-# makes the server exit rather than run unauthenticated).
+# makes the server exit rather than run unauthenticated. The file itself must be
+# an absolute path to a regular file you own, mode 600 (no group/other bits, no
+# ACL), in directories only you or root can write: otherwise serve exits 1 and
+# names the file and the fix, e.g. `chmod 600 <file>` or move it out of a shared
+# directory; see docs/operations.md#token-file-replaces-env-tokens).
 # The LaunchAgent installer and renderer refuse both env tokens: use
 # PIPECAT_STT_AUTH_TOKEN_FILE there.
 uv run python -m stt_server --host 127.0.0.1 --port 9565 --auth-token-file /path/to/token

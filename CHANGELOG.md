@@ -132,13 +132,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Loopback TCP without a token logs INFO, not a warning.** That is the default
   agent setup, and non-loopback binds are refused, so there was nothing to warn
   about. The message names `--auth-token-file`, not the env token.
+- **Breaking for hand or supervised launches: `serve --auth-token-file` enforces
+  the token-file policy at every start**, the one the installer already applied:
+  the path must be absolute; the file is opened with `O_NOFOLLOW` (a symlink is
+  refused) and the opened descriptor must be a regular file owned by the user
+  running the server with no group/other permission bits and no ACL allow
+  entry; every directory of its resolved path must be owned by that user or root
+  and writable by nobody else (by mode, or by a write-class ACL allow entry;
+  group write only on a root-owned `wheel`/`admin` directory; a sticky bit
+  exempts nothing, so `/tmp` is refused). A refused file stops startup (exit 1)
+  with a message naming the file, the problem and the fix (`chmod 600 <file>`,
+  `chmod -N` for an ACL, or move it out of a shared directory into one only you
+  can write, e.g. `~/.config/pipecat-stt`). The policy is one Python
+  implementation, `stt_server.auth.load_token_file`; the installer's preflight
+  now calls it instead of its own bash checks, so installer and server cannot
+  disagree. An installed agent is unaffected (its file passed the same check);
+  a `0644` token file, a relative path or one under `/tmp` passed to `serve` by
+  hand or by a supervising app now fails. The probe (`status`) is unchanged.
 - **`serve --auth-token-file` is strict.** An empty or whitespace-only file, a
   token with internal whitespace (a space, tab or newline inside it; a trailing
   newline is stripped and fine) or a non-ASCII character, or a
   non-UTF-8 file now stops the server at startup instead of silently running
   without auth (an empty token disabled it) or never matching any client. The
   probe (`status`) stays lenient. The installer runs the same check
-  (`stt_server.auth.read_token_file`) before writing the plist, and now also
+  (`stt_server.auth.load_token_file`) before writing the plist, and now also
   requires the token file's parent directories (symlinks resolved) to belong to
   you or root and not be writable by others (group write only on a root-owned
   directory of group `wheel` or `admin`; a sticky bit is no exception). The plist records the

@@ -1853,8 +1853,7 @@ def test_endpoint_read_alone_refuses_a_malformed_plist(tmp_path: Path, held_sock
     plist = _agents(home) / f"{NEW_LABEL}.plist"
     before = plist.read_bytes()
     malformed_now = (
-        'if [[ "$STRICT" == 1 ]]; then echo "error: cannot read plist" >&2; exit 2; fi; '
-        "exit 0"
+        'if [[ "$STRICT" == 1 ]]; then echo "error: cannot read plist" >&2; exit 2; fi; exit 0'
     )
     py = _reader_python(stub_dir, sweep=malformed_now)
     shutil.copy(py, stub_dir / "python3")
@@ -1908,7 +1907,9 @@ def test_install_reads_the_plist_under_its_own_python(tmp_path: Path):
 # 1775 sticky gid 80, root 1770 sticky gid 20 ('T'), user 1700 sticky, user 1770
 # sticky ('T'), user 1777 sticky ('t'), root 1777 sticky gid 0 (/private/tmp),
 # root 0777} x token path {plain, middle symlink}. Root
-# ownership and the gid are faked by a `stat` stub for that one directory.
+# ownership and the gid are faked for that one directory by an interpreter shim
+# (``_fake_root_python``) that patches ``os.stat`` before running the installer's
+# Python, since the policy is stt_server.auth's, not a `stat` command.
 # ---------------------------------------------------------------------------
 
 _PARENT_CASES = {
@@ -1936,19 +1937,56 @@ _PARENT_CASES = {
 }
 
 
-def _fake_root_stat(stub_dir: Path) -> None:
-    _write_executable(
-        stub_dir / "stat",
-        """#!/usr/bin/env bash
-if [[ "$1" == "-f" && -n "${FAKE_ROOT_DIR:-}" && "$3" == "$FAKE_ROOT_DIR" ]]; then
-    case "$2" in
-    %u) echo 0; exit 0 ;;
-    %g) echo "$FAKE_ROOT_GID"; exit 0 ;;
-    esac
-fi
-exec /usr/bin/stat "$@"
-""",
-    )
+def _fake_root_stat(real_stat, target: str, gid: int):
+    """An ``os.stat`` that reports directory ``target`` as owned by root with
+    group ``gid``; every other path is the real answer. Shared by the installer
+    shim and the in-process serve side, so both see the same fake."""
+
+    def fake(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        if isinstance(path, (str, bytes, os.PathLike)) and os.path.realpath(path) == target:
+            vals = list(st)
+            vals[4], vals[5] = 0, gid
+            return os.stat_result(vals)
+        return st
+
+    return fake
+
+
+_SHIM = """
+import os, runpy, sys
+target, gid = os.environ.get("FAKE_ROOT_DIR"), os.environ.get("FAKE_ROOT_GID")
+if target:
+    real_stat = os.stat
+    def fake(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        if isinstance(path, (str, bytes, os.PathLike)) and os.path.realpath(path) == target:
+            vals = list(st)
+            vals[4], vals[5] = 0, int(gid)
+            return os.stat_result(vals)
+        return st
+    os.stat = fake
+args = sys.argv[1:]
+while args and args[0] in ("-I", "-E", "-s"):
+    args.pop(0)
+if args[0] == "-c":
+    sys.argv = ["-c", *args[2:]]
+    exec(compile(args[1], "<string>", "exec"), {"__name__": "__main__"})
+else:
+    sys.argv = args
+    sys.path[0] = os.path.dirname(os.path.abspath(args[0]))
+    runpy.run_path(args[0], run_name="__main__")
+"""
+
+
+def _fake_root_python(stub_dir: Path) -> Path:
+    """An interpreter for PIPECAT_STT_PYTHON: the venv python, with ``os.stat``
+    faking FAKE_ROOT_DIR as root-owned (group FAKE_ROOT_GID) when set."""
+    shim = stub_dir / "fakeroot_shim.py"
+    shim.write_text(_SHIM)
+    py = stub_dir / "fakerootpy"
+    _write_executable(py, f'#!/usr/bin/env bash\nexec "{VENV_PYTHON}" -I "{shim}" "$@"\n')
+    return py
 
 
 @pytest.mark.parametrize("via", ["plain", "middle-symlink"])
@@ -1956,7 +1994,7 @@ exec /usr/bin/stat "$@"
 def test_token_file_parent_and_resolved_path_state_space(tmp_path: Path, case: str, via: str):
     mode, gid, accepted = _PARENT_CASES[case]
     stub_dir, argv_log = _make_stub_dir(tmp_path)
-    _fake_root_stat(stub_dir)
+    fake_py = _fake_root_python(stub_dir)
     shared = tmp_path / "shared"
     shared.mkdir()
     real = shared / "token.txt"
@@ -1967,7 +2005,7 @@ def test_token_file_parent_and_resolved_path_state_space(tmp_path: Path, case: s
     if via == "middle-symlink":
         (tmp_path / "link").symlink_to(shared)
         given = tmp_path / "link" / "token.txt"
-    env = {"PIPECAT_STT_AUTH_TOKEN_FILE": str(given)}
+    env = {"PIPECAT_STT_AUTH_TOKEN_FILE": str(given), "PIPECAT_STT_PYTHON": str(fake_py)}
     if gid is not None:
         env.update(FAKE_ROOT_DIR=os.path.realpath(shared), FAKE_ROOT_GID=gid)
     try:
@@ -2288,3 +2326,229 @@ def test_timed_out_cleanup_command_is_quoted_and_rechecks(tmp_path: Path, held_s
     assert not os.path.lexists(sock), "the printed command must remove the stale socket"
     assert real.exists()
     assert not list(tmp_path.rglob("pwned")), "the recorded path was expanded by the shell"
+
+
+# ---------------------------------------------------------------------------
+# Token-file policy: validator (installer preflight) == consumer (serve).
+# Invariant: for every cell, `install` accepts PIPECAT_STT_AUTH_TOKEN_FILE=P
+# exactly when `serve --auth-token-file P` (stt_server.__main__'s
+# _resolve_auth_token, strict) starts, and both name the same reason; both run
+# stt_server.auth.load_token_file, and this table pins what that policy answers.
+# State space (one table, both sides): path {absolute, relative, missing,
+# directory, FIFO, final symlink, middle symlink} x file {0600, 0640, 0604,
+# 0620, another owner} x parent {every _PARENT_CASES cell} x ACL {every
+# _ACL_CASES cell, macOS} x content {ok, empty, internal space, non-UTF-8}.
+# ---------------------------------------------------------------------------
+
+_POLICY_CELLS: dict[str, tuple[bool, str | None]] = {
+    # case: (accepted, refusal fragment both sides must print)
+    "ok": (True, None),
+    "relative": (False, "absolute"),
+    "missing": (False, "not an existing regular file"),
+    "directory": (False, "not an existing regular file"),
+    "fifo": (False, "not an existing regular file"),
+    "symlink": (False, "symlink"),
+    "middle-symlink": (True, None),
+    "mode-0640": (False, "chmod 600"),
+    "mode-0604": (False, "chmod 600"),
+    "mode-0620": (False, "chmod 600"),
+    "other-owner": (False, "not owned by the current user"),
+    "empty": (False, "empty"),
+    "internal-space": (False, "visible ASCII"),
+    "non-utf8": (False, "UTF-8"),
+    **{
+        f"parent-{c}": (acc, None if acc else "writable by others")
+        for c, (_m, _g, acc) in _PARENT_CASES.items()
+    },
+    **(
+        {f"acl-{c}": (acc, None if acc else "ACL") for c, (_t, _a, acc) in _ACL_CASES.items()}
+        if sys.platform == "darwin"
+        else {}
+    ),
+}
+
+
+def _policy_cell(tmp_path: Path, case: str) -> tuple[str, dict]:
+    """Build one cell; return (the path as given, fakes): fakes may carry
+    ``uid`` (who the caller is) and ``root`` ((directory, gid) faked root-owned),
+    and ``cleanup`` callables."""
+    fakes: dict = {"cleanup": []}
+    shared = tmp_path / "tokdir"
+    shared.mkdir(mode=0o700)
+    tok = shared / "token.txt"
+    tok.write_text(SECRET + "\n")
+    tok.chmod(0o600)
+    if case == "ok":
+        return str(tok), fakes
+    if case == "relative":
+        return os.path.relpath(tok, REPO_ROOT), fakes
+    if case == "missing":
+        return str(shared / "nope"), fakes
+    if case == "directory":
+        return str(shared), fakes
+    if case == "fifo":
+        fifo = shared / "fifo"
+        os.mkfifo(fifo, 0o600)
+        return str(fifo), fakes
+    if case == "symlink":
+        (shared / "link").symlink_to(tok)
+        return str(shared / "link"), fakes
+    if case == "middle-symlink":
+        (tmp_path / "dirlink").symlink_to(shared)
+        return str(tmp_path / "dirlink" / "token.txt"), fakes
+    if case.startswith("mode-"):
+        tok.chmod(int(case[5:], 8))
+        return str(tok), fakes
+    if case == "other-owner":
+        fakes["uid"] = 99999
+        return str(tok), fakes
+    if case in ("empty", "internal-space", "non-utf8"):
+        tok.write_bytes(
+            {"empty": b"\n", "internal-space": b"a b\n", "non-utf8": b"\xff\xfe\n"}[case]
+        )
+        return str(tok), fakes
+    if case.startswith("parent-"):
+        mode, gid, _acc = _PARENT_CASES[case[7:]]
+        shared.chmod(mode)
+        fakes["cleanup"].append(lambda: shared.chmod(0o700))
+        if gid is not None:
+            fakes["root"] = (os.path.realpath(shared), int(gid))
+        return str(tok), fakes
+    if case.startswith("acl-"):
+        target, acl, _acc = _ACL_CASES[case[4:]]
+        victim = tok if target == "file" else shared
+        subprocess.run(["/bin/chmod", *acl, str(victim)], check=True)
+        fakes["cleanup"].append(
+            lambda: subprocess.run(["/bin/chmod", "-N", str(victim)], check=False)
+        )
+        return str(tok), fakes
+    raise AssertionError(case)
+
+
+def _installer_verdict(tmp_path: Path, given: str, fakes: dict) -> tuple[bool, str, Path]:
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    env = {
+        "PIPECAT_STT_AUTH_TOKEN_FILE": given,
+        "PIPECAT_STT_PYTHON": str(_fake_root_python(stub_dir)),
+    }
+    if "root" in fakes:
+        env.update(FAKE_ROOT_DIR=fakes["root"][0], FAKE_ROOT_GID=str(fakes["root"][1]))
+    if "uid" in fakes:
+        _write_executable(
+            stub_dir / "id",
+            f'#!/usr/bin/env bash\nif [[ "$1" == "-u" ]]; then echo {fakes["uid"]}; exit 0; fi\n'
+            'exec /usr/bin/id "$@"\n',
+        )
+    r = _run_install(tmp_path, stub_dir, env_overrides=env)
+    assert SECRET not in r.stdout + r.stderr, "token value leaked"
+    if r.returncode != 0:
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+    return r.returncode == 0, r.stderr, tmp_path / "home"
+
+
+def _serve_verdict(monkeypatch, given: str, fakes: dict) -> tuple[bool, str]:
+    from stt_server.__main__ import _resolve_auth_token
+
+    with monkeypatch.context() as m:
+        if "root" in fakes:
+            m.setattr(os, "stat", _fake_root_stat(os.stat, *fakes["root"]))
+        if "uid" in fakes:
+            m.setattr(os, "geteuid", lambda: fakes["uid"])
+        try:
+            token = _resolve_auth_token(given, client=False)
+        except ValueError as exc:
+            msg = str(exc)
+            assert SECRET not in msg, "token value leaked"
+            return False, msg
+    assert token == SECRET
+    return True, ""
+
+
+@pytest.mark.parametrize("case", sorted(_POLICY_CELLS))
+def test_token_file_policy_installer_and_serve_agree(tmp_path: Path, monkeypatch, case: str):
+    accepted, fragment = _POLICY_CELLS[case]
+    given, fakes = _policy_cell(tmp_path, case)
+    try:
+        inst_ok, inst_err, home = _installer_verdict(tmp_path, given, fakes)
+        serve_ok, serve_err = _serve_verdict(monkeypatch, given, fakes)
+    finally:
+        for undo in fakes["cleanup"]:
+            undo()
+    assert inst_ok == serve_ok == accepted, (
+        f"{case}: installer={inst_ok} serve={serve_ok} want={accepted}\n"
+        f"installer: {inst_err}\nserve: {serve_err}"
+    )
+    if accepted:
+        recorded = _flag(_rendered(home)["ProgramArguments"], "--auth-token-file")
+        assert recorded == os.path.realpath(given)
+        return
+    assert "PIPECAT_STT_AUTH_TOKEN_FILE" in inst_err, inst_err
+    assert fragment in inst_err and fragment in serve_err, (fragment, inst_err, serve_err)
+    # The serve message names the file and how to fix it (content refusals name
+    # the file; the policy refusals also carry "fix:").
+    assert given in serve_err, serve_err
+    if case not in ("empty", "internal-space", "non-utf8"):
+        assert "fix:" in serve_err, serve_err
+
+
+def test_policy_refuses_a_file_swapped_after_it_was_opened(tmp_path: Path):
+    """The checks run on what was opened: if the name now resolves to another
+    file than the descriptor's, the policy refuses instead of vouching for it."""
+    from stt_server.auth import check_token_file_policy
+    from stt_server.errors import ConfigError
+
+    d = tmp_path / "d"
+    d.mkdir(mode=0o700)
+    a, b = d / "a", d / "b"
+    for f in (a, b):
+        f.write_text(SECRET)
+        f.chmod(0o600)
+    assert check_token_file_policy(str(a), opened=os.stat(a)) == os.path.realpath(a)
+    with pytest.raises(ConfigError, match="does not resolve to the same regular file"):
+        check_token_file_policy(str(a), opened=os.stat(b))
+
+
+def test_serve_cli_refuses_a_group_readable_token_file(tmp_path: Path):
+    """`python -m stt_server serve --auth-token-file F` with a 0644 F exits 1
+    before it binds, printing the path and the fix (the behaviour change for a
+    hand or Koda launch; an installed agent's file already passed the preflight)."""
+    d = tmp_path / "cfg"
+    d.mkdir(mode=0o700)
+    tok = d / "token"
+    tok.write_text(SECRET + "\n")
+    tok.chmod(0o644)
+    r = subprocess.run(
+        [
+            str(VENV_PYTHON),
+            "-m",
+            "stt_server",
+            "serve",
+            "--backend",
+            "echo",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--auth-token-file",
+            str(tok),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(REPO_ROOT),
+    )
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert str(tok) in r.stderr and "chmod 600" in r.stderr, r.stderr
+    assert SECRET not in r.stdout + r.stderr
+
+
+def test_probe_client_token_file_stays_lenient(tmp_path: Path):
+    """Only serve (strict) applies the file policy; the probe's client token file
+    (status --auth-token-file) is read as before, symlink and 0644 included."""
+    from stt_server.__main__ import _resolve_auth_token
+
+    tok = tmp_path / "tok"
+    tok.write_text(SECRET + "\n")
+    tok.chmod(0o644)
+    (tmp_path / "link").symlink_to(tok)
+    assert _resolve_auth_token(str(tmp_path / "link"), client=True) == SECRET

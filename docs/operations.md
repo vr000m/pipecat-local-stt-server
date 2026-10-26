@@ -120,12 +120,33 @@ UTF-8 and strips surrounding whitespace, and the result must be one token of
 visible ASCII characters with no internal whitespace. An empty file would disable
 auth, and a token with a space, tab or newline left inside it after stripping, or a
 non-ASCII character, can never match an `Authorization` header, so both fail the
-install (the installer calls the server's own `stt_server.auth.read_token_file`, so
-the rules cannot drift). Leading and trailing whitespace, including the trailing
-newline an editor or `echo` adds, is stripped and fine. `serve`
-applies the same check at startup and exits rather than run unauthenticated; a
-missing file crash-loops the agent, so the installer refuses that too. The probe
-(`status`) stays lenient for a client-side token file.
+install. Leading and trailing whitespace, including the trailing
+newline an editor or `echo` adds, is stripped and fine. A missing file would
+crash-loop the agent, so the installer refuses that too. The probe (`status`)
+stays lenient for a client-side token file.
+
+**`serve --auth-token-file` enforces the same policy at every start.** All of the
+rules above, file and content alike, are one implementation,
+`stt_server.auth.load_token_file`, which the installer's preflight and `serve`
+both run, so an installed agent never trips over them. `serve` opens the file
+with `O_NOFOLLOW`, checks the descriptor it opened (a regular file owned by the
+user running the server, no group/other bits, no ACL allow entry) and then walks
+its resolved directory chain, and reads the token from that same descriptor. The
+path must be absolute. This applies to a server you launch by hand, or one a
+supervising app (Koda, the menu bar app) launches with `--auth-token-file`: a
+file the installer would refuse now stops startup with exit 1 and a one-line
+message naming the file, the problem and the fix, for example
+
+```text
+stt_server: auth token file '/Users/me/token' has mode 644; it must not be group/other accessible; fix: chmod 600 '/Users/me/token'
+```
+
+To fix a refused file: `chmod 600 <file>` for group/other bits; `chmod -N <file>`
+(or `<dir>`) for an ACL; for a parent directory others can write (a shared
+directory, `/tmp`, a group-writable folder) move the file into a directory only you
+can write, e.g. `install -d -m 700 ~/.config/pipecat-stt`, and pass the new
+absolute path; recreate a file someone else owns as yourself (`install -m 600
+/dev/null <file>`, then write the token); pass the real file, not a symlink to it.
 
 A reinstall never silently drops auth: if the installed plist carries a token (a
 pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
