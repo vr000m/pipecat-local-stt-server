@@ -1,4 +1,4 @@
-"""Transport trust policy shared by the server, its CLI and the install scripts.
+"""Bearer-token rules and the TCP bind-host allowlist (server, CLI, install scripts).
 
 - ``LOOPBACK_HOSTS``: the only hosts a TCP listener may bind. Loopback TCP has
   no peer-uid check (any local process can connect); a bearer token is the
@@ -9,8 +9,11 @@
   (``scripts/install_stt_agent.sh``) all call these, so a token one accepts can
   never be one another refuses.
 
-Stdlib only (plus ``stt_server.errors``), so the renderer and the installer's
-preflight can import it without pulling in the server runtime.
+This module itself uses only the stdlib (plus ``stt_server.errors``), but
+``import stt_server.auth`` first runs the package ``__init__``, which imports
+``stt_server.client`` and so ``websockets``: callers (the renderer, the
+installer's preflight) need the project venv, not a bare system python3. It does
+not load the server runtime or any backend implementation.
 """
 
 from __future__ import annotations
