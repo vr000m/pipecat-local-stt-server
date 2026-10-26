@@ -20,7 +20,12 @@
 #   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
 #                       file must be a regular file (not a symlink) owned by you,
-#                       with no group/other permission bits, and non-empty.
+#                       with no group/other permission bits, in a directory chain
+#                       (symlinks resolved) that only you or root own and nobody
+#                       else can write to. Its content must be one token of
+#                       visible ASCII (UTF-8, surrounding whitespace stripped; an
+#                       empty file, internal whitespace or non-ASCII is refused,
+#                       by the server's own stt_server.env.read_token_file).
 #   PIPECAT_STT_UNLOAD_WAIT  seconds (integer 0..86400, read as decimal so "08"
 #                       is 8; larger values are refused, not wrapped) to wait for
 #                       launchd to finish tearing the old job down before
@@ -227,6 +232,12 @@ installed_has_auth() {
 validate_token_file() {
     local f="$1" owner mode dir me sticky
     me="$(id -u)"
+    # The renderer requires an absolute path; say so here, before any mkdir, and
+    # under this variable's own name rather than the renderer's AUTH_TOKEN_FILE.
+    if [[ "$f" != /* ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' must be an absolute path" >&2
+        exit 1
+    fi
     if [[ -L "$f" ]]; then
         echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is a symlink; point it at the real file" >&2
         exit 1
@@ -274,7 +285,15 @@ validate_token_file() {
     fi
     if ! "$PYTHON" -I -c '
 import sys
-from stt_server.env import read_token_file
+try:
+    from stt_server.env import read_token_file
+except ImportError:
+    print(
+        "error: cannot import stt_server - run with the project venv interpreter "
+        "(PIPECAT_STT_PYTHON, default .venv/bin/python after uv sync)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 try:
     read_token_file(sys.argv[1], strict=True)
 except ValueError as exc:

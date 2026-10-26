@@ -8,7 +8,11 @@ Inputs are read from env vars (see ``scripts/install_stt_agent.sh``) and
 allowlist-validated before being placed in the plist. Unknown/invalid values
 fail loudly rather than silently producing a broken or malicious plist.
 
-May be run directly (not only via ``install_stt_agent.sh``). Only the label
+May be run directly (not only via ``install_stt_agent.sh``). The transport is
+``SOCKET_PATH`` (a Unix socket) or ``HOST`` + ``PORT`` (loopback TCP, the
+default; ``HOST`` defaults to 127.0.0.1), never both. These are the generic
+names, so a shell that already exports ``HOST`` or ``PORT`` will trip them:
+the installer clears the ones that do not apply, a direct run must too. Only the label
 accepts the canonical ``PIPECAT_STT_LABEL`` name or the deprecated
 ``KODA_STT_LABEL`` alias, resolved canonical-first by ``env_first``. The auth
 token is never read from the environment: ``PIPECAT_STT_AUTH_TOKEN`` /

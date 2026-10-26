@@ -56,7 +56,7 @@ class LocalWebSocketSTTService(SegmentedSTTService):
 
     - ``socket_path="~/Library/Caches/pipecat-stt/stt.sock"`` (UDS, recommended
       for local use — no port, no token), or
-    - ``host="127.0.0.1", port=8765`` (loopback TCP; pair with ``auth_token``
+    - ``host="127.0.0.1", port=9565`` (loopback TCP; pair with ``auth_token``
       if the server was started with one).
     """
 

@@ -1535,6 +1535,27 @@ def test_token_file_validated_in_tcp_mode(tmp_path: Path, case: str):
         assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
 
 
+def test_relative_token_file_is_refused_by_the_preflight(tmp_path: Path):
+    """The renderer needs an absolute path; the preflight must say so under the
+    installer's own variable name, before any directory is created."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    log_dir = tmp_path / "logs"
+    tok = _good_token_file(tmp_path)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_AUTH_TOKEN_FILE": os.path.relpath(tok, REPO_ROOT),
+            "PIPECAT_STT_LOG_DIR": str(log_dir),
+        },
+    )
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "PIPECAT_STT_AUTH_TOKEN_FILE" in r.stderr and "absolute" in r.stderr
+    assert not log_dir.exists(), "LOG_DIR created before the token file was rejected"
+    assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+    assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
 # ---------------------------------------------------------------------------
 # Installer <-> renderer backend contract: the installer accepts exactly the
 # renderer's _BACKEND_RE names and rejects anything else before any mkdir.
