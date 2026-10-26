@@ -158,7 +158,9 @@ config uses (e.g. onoats' `config.toml` `[stt] ws_socket`; for a TCP agent use
 `KeepAlive`, so `install_stt_agent.sh stop` (a plain `SIGTERM`) is respawned
 immediately. `stt-disable` instead does `launchctl bootout`, which takes the
 agent down **until the next login** — the plist stays on disk and launchd
-reloads it when you log back in. `stt-uninstall` removes the plist, so the agent
+reloads it when you log back in. It returns once launchd no longer lists the
+agent (up to 30 s), so a `just stt-enable` straight after it does not hit
+`Bootstrap failed: 5`. `stt-uninstall` removes the plist, so the agent
 stays gone. For cross-login suppression without removing the plist, use
 `launchctl disable gui/$(id -u)/<label>`.
 

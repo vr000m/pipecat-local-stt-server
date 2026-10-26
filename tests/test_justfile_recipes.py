@@ -75,6 +75,7 @@ def _make_stub_dir(
     print_loaded: bool = False,
     status_exit: int = 0,
     fail_actions: tuple[str, ...] = (),
+    unload_polls: int = 0,
 ) -> tuple[Path, Path]:
     """Stub ``launchctl`` / ``id`` / ``uv`` that log argv to ``argv.log``.
 
@@ -84,6 +85,10 @@ def _make_stub_dir(
     ``fail_actions`` names ``launchctl`` subcommands (e.g. ``bootout``,
     ``bootstrap``, ``kickstart``) that should exit non-zero, so recipe
     error-handling on a failed state change can be exercised.
+    ``unload_polls`` models asynchronous teardown: after a successful
+    ``bootout``, ``print`` still reports the job loaded for that many calls
+    (``-1``: forever), then reports it gone; a ``bootstrap`` while it is still
+    listed fails with exit 5, as launchd does in that window.
     """
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir()
@@ -95,6 +100,19 @@ def _make_stub_dir(
         stub_dir / "launchctl",
         f"""#!/usr/bin/env bash
 printf 'launchctl %s\\n' "$*" >> {argv_log!s}
+TEARDOWN={stub_dir!s}/teardown-polls
+if [[ -e "$TEARDOWN" ]]; then
+    n=$(cat "$TEARDOWN")
+    if [[ "$1" == "print" ]]; then
+        if [[ "$n" -eq 0 ]]; then exit 1; fi
+        if [[ "$n" -gt 0 ]]; then printf '%s' $((n - 1)) > "$TEARDOWN"; fi
+        exit 0
+    fi
+    if [[ "$1" == "bootstrap" && "$n" -ne 0 ]]; then
+        echo "Bootstrap failed: 5: Input/output error" >&2
+        exit 5
+    fi
+fi
 if [[ "$1" == "print" ]]; then
     if [[ {print_rc} -eq 0 ]]; then
         printf 'state = running\\n\\tpid = 4242\\n'
@@ -105,6 +123,8 @@ FAIL_ACTIONS="{fail_set}"
 for a in $FAIL_ACTIONS; do
     [[ "$1" == "$a" ]] && exit 1
 done
+if [[ "$1" == "bootout" ]]; then printf '%s' {unload_polls} > "$TEARDOWN"; fi
+if [[ "$1" == "bootstrap" ]]; then rm -f "$TEARDOWN"; fi
 exit 0
 """,
     )
@@ -1200,6 +1220,36 @@ def test_stt_disable_fails_when_bootout_fails(tmp_path):
     assert res.returncode != 0, "bootout failure must propagate"
     assert "booted out" not in res.stdout
     assert "bootout failed" in res.stderr
+
+
+# bootout is asynchronous: launchd lists the job until it has torn it down, and
+# a bootstrap in that window fails with error 5. Invariant: stt-disable reports
+# "booted out" only once launchd no longer lists the label, so an stt-enable
+# right after it bootstraps cleanly; still listed at its 30 s cap, it warns and
+# exits 0 without "booted out". State space: teardown {immediate, 3 polls,
+# never}, then stt-enable.
+@pytest.mark.parametrize("unload_polls", [0, 3, -1])
+def test_stt_disable_waits_for_teardown_before_enable(tmp_path, unload_polls):
+    stub_dir, argv_log = _make_stub_dir(tmp_path, print_loaded=True, unload_polls=unload_polls)
+    _write_executable(stub_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+    label = "pipecat.stt-server"
+    home = _home_with_agents(tmp_path, [label])
+    res = _run_just(["stt-disable", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    lines = _argv_lines(argv_log)
+    out = lines.index(f"launchctl bootout gui/{FAKE_UID}/{label}")
+    polls = [ln for ln in lines[out:] if ln == f"launchctl print gui/{FAKE_UID}/{label}"]
+    if unload_polls < 0:
+        assert "still loaded" in res.stderr, res.stderr
+        assert "booted out" not in res.stdout
+        assert len(polls) == 31, polls  # bounded: the 30 s cap, one poll a second
+        return
+    # Polled until launchd stopped listing it: N "loaded" answers plus the "gone" one.
+    assert len(polls) == unload_polls + 1, polls
+    assert "booted out" in res.stdout
+    enable = _run_just(["stt-enable", "whisper"], home=home, stub_dir=stub_dir)
+    assert enable.returncode == 0, f"stdout={enable.stdout!r} stderr={enable.stderr!r}"
+    assert "Bootstrap failed" not in enable.stderr
 
 
 # --------------------------------------------------------------------------- #

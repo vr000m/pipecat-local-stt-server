@@ -226,6 +226,21 @@ stt-disable backend:
       echo "stt-disable: launchctl bootout failed for $label" >&2
       exit 1
     fi
+    # bootout returns before launchd has torn the job down (a loaded model takes
+    # seconds to exit), and an stt-enable in that window fails with "Bootstrap
+    # failed: 5". So wait, like the installer's wait_unloaded (30 s, its default
+    # PIPECAT_STT_UNLOAD_WAIT), until launchd no longer lists the label. Still
+    # loaded at the cap: say so instead of "booted out" (exit 0, as uninstall).
+    waited=0
+    while launchctl print "gui/$uid/$label" >/dev/null 2>&1; do
+      if [[ "$waited" -ge 30 ]]; then
+        echo "stt-disable: $label still loaded 30s after bootout; wait until 'launchctl print gui/$uid/$label' reports no such service before 'just stt-enable $backend'" >&2
+        echo "stt-disable: bootout requested for $label, still unloading (plist kept)."
+        exit 0
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
     echo "stt-disable: booted out $label (plist kept; reloads at next login)."
     echo "             Use 'just stt-uninstall $backend' to remove it durably."
 

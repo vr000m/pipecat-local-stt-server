@@ -189,6 +189,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `_ensure-extra` re-runs the import probe after a successful `uv sync` and fails
   if it still fails, instead of reporting the extra ready and letting the agent
   crash-loop.
+- `just stt-disable` waits (up to 30 s) until launchd no longer lists the agent
+  before it reports `booted out`, so a `just stt-enable` straight after it no
+  longer fails with `Bootstrap failed: 5: Input/output error` while the old job
+  tears down. Still listed at the cap, it warns and reports the bootout as still
+  unloading (exit 0).
 
 ## [0.4.0] - 2026-10-25
 
