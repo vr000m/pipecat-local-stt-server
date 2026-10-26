@@ -197,7 +197,7 @@ if [[ "$cmd" == "install" && ! -x "$PYTHON" ]]; then
 fi
 
 # scripts/read_stt_plist.py is the one reader of the installed plist (the justfile
-# calls it too). It and lock_free below are stdlib only: install, which already
+# calls it too). It and unlink_socket_under_lock below are stdlib only: install, which already
 # requires $PYTHON, runs them there; every other subcommand (uninstall) runs them
 # under the system python3, so it works with no venv.
 if [[ "$cmd" == "install" ]]; then
@@ -424,40 +424,118 @@ wait_unloaded() {
     return 0
 }
 
-# Exit 0 when no process holds the flock on lock file $1 (or there is no plain
-# file there, which no server can hold: it opens the lock O_NOFOLLOW and refuses
-# anything but a regular file), 1 when one holds it, 2 when the probe cannot
-# tell. Mirrors stt_server.server.socket_lock_held (a shared, non-blocking flock
-# for an instant, so it conflicts with a server's exclusive lock but never makes
-# a real starter fail, as that retries 250 ms), stdlib only and run under
-# $READER_PYTHON, so install needs no system python3 and uninstall no venv. It
-# is deliberately stricter than socket_lock_held, which answers "not held" for
-# a file another user owns or one it cannot open
-# (start() reports those): here every error is 2, "cannot tell", and the caller
-# then leaves the socket alone (fails closed). The caller passes
-# "$sock.lock", the server's _lock_path rule. Both the name rule and the lock
-# conflict are pinned against the server's own _lock_path and
-# acquire_socket_lock by tests/test_install_migration.py
-# (test_socket_cleanup_respects_a_held_lock).
-lock_free() {
+# Unlink the stale socket $1 while holding a shared flock on "$1.lock" (the
+# server's _lock_path rule), so the lock check and the unlink are one step: a
+# starter takes that lock (exclusive) before it binds, so while this holds it no
+# server can bind a fresh socket at the path, and the unlink can only hit a
+# socket no live server owns. The checks on the socket (a real socket per lstat,
+# so never a symlink; owned by uid $2) run under the same lock, right before the
+# unlink. Exit status: 0 removed (or nothing there), 1 the lock is held by
+# another process (a running server), 2 cannot tell (any error: fails closed),
+# 3 not a socket, 4 not owned by uid $2, 5 the unlink failed.
+#   * The lock is shared and held only for these few syscalls: it conflicts with
+#     a server's exclusive lock, and acquire_socket_lock retries a contended lock
+#     for 250 ms, so it never makes a real starter fail (as for
+#     stt_server.server.socket_lock_held). The lock drops when this exits, after
+#     the unlink.
+#   * No regular file at "$1.lock": no server can hold it (it opens the lock
+#     O_NOFOLLOW and refuses anything but a regular file it owns; an absent one
+#     must first be created). The installer never creates the .lock (nor unlinks
+#     it), so there is nothing to lock; the .lock entry is re-read right before
+#     the unlink and any change since the first look is 2, so a starter that
+#     created it meanwhile wins.
+#   * Stricter than socket_lock_held, which answers "not held" for a lock another
+#     user owns or one it cannot open: this flocks any regular file there, and
+#     every error is 2.
+# Stdlib only, run under $READER_PYTHON, so install needs no system python3 and
+# uninstall no venv. The name rule and the lock conflict are pinned against the
+# server's own _lock_path and acquire_socket_lock, and the lock being held at the
+# unlink is checked with an audit hook, by tests/test_install_migration.py
+# (test_socket_cleanup_lock_target_state_space).
+unlink_socket_under_lock() {
     "$READER_PYTHON" -I -c '
 import errno, fcntl, os, stat, sys
-try:
+def entry(path):
     try:
-        st = os.lstat(sys.argv[1])
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode))
+try:
+    sock, uid = sys.argv[1], int(sys.argv[2])
+    lock = sock + ".lock"
+    if entry(sock) is None:
+        sys.exit(0)
+    before = entry(lock)
+    fd = None
+    if before is not None and stat.S_ISREG(before[2]):
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != before[:2]:
+            sys.exit(2)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            sys.exit(1 if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK) else 2)
+    try:
+        st = os.lstat(sock)
     except FileNotFoundError:
         sys.exit(0)
-    if not stat.S_ISREG(st.st_mode):
-        sys.exit(0)
-    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    if not stat.S_ISSOCK(st.st_mode):
+        sys.exit(3)
+    if st.st_uid != uid:
+        sys.exit(4)
+    if entry(lock) != before:
+        sys.exit(2)
     try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except OSError as exc:
-        sys.exit(1 if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK) else 2)
+        os.unlink(sock)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        sys.exit(5)
     sys.exit(0)
 except Exception:
     sys.exit(2)
-' "$1" 2>/dev/null
+' "$1" "$2" 2>/dev/null
+}
+
+# Print why socket path $1 is unsafe to act on (and return 1), or nothing (and
+# return 0). The same lexical rules as validate_socket_path (absolute, no '..'
+# component, under $HOME), plus no symlinked directory component from the
+# socket's parent up to and including $HOME (the lexical check alone would
+# follow one out of $HOME). Used by remove_socket_owned.
+socket_path_unsafe() {
+    local sock="$1" dir home="${HOME%/}" component parent
+    dir="$(dirname "$sock")"
+    case "$sock" in
+    /*) : ;;
+    *)
+        echo "is not absolute"
+        return 1
+        ;;
+    esac
+    case "/$sock/" in
+    */../*)
+        echo "contains '..' components"
+        return 1
+        ;;
+    esac
+    if [[ "$dir" != "$home" && "$dir" != "$home/"* ]]; then
+        echo "is not under \$HOME ($home)"
+        return 1
+    fi
+    component="$dir"
+    while :; do
+        if [[ -L "$component" ]]; then
+            echo "has a symlinked directory component '$component'"
+            return 1
+        fi
+        [[ "$component" == "$home" ]] && break
+        parent="$(dirname "$component")"
+        [[ "$parent" == "$component" ]] && break
+        component="$parent"
+    done
+    return 0
 }
 
 # Remove the stale socket named by an INSTALLED plist (never its .lock, see
@@ -466,76 +544,39 @@ except Exception:
 # any path in it), so this is deliberately conservative and NEVER aborts the
 # caller (it runs after bootout, under `set -e`): every refusal or failure is a
 # warning, and the function always returns 0. It acts only when:
-#   * the path is absolute, has no '..' component, and lives under $HOME (the
-#     same lexical rules as validate_socket_path, but warn-and-skip, not exit);
-#   * no directory component from the socket's parent up to and including $HOME
-#     is a symlink (the lexical check alone would follow one out of $HOME);
-#   * the socket is a real socket (-S) and not a symlink (so a plist naming a
-#     file, directory or symlink never deletes it);
-#   * the socket is owned by the current user;
-#   * no process holds the .lock (lock_free above). launchd no longer listing the
-#     old job is not enough: a server started by hand can own the recorded path.
-#     A held lock (or a probe that cannot tell) leaves the socket in place. A
-#     server that starts in the instant between the probe and the unlink can
-#     lose its socket (it then runs unreachable until restarted); that window
-#     is not covered.
+#   * the path passes socket_path_unsafe above: absolute, no '..' component,
+#     under $HOME (the same lexical rules as validate_socket_path, but
+#     warn-and-skip, not exit), and no symlinked directory component up to and
+#     including $HOME;
+#   * and then, in one step under the .lock (unlink_socket_under_lock above):
+#     no process holds the .lock, and the path is a real socket (lstat, so a
+#     plist naming a file, directory or symlink never deletes it) owned by the
+#     current user. launchd no longer listing the old job is not enough: a
+#     server started by hand can own the recorded path. A held lock (or a check
+#     that cannot tell) leaves the socket in place. The shared lock is held
+#     through the unlink, so a server starting meanwhile waits for it (its lock
+#     retry) and binds after the unlink: it never loses a fresh socket.
 # The .lock itself is never removed, like the server never removes it
 # (acquire_socket_lock in stt_server/server.py): every starter must flock the
-# same inode. The probe drops its lock when it exits, so unlinking the .lock
+# same inode. The lock drops when the check exits, so unlinking the .lock
 # after it would let a starter that just locked the old inode run beside a
 # later one that creates a new inode at the same path. A leftover .lock is
 # harmless; the next server reuses it.
 remove_socket_owned() {
-    local sock="$1" dir home="${HOME%/}" f owner
-    dir="$(dirname "$sock")"
-    case "$sock" in
-    /*) : ;;
-    *)
-        echo "warning: installed socket path '$sock' is not absolute; leaving it" >&2
+    local sock="$1" reason rc=0
+    if ! reason="$(socket_path_unsafe "$sock")"; then
+        echo "warning: installed socket path '$sock' $reason; leaving it" >&2
         return 0
-        ;;
+    fi
+    unlink_socket_under_lock "$sock" "$(id -u)" || rc=$?
+    case "$rc" in
+    0) : ;;
+    1) echo "warning: $sock.lock is held by a running server; leaving $sock" >&2 ;;
+    3) echo "warning: $sock is not a socket; leaving it" >&2 ;;
+    4) echo "warning: $sock not owned by current user, leaving it" >&2 ;;
+    5) echo "warning: could not remove $sock" >&2 ;;
+    *) echo "warning: could not tell whether $sock.lock is held; leaving $sock" >&2 ;;
     esac
-    case "/$sock/" in
-    */../*)
-        echo "warning: installed socket path '$sock' contains '..' components; leaving it" >&2
-        return 0
-        ;;
-    esac
-    if [[ "$dir" != "$home" && "$dir" != "$home/"* ]]; then
-        echo "warning: installed socket path '$sock' is not under \$HOME ($home); leaving it" >&2
-        return 0
-    fi
-    local component="$dir" parent
-    while :; do
-        if [[ -L "$component" ]]; then
-            echo "warning: installed socket path '$sock' has a symlinked directory component '$component'; leaving it" >&2
-            return 0
-        fi
-        [[ "$component" == "$home" ]] && break
-        parent="$(dirname "$component")"
-        [[ "$parent" == "$component" ]] && break
-        component="$parent"
-    done
-    local lock_rc=0
-    lock_free "$sock.lock" || lock_rc=$?
-    if [[ "$lock_rc" -eq 1 ]]; then
-        echo "warning: $sock.lock is held by a running server; leaving $sock" >&2
-        return 0
-    elif [[ "$lock_rc" -ne 0 ]]; then
-        echo "warning: could not tell whether $sock.lock is held; leaving $sock" >&2
-        return 0
-    fi
-    f="$sock"
-    if [[ ! -S "$f" || -L "$f" ]]; then
-        if [[ -e "$f" || -L "$f" ]]; then echo "warning: $f is not a socket; leaving it" >&2; fi
-        return 0
-    fi
-    owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
-    if [[ "$owner" == "$(id -u)" ]]; then
-        rm -f "$f" 2>/dev/null || echo "warning: could not remove $f" >&2
-    else
-        echo "warning: $f not owned by current user, leaving it" >&2
-    fi
     return 0
 }
 
@@ -543,8 +584,8 @@ remove_socket_owned() {
 # Used when the wait for unload timed out: the plist that named the socket is
 # then gone (uninstall) or replaced (install), so no later run can find it. The
 # command removes the path only if it is still a socket, and never the .lock;
-# the lsof condition stands in for lock_free (a process holding the .lock has it
-# open).
+# the lsof condition stands in for the lock check (a process holding the .lock
+# has it open).
 manual_socket_cleanup() {
     local q
     printf -v q '%q' "$1"

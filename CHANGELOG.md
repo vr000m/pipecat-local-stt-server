@@ -95,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory outside the `wheel`/`admin` rule is refused, since anyone who can
   write there can create the name once it is gone (macOS empties `/tmp` at boot)
   and the server re-opens the path at every start.
-- `install` runs the plist reader and the socket lock probe under its venv
+- `install` runs the plist reader and the socket cleanup's lock step under its venv
   python (it needs no system `python3`, also when it retires an old socket); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
   --strict`) fails on a malformed plist by itself, so it no longer relies on the
   `--has-auth` read having run first.
@@ -170,6 +170,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30) until the label is gone
   and retries the bootstrap once. Existed before 0.5.0 (same bootout/bootstrap
   sequence); reproduced on a nemotron reinstall.
+- **Socket cleanup no longer races a starting server.** The installer checked
+  the old socket's `.lock` and released it before unlinking the socket, so a
+  server that took the lock and bound in between lost its fresh socket. The lock
+  check, the socket checks (a real socket, not a symlink, owned by you) and the
+  unlink now run in one step while the installer holds a shared lock on the
+  `.lock`; a starter waits for it (its 250 ms lock retry) and binds after.
 
 ## [0.4.0] - 2026-10-25
 

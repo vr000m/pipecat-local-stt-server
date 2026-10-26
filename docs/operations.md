@@ -185,8 +185,12 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   On a transport change and on `uninstall` of a socket agent it removes only the
   stale socket, once launchd no longer lists the old job and no process holds
   the lock. A held lock (or one it cannot check) leaves the socket in place,
-  with a warning. A server started in the same instant as that check can lose
-  its socket (it runs unreachable until restarted); that window is not covered.
+  with a warning. The check and the unlink are one step under a shared lock on
+  the `.lock`, so a server starting at that moment waits for it (a starter
+  retries a contended lock for 250 ms) and binds only after the unlink; it never
+  loses its fresh socket. With no `.lock` there, nothing is locked (the installer
+  never creates one), and a `.lock` that appears before the unlink leaves the
+  socket in place.
 - `serve --supervised` checks it before binding (a held lock is reported as
   `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
   a contended lock for 250 ms, so the check never makes a real start fail. It

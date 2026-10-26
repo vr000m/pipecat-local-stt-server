@@ -1871,7 +1871,7 @@ def test_endpoint_read_alone_refuses_a_malformed_plist(tmp_path: Path, held_sock
     assert sock.exists() and lock.exists(), "an unreadable plist names no socket to remove"
 
 
-# Every stdlib helper an install runs (the plist reader and the lock_free probe)
+# Every stdlib helper an install runs (the plist reader and the unlink-under-lock step)
 # runs under $PYTHON, so a socket->TCP install, the main 0.4.x upgrade path,
 # needs no system python3: with python3 broken it still retires the old socket.
 def test_install_socket_cleanup_needs_no_system_python3(tmp_path: Path, held_sockets):
@@ -2057,7 +2057,7 @@ def test_socket_cleanup_respects_a_held_lock(
 ):
     # The lock is taken the way a live server takes it (stt_server.server's
     # acquire_socket_lock, at its _lock_path), not by a hand-rolled flock, so the
-    # installer's lock_free probe is pinned to the server's real lock: same file
+    # installer's unlink-under-lock step is pinned to the server's real lock: same file
     # name rule ("$sock.lock") and a conflicting lock mode.
     from stt_server.server import _lock_path, acquire_socket_lock
 
@@ -2090,3 +2090,145 @@ def test_socket_cleanup_respects_a_held_lock(
         # Same inode as before: a starter that locked it during cleanup and any
         # later starter contend on one file, never on two.
         assert lock.exists() and os.stat(lock).st_ino == lock_ino, "the .lock is never unlinked"
+
+
+# ---------------------------------------------------------------------------
+# Socket cleanup vs the server's lock protocol. Invariant: the installer unlinks
+# an old socket only while it holds a shared flock on the same <socket>.lock
+# inode every starter must lock exclusively before it binds (acquire_socket_lock),
+# so a server starting meanwhile can never have its fresh socket deleted; with no
+# regular .lock there is nothing any server can hold, and the installer never
+# creates or unlinks the .lock. The socket checks (a real socket per lstat, owned)
+# run under that same lock. Observed with an audit hook on ``os.remove`` inside
+# the installer's own interpreter: at the moment of the unlink a second,
+# exclusive flock on the .lock must fail. State space: lock {absent, free, held}
+# x target {socket, regular file, symlink to a socket, socket of another uid} x
+# cmd {install socket->TCP, uninstall}. "Another uid" is the `id -u` the
+# installer compares against, stubbed to a uid that does not own the socket.
+# ---------------------------------------------------------------------------
+
+
+def _audited_python(tmp_path: Path) -> tuple[Path, Path]:
+    """Return ``(wrapper, record)``: an interpreter that runs the installer's
+    unlink-under-lock program with an ``os.remove`` audit hook appending
+    ``<path> <lock state at unlink>`` to ``record``; every other invocation
+    is passed to the real interpreter unchanged."""
+    record = tmp_path / "unlink-record.txt"
+    driver = tmp_path / "audit_driver.py"
+    driver.write_text(
+        f"""import fcntl, os, sys
+RECORD = {str(record)!r}
+args = sys.argv[1:]
+if not (args[:2] == ["-I", "-c"] and len(args) >= 3 and "os.unlink(sock)" in args[2]):
+    os.execv(sys.executable, [sys.executable, *args])
+def hook(event, a):
+    if event != "os.remove":
+        return
+    path = os.fsdecode(a[0])
+    try:
+        fd = os.open(path + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        state = "absent"
+    except OSError:
+        state = "unopenable"
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            state = "held"
+        else:
+            state = "free"
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    with open(RECORD, "a") as f:
+        f.write(f"{{path}} {{state}}\\n")
+sys.addaudithook(hook)
+sys.argv = ["-c", *args[3:]]
+exec(compile(args[2], "<installer>", "exec"), {{"__name__": "__main__"}})
+"""
+    )
+    wrapper = tmp_path / "audited" / "python"
+    wrapper.parent.mkdir()
+    _write_executable(wrapper, f'#!/usr/bin/env bash\nexec {sys.executable} -I {driver} "$@"\n')
+    return wrapper, record
+
+
+def _other_uid_id_stub(stub_dir: Path) -> None:
+    _write_executable(
+        stub_dir / "id",
+        f"""#!/usr/bin/env bash
+if [[ "$1" == "-u" ]]; then
+    printf '{os.getuid() + 1}\\n'
+    exit 0
+fi
+exec /usr/bin/id "$@"
+""",
+    )
+
+
+@pytest.mark.parametrize("cmd", ["install", "uninstall"])
+@pytest.mark.parametrize("target", ["socket", "regular", "symlink", "other-owner"])
+@pytest.mark.parametrize("lock_state", ["absent", "free", "held"])
+def test_socket_cleanup_lock_target_state_space(
+    tmp_path: Path, held_sockets, lock_state: str, target: str, cmd: str
+):
+    from stt_server.server import acquire_socket_lock
+
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    cache = _cache_dir(home)
+    sock = cache / "stt.sock"
+    lock = cache / "stt.sock.lock"
+    survivors: list[Path] = [sock]
+    if target in ("socket", "other-owner"):
+        held_sockets.append(_bind_socket(sock))
+    elif target == "regular":
+        sock.write_text("precious")
+    else:
+        real = cache / "real.sock"
+        held_sockets.append(_bind_socket(real))
+        sock.symlink_to(real)
+        survivors.append(real)
+    if target == "other-owner":
+        _other_uid_id_stub(stub_dir)
+    if lock_state != "absent":
+        lock.write_text("")
+    lock_ino = os.stat(lock).st_ino if lock.exists() else None
+    _seed_plist(home, ["--socket-path", str(sock)])
+    wrapper, record = _audited_python(tmp_path)
+    if cmd == "uninstall":
+        _write_executable(stub_dir / "python3", f'#!/usr/bin/env bash\nexec {wrapper} "$@"\n')
+        env = {}
+    else:
+        env = {"PIPECAT_STT_PYTHON": str(wrapper)}
+    fd = acquire_socket_lock(sock) if lock_state == "held" else None
+    try:
+        r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides=env)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    unlinks = record.read_text().splitlines() if record.exists() else []
+    if lock_state == "held":
+        assert "held by a running server" in r.stderr, r.stderr
+    elif target == "socket":
+        assert "warning" not in r.stderr, r.stderr
+    elif target == "other-owner":
+        assert "not owned by current user" in r.stderr, r.stderr
+    else:
+        assert "is not a socket" in r.stderr, r.stderr
+    if lock_state != "held" and target == "socket":
+        assert not os.path.lexists(sock), "a stale socket is removed"
+        # The unlink happened while the installer itself held the lock: a
+        # starter's exclusive flock could not have been taken at that moment.
+        want = "absent" if lock_state == "absent" else "held"
+        assert unlinks == [f"{sock} {want}"], unlinks
+    else:
+        assert unlinks == [], f"nothing may be unlinked; {unlinks}"
+        for path in survivors:
+            assert os.path.lexists(path), f"{path} was deleted"
+    if lock_state == "absent":
+        assert not os.path.lexists(lock), "the installer never creates the lock"
+    else:
+        assert os.stat(lock).st_ino == lock_ino, "the .lock is never unlinked"
