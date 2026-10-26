@@ -444,6 +444,8 @@ def test_backend_set_is_derived_from_resolve_and_mirrored_everywhere():
     assert _valid_line_backends("_resolve") == from_resolve
     assert _case_arm_backends("_ensure-extra") == from_resolve
     assert _valid_line_backends("_ensure-extra") == from_resolve
+    assert _case_arm_backends("_agent-python") == from_resolve
+    assert _valid_line_backends("_agent-python") == from_resolve
     assert set(_readme_map()) == from_resolve
     assert set(BACKENDS) == from_resolve
     assert set(EXPECTED) == from_resolve
@@ -1415,9 +1417,9 @@ def _delegation_stub(tmp_path: Path) -> tuple[Path, Path]:
     _write_executable(
         stub,
         f"""#!/usr/bin/env bash
-printf 'CMD=%s LABEL=%s PIPECAT_STT_HOST=%s PIPECAT_STT_PORT=%s SOCKET=%s BACKEND=%s\\n' \
+printf 'CMD=%s LABEL=%s PIPECAT_STT_HOST=%s PIPECAT_STT_PORT=%s SOCKET=%s BACKEND=%s PYTHON=%s\\n' \
   "$1" "$PIPECAT_STT_LABEL" "${{PIPECAT_STT_HOST-}}" "${{PIPECAT_STT_PORT-}}" \
-  "${{PIPECAT_STT_SOCKET-}}" "$PIPECAT_STT_BACKEND" \
+  "${{PIPECAT_STT_SOCKET-}}" "$PIPECAT_STT_BACKEND" "${{PIPECAT_STT_PYTHON-<unset>}}" \
   >> {env_log!s}
 exit 0
 """,
@@ -1691,7 +1693,8 @@ def test_nested_ensure_extra_inherits_venv_overrides(tmp_path, recipe, backend, 
 # The preflight checks the interpreter the agent will run. Invariant: with
 # PIPECAT_STT_PYTHON set (the installer's override), `_ensure-extra` and
 # `stt-install` probe that interpreter, never the default venv, and never run a
-# sync that could not fix it; a failed probe fails the recipe. State space: recipe
+# sync that could not fix it; a failed probe fails the recipe; stt-install hands
+# the installer exactly the probed interpreter. State space: recipe
 # {_ensure-extra, stt-install} x backend {whisper (shared venv), kyutai} x custom
 # probe {ok, fails}. stt-enable reads its installed plist instead (below).
 @pytest.mark.parametrize("probe_ok", [True, False])
@@ -1723,6 +1726,8 @@ def test_ensure_extra_probes_the_agent_interpreter_override(tmp_path, recipe, ba
     assert not any(ln.startswith("uv sync") for ln in _argv_lines(argv_log))
     if probe_ok:
         assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        if recipe == "stt-install":
+            assert f"PYTHON={custom}" in _read(env_log), "installer got another interpreter"
     else:
         assert res.returncode != 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
         assert "PIPECAT_STT_PYTHON" in res.stderr
@@ -1824,6 +1829,74 @@ def test_stt_enable_refuses_a_plist_with_no_readable_interpreter(tmp_path, state
     assert "stt-install" in res.stderr, res.stderr
     assert _read(decoy_log) == "" and _read(logs["main"]) == "" and _read(logs["kyutai"]) == ""
     assert not any(ln.startswith("launchctl bootstrap") for ln in _argv_lines(argv_log))
+
+
+# stt-install: the probed interpreter is the installed one by construction.
+# Invariant: the PIPECAT_STT_PYTHON the installer receives equals the interpreter
+# _ensure-extra probed, for every way of choosing it. State space: backend
+# {whisper, kyutai} x choice {default venv, `venv=`/`kyutai_venv=` override,
+# caller PIPECAT_STT_PYTHON}.
+@pytest.mark.parametrize("choice", ["default", "override", "env"])
+@pytest.mark.parametrize("backend,key", [("whisper", "main"), ("kyutai", "kyutai")])
+def test_stt_install_hands_the_installer_the_probed_interpreter(tmp_path, backend, key, choice):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    overrides: list[str] = []
+    extra_env = {"PIPECAT_STT_SKIP_DEP_SYNC": "1"}
+    venv_dir = ".venv-kyutai" if key == "kyutai" else ".venv"
+    want = str(REPO_ROOT / venv_dir / "bin" / "python")
+    if choice == "override":
+        args, _logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+        overrides = args
+        want = str(venvs[key] / "bin" / "python")
+    elif choice == "env":
+        want = str(tmp_path / "elsewhere" / "python")
+        extra_env["PIPECAT_STT_PYTHON"] = want
+    probed = _run_just(
+        [*overrides, "_agent-python", backend], home=home, stub_dir=stub_dir, extra_env=extra_env
+    )
+    assert probed.returncode == 0, probed.stderr
+    assert probed.stdout.strip() == want
+    res = _run_just(
+        [*overrides, f"script={fake_script}", "stt-install", backend],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env=extra_env,
+    )
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert _read(env_log).strip().endswith(f"PYTHON={want}"), _read(env_log)
+
+
+@pytest.mark.skipif(not VENV_PYTHON.exists(), reason="installer needs .venv/bin/python")
+def test_stt_install_under_a_venv_override_records_the_probed_interpreter(tmp_path):
+    """Through the REAL installer: with `venv=` pointing elsewhere, the plist's
+    ProgramArguments[0] is the overridden venv's python, the one _ensure-extra
+    probed, not the installer's own .venv default."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    venv = tmp_path / "othervenv"
+    log = tmp_path / "py-other.log"
+    (venv / "bin").mkdir(parents=True)
+    _write_executable(
+        venv / "bin" / "python",
+        # The import probe (`-c`) passes; everything else (the installer's
+        # renderer and plist reader) runs on the real venv python.
+        f"#!/usr/bin/env bash\nprintf 'python %s\\n' \"$*\" >> {log!s}\n"
+        f'[[ "$1" == -c ]] && exit 0\nexec {VENV_PYTHON!s} "$@"\n',
+    )
+    res = _run_just(
+        [f"venv={venv}", "stt-install", "whisper"],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": "", "PIPECAT_STT_MODEL": "test/model"},
+    )
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    args = plistlib.loads(
+        (home / "Library" / "LaunchAgents" / "pipecat.stt-server.plist").read_bytes()
+    )["ProgramArguments"]
+    assert args[0] == str(venv / "bin" / "python"), args[0]
+    assert "-c" in _read(log), "the recorded interpreter was not the probed one"
 
 
 def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):

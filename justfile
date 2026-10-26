@@ -277,7 +277,7 @@ stt-enable backend:
     # just resume the crash-loop. The probe runs the interpreter the INSTALLED
     # plist names (its ProgramArguments[0]), never the caller's PIPECAT_STT_PYTHON:
     # that is what launchd will run. (Skipped under PIPECAT_STT_SKIP_DEP_SYNC.)
-    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" "$plist" || exit 1
+    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" "" "$plist" || exit 1
     # Guard each state change: set -uo pipefail does NOT abort on a failed
     # simple command, so an unguarded failure would be masked by the success
     # echo (exit 0 while the agent never started).
@@ -302,6 +302,25 @@ smoke-peercred:
     set -uo pipefail
     exec uv run python "{{justfile_directory()}}/scripts/smoke_peercred.py"
 
+# The interpreter an agent installed now would run: PIPECAT_STT_PYTHON when it is
+# set and non-empty, else the backend's venv python (kyutai: kyutai_venv). The one
+# place the justfile picks an interpreter: stt-install probes this value and
+# passes it to the installer as PIPECAT_STT_PYTHON, so the probed interpreter is
+# the installed one by construction (under a `venv=` override too); the
+# installer's own default applies only to a direct installer run.
+_agent-python backend:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    backend={{quote(backend)}}
+    case "$backend" in
+      whisper)  py={{quote(venv / "bin" / "python")}} ;;
+      parakeet) py={{quote(venv / "bin" / "python")}} ;;
+      nemotron) py={{quote(venv / "bin" / "python")}} ;;
+      kyutai)   py={{quote(kyutai_venv / "bin" / "python")}} ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
+    esac
+    printf '%s\n' "${PIPECAT_STT_PYTHON:-$py}"
+
 # Ensure a backend's optional Python extra is installed in .venv, additively
 # (kyutai: its own .venv-kyutai, see kyutai_venv).
 # The server imports its backend lib lazily in backend.start(); a bare
@@ -315,11 +334,11 @@ smoke-peercred:
 # a sync (any other interpreter fails with the remedy):
 #   * `plist` given (stt-enable): ProgramArguments[0] of that installed plist, read
 #     with the plist reader's --strict form; the caller's env plays no part;
-#   * else (stt-install, a direct call): PIPECAT_STT_PYTHON when set and non-empty
-#     (the installer's own `${PIPECAT_STT_PYTHON:-default}` rule), else the venv.
+#   * else `python` given (stt-install): that interpreter, from _agent-python;
+#   * else (a direct call): _agent-python's rule (PIPECAT_STT_PYTHON, else the venv).
 # Set PIPECAT_STT_SKIP_DEP_SYNC=1 to manage
 # extras yourself (the recipe tests set it so they never shell out to `uv sync`).
-_ensure-extra backend plist='':
+_ensure-extra backend python='' plist='':
     #!/usr/bin/env bash
     set -uo pipefail
     backend={{quote(backend)}}
@@ -354,6 +373,7 @@ _ensure-extra backend plist='':
       sync=(env -u UV_PROJECT_ENVIRONMENT uv sync --extra "$extra" --inexact)
     fi
     plist={{quote(plist)}}
+    python={{quote(python)}}
     if [[ -n "$plist" ]]; then
       if ! py=$(just _plist_field "$plist" interpreter 1); then
         echo "_ensure-extra: cannot read the interpreter from $plist; fix or reinstall it ('just stt-install $backend')" >&2
@@ -365,7 +385,11 @@ _ensure-extra backend plist='':
       fi
       remedy="the installed agent runs $py (ProgramArguments[0] of $plist); install the '$extra' extra into that interpreter, or reinstall the agent (stt-install $backend)"
     else
-      py="${PIPECAT_STT_PYTHON:-$default_py}"
+      if [[ -n "$python" ]]; then
+        py="$python"
+      elif ! py=$(just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _agent-python "$backend"); then
+        exit 1
+      fi
       remedy="PIPECAT_STT_PYTHON=$py cannot run '$probe'; install the '$extra' extra into that interpreter, or unset PIPECAT_STT_PYTHON to use $default_py"
     fi
     if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
@@ -392,7 +416,9 @@ _ensure-extra backend plist='':
 
 # Install an agent — delegates to install_stt_agent.sh (no plist reimplementation).
 # Ensures the backend's Python extra first (see _ensure-extra) so the freshly
-# installed agent doesn't immediately crash-loop on a missing backend import.
+# installed agent doesn't immediately crash-loop on a missing backend import. The
+# interpreter it probes (_agent-python) is passed to the installer as
+# PIPECAT_STT_PYTHON, so the plist records exactly the interpreter that was checked.
 stt-install backend:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -401,11 +427,12 @@ stt-install backend:
     # One field per line; four reads keep this bash-3.2-compatible — macOS
     # system bash has no `mapfile`.
     { read -r label; read -r _host; read -r _port; read -r bk; } <<<"$resolved"
-    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" || exit 1
+    py=$(just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _agent-python "$backend") || exit 1
+    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" "$py" || exit 1
     # Strip an ambient HOST/PORT so the installer's canonical defaults apply; the
     # installer alone decides socket vs TCP (see the NOTE near the top).
     env -u PIPECAT_STT_HOST -u PIPECAT_STT_PORT PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
-      "{{script}}" install
+      PIPECAT_STT_PYTHON="$py" "{{script}}" install
 
 # Uninstall an agent (removes the plist) — delegates to install_stt_agent.sh.
 stt-uninstall backend:

@@ -53,13 +53,17 @@ plist. Until an agent is reinstalled, both still show and probe its old socket.
 kyutai's extra conflicts with the other MLX extras, so `_ensure-extra` syncs it
 into a separate `.venv-kyutai` (`UV_PROJECT_ENVIRONMENT=.venv-kyutai uv sync
 --frozen --python 3.12 --extra kyutai`), never the shared `.venv`. It needs Python 3.12.
-The installer runs the kyutai agent with `.venv-kyutai/bin/python` (override with
-`PIPECAT_STT_PYTHON`). With `PIPECAT_STT_PYTHON` set, `just stt-install`
-checks the backend's extra under that interpreter instead and does not sync; a
-missing extra fails the recipe, since a sync into the venv cannot fix another
-interpreter. `just stt-enable` checks the interpreter the installed plist runs
-(its `ProgramArguments[0]`) and ignores `PIPECAT_STT_PYTHON` in your environment,
-so there is nothing to re-export; only the venv python can be fixed by a sync.
+The kyutai agent runs `.venv-kyutai/bin/python` (override with
+`PIPECAT_STT_PYTHON`). `just stt-install` picks the interpreter once
+(`PIPECAT_STT_PYTHON` when set, else the backend's venv python, honouring a
+`venv=`/`kyutai_venv=` override), checks the backend's extra under it and passes
+that same interpreter to the installer as `PIPECAT_STT_PYTHON`, so the plist
+records the interpreter that was checked. `just stt-enable` checks the
+interpreter the installed plist runs (its `ProgramArguments[0]`) and ignores
+`PIPECAT_STT_PYTHON` in your environment, so there is nothing to re-export. Only
+the venv python can be fixed by a sync; for any other interpreter a missing extra
+fails the recipe with the remedy (install the extra into it, or reinstall the
+agent).
 
 ### Loopback TCP caveats
 
@@ -335,6 +339,12 @@ supervisor can show `downloaded_bytes / total_bytes` directly:
 - `files_done`: how many of those files have finished.
 - The last `progress` before `done` always has `downloaded_bytes == total_bytes`
   and `files_done == files_total`.
+
+For the four default models, `prefetch` fetches the commit pinned in
+`PINNED_REVISIONS` (`stt_server/backends/__init__.py`), so the `start`/`check`
+events carry that SHA as `revision`; any other `--model` reports `revision: null`
+and follows the repo's `main`. The server loads the same commit, so a fetched
+snapshot is the one it serves.
 
 The `kyutai` backend reads its weight filenames from the repo's `config.json`,
 so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open. Each

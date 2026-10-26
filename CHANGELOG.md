@@ -49,9 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.venv/bin/python`, or `.venv-kyutai/bin/python` for kyutai). `just
   stt-install` checks the backend extra under it when it is set (and fails rather
   than sync the venv), so a custom interpreter without the extra no longer passes
-  the check and then crash-loops. `just stt-enable` checks the interpreter the
-  installed plist runs (`ProgramArguments[0]`, read through the plist reader) and
-  ignores the caller's `PIPECAT_STT_PYTHON`.
+  the check and then crash-loops; it passes the interpreter it checked to the
+  installer as `PIPECAT_STT_PYTHON`, so the plist records the checked interpreter
+  by construction, under a `venv=` override too. `just stt-enable` checks the
+  interpreter the installed plist runs (`ProgramArguments[0]`, read through the
+  plist reader) and ignores the caller's `PIPECAT_STT_PYTHON`.
 - Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
   nemotron 9865 (parakeet and nemotron confirmed with the menu bar app side on
   2026-10-26).
@@ -191,7 +193,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   && rm -f -- P`).
 - `_ensure-extra` (run by `stt-install`/`stt-enable`) probes the interpreter
   the agent will run: for `stt-install`, `PIPECAT_STT_PYTHON` when it is set and
-  non-empty (the installer's override), else the venv; for `stt-enable`, the
+  non-empty (the installer's override), else the venv, and that interpreter is
+  the one installed; for `stt-enable`, the
   installed plist's `ProgramArguments[0]` (a plist with no interpreter, or one the
   reader cannot parse, fails before any bootstrap). A failed probe of an
   interpreter outside the venv fails the recipe with the remedy instead of

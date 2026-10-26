@@ -143,7 +143,9 @@ install`; see [Operations](docs/operations.md#per-backend-port-convention)).
 installed so a freshly installed agent doesn't crash-loop on a missing import
 (`uv sync --extra <backend> --inexact`, additive; kyutai instead syncs into its
 own `.venv-kyutai` with `--frozen --python 3.12` and no `--inexact`); set `PIPECAT_STT_SKIP_DEP_SYNC=1` to
-manage the extras yourself. `stt-enable` checks the interpreter the installed
+manage the extras yourself. The check runs the interpreter the agent runs:
+`stt-install` checks `PIPECAT_STT_PYTHON` (else the venv python) and hands that
+same interpreter to the installer, and `stt-enable` checks the one the installed
 plist names (`ProgramArguments[0]`), whatever your environment says.
 
 `stt-status <backend>` reads the installed plist's endpoint (socket or TCP, plus
