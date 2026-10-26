@@ -113,7 +113,7 @@ for the wire protocol, the import name or the Python client.
    token. A socket reinstall is not refused (it warns that the socket agent
    carries no token).
 
-**Rollback / keeping a socket agent:**
+**Keeping a socket agent (the 0.4.x transport):**
 
 ```bash
 PIPECAT_STT_SOCKET=<path> just stt-install <backend>

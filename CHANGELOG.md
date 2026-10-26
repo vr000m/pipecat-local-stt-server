@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent; use the installer script directly for a custom one. With
   `PIPECAT_STT_SOCKET` set they pass no host/port, so the socket rollback no
   longer warns about ignored TCP settings.
+- **`serve --auth-token-file` is strict.** An empty or whitespace-only file, a
+  token with internal whitespace, a newline or a non-ASCII character, or a
+  non-UTF-8 file now stops the server at startup instead of silently running
+  without auth (an empty token disabled it) or never matching any client. The
+  probe (`status`) stays lenient. The installer runs the same check
+  (`stt_server.env.read_token_file`) before writing the plist, and now also
+  requires the token file's parent directories (symlinks resolved) to belong to
+  you or root and not be writable by others.
 - **The installer refuses to drop auth on reinstall.** If the installed plist
   carries a token (a pre-0.5.0 `PIPECAT_STT_AUTH_TOKEN`/`KODA_STT_AUTH_TOKEN` in
   `EnvironmentVariables`, or `--auth-token-file`) and a TCP install sets no

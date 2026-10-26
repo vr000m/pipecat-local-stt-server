@@ -29,7 +29,7 @@ async def run():
 
     # Loopback TCP with bearer token
     async with TranscriptionClient(
-        host="127.0.0.1", port=8765, auth_token="..."
+        host="127.0.0.1", port=9565, auth_token="..."
     ) as c:
         ...
 ```
@@ -57,7 +57,7 @@ from stt_server.examples.pipecat_stt_service import LocalWebSocketSTTService
 
 stt = LocalWebSocketSTTService(
     socket_path="~/Library/Caches/pipecat-stt/stt.sock",
-    # or: host="127.0.0.1", port=8765, auth_token="..."
+    # or: host="127.0.0.1", port=9565, auth_token="..."
     sample_rate=16000,  # the server's wire format is pinned to 16 kHz mono
 )
 # pipeline = Pipeline([transport.input(), stt, llm, tts, transport.output()])

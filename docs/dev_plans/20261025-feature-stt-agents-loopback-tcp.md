@@ -1,12 +1,12 @@
 # Task: STT LaunchAgents on loopback TCP ports (TTS parity)
 
-**Status**: Complete pending live checks (not run on this machine: token-file auth, port-collision loop, socket rollback, login persistence)
+**Status**: Implemented, in review (PR #16). Open before merge: Open Question 2 (Koda/onoats installer invocation) and the live checks not run on this machine (token-file auth, port-collision loop, socket rollback, login persistence)
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: High
 **Branch**: feat/stt-recipes-tcp-endpoints
 **Created**: 2026-10-25
-**Completed**: 2026-10-26
+**Completed**:
 **Review Gates**: none
 
 ## Objective
@@ -20,7 +20,7 @@ Make STT LaunchAgents bind a canonical loopback TCP port per backend, the way `p
 - Menu bar interop is a dependency, not a deliverable of this plan. The app does not adopt an occupied port yet: its adopt plan (`pipecat-local-tts-server/macos/docs/plans/20261025-feature-macos-adopt-external-servers.md`) is Not Started and `ServiceLifecycle.swift` reports an occupied port as `failed(.portBusy)`. Until that ships, an app-started server and an agent on the same port contend, and the app shows "Port busy". The recipes work either way; `stt-probe` reaches any endpoint.
 - Decided by the user (2026-10-25/26): move agents to TCP; loopback only; no token on loopback (same as TTS); `PIPECAT_STT_SOCKET` stays as an explicit opt-in so existing socket agents and onoats keep working until migrated; Kyutai gets full agent support from its own venv; version 0.5.0.
 - Decided in `/review-plan` (2026-10-26): ports align with the menu bar app: whisper 9565 and kyutai 9665 are the app's existing numbers (`Service.swift`, `CoreTests.swift:30-31`; Apple Speech 9465 is the app's own and is not an agent). Parakeet 9765 and Nemotron 9865 are new numbers continuing the series; the app does not use them today, and they must be agreed with the app side before release. Env tokens are refused in the renderer, same as TTS.
-- A `stt-probe` recipe (explicit `--socket-path` / `--host`+`--port` / `--uri`, passes through to `status`) was added in the first commit on this branch (`0eedf0a`). It has no tests yet.
+- A `stt-probe` recipe (explicit `--socket-path` / `--host`+`--port` / `--uri`, passes through to `status`) was added in the first commit on this branch (`0eedf0a`). Its tests are in `tests/test_justfile_recipes.py`.
 
 ## Requirements
 
@@ -237,7 +237,7 @@ sequenceDiagram
 
 ## Open Questions
 
-1. Parakeet 9765 and Nemotron 9865 are proposals. Agree them with the menu bar app side before release.
+1. ~~Parakeet 9765 and Nemotron 9865 are proposals.~~ RESOLVED 2026-10-26: the `pipecat-local-tts-server` session (menu bar app side) confirmed both numbers match its toolbar plan, needs no 0.5.0 pin, and asked to be told when 0.5.0 is released (reported by that session; not checked against its repo here). `docs/operations.md` stays the port table of record.
 2. Koda and onoats: how do they invoke the installer? A bare `just stt-install` flips their agent to TCP. Check before merge, or ship their config change first.
 3. ~~onoats' config loader~~ RESOLVED 2026-10-26: verified against onoats-bot `1a7b8c7` (see Findings); it reads `STT_WS_HOST`/`STT_WS_PORT`, and a leftover `ws_socket` outranks them.
 4. ~~Does `moshi_mlx` load as an agent from `.venv-kyutai`?~~ RESOLVED 2026-10-26: it loads and decodes live; no "experimental" fallback needed.
@@ -250,7 +250,7 @@ sequenceDiagram
 - [x] Phase 2: Installer
 - [x] Phase 3: Port table, justfile and mirror test
 - [x] Phase 4: Docs and release
-- [x] Phase 5: Verify on this machine (2026-10-26: full suite 801 passed / 7 skipped, ruff format+check clean, all four agents running as loopback TCP agents reporting their live backend in `just stt-list`; the explicit `TranscriptionClient` decode check is recorded below for the three agents reinstalled first, and the handoff states all four decode live; token-file auth, port-collision restart loop, socket rollback and login persistence deferred, not checked live)
+- [x] Phase 5: Verify on this machine (2026-10-26: full suite 963 passed / 7 skipped after the review-gauntlet fixes (801 at the first Phase 5 run), ruff format+check clean, all four agents running as loopback TCP agents reporting their live backend in `just stt-list`; the explicit `TranscriptionClient` decode check is recorded below for the three agents reinstalled first, and the fourth is reported decoding live by the user, not re-run here; token-file auth, port-collision restart loop, socket rollback and login persistence deferred, not checked live)
 
 ## Findings
 

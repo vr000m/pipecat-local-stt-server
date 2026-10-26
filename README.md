@@ -72,10 +72,12 @@ uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 
 # Loopback TCP with auth (recommended for anything non-experimental — use
 # --auth-token-file or PIPECAT_STT_AUTH_TOKEN env; legacy KODA_STT_AUTH_TOKEN
-# still honoured; --auth-token on argv is visible via `ps` and marked DEPRECATED).
+# still honoured; there is no --auth-token flag, since argv is visible via `ps`.
+# A token file must hold one token of visible ASCII; an empty or malformed one
+# makes the server exit rather than run unauthenticated).
 # The LaunchAgent installer and renderer refuse both env tokens: use
 # PIPECAT_STT_AUTH_TOKEN_FILE there.
-uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
+uv run python -m stt_server --host 127.0.0.1 --port 9565 --auth-token-file /path/to/token
 ```
 
 > **Ports:** there is no baked-in default port — you choose it (`--port 9900`).
@@ -205,7 +207,9 @@ backend at a mismatched repo fails fast at decode.
 Each Unix socket gets a sibling `<socket>.lock` file (e.g. `parakeet.sock.lock`,
 mode `0600`). The server holds an `flock` on it for its lifetime, so a second
 server for the same socket fails at once with `EADDRINUSE`. The kernel releases
-it when the process exits; the file is never deleted and is safe to leave. See
+it when the process exits. The server never deletes the file, so leaving it is safe;
+the installer removes it together with its socket on a transport change, once the old
+job has unloaded. See
 [Operations: single-server lock file](docs/operations.md#single-server-lock-file).
 
 Nemotron's runtime dependency is `mlx-audio>=0.4.4` — the first PyPI release

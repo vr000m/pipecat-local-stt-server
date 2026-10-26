@@ -81,16 +81,24 @@ token would be written into the plist. Put the token in a file and pass its
 absolute path instead:
 
 ```bash
-install -d -m 700 ~/.config                            # no-op if it exists
-install -m 600 /dev/null ~/.config/pipecat-stt-token   # then write the token into it
-PIPECAT_STT_AUTH_TOKEN_FILE=$HOME/.config/pipecat-stt-token \
+install -d -m 700 ~/.config/pipecat-stt                # your own directory; sets mode 700
+install -m 600 /dev/null ~/.config/pipecat-stt/token   # then write the token into it
+PIPECAT_STT_AUTH_TOKEN_FILE=$HOME/.config/pipecat-stt/token \
   PIPECAT_STT_BACKEND=mlx scripts/install_stt_agent.sh install
 ```
 
 In TCP mode the installer checks the file before writing the plist: a regular
-file (not a symlink), owned by you, with no group/other permission bits, and
-non-empty. Anything else fails the install, since an empty file disables auth and a
-missing one crash-loops the agent.
+file (not a symlink), owned by you, with no group/other permission bits, in a
+directory chain (symlinks resolved) that only you or root own and that no one else
+can write to. The content must be what the server accepts: it reads the file as
+UTF-8 and strips surrounding whitespace, and the result must be one token of
+visible ASCII characters with no internal whitespace. An empty file would disable
+auth, and a token with a newline, a space or a non-ASCII character can never match
+an `Authorization` header, so both fail the install (the installer calls the
+server's own `stt_server.env.read_token_file`, so the rules cannot drift). `serve`
+applies the same check at startup and exits rather than run unauthenticated; a
+missing file crash-loops the agent, so the installer refuses that too. The probe
+(`status`) stays lenient for a client-side token file.
 
 A reinstall never silently drops auth: if the installed plist carries a token (a
 pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
