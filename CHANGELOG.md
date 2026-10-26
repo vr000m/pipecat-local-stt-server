@@ -99,7 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `uninstall` waits for launchd to drop the job for a TCP agent too, and prints
   `uninstalled: <label>` only once it is gone; a job still loaded after
   `PIPECAT_STT_UNLOAD_WAIT` gets a warning and `uninstall incomplete (still
-  loaded)` instead (exit status unchanged, 0).
+  loaded)` instead (exit status unchanged, 0). When that wait times out on a
+  socket agent (on `uninstall`, or on an install that changes the socket path),
+  the warning prints the command that removes the stale socket by hand, instead
+  of advising a re-run that could no longer find it.
 - Socket cleanup on a transport change or `uninstall` leaves the socket in
   place, with a warning, while any process holds its `.lock` (a server started
   by hand can own the recorded path). The installer never removes the `.lock`

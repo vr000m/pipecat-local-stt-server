@@ -152,6 +152,10 @@ it is left in place with a warning. The `.lock` is never removed (see below). `u
 for a TCP agent too (its server can own the port until it exits): it prints
 `uninstalled: <label>` only once launchd no longer lists the job, and otherwise a
 warning and `uninstall incomplete (still loaded): <label>` (exit 0 either way).
+When a wait times out, no later run can find the old socket (its plist is gone or
+replaced), so the warning prints the command to remove it once the old server has
+exited (`lsof -- <socket>.lock` lists no process): `test -S <socket> && rm -f --
+<socket>`.
 
 ### Single-server lock file
 

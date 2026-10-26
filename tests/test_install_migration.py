@@ -1393,6 +1393,38 @@ def test_uninstall_waits_for_unload_on_every_transport(
         assert sock.exists() == (transport == "tcp")
 
 
+# A timed-out wait leaves the old socket, and the plist that named it is then gone
+# (uninstall) or replaced (install), so a re-run cannot find it. Invariant: the
+# installer never advises a re-run that cannot clean up; it prints a command that
+# removes exactly that socket (only if it is still a socket, never the .lock).
+# State space: cmd {uninstall, install socket->TCP} x follow-up {printed command,
+# re-run uninstall}.
+@pytest.mark.parametrize("cmd", ["uninstall", "install"])
+def test_timed_out_socket_cleanup_prints_a_command_that_works(
+    tmp_path: Path, held_sockets, cmd: str
+):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    _slow_teardown_launchctl(stub_dir, tmp_path, still_loaded_polls=10_000, bootstrap_failures=0)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock)])
+    env = {"PIPECAT_STT_UNLOAD_WAIT": "0"}
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides=env)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert sock.exists() and lock.exists()
+    assert "re-run uninstall" not in r.stderr
+    # A re-run finds no plist naming the socket, so it would clean nothing.
+    rerun = _run_install(tmp_path, stub_dir, cmd="uninstall", env_overrides=env)
+    assert rerun.returncode == 0 and sock.exists()
+    marker = "remove it with: "
+    assert marker in r.stderr, r.stderr
+    command = r.stderr.split(marker, 1)[1].splitlines()[0]
+    assert str(sock) in command and "lock" not in command, command
+    subprocess.run(["bash", "-c", command], check=True)
+    assert not sock.exists(), "the printed command must remove the stale socket"
+    assert lock.exists(), "...and never the .lock"
+
+
 def test_socket_a_to_socket_b_reinstall_notes_change(tmp_path: Path, held_sockets):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"

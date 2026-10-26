@@ -538,6 +538,18 @@ remove_socket_owned() {
     return 0
 }
 
+# Print, on stderr, how to remove a stale socket $1 by hand once its job is gone.
+# Used when the wait for unload timed out: the plist that named the socket is
+# then gone (uninstall) or replaced (install), so no later run can find it. The
+# command removes the path only if it is still a socket, and never the .lock;
+# the lsof condition stands in for lock_free (a process holding the .lock has it
+# open).
+manual_socket_cleanup() {
+    local q
+    printf -v q '%q' "$1"
+    echo "warning: no later run will remove it (no installed plist names it any more); once the old server has exited ('lsof -- $q.lock' lists no process), remove it with: test -S $q && rm -f -- $q" >&2
+}
+
 # Validate the literal socket path against the SAME rules the server enforces in
 # _enforce_socket_dir_secure() (stt_server/server.py) BEFORE creating or
 # chmod-ing anything. The server refuses to start unless the socket directory is
@@ -750,6 +762,7 @@ install)
             remove_socket_owned "$old_socket"
         else
             echo "warning: old job may still hold $old_socket.lock; leaving $old_socket" >&2
+            manual_socket_cleanup "$old_socket"
         fi
     fi
     launchctl enable "gui/$(id -u)/$LABEL"
@@ -780,14 +793,17 @@ uninstall)
     # the socket goes only once launchd no longer lists the job (its .lock stays).
     # Still loaded at the cap: say so instead of claiming a clean uninstall (the
     # exit status stays 0, as before).
+    # The plist is already gone at that point, so a re-run of uninstall finds no
+    # socket to clean: print the exact cleanup instead of advising a re-run.
     if wait_unloaded; then
         [[ -n "$old_socket" ]] && remove_socket_owned "$old_socket"
         echo "uninstalled: $LABEL"
     else
         if [[ -n "$old_socket" ]]; then
             echo "warning: $LABEL may still hold $old_socket.lock; leaving $old_socket" >&2
+            manual_socket_cleanup "$old_socket"
         fi
-        echo "warning: $LABEL is still loaded, so its endpoint may still be in use; its plist is removed but the uninstall is incomplete. Check 'launchctl print gui/$(id -u)/$LABEL' and re-run uninstall" >&2
+        echo "warning: $LABEL is still loaded, so its endpoint may still be in use; its plist is removed (it will not load again at login) but the uninstall is incomplete. Check 'launchctl print gui/$(id -u)/$LABEL' until it reports no such service" >&2
         echo "uninstall incomplete (still loaded): $LABEL"
     fi
     ;;
