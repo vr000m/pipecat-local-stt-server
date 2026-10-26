@@ -274,8 +274,10 @@ stt-enable backend:
     fi
     # Self-heal a pruned venv before re-loading: if a bare `uv run`/`uv sync`
     # stripped this backend's extra since install, bootstrapping the plist would
-    # just resume the crash-loop. (Skipped under PIPECAT_STT_SKIP_DEP_SYNC.)
-    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" || exit 1
+    # just resume the crash-loop. The probe runs the interpreter the INSTALLED
+    # plist names (its ProgramArguments[0]), never the caller's PIPECAT_STT_PYTHON:
+    # that is what launchd will run. (Skipped under PIPECAT_STT_SKIP_DEP_SYNC.)
+    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" "$plist" || exit 1
     # Guard each state change: set -uo pipefail does NOT abort on a failed
     # simple command, so an unguarded failure would be masked by the success
     # echo (exit 0 while the agent never started).
@@ -308,16 +310,20 @@ smoke-peercred:
 # onboarding is self-healing. `--inexact` is load-bearing: plain
 # `uv sync --extra X` prunes the OTHER backends' extras, breaking a multi-backend
 # host. We probe via the venv python directly — NOT `uv run`, which would itself
-# re-sync/prune before we could check. With PIPECAT_STT_PYTHON set (the
-# installer's interpreter override) it probes that interpreter instead and never
-# syncs; stt-enable reads the same variable, so export it as for the install.
+# re-sync/prune before we could check.
+# It probes the interpreter the agent runs, and only a venv python can be fixed by
+# a sync (any other interpreter fails with the remedy):
+#   * `plist` given (stt-enable): ProgramArguments[0] of that installed plist, read
+#     with the plist reader's --strict form; the caller's env plays no part;
+#   * else (stt-install, a direct call): PIPECAT_STT_PYTHON when set and non-empty
+#     (the installer's own `${PIPECAT_STT_PYTHON:-default}` rule), else the venv.
 # Set PIPECAT_STT_SKIP_DEP_SYNC=1 to manage
 # extras yourself (the recipe tests set it so they never shell out to `uv sync`).
-_ensure-extra backend:
+_ensure-extra backend plist='':
     #!/usr/bin/env bash
     set -uo pipefail
     backend={{quote(backend)}}
-    # extra == the install backend-name (the 3rd field of `_resolve`); only the
+    # extra == the install backend-name (the 4th field of `_resolve`); only the
     # import probe differs. The probe MUST match what backend.start() imports
     # (nemotron does `from mlx_audio.stt import load`, not `import mlx_audio`) —
     # a coarser `import mlx_audio` would pass for a partially-installed package
@@ -335,29 +341,39 @@ _ensure-extra backend:
       exit 0
     fi
     # kyutai's extra conflicts with the other MLX extras, so it syncs into its own
-    # venv (never .venv); the others sync additively into .venv.
+    # venv (never .venv); the others sync additively into .venv. default_py is the
+    # interpreter that sync fills, the only one a sync can fix.
     if [[ "$extra" == "kyutai" ]]; then
       venv={{quote(kyutai_venv)}}
-      py="$venv/bin/python"
+      default_py="$venv/bin/python"
       sync=(env "UV_PROJECT_ENVIRONMENT=$venv" uv sync --frozen --python 3.12 --extra kyutai)
     else
-      py={{quote(venv)}}"/bin/python"
+      default_py={{quote(venv)}}"/bin/python"
       # `env -u`: never inherit an ambient UV_PROJECT_ENVIRONMENT (e.g. a shell
       # exported for kyutai) — that would sync this extra into the wrong venv.
       sync=(env -u UV_PROJECT_ENVIRONMENT uv sync --extra "$extra" --inexact)
     fi
-    # The agent runs under the installer's interpreter: PIPECAT_STT_PYTHON when
-    # set and non-empty (the installer's own `${PIPECAT_STT_PYTHON:-default}`
-    # rule), else the venv above. Probe that one. A sync only fills the venv, so
-    # it cannot fix a custom interpreter: that case fails with the remedy.
-    default_py="$py"
-    py="${PIPECAT_STT_PYTHON:-$py}"
+    plist={{quote(plist)}}
+    if [[ -n "$plist" ]]; then
+      if ! py=$(just _plist_field "$plist" interpreter 1); then
+        echo "_ensure-extra: cannot read the interpreter from $plist; fix or reinstall it ('just stt-install $backend')" >&2
+        exit 1
+      fi
+      if [[ -z "$py" ]]; then
+        echo "_ensure-extra: $plist names no interpreter (no ProgramArguments); reinstall it ('just stt-install $backend')" >&2
+        exit 1
+      fi
+      remedy="the installed agent runs $py (ProgramArguments[0] of $plist); install the '$extra' extra into that interpreter, or reinstall the agent (stt-install $backend)"
+    else
+      py="${PIPECAT_STT_PYTHON:-$default_py}"
+      remedy="PIPECAT_STT_PYTHON=$py cannot run '$probe'; install the '$extra' extra into that interpreter, or unset PIPECAT_STT_PYTHON to use $default_py"
+    fi
     if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
       echo "_ensure-extra: '$extra' extra already present ($probe, $py)"
       exit 0
     fi
     if [[ "$py" != "$default_py" ]]; then
-      echo "_ensure-extra: PIPECAT_STT_PYTHON=$py cannot run '$probe'; install the '$extra' extra into that interpreter, or unset PIPECAT_STT_PYTHON to use $default_py" >&2
+      echo "_ensure-extra: $remedy" >&2
       exit 1
     fi
     echo "_ensure-extra: '$extra' import check failed ($probe) — installing (${sync[*]})…"

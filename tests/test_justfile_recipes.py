@@ -424,7 +424,9 @@ def _recipe_body(name: str) -> str:
 
 
 def _case_arm_backends(recipe: str) -> set[str]:
-    return set(re.findall(r"^\s+(\w+)\)\s+(?:printf|extra=)", _recipe_body(recipe), re.MULTILINE))
+    return set(
+        re.findall(r"^\s+(\w+)\)\s+(?:printf|extra=|py=)", _recipe_body(recipe), re.MULTILINE)
+    )
 
 
 def _valid_line_backends(recipe: str) -> set[str]:
@@ -1671,7 +1673,10 @@ def test_nested_ensure_extra_inherits_venv_overrides(tmp_path, recipe, backend, 
     label = EXPECTED[backend][0]
     home = _home_with_agents(tmp_path, [label])
     fake_script, _env_log = _delegation_stub(tmp_path)
-    args, logs, _venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+    args, logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+    # stt-enable probes the interpreter its installed plist names: an agent
+    # installed under these overrides records the overridden venv's python.
+    _write_agent_plist(home, label, venvs[key] / "bin" / "python")
     res = _run_just(
         [*args, f"script={fake_script}", recipe, backend],
         home=home,
@@ -1684,14 +1689,14 @@ def test_nested_ensure_extra_inherits_venv_overrides(tmp_path, recipe, backend, 
 
 
 # The preflight checks the interpreter the agent will run. Invariant: with
-# PIPECAT_STT_PYTHON set (the installer's override), `_ensure-extra` probes that
-# interpreter, never the default venv, and never runs a sync that could not fix
-# it; a failed probe fails the recipe. State space: recipe {_ensure-extra,
-# stt-install, stt-enable} x backend {whisper (shared venv), kyutai} x custom
-# probe {ok, fails}.
+# PIPECAT_STT_PYTHON set (the installer's override), `_ensure-extra` and
+# `stt-install` probe that interpreter, never the default venv, and never run a
+# sync that could not fix it; a failed probe fails the recipe. State space: recipe
+# {_ensure-extra, stt-install} x backend {whisper (shared venv), kyutai} x custom
+# probe {ok, fails}. stt-enable reads its installed plist instead (below).
 @pytest.mark.parametrize("probe_ok", [True, False])
 @pytest.mark.parametrize("backend", ["whisper", "kyutai"])
-@pytest.mark.parametrize("recipe", ["_ensure-extra", "stt-install", "stt-enable"])
+@pytest.mark.parametrize("recipe", ["_ensure-extra", "stt-install"])
 def test_ensure_extra_probes_the_agent_interpreter_override(tmp_path, recipe, backend, probe_ok):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     label = EXPECTED[backend][0]
@@ -1722,6 +1727,103 @@ def test_ensure_extra_probes_the_agent_interpreter_override(tmp_path, recipe, ba
         assert res.returncode != 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
         assert "PIPECAT_STT_PYTHON" in res.stderr
         assert not env_log.exists() or _read(env_log) == "", "installer ran after a failed probe"
+
+
+def _write_agent_plist(home: Path, label: str, interpreter: Path | str | None) -> Path:
+    """An installed plist whose ProgramArguments[0] is ``interpreter`` (no
+    ProgramArguments at all for None)."""
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    plist = agents / f"{label}.plist"
+    data: dict = {"Label": label}
+    if interpreter is not None:
+        data["ProgramArguments"] = [str(interpreter), "-m", "stt_server", "serve"]
+    plist.write_bytes(plistlib.dumps(data))
+    return plist
+
+
+def _logging_python(path: Path, log: Path, rc: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_executable(
+        path, f"#!/usr/bin/env bash\nprintf 'python %s\\n' \"$*\" >> {log!s}\nexit {rc}\n"
+    )
+    return path
+
+
+# stt-enable re-loads an EXISTING plist, so the interpreter launchd will run is
+# the plist's ProgramArguments[0], whatever the caller's env says. Invariant:
+# stt-enable probes exactly that interpreter, never PIPECAT_STT_PYTHON and never
+# a default venv the plist does not name; only when the plist names the venv
+# python can a sync fix a failed probe, otherwise it fails with the remedy and
+# never bootstraps. State space: plist interpreter {default venv, custom} x probe
+# {ok, fails} x caller env PIPECAT_STT_PYTHON {unset, a decoy} x backend
+# {whisper, kyutai}.
+@pytest.mark.parametrize("backend,key", [("whisper", "main"), ("kyutai", "kyutai")])
+@pytest.mark.parametrize("decoy", [False, True])
+@pytest.mark.parametrize("probe_ok", [True, False])
+@pytest.mark.parametrize("which", ["default", "custom"])
+def test_stt_enable_probes_the_installed_plists_interpreter(
+    tmp_path, which, probe_ok, decoy, backend, key
+):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    label = EXPECTED[backend][0]
+    home = _home_with_agents(tmp_path, [])
+    args, logs, venvs = _venv_overrides(
+        tmp_path, stub_dir, home, probe_rc=0 if probe_ok else 1, fixed_by_sync=True
+    )
+    custom_log = tmp_path / "py-custom.log"
+    custom = _logging_python(tmp_path / "custom" / "python", custom_log, 0 if probe_ok else 1)
+    decoy_log = tmp_path / "py-decoy.log"
+    decoy_py = _logging_python(tmp_path / "decoy" / "python", decoy_log, 0)
+    interp = venvs[key] / "bin" / "python" if which == "default" else custom
+    plist = _write_agent_plist(home, label, interp)
+    env = {"PIPECAT_STT_SKIP_DEP_SYNC": ""}
+    if decoy:
+        env["PIPECAT_STT_PYTHON"] = str(decoy_py)
+    res = _run_just([*args, "stt-enable", backend], home=home, stub_dir=stub_dir, extra_env=env)
+    probed = _read(logs[key]) if which == "default" else _read(custom_log)
+    assert "-c" in probed, "the plist's interpreter was not probed"
+    assert _read(decoy_log) == "", "the caller's PIPECAT_STT_PYTHON was probed"
+    others = [k for k in ("main", "kyutai") if which == "custom" or k != key]
+    assert all(_read(logs[k]) == "" for k in others), "a venv the plist does not name was probed"
+    syncs = [ln for ln in _argv_lines(argv_log) if ln.startswith("uv sync")]
+    bootstrap = f"launchctl bootstrap gui/{FAKE_UID} {plist}"
+    if probe_ok or which == "default":
+        # ok, or the venv python the plist names healed by one sync.
+        assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        assert len(syncs) == (0 if probe_ok else 1), syncs
+        assert bootstrap in _argv_lines(argv_log)
+    else:
+        assert res.returncode != 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        assert "ProgramArguments[0]" in res.stderr and str(custom) in res.stderr, res.stderr
+        assert not syncs, "a sync cannot fix an interpreter outside the venv"
+        assert not any(ln.startswith("launchctl bootstrap") for ln in _argv_lines(argv_log))
+
+
+@pytest.mark.parametrize("state", ["no-program-arguments", "malformed"])
+def test_stt_enable_refuses_a_plist_with_no_readable_interpreter(tmp_path, state):
+    """With no interpreter to probe (no ProgramArguments, or a plist the reader
+    cannot parse) stt-enable fails before any bootstrap; it never falls back to
+    the caller's PIPECAT_STT_PYTHON or a default venv."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    label = EXPECTED["whisper"][0]
+    home = _home_with_agents(tmp_path, [])
+    args, logs, _venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+    plist = _write_agent_plist(home, label, None)
+    if state == "malformed":
+        plist.write_text("not a plist")
+    decoy_log = tmp_path / "py-decoy.log"
+    decoy_py = _logging_python(tmp_path / "decoy" / "python", decoy_log, 0)
+    res = _run_just(
+        [*args, "stt-enable", "whisper"],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": "", "PIPECAT_STT_PYTHON": str(decoy_py)},
+    )
+    assert res.returncode != 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "stt-install" in res.stderr, res.stderr
+    assert _read(decoy_log) == "" and _read(logs["main"]) == "" and _read(logs["kyutai"]) == ""
+    assert not any(ln.startswith("launchctl bootstrap") for ln in _argv_lines(argv_log))
 
 
 def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):

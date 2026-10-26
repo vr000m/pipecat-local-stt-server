@@ -54,10 +54,12 @@ kyutai's extra conflicts with the other MLX extras, so `_ensure-extra` syncs it
 into a separate `.venv-kyutai` (`UV_PROJECT_ENVIRONMENT=.venv-kyutai uv sync
 --frozen --python 3.12 --extra kyutai`), never the shared `.venv`. It needs Python 3.12.
 The installer runs the kyutai agent with `.venv-kyutai/bin/python` (override with
-`PIPECAT_STT_PYTHON`). With `PIPECAT_STT_PYTHON` set, `just stt-install` and
-`just stt-enable` check the backend's extra under that interpreter instead and do
-not sync; a missing extra fails the recipe, since a sync into the venv cannot fix
-another interpreter. Export it for `stt-enable` too.
+`PIPECAT_STT_PYTHON`). With `PIPECAT_STT_PYTHON` set, `just stt-install`
+checks the backend's extra under that interpreter instead and does not sync; a
+missing extra fails the recipe, since a sync into the venv cannot fix another
+interpreter. `just stt-enable` checks the interpreter the installed plist runs
+(its `ProgramArguments[0]`) and ignores `PIPECAT_STT_PYTHON` in your environment,
+so there is nothing to re-export; only the venv python can be fixed by a sync.
 
 ### Loopback TCP caveats
 

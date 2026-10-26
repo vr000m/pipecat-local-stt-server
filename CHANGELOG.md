@@ -47,9 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AUTH_TOKEN_FILE`.
 - `PIPECAT_STT_PYTHON`: installer interpreter override (default
   `.venv/bin/python`, or `.venv-kyutai/bin/python` for kyutai). `just
-  stt-install`/`stt-enable` check the backend extra under it when it is set (and
-  fail rather than sync the venv), so a custom interpreter without the extra no
-  longer passes the check and then crash-loops.
+  stt-install` checks the backend extra under it when it is set (and fails rather
+  than sync the venv), so a custom interpreter without the extra no longer passes
+  the check and then crash-loops. `just stt-enable` checks the interpreter the
+  installed plist runs (`ProgramArguments[0]`, read through the plist reader) and
+  ignores the caller's `PIPECAT_STT_PYTHON`.
 - Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
   nemotron 9865 (parakeet and nemotron confirmed with the menu bar app side on
   2026-10-26).
@@ -188,9 +190,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket, not a symlink, and owned by you (`test -S P && ! test -L P && test -O P
   && rm -f -- P`).
 - `_ensure-extra` (run by `stt-install`/`stt-enable`) probes the interpreter
-  the agent will run: `PIPECAT_STT_PYTHON` when it is set and non-empty (the
-  installer's override), else the venv. A failed probe of that interpreter fails
-  the recipe with the remedy instead of syncing the venv, which could not fix it.
+  the agent will run: for `stt-install`, `PIPECAT_STT_PYTHON` when it is set and
+  non-empty (the installer's override), else the venv; for `stt-enable`, the
+  installed plist's `ProgramArguments[0]` (a plist with no interpreter, or one the
+  reader cannot parse, fails before any bootstrap). A failed probe of an
+  interpreter outside the venv fails the recipe with the remedy instead of
+  syncing the venv, which could not fix it.
 - `_ensure-extra` re-runs the import probe after a successful `uv sync` and fails
   if it still fails, instead of reporting the extra ready and letting the agent
   crash-loop.
