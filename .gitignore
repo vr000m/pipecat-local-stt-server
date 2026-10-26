@@ -7,6 +7,7 @@ __pycache__/
 
 # uv / virtualenv
 .venv/
+.venv-kyutai/
 
 # OS
 .DS_Store

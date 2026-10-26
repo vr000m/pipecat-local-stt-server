@@ -248,7 +248,7 @@ sequenceDiagram
 
 - [x] Phase 1: Renderer
 - [x] Phase 2: Installer
-- [ ] Phase 3: Port table, justfile and mirror test
+- [x] Phase 3: Port table, justfile and mirror test
 - [ ] Phase 4: Docs and release
 - [ ] Phase 5: Verify on this machine
 
@@ -257,6 +257,7 @@ sequenceDiagram
 - (append findings here as work proceeds)
 - Phase 1 reviewer (advisory, Minor, unfixed): (a) `scripts/render_stt_plist.py` module docstring (lines ~11-13) still describes env tokens via `env_first`; reword. (b) `_require` uses `re.match` with `$`, which accepts a trailing newline (AUTH_TOKEN_FILE/SOCKET_PATH/PYTHON); use `fullmatch` and add a trailing-newline test case.
 - Phase 2 reviewer (advisory, Minor, unfixed): (a) `remove_socket_owned` (`scripts/install_stt_agent.sh` ~149-160) deletes whatever `--socket-path` the installed plist names after only an owner check; add `-S` / regular-file / no-symlink checks and validate_socket_path's lexical rules (warn and skip). (b) Socket mode silently drops `PIPECAT_STT_AUTH_TOKEN_FILE`/`HOST`/`PORT`; warn on stderr. (c) `test_env_auth_token_never_reaches_plist` should also assert the secret is absent from stderr. (d) No test for ambient `SOCKET_PATH`/`HOST`/`PORT`/`AUTH_TOKEN_FILE` leaking into the renderer.
+- Phase 3 reviewer (advisory, all Minor, unfixed): (a) `_ensure-extra` shared arm does not clear an inherited `UV_PROJECT_ENVIRONMENT` (pin it or `env -u`; test with ambient value). (b) Mirror test uses a hard-coded `BACKENDS` tuple; derive it from `_resolve` and assert equality with the docs rows. (c) `test_port_table_matches_installer_default` skips without `.venv/bin/python` though it uses a `sys.executable` wrapper; drop the skipif. (d) `_venv_overrides` `forced=False` escape hatch silently weakens the shared-venv test; assert exactly one main-venv variable. (e) `stt-list` uses `read -r` without `IFS=`; paths with edge whitespace; add a spaces test. (f) `stt-install`/`stt-uninstall` always overwrite caller `PIPECAT_STT_HOST`/`PORT` with the `_resolve` values (matches the plan; docs must say custom ports need the installer script directly, or honour `${PIPECAT_STT_PORT:-$port}`). (g) Stale wording: `docs/operations.md` intro (lines ~9-11, 'separate socket'), `stt-probe` comment uses TTS port 8765 and 'canonical-socket recipes', `README.md:44` still says kyutai 'is not wired into' the tooling (Phase 4). (h) `stt-status` `-S` branch resolves bare socket names against the repo root.
 
 ### Review Waivers
 

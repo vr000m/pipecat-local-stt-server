@@ -4,12 +4,12 @@
 # the cross-agent "operate the listed servers" surface the script structurally
 # lacks (it manages exactly one agent per invocation, keyed by env vars).
 #
-# The backend -> (label, socket, backend-name) map below is a CHECKED MIRROR of
-# the canonical README per-ASR table ("### Per-ASR socket convention"). A test
-# (tests/test_justfile_recipes.py) parses that table and asserts this map equals
-# it, so drift fails CI. Only whisper's socket is an actual install_stt_agent.sh
-# default; parakeet/nemotron sockets are operator-supplied env, so this map is a
-# third copy and the mirror test is what keeps it honest.
+# The backend -> (label, host, port, backend-name) map in `_resolve` is a CHECKED
+# MIRROR of the canonical "Per-backend port convention" table in
+# docs/operations.md. A test (tests/test_justfile_recipes.py) parses that table
+# and asserts this map equals it, so drift fails CI. `_resolve` prints FOUR
+# fields, one per line: label, host (always 127.0.0.1), port, backend-name.
+# Agents default to loopback TCP; a Unix socket is opt-in via PIPECAT_STT_SOCKET.
 #
 # stt-disable vs stt-uninstall: the rendered plist sets RunAtLoad=True +
 # KeepAlive=True (render_stt_plist.py). So `stt-disable` (launchctl bootout, plist
@@ -27,25 +27,61 @@ cache_dir := env_var('HOME') / "Library/Caches/pipecat-stt"
 la_dir := env_var('HOME') / "Library/LaunchAgents"
 # Overridable so tests can point install/uninstall delegation at a stub.
 script := justfile_directory() / "scripts/install_stt_agent.sh"
+# kyutai's extra conflicts with the other MLX extras, so it lives in its own venv.
+# Overridable (e.g. `just kyutai_venv=/tmp/x _ensure-extra kyutai`) so tests never
+# touch the real one.
+kyutai_venv := justfile_directory() / ".venv-kyutai"
+# Shared venv for the non-kyutai extras; tests override it on the command line
+# like kyutai_venv.
+venv := justfile_directory() / ".venv"
 
 # Default: show the recipe list.
 default:
     @just --list
 
-# Resolve a backend name to LABEL / SOCKET / BACKEND_NAME on three separate lines
-# (one field per line so a socket path containing spaces survives the read in the
-# callers); fail fast on unknown. `quote()` shell-escapes the interpolated arg so
-# it can never break out of the `case` and run as a command — the `case` arms are
-# the allowlist, everything else exits non-zero.
+# Resolve a backend name to LABEL / HOST / PORT / BACKEND_NAME on four separate
+# lines (one field per line so the reads stay bash-3.2-compatible — macOS system
+# bash has no `mapfile`); fail fast on unknown. `quote()` shell-escapes the
+# interpolated arg so it can never break out of the `case` and run as a command —
+# the `case` arms are the allowlist, everything else exits non-zero.
 _resolve backend:
     #!/usr/bin/env bash
     backend={{quote(backend)}}
     case "$backend" in
-      whisper)  printf '%s\n' "pipecat.stt-server" "{{cache_dir}}/stt.sock" "mlx" ;;
-      parakeet) printf '%s\n' "pipecat.stt-server.parakeet" "{{cache_dir}}/parakeet.sock" "parakeet" ;;
-      nemotron) printf '%s\n' "pipecat.stt-server.nemotron" "{{cache_dir}}/nemotron.sock" "nemotron" ;;
-      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron)" >&2; exit 1 ;;
+      whisper)  printf '%s\n' "pipecat.stt-server"          "127.0.0.1" "9565" "mlx" ;;
+      parakeet) printf '%s\n' "pipecat.stt-server.parakeet" "127.0.0.1" "9765" "parakeet" ;;
+      nemotron) printf '%s\n' "pipecat.stt-server.nemotron" "127.0.0.1" "9865" "nemotron" ;;
+      kyutai)   printf '%s\n' "pipecat.stt-server.kyutai"   "127.0.0.1" "9665" "kyutai" ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
     esac
+
+# Extract the serve endpoint from an installed agent's plist ProgramArguments.
+# Emits FOUR lines — host, port, socket-path, auth-token-file — each empty when
+# the flag is absent. The plist is the source of truth, so stt-list never
+# re-encodes the _resolve map and stays correct for custom labels/transports.
+# Reads ProgramArguments structurally via `plutil`, element by element; the flag's
+# VALUE is consumed in the same step that recognises the flag (the `expect`
+# latch), so a value that looks like a flag can never be mis-read as one.
+_plist_endpoint plist:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    plist={{quote(plist)}}
+    host=""; port=""; sock=""; authfile=""; expect=""; i=0
+    while el=$(plutil -extract "ProgramArguments.$i" raw -o - "$plist" 2>/dev/null); do
+      if [[ -n "$expect" ]]; then
+        case "$expect" in
+          --host)            host="$el" ;;
+          --port)            port="$el" ;;
+          --socket-path)     sock="$el" ;;
+          --auth-token-file) authfile="$el" ;;
+        esac
+        expect=""
+      elif [[ "$el" == --* ]]; then
+        expect="$el"
+      fi
+      i=$((i + 1))
+    done
+    printf '%s\n' "$host" "$port" "$sock" "$authfile"
 
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
@@ -67,29 +103,34 @@ stt-list:
       else
         printf 'stopped  %-32s (plist present, not loaded)\n' "$label"
       fi
-      # Live backend probe — canonical sockets only (a custom label's socket is
-      # not derivable from its label, so it gets no socket/live line by design).
-      sock=""
-      case "$label" in
-        pipecat.stt-server)          sock="{{cache_dir}}/stt.sock" ;;
-        pipecat.stt-server.parakeet) sock="{{cache_dir}}/parakeet.sock" ;;
-        pipecat.stt-server.nemotron) sock="{{cache_dir}}/nemotron.sock" ;;
-      esac
+      # Live backend probe: read the endpoint from the agent's OWN plist (four
+      # lines: host/port/socket/auth-token-file), so custom labels, custom ports
+      # and socket-mode agents are all probed, and a secured agent authenticates.
+      { read -r host; read -r port; read -r sock; read -r authfile; } < <(just _plist_endpoint "$plist")
+      # Empty-safe array expansion for bash 3.2 under `set -u`.
+      auth=()
+      [[ -n "$authfile" ]] && auth=(--auth-token-file "$authfile")
+      # status raises SystemExit(1) on a stopped/absent endpoint and never prints
+      # "stopped"/"unreachable" itself, so the recipe owns that display. Capture
+      # only the first token after `backend:` (never a `(model: ...)` suffix).
+      tilde='~'
       if [[ -n "$sock" ]]; then
-        # Print the socket in the same ~-form onoats config.toml's `ws_socket`
-        # uses, so an operator can match a config line to an agent directly
-        # (note whisper's socket is `stt.sock`, not `whisper.sock`).
-        printf '         socket: %s\n' "${sock/#$HOME/~}"
-        # status raises SystemExit(1) on a stopped/absent socket and never prints
-        # "stopped"/"unreachable" itself, so the recipe owns that display.
-        if live=$(uv run python -m stt_server status --socket-path "$sock" 2>/dev/null); then
-          backend=$(grep -m1 -E '^[[:space:]]*backend:' <<<"$live" | sed -E 's/.*backend:[[:space:]]*//')
+        printf '         socket: %s\n' "${sock/#$HOME/$tilde}"
+        probe=(--socket-path "$sock")
+      elif [[ -n "$host" && -n "$port" ]]; then
+        printf '         endpoint: %s:%s\n' "$host" "$port"
+        probe=(--host "$host" --port "$port")
+      else
+        printf '         endpoint: (no serve endpoint found in plist)\n'
+        probe=()
+      fi
+      if [[ ${#probe[@]} -gt 0 ]]; then
+        if live=$(uv run python -m stt_server status "${probe[@]}" "${auth[@]+"${auth[@]}"}" 2>/dev/null); then
+          backend=$(grep -m1 -E '^[[:space:]]*backend:' <<<"$live" | sed -E 's/.*backend:[[:space:]]*([^[:space:]]+).*/\1/')
           printf '         live: %s\n' "${backend:-?}"
         else
           printf '         live: stopped/unreachable\n'
         fi
-      else
-        printf '         socket: (custom label — not in the canonical map)\n'
       fi
     done
     if [[ "$found" -eq 0 ]]; then
@@ -101,16 +142,27 @@ stt-list:
     # below must guard its own non-zero with `|| echo …` to preserve this.
     exit 0
 
-# Wire status probe for one backend (exits with the probe's own status).
-stt-status backend:
+# Wire status probe for one server (exits with the probe's own status).
+#
+# A target containing `/` or naming an existing socket file is a literal
+# --socket-path (probed first, so a socket file sharing a backend's name is never
+# reinterpreted). A bare backend name resolves to its canonical --host/--port from
+# `_resolve`. Note this probes the CANONICAL port; `stt-list` reads the live
+# endpoint from the plist for a customised install.
+stt-status target:
     #!/usr/bin/env bash
     set -uo pipefail
-    backend={{quote(backend)}}
-    resolved=$(just _resolve "$backend") || exit 1
-    # One field per line (so a spaced socket path survives); three reads keep
-    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
-    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
-    exec uv run python -m stt_server status --socket-path "$sock"
+    target={{quote(target)}}
+    # A deliberate single probe (unlike stt-list's fast sweep): a freshly installed
+    # agent can take several seconds to load its model, so be forgiving.
+    timeout=10
+    if [[ "$target" == */* || -S "$target" ]]; then
+      exec uv run python -m stt_server status --socket-path "$target" --timeout "$timeout"
+    fi
+    resolved=$(just _resolve "$target") || exit 1
+    # One field per line; four reads keep this bash-3.2-compatible.
+    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
+    exec uv run python -m stt_server status --host "$host" --port "$port" --timeout "$timeout"
 
 # Wire status probe for any endpoint: a server a supervising app started (TCP,
 # no plist, so the canonical-socket recipes above cannot see it) or any socket.
@@ -141,9 +193,9 @@ stt-disable backend:
     set -uo pipefail
     backend={{quote(backend)}}
     resolved=$(just _resolve "$backend") || exit 1
-    # One field per line (so a spaced socket path survives); three reads keep
-    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
-    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
+    # One field per line; four reads keep this bash-3.2-compatible — macOS
+    # system bash has no `mapfile`.
+    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
     uid=$(id -u)
     if ! launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
       echo "stt-disable: $label not loaded — nothing to do"
@@ -165,9 +217,9 @@ stt-enable backend:
     set -uo pipefail
     backend={{quote(backend)}}
     resolved=$(just _resolve "$backend") || exit 1
-    # One field per line (so a spaced socket path survives); three reads keep
-    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
-    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
+    # One field per line; four reads keep this bash-3.2-compatible — macOS
+    # system bash has no `mapfile`.
+    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
     uid=$(id -u)
     plist="{{la_dir}}/$label.plist"
     if [[ ! -e "$plist" ]]; then
@@ -202,7 +254,8 @@ smoke-peercred:
     set -uo pipefail
     exec uv run python "{{justfile_directory()}}/scripts/smoke_peercred.py"
 
-# Ensure a backend's optional Python extra is installed in .venv, additively.
+# Ensure a backend's optional Python extra is installed in .venv, additively
+# (kyutai: its own .venv-kyutai, see kyutai_venv).
 # The server imports its backend lib lazily in backend.start(); a bare
 # `uv run`/`uv sync` prunes optional extras, so an agent can be installed yet
 # crash-loop on `ModuleNotFoundError`. `stt-install`/`stt-enable` call this so
@@ -225,20 +278,30 @@ _ensure-extra backend:
       whisper)  extra="mlx";      probe="import mlx_whisper" ;;
       parakeet) extra="parakeet"; probe="import parakeet_mlx" ;;
       nemotron) extra="nemotron"; probe="from mlx_audio.stt import load" ;;
-      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron)" >&2; exit 1 ;;
+      kyutai)   extra="kyutai";   probe="import moshi_mlx" ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
     esac
     if [[ -n "${PIPECAT_STT_SKIP_DEP_SYNC:-}" ]]; then
       echo "_ensure-extra: PIPECAT_STT_SKIP_DEP_SYNC set — skipping '$extra' extra check"
       exit 0
     fi
-    py="{{justfile_directory()}}/.venv/bin/python"
+    # kyutai's extra conflicts with the other MLX extras, so it syncs into its own
+    # venv (never .venv); the others sync additively into .venv.
+    if [[ "$extra" == "kyutai" ]]; then
+      venv={{quote(kyutai_venv)}}
+      py="$venv/bin/python"
+      sync=(env "UV_PROJECT_ENVIRONMENT=$venv" uv sync --python 3.12 --extra kyutai)
+    else
+      py={{quote(venv)}}"/bin/python"
+      sync=(uv sync --extra "$extra" --inexact)
+    fi
     if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
       echo "_ensure-extra: '$extra' extra already present ($probe)"
       exit 0
     fi
-    echo "_ensure-extra: '$extra' import check failed ($probe) — installing (uv sync --extra $extra --inexact)…"
-    if ! uv sync --extra "$extra" --inexact; then
-      echo "_ensure-extra: 'uv sync --extra $extra --inexact' failed; install the '$extra' extra manually" >&2
+    echo "_ensure-extra: '$extra' import check failed ($probe) — installing (${sync[*]})…"
+    if ! "${sync[@]}"; then
+      echo "_ensure-extra: '${sync[*]}' failed; install the '$extra' extra manually" >&2
       exit 1
     fi
     echo "_ensure-extra: '$extra' extra ready."
@@ -251,11 +314,12 @@ stt-install backend:
     set -uo pipefail
     backend={{quote(backend)}}
     resolved=$(just _resolve "$backend") || exit 1
-    # One field per line (so a spaced socket path survives); three reads keep
-    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
-    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
+    # One field per line; four reads keep this bash-3.2-compatible — macOS
+    # system bash has no `mapfile`.
+    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
     just _ensure-extra "$backend" || exit 1
-    PIPECAT_STT_LABEL="$label" PIPECAT_STT_SOCKET="$sock" PIPECAT_STT_BACKEND="$bk" \
+    PIPECAT_STT_LABEL="$label" PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port" \
+      PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" install
 
 # Uninstall an agent (removes the plist) — delegates to install_stt_agent.sh.
@@ -264,8 +328,9 @@ stt-uninstall backend:
     set -uo pipefail
     backend={{quote(backend)}}
     resolved=$(just _resolve "$backend") || exit 1
-    # One field per line (so a spaced socket path survives); three reads keep
-    # this bash-3.2-compatible — macOS system bash has no `mapfile`.
-    { read -r label; read -r sock; read -r bk; } <<<"$resolved"
-    PIPECAT_STT_LABEL="$label" PIPECAT_STT_SOCKET="$sock" PIPECAT_STT_BACKEND="$bk" \
+    # One field per line; four reads keep this bash-3.2-compatible — macOS
+    # system bash has no `mapfile`.
+    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
+    PIPECAT_STT_LABEL="$label" PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port" \
+      PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" uninstall

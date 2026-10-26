@@ -10,18 +10,20 @@ A/B-benchmark Parakeet against Whisper — start a second server process on a
 **separate socket**. The V1 wire protocol is unchanged; the only difference
 between two ASRs from the bot's perspective is which socket it connects to.
 
-### Per-ASR socket convention
+### Per-backend port convention
 
-| ASR | LaunchAgent label | Socket | Bot selection |
-|---|---|---|---|
-| whisper (`mlx`) | `pipecat.stt-server` | `~/Library/Caches/pipecat-stt/stt.sock` | leave `STT_WS_SOCKET` unset |
-| parakeet | `pipecat.stt-server.parakeet` | `~/Library/Caches/pipecat-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
-| nemotron | `pipecat.stt-server.nemotron` | `~/Library/Caches/pipecat-stt/nemotron.sock` | set `STT_WS_SOCKET` to the nemotron socket |
+| ASR | LaunchAgent label | Port |
+|---|---|---|
+| whisper (`mlx`) | `pipecat.stt-server` | 9565 |
+| parakeet | `pipecat.stt-server.parakeet` | 9765 |
+| nemotron | `pipecat.stt-server.nemotron` | 9865 |
+| kyutai | `pipecat.stt-server.kyutai` | 9665 |
 
-`kyutai` has no row on purpose: it is not wired into the LaunchAgent tooling
-(`just stt-install`, the plist renderer). Its extra conflicts with the other MLX
-extras, so it runs from its own environment; start it by hand with
-`--backend kyutai --socket-path <path>` on a socket of your choosing.
+Agents bind loopback TCP (`127.0.0.1:<port>`) by default. A Unix socket is
+opt-in: set `PIPECAT_STT_SOCKET` when running `just stt-install`. Point the bot
+at the agent with `STT_WS_HOST`/`STT_WS_PORT`. kyutai's extra conflicts with the
+other MLX extras, so `just stt-install kyutai` syncs it into its own
+`.venv-kyutai`.
 
 ### Single-server lock file
 
