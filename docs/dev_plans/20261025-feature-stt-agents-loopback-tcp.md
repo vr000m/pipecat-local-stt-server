@@ -1,12 +1,12 @@
 # Task: STT LaunchAgents on loopback TCP ports (TTS parity)
 
-**Status**: In Progress
+**Status**: Complete
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: High
 **Branch**: feat/stt-recipes-tcp-endpoints
 **Created**: 2026-10-25
-**Completed**: (fill when done)
+**Completed**: 2026-10-26
 **Review Gates**: none
 
 ## Objective
@@ -250,7 +250,7 @@ sequenceDiagram
 - [x] Phase 2: Installer
 - [x] Phase 3: Port table, justfile and mirror test
 - [x] Phase 4: Docs and release
-- [ ] Phase 5: Verify on this machine (automated part done 2026-10-26: full suite 760 passed / 3 skipped, ruff format+check clean with `.venv/bin/ruff`, validation probe of the live nemotron socket OK; manual steps and kyutai decode pending the user's go-ahead)
+- [x] Phase 5: Verify on this machine (2026-10-26: full suite 801 passed / 7 skipped, ruff format+check clean, all four agents decode live; token-file auth, port-collision restart loop, socket rollback and login persistence deferred, not checked live)
 
 ## Findings
 

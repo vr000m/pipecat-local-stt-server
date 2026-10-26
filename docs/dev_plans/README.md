@@ -11,7 +11,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [STT vocabulary/prompt biasing on the wire protocol](20260607-feature-stt-prompt-biasing.md) | Wire Protocol / ASR Backends | ⬜ Not started — analysis/handoff only |
 | [UDS server-side trust-boundary hardening](20260626-feature-uds-trust-boundary-hardening.md) | Server Transport | ✅ Shipped — PR #13 merged 2026-06-28 |
 | [PR #14 review findings](20261024-bug-pr14-review-findings.md) | Server Runtime | ✅ Complete (PR #15) |
-| [STT LaunchAgents on loopback TCP ports (0.5.0)](20261025-feature-stt-agents-loopback-tcp.md) | Install & Packaging | 🔄 In progress — PR #16 open; phases 1-4 done, review findings fixed, Phase 5 manual verification partly done |
+| [STT LaunchAgents on loopback TCP ports (0.5.0)](20261025-feature-stt-agents-loopback-tcp.md) | Install & Packaging | ✅ Complete — PR #16 open; all phases done, review findings fixed; token-file auth, port-collision loop, socket rollback and login persistence not checked live |
 
 ## Conventions
 
