@@ -1091,6 +1091,70 @@ def test_install_uninstall_socket_mode_only_when_caller_sets_it(tmp_path, recipe
     assert "PIPECAT_STT_HOST= " in logged and "PIPECAT_STT_PORT= " in logged, logged
 
 
+# Contract: stt-install / stt-uninstall pass the canonical HOST/PORT to the installer
+# IFF the installer itself will resolve to TCP, i.e. its
+# SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-}}" is empty. There is exactly
+# one source of truth (the process environment); no justfile variable can desync it.
+# State space: PIPECAT_STT_SOCKET {unset, empty, set} x KODA_STT_SOCKET {unset, empty,
+# set} x command-line override of the former `agent_transport` variable {none, socket,
+# tcp} x {install, uninstall}. The override cells must be REJECTED by just (the
+# variable no longer exists), never silently honoured.
+def _installer_socket_path(env: dict[str, str]) -> str:
+    """Evaluate the REAL installer's SOCKET_PATH resolution line under `env`."""
+    text = (REPO_ROOT / "scripts" / "install_stt_agent.sh").read_text()
+    m = re.search(r"^SOCKET_PATH=.*$", text, re.MULTILINE)
+    assert m, "installer no longer defines SOCKET_PATH on one line; update this contract test"
+    out = subprocess.run(
+        ["/bin/bash", "-c", f'{m.group(0)}; printf %s "$SOCKET_PATH"'],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    return out.stdout
+
+
+@pytest.mark.parametrize("override", [None, "agent_transport=socket", "agent_transport=tcp"])
+@pytest.mark.parametrize(
+    "koda", [None, "", "/k.sock"], ids=["koda-unset", "koda-empty", "koda-set"]
+)
+@pytest.mark.parametrize("pipecat", [None, "", "/p.sock"], ids=["pc-unset", "pc-empty", "pc-set"])
+@pytest.mark.parametrize("recipe", ["stt-install", "stt-uninstall"])
+def test_canonical_host_port_passed_iff_installer_resolves_tcp(
+    tmp_path, recipe, pipecat, koda, override
+):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    extra_env = {}
+    if pipecat is not None:
+        extra_env["PIPECAT_STT_SOCKET"] = pipecat
+    if koda is not None:
+        extra_env["KODA_STT_SOCKET"] = koda
+    args = ([override] if override else []) + [f"script={fake_script}", recipe, "whisper"]
+    res = _run_just(args, home=home, stub_dir=stub_dir, extra_env=extra_env)
+    if override:
+        # The transport is not a command-line knob: just refuses, nothing is delegated.
+        assert res.returncode != 0, "a transport override must not be accepted"
+        assert not env_log.exists(), "a rejected override must not delegate"
+        return
+    assert res.returncode == 0, res.stderr
+    logged = env_log.read_text().strip()
+    resolves_tcp = _installer_socket_path(extra_env) == ""
+    if resolves_tcp:
+        assert "PIPECAT_STT_HOST=127.0.0.1 PIPECAT_STT_PORT=9565 " in logged, logged
+    else:
+        assert "PIPECAT_STT_HOST= PIPECAT_STT_PORT= " in logged, logged
+
+
+def test_no_toplevel_variable_derives_from_transport_env():
+    """Every top-level variable is command-line overridable, so a variable computed
+    from the installer's transport env would be a second source of truth."""
+    text = (REPO_ROOT / "justfile").read_text()
+    offenders = re.findall(r"^([A-Za-z_]\w*)\s*:=.*(?:PIPECAT_STT_|KODA_STT_)", text, re.MULTILINE)
+    assert not offenders, f"transport env must be read inside recipes, not variables: {offenders}"
+
+
 @pytest.mark.skipif(not VENV_PYTHON.exists(), reason="installer needs .venv/bin/python")
 def test_stt_install_socket_rollback_prints_no_ignored_settings_warning(tmp_path):
     """The documented rollback `PIPECAT_STT_SOCKET=<path> just stt-install <backend>`
@@ -1418,7 +1482,12 @@ def test_branch_diff_does_not_touch_koda_surface():
 
 def _justfile_recipes() -> tuple[set[str], dict[str, list[str]]]:
     text = (REPO_ROOT / "justfile").read_text()
-    variables = set(re.findall(r"^([A-Za-z_]\w*)\s*:=", text, re.M))
+    # Forwardable variables are the command-line knobs. A variable derived from the
+    # installer's transport env would be a second source of truth, not a knob (and is
+    # forbidden outright by test_no_toplevel_variable_derives_from_transport_env).
+    variables = set(
+        re.findall(r"^([A-Za-z_]\w*)\s*:=(?!.*(?:PIPECAT_STT_|KODA_STT_))", text, re.MULTILINE)
+    )
     recipes: dict[str, list[str]] = {}
     current: list[str] | None = None
     for line in text.splitlines():
@@ -1440,6 +1509,7 @@ def test_nested_just_calls_forward_the_variables_their_callee_reads():
         return {v for v in variables if re.search(rf"{{{{[^}}]*\b{v}\b[^}}]*}}}}", body)}
 
     nested = 0
+    callers_seen: set[str] = set()
     for caller, body in recipes.items():
         for line in body:
             if re.match(r"\s*(echo|printf)\b", line):
@@ -1449,10 +1519,17 @@ def test_nested_just_calls_forward_the_variables_their_callee_reads():
                 if callee not in recipes:
                     continue
                 nested += 1
+                callers_seen.add(caller)
                 forwarded = set(re.findall(r"(\w+)=", m.group(1)))
                 missing = reads(callee) - forwarded
                 assert not missing, (
                     f"{caller}: nested `just {callee}` does not forward {sorted(missing)}; "
                     "an override given to the caller would be lost"
                 )
-    assert nested >= 5, "scan found too few nested just calls; the pattern is stale"
+    # A staleness floor, not a pin: it only proves the scan still finds nested calls
+    # at all. Known callers are asserted by name so dropping one is a deliberate edit.
+    assert nested >= 1, "scan found no nested just calls; the pattern is stale"
+    assert {"stt-status", "stt-enable", "stt-install"} <= callers_seen, (
+        f"expected nested just calls from stt-status, stt-enable and stt-install; "
+        f"scan saw {sorted(callers_seen)}"
+    )
