@@ -80,7 +80,7 @@ def _make_stub_dir(
 
     ``print_loaded`` controls ``launchctl print``'s exit code (0 == agent
     loaded). ``status_exit`` controls the exit code of the stubbed
-    ``uv run python -m stt_server status`` probe (non-zero == stopped socket).
+    ``uv run --no-sync python -m stt_server status`` probe (non-zero == stopped socket).
     ``fail_actions`` names ``launchctl`` subcommands (e.g. ``bootout``,
     ``bootstrap``, ``kickstart``) that should exit non-zero, so recipe
     error-handling on a failed state change can be exercised.
@@ -121,16 +121,16 @@ exec /usr/bin/id "$@"
 """,
     )
 
-    # uv stub: log argv; for `uv run python -m stt_server status ...` emit a
+    # uv stub: log argv; for `uv run --no-sync python -m stt_server status ...` emit a
     # status-shaped line and exit `status_exit`. Dispatch is argv-position-aware
-    # (run / -m stt_server / status), not a substring match on the whole arg
+    # (run / --no-sync / -m stt_server / status), not a substring match on the whole arg
     # string, so it fails loud if the `uv run … status` invocation shape changes.
     _write_executable(
         stub_dir / "uv",
         f"""#!/usr/bin/env bash
 printf 'uv %s\\n' "$*" >> {argv_log!s}
 printf 'uvenv UV_PROJECT_ENVIRONMENT=%s\\n' "${{UV_PROJECT_ENVIRONMENT-<unset>}}" >> {argv_log!s}
-if [[ "$1" == "run" && "$4" == "stt_server" && "$5" == "status" ]]; then
+if [[ "$1" == "run" && "$2" == "--no-sync" && "$5" == "stt_server" && "$6" == "status" ]]; then
     if [[ {status_exit} -eq 0 ]]; then
         printf 'stt_server: ok\\n  backend: nemotron (model: x)\\n'
     fi
@@ -863,61 +863,96 @@ def test_plist_endpoint_and_stt_list_keep_paths_with_spaces(tmp_path):
     assert call.endswith(f"--socket-path {sock}"), repr(call)
 
 
-def _installer_reader(plist: Path, flag: str) -> str:
-    """Run the installer's OWN ``installed_arg`` function against ``plist``."""
-    src = INSTALLER.read_text()
-    m = re.search(r"^installed_arg\(\) \{\n.*?^\}\n", src, re.MULTILINE | re.DOTALL)
-    assert m, "installed_arg() not found in the installer"
-    res = subprocess.run(
-        ["bash", "-c", m.group(0) + 'installed_arg "$1"', "_", flag],
+READ_PLIST = REPO_ROOT / "scripts" / "read_stt_plist.py"
+
+
+def _read_plist(plist: Path, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-I", str(READ_PLIST), *extra, str(plist)],
         capture_output=True,
         text=True,
         timeout=60,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PLIST_DST": str(plist)},
     )
-    assert res.returncode == 0, res.stderr
-    return res.stdout
 
 
-@pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
+def _plist_shape(home: Path, case: str) -> tuple[Path, list[str]]:
+    """Render/write one plist shape; return it and the four expected lines."""
+    label = "pipecat.stt-server.x"
+    plist = home / "Library" / "LaunchAgents" / f"{label}.plist"
+    if case == "tcp":
+        _render_plist(home, label, port=9871)
+        return plist, ["127.0.0.1", "9871", "", ""]
+    if case == "socket":
+        _render_plist(home, label, socket_path=home / "s.sock")
+        return plist, ["", "", str(home / "s.sock"), ""]
+    if case == "token":
+        _render_plist(home, label, port=9765, auth_token_file=home / "tok")
+        return plist, ["127.0.0.1", "9765", "", str(home / "tok")]
+    if case == "spaces":
+        sock = home / "my dir" / "s sock "
+        _render_plist(home, label, socket_path=sock)
+        return plist, ["", "", str(sock), ""]
+    args = {
+        "quote-in-path": ["py", "--socket-path", '/h/a"b/s.sock'],
+        "flag-like-value": ["py", "--log-level", "--socket-path", "/h/x.sock"],
+        "no-args": [],
+    }.get(case)
+    if args is not None:
+        plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": args}))
+    want = {
+        "quote-in-path": ["", "", '/h/a"b/s.sock', ""],
+        # --socket-path is the VALUE of --log-level here, so it is not a flag.
+        "flag-like-value": ["", "", "", ""],
+    }.get(case, ["", "", "", ""])
+    return plist, want
+
+
 @pytest.mark.parametrize(
     "case",
     ["tcp", "socket", "token", "spaces", "quote-in-path", "flag-like-value", "absent", "no-args"],
 )
-def test_plist_readers_agree(tmp_path, case):
-    """Contract: the two readers of the renderer's ProgramArguments (installer
-    ``installed_arg``, justfile ``_plist_endpoint``) return the same host, port,
+def test_plist_reader_shapes(tmp_path, case):
+    """The one reader of the renderer's ProgramArguments (justfile
+    ``_plist_endpoint`` and the installer both call it) gives host, port,
     socket-path and auth-token-file for every plist shape."""
-    stub_dir, _ = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
-    agents = home / "Library" / "LaunchAgents"
-    label = "pipecat.stt-server.x"
-    plist = agents / f"{label}.plist"
-    if case == "tcp":
-        _render_plist(home, label, port=9871)
-    elif case == "socket":
-        _render_plist(home, label, socket_path=home / "s.sock")
-    elif case == "token":
-        _render_plist(home, label, port=9765, auth_token_file=home / "tok")
-    elif case == "spaces":
-        _render_plist(home, label, socket_path=home / "my dir" / "s sock ")
-    else:
-        pa = {
-            "quote-in-path": ["py", "--socket-path", '/h/a"b/s.sock'],
-            "flag-like-value": ["py", "--log-level", "--socket-path", "/h/x.sock"],
-            "absent": None,
-            "no-args": [],
-        }[case]
-        if pa is not None:
-            plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": pa}))
-    res = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
+    plist, want = _plist_shape(home, case)
+    res = _read_plist(plist)
     assert res.returncode == 0, res.stderr
-    just_vals = (res.stdout.splitlines() + [""] * 4)[:4]
-    inst_vals = [
-        _installer_reader(plist, f)
-        for f in ("--host", "--port", "--socket-path", "--auth-token-file")
-    ]
-    assert inst_vals == just_vals, f"{case}: installer {inst_vals} != justfile {just_vals}"
+    assert res.stdout.split("\n")[:4] == want
+    # The justfile recipe is a pass-through to the same reader.
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    via_just = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
+    assert via_just.returncode == 0, via_just.stderr
+    assert via_just.stdout == res.stdout
+
+
+def test_plist_reader_garbage_plist_is_empty_not_an_error(tmp_path):
+    bad = tmp_path / "bad.plist"
+    bad.write_text("not a plist")
+    res = _read_plist(bad)
+    assert res.returncode == 0
+    assert res.stdout == "\n\n\n\n"
+    assert _read_plist(bad, "--has-auth").returncode == 1
+
+
+@pytest.mark.parametrize(
+    "env,args,want",
+    [
+        ({"PIPECAT_STT_AUTH_TOKEN": "x"}, ["py"], 0),
+        ({"KODA_STT_AUTH_TOKEN": "x"}, ["py"], 0),
+        ({"PIPECAT_STT_AUTH_TOKEN": ""}, ["py"], 1),
+        ({}, ["py", "--auth-token-file", "/h/tok"], 0),
+        ({}, ["py", "--log-level", "--auth-token-file"], 1),
+        ({}, ["py", "--port", "9"], 1),
+    ],
+)
+def test_plist_reader_has_auth(tmp_path, env, args, want):
+    plist = tmp_path / "a.plist"
+    plist.write_bytes(
+        plistlib.dumps({"Label": "x", "ProgramArguments": args, "EnvironmentVariables": env})
+    )
+    assert _read_plist(plist, "--has-auth").returncode == want
 
 
 # --------------------------------------------------------------------------- #

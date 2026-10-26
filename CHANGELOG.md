@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ambient `PIPECAT_STT_HOST`/`PIPECAT_STT_PORT` and leave the transport to the
   installer, so the socket rollback (`PIPECAT_STT_SOCKET` set) no longer warns
   about ignored TCP settings and the socket-vs-TCP rule lives in one place.
+- **`PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN` get the same check as the token
+  file.** A value with internal whitespace or non-ASCII characters now fails
+  startup instead of running with a token no client can send.
+- `just stt-list`, `stt-status` and `stt-probe` run `uv run --no-sync`, so a probe can
+  no longer prune an agent's backend extras.
+- The installer and the justfile read an installed plist through one helper,
+  `scripts/read_stt_plist.py` (stdlib `plistlib`), instead of two `plutil` loops.
+- The installer's token-file check refuses a path outside the plist allowlist
+  before it creates any directory.
 - **Loopback TCP without a token logs INFO, not a warning.** That is the default
   agent setup, and non-loopback binds are refused, so there was nothing to warn
   about. The message names `--auth-token-file`, not the env token.

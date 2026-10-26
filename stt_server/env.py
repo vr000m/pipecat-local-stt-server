@@ -136,6 +136,22 @@ def env_int_first(*names: str, default: int) -> int:
     return env_int(name, default)
 
 
+def check_token_chars(token: str, what: str) -> str:
+    """Refuse a token that can never match an ``Authorization`` header.
+
+    ``token`` is already stripped and non-empty. Raises ``ConfigError`` naming
+    ``what`` (the source, never the value) for internal whitespace, a control
+    character or a non-ASCII character. Shared by the token file and env paths.
+    """
+    if any(not 0x21 <= ord(c) <= 0x7E for c in token):
+        raise ConfigError(
+            f"{what} must hold one token of visible ASCII characters "
+            "(no internal whitespace, newlines or non-ASCII); anything else can never "
+            "match an Authorization header"
+        )
+    return token
+
+
 def read_token_file(path: str | os.PathLike[str], *, strict: bool = False) -> str | None:
     """Read a bearer-token file: UTF-8, surrounding whitespace stripped.
 
@@ -156,10 +172,4 @@ def read_token_file(path: str | os.PathLike[str], *, strict: bool = False) -> st
         return token or None
     if not token:
         raise ConfigError(f"auth token file {path} is empty; an empty token would disable auth")
-    if any(not 0x21 <= ord(c) <= 0x7E for c in token):
-        raise ConfigError(
-            f"auth token file {path} must hold one token of visible ASCII characters "
-            "(no internal whitespace, newlines or non-ASCII); anything else can never "
-            "match an Authorization header"
-        )
-    return token
+    return check_token_chars(token, f"auth token file {path}")

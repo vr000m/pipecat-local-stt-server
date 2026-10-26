@@ -64,29 +64,10 @@ _resolve backend:
 # Emits FOUR lines — host, port, socket-path, auth-token-file — each empty when
 # the flag is absent. The plist is the source of truth, so stt-list never
 # re-encodes the _resolve map and stays correct for custom labels/transports.
-# Reads ProgramArguments structurally via `plutil`, element by element; the flag's
-# VALUE is consumed in the same step that recognises the flag (the `expect`
-# latch), so a value that looks like a flag can never be mis-read as one.
+# scripts/read_stt_plist.py is the one reader (the installer calls it too); it
+# runs under the system python3, so a pruned or missing venv cannot break it.
 _plist_endpoint plist:
-    #!/usr/bin/env bash
-    set -uo pipefail
-    plist={{quote(plist)}}
-    host=""; port=""; sock=""; authfile=""; expect=""; i=0
-    while el=$(plutil -extract "ProgramArguments.$i" raw -o - "$plist" 2>/dev/null); do
-      if [[ -n "$expect" ]]; then
-        case "$expect" in
-          --host)            host="$el" ;;
-          --port)            port="$el" ;;
-          --socket-path)     sock="$el" ;;
-          --auth-token-file) authfile="$el" ;;
-        esac
-        expect=""
-      elif [[ "$el" == --* ]]; then
-        expect="$el"
-      fi
-      i=$((i + 1))
-    done
-    printf '%s\n' "$host" "$port" "$sock" "$authfile"
+    @python3 -I "{{justfile_directory()}}/scripts/read_stt_plist.py" {{quote(plist)}}
 
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
@@ -131,7 +112,7 @@ stt-list:
         probe=()
       fi
       if [[ ${#probe[@]} -gt 0 ]]; then
-        if live=$(uv run python -m stt_server status "${probe[@]}" "${auth[@]+"${auth[@]}"}" 2>/dev/null); then
+        if live=$(uv run --no-sync python -m stt_server status "${probe[@]}" "${auth[@]+"${auth[@]}"}" 2>/dev/null); then
           backend=$(grep -m1 -E '^[[:space:]]*backend:' <<<"$live" | sed -E 's/.*backend:[[:space:]]*([^[:space:]]+).*/\1/')
           printf '         live: %s\n' "${backend:-?}"
         else
@@ -176,7 +157,7 @@ stt-status target='':
     # agent can take several seconds to load its model, so be forgiving.
     timeout=10
     if [[ "$target" == */* || -S "$target" ]]; then
-      exec uv run python -m stt_server status --socket-path "$target" --timeout "$timeout"
+      exec uv run --no-sync python -m stt_server status --socket-path "$target" --timeout "$timeout"
     fi
     resolved=$(just _resolve "$target") || exit 1
     # One field per line; four reads keep this bash-3.2-compatible.
@@ -198,7 +179,7 @@ stt-status target='':
     else
       probe=(--host "$host" --port "$port")
     fi
-    exec uv run python -m stt_server status "${probe[@]}" "${auth[@]+"${auth[@]}"}" --timeout "$timeout"
+    exec uv run --no-sync python -m stt_server status "${probe[@]}" "${auth[@]+"${auth[@]}"}" --timeout "$timeout"
 
 # Wire status probe for any endpoint: a server a supervising app started (TCP,
 # no plist, so `stt-list`/`stt-status` cannot see it) or any socket. The TCP
@@ -222,7 +203,7 @@ stt-probe *args:
       echo "stt-probe: pass an endpoint: --socket-path PATH, --host H --port N, or --uri URI" >&2
       exit 2
     fi
-    exec uv run python -m stt_server status "$@"
+    exec uv run --no-sync python -m stt_server status "$@"
 
 # Stop an agent until next login (launchctl bootout; plist kept). Idempotent.
 stt-disable backend:

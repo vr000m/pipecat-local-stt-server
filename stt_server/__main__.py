@@ -35,7 +35,7 @@ from .backend import EchoBackend
 # imports no backend module, so the serve path stays lean at every launch.
 from .backends import BACKENDS, import_backend
 from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
-from .env import env_first, read_token_file
+from .env import check_token_chars, env_first, read_token_file
 from .errors import ConfigError
 from .server import serve
 
@@ -120,7 +120,9 @@ def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str 
         client_val = (os.environ.get("STT_WS_TOKEN") or "").strip()
         return client_val or None
     env_val = (env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN") or "").strip()
-    return env_val or None
+    # Same rule as the token file: a token that no header can match must fail
+    # startup, not run with auth nobody can satisfy.
+    return check_token_chars(env_val, "the auth token environment variable") if env_val else None
 
 
 def _load_dotenv_best_effort() -> None:

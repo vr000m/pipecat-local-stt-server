@@ -88,6 +88,7 @@ set -euo pipefail
 LABEL="${PIPECAT_STT_LABEL:-${KODA_STT_LABEL:-pipecat.stt-server}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RENDER_PY="$REPO_ROOT/scripts/render_stt_plist.py"
+READ_PLIST_PY="$REPO_ROOT/scripts/read_stt_plist.py"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/pipecat-stt}}"
 # Transport: socket mode only when PIPECAT_STT_SOCKET (or the deprecated
@@ -190,23 +191,25 @@ fi
 
 # Print the value of FLAG (e.g. --socket-path) in the installed plist's
 # ProgramArguments (empty if the plist is absent/unreadable or has no such flag).
-# Same algorithm as the justfile's _plist_endpoint: walk the array element by
-# element via plutil, and consume a flag's VALUE in the step after the flag, so a
-# value that looks like a flag is never read as one. Used to decide socket
-# cleanup from the transport actually installed, not from the caller's env.
+# scripts/read_stt_plist.py is the one reader of the installed plist (the justfile
+# calls it too), run under the system python3 so an uninstall works with no venv.
+# Used to decide socket cleanup from the transport actually installed, not from
+# the caller's env.
 installed_arg() {
-    local flag="$1" el expect="" i=0 val=""
+    local flag="$1" host port sock authfile
     [[ -f "$PLIST_DST" ]] || return 0
-    while el=$(plutil -extract "ProgramArguments.$i" raw -o - "$PLIST_DST" 2>/dev/null); do
-        if [[ -n "$expect" ]]; then
-            if [[ "$expect" == "$flag" ]]; then val="$el"; fi
-            expect=""
-        elif [[ "$el" == --* ]]; then
-            expect="$el"
-        fi
-        i=$((i + 1))
-    done
-    printf '%s' "$val"
+    {
+        IFS= read -r host
+        IFS= read -r port
+        IFS= read -r sock
+        IFS= read -r authfile
+    } < <(python3 -I "$READ_PLIST_PY" "$PLIST_DST")
+    case "$flag" in
+        --host) printf '%s' "$host" ;;
+        --port) printf '%s' "$port" ;;
+        --socket-path) printf '%s' "$sock" ;;
+        --auth-token-file) printf '%s' "$authfile" ;;
+    esac
 }
 
 # Succeed when the INSTALLED agent requires a token: a non-empty env token in its
@@ -214,12 +217,7 @@ installed_arg() {
 # token value is never printed.
 installed_has_auth() {
     [[ -f "$PLIST_DST" ]] || return 1
-    local k v
-    for k in PIPECAT_STT_AUTH_TOKEN KODA_STT_AUTH_TOKEN; do
-        v="$(plutil -extract "EnvironmentVariables.$k" raw -o - "$PLIST_DST" 2>/dev/null)" || continue
-        if [[ -n "$v" ]]; then return 0; fi
-    done
-    [[ -n "$(installed_arg --auth-token-file)" ]]
+    python3 -I "$READ_PLIST_PY" --has-auth "$PLIST_DST"
 }
 
 # Refuse a token file the server would mis-handle. File-system policy lives here:
@@ -294,12 +292,26 @@ except ImportError:
         file=sys.stderr,
     )
     sys.exit(1)
+# The renderer writes this path into the plist and enforces its own allowlist
+# after the directories exist; load its regex so the two cannot drift.
+import importlib.util
+
+spec = importlib.util.spec_from_file_location("render_stt_plist", sys.argv[2])
+renderer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(renderer)
+if not renderer._ABSPATH_RE.fullmatch(sys.argv[1]):
+    print(
+        f"error: PIPECAT_STT_AUTH_TOKEN_FILE {sys.argv[1]!r} has characters the plist "
+        "allowlist refuses (letters, digits, space and . _ / + - @ only)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 try:
     read_token_file(sys.argv[1], strict=True)
 except ValueError as exc:
     print(f"error: PIPECAT_STT_AUTH_TOKEN_FILE: {exc}", file=sys.stderr)
     sys.exit(1)
-' "$f"; then
+' "$f" "$RENDER_PY"; then
         exit 1
     fi
 }

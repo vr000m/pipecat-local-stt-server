@@ -1556,6 +1556,30 @@ def test_relative_token_file_is_refused_by_the_preflight(tmp_path: Path):
     assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
 
 
+def test_token_path_the_renderer_would_refuse_is_refused_by_the_preflight(tmp_path: Path):
+    """A path outside the renderer's allowlist (here, parentheses) must fail in the
+    preflight, before any directory is created, not later in the renderer."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    log_dir = tmp_path / "logs"
+    odd = tmp_path / "tok(1)"
+    odd.mkdir()
+    tok = odd / "token.txt"
+    tok.write_text(SECRET + "\n")
+    tok.chmod(0o600)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_AUTH_TOKEN_FILE": str(tok),
+            "PIPECAT_STT_LOG_DIR": str(log_dir),
+        },
+    )
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "allowlist" in r.stderr and "PIPECAT_STT_AUTH_TOKEN_FILE" in r.stderr
+    assert not log_dir.exists()
+    assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
 # ---------------------------------------------------------------------------
 # Installer <-> renderer backend contract: the installer accepts exactly the
 # renderer's _BACKEND_RE names and rejects anything else before any mkdir.

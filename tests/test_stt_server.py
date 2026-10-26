@@ -805,6 +805,31 @@ def test_resolve_auth_token_serve_refuses_unusable_token_file(tmp_path: Path, co
         _resolve_auth_token(str(tok), client=False)
 
 
+@pytest.mark.parametrize("name", ["PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"])
+@pytest.mark.parametrize("value", ["tok en", "tok\nen", "t\u00f6k"])
+def test_resolve_auth_token_serve_refuses_unmatchable_env_token(monkeypatch, name, value):
+    """Same rule as the token file: a token no header can match must fail startup."""
+    from stt_server.__main__ import _resolve_auth_token
+    from stt_server.errors import ConfigError
+
+    monkeypatch.delenv("PIPECAT_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError) as exc:
+        _resolve_auth_token(None, client=False)
+    assert value not in str(exc.value)
+
+
+def test_resolve_auth_token_env_token_is_stripped_and_probe_unaffected(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "  good-token \n")
+    assert _resolve_auth_token(None, client=False) == "good-token"
+    monkeypatch.setenv("STT_WS_TOKEN", "client tok")
+    assert _resolve_auth_token(None, client=True) == "client tok"
+
+
 def test_resolve_auth_token_probe_stays_lenient_on_empty_token_file(tmp_path: Path):
     from stt_server.__main__ import _resolve_auth_token
 
