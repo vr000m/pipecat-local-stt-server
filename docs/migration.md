@@ -71,10 +71,11 @@ for the wire protocol, the import name or the Python client.
      `STT_WS_HOST`/`PORT`, so remove or replace that line after a TCP reinstall.
 
 2. **Reinstall the agent.** `just stt-install <backend>` writes the TCP plist,
-   removes the old socket (and its lock) it was replacing, and prints a note.
-   The socket is removed only once the old job is seen unloaded (up to
-   `PIPECAT_STT_UNLOAD_WAIT` seconds) and no process holds its lock; otherwise
-   a warning is printed and the socket and lock are left in place. For a TCP agent the recipe uses the
+   removes the old socket it was replacing, and prints a note. Its
+   `<socket>.lock` is never removed (every server must lock the same file;
+   leaving it is harmless). The socket is removed only once the old job is seen
+   unloaded (up to `PIPECAT_STT_UNLOAD_WAIT` seconds) and no process holds its
+   lock; otherwise a warning is printed and the socket is left in place. For a TCP agent the recipe uses the
    canonical host and port; for a custom one run the
    installer directly, with the label and backend set so it does not replace the
    default whisper agent, e.g. `PIPECAT_STT_LABEL=pipecat.stt-server.alt
