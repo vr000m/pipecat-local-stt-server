@@ -1,8 +1,8 @@
 """Phase 4 (docs and release) acceptance checks for the loopback-TCP plan.
 
-Greps the docs for the agreed literal phrases and checks that the 0.5.0
-version bump is consistent across ``pyproject.toml``, ``uv.lock`` and
-``CHANGELOG.md``.
+Greps the docs for the agreed literal phrases, checks that ``pyproject.toml``
+and ``uv.lock`` agree on the version (0.5.0 or later) with a matching
+``CHANGELOG.md`` section, and checks the 0.5.0 upgrade notes.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ OPERATIONS = REPO_ROOT / "docs" / "operations.md"
 MIGRATION = REPO_ROOT / "docs" / "migration.md"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 PLANS_README = REPO_ROOT / "docs" / "dev_plans" / "README.md"
+# The release that shipped the loopback-TCP agents; a floor, not a pin.
 VERSION = "0.5.0"
 
 
@@ -41,21 +42,32 @@ def test_operations_headings_renamed() -> None:
     assert re.search(r"^#+\s*per-backend port convention", lower, re.MULTILINE)
 
 
-def test_version_consistent_across_files() -> None:
-    pyproject = tomllib.loads(_read(REPO_ROOT / "pyproject.toml"))
-    assert pyproject["project"]["version"] == VERSION
+def _project_version() -> str:
+    return tomllib.loads(_read(REPO_ROOT / "pyproject.toml"))["project"]["version"]
 
+
+def test_version_consistent_across_files() -> None:
+    # Not pinned to one release: pyproject and uv.lock must agree, and the
+    # current version must be at least the release that shipped this plan.
+    version = _project_version()
     lock = tomllib.loads(_read(REPO_ROOT / "uv.lock"))
     pkgs = [p for p in lock["package"] if p["name"] == "pipecat-local-stt-server"]
     assert len(pkgs) == 1
-    assert pkgs[0]["version"] == VERSION
+    assert pkgs[0]["version"] == version
+    as_tuple = tuple(int(x) for x in re.findall(r"\d+", version)[:3])
+    assert as_tuple >= tuple(int(x) for x in VERSION.split(".")), version
+
+
+def test_changelog_has_current_version_section() -> None:
+    version = re.escape(_project_version())
+    assert re.search(rf"^## \[{version}\]", _read(CHANGELOG), re.MULTILINE), (
+        f"CHANGELOG.md has no ## [{_project_version()}] section"
+    )
 
 
 def test_changelog_0_5_0_section() -> None:
+    # The 0.5.0 upgrade notes, wherever the section sits once later releases land.
     text = _read(CHANGELOG)
-    assert re.search(r"^## \[Unreleased\]\s*\n+## \[0\.5\.0\]", text, re.MULTILINE), (
-        "## [0.5.0] must sit directly below ## [Unreleased]"
-    )
     m = re.search(r"^## \[0\.5\.0\].*?(?=^## \[|\Z)", text, re.MULTILINE | re.DOTALL)
     assert m is not None
     section = m.group(0)
