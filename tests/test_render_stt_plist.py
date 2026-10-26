@@ -597,8 +597,13 @@ def test_render_label_pipecat_wins_over_koda(tmp_path: Path):
 
 
 def test_renderer_loopback_hosts_match_the_servers():
-    """The renderer keeps its own copy of the server's TCP bind allowlist (it must
-    not import the server); this pins the two together."""
+    """One loopback set, ``stt_server.auth.LOOPBACK_HOSTS``: the renderer and the
+    server's ``ServerConfig`` both use it (the renderer imports it, not the
+    server). The client's private copy cannot change on this branch (it is the
+    Koda-imported surface, see test_branch_diff_does_not_touch_koda_surface), so
+    it is pinned to the same set here."""
+    from stt_server import client
+    from stt_server.auth import LOOPBACK_HOSTS
     from stt_server.errors import ConfigError
     from stt_server.server import ServerConfig
 
@@ -609,9 +614,39 @@ def test_renderer_loopback_hosts_match_the_servers():
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    for host in sorted(mod._LOOPBACK_HOSTS):
+    assert mod.LOOPBACK_HOSTS is LOOPBACK_HOSTS
+    assert not hasattr(mod, "_LOOPBACK_HOSTS"), "the renderer must not keep its own copy"
+    assert set(client._LOOPBACK_HOSTS) == set(LOOPBACK_HOSTS)
+    for host in sorted(LOOPBACK_HOSTS):
         ServerConfig(host=host, port=9999)
     for host in ("0.0.0.0", "::", "192.168.1.5", "example.com", "127.0.0.2"):
-        assert host not in mod._LOOPBACK_HOSTS
+        assert host not in LOOPBACK_HOSTS
         with pytest.raises(ConfigError):
             ServerConfig(host=host, port=9999)
+
+
+@pytest.mark.parametrize(
+    "value,ok",
+    [("/Users/test/tok", True), ("/a b/c+d@e-f_g.h", True), ("rel/tok", False), ("/a(1)/t", False)],
+)
+def test_check_abspath_mode_is_the_plist_allowlist(value: str, ok: bool):
+    """``--check-abspath NAME VALUE`` applies ``_ABSPATH_RE`` (the installer's
+    preflight calls it instead of loading the module for a private regex)."""
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--check-abspath", "SOME_NAME", value],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    assert r.returncode == (0 if ok else 2), r.stderr
+    if not ok:
+        assert "SOME_NAME" in r.stderr and "allowlist" in r.stderr
+
+
+def test_token_helpers_live_in_auth_not_env():
+    import stt_server.auth as auth
+    import stt_server.env as env
+
+    assert callable(auth.read_token_file) and callable(auth.check_token_chars)
+    assert not hasattr(env, "read_token_file") and not hasattr(env, "check_token_chars")

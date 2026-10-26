@@ -35,6 +35,7 @@ from pathlib import Path
 # fails with the same actionable hint the shell guard gives, not an opaque
 # traceback.
 try:
+    from stt_server.auth import LOOPBACK_HOSTS
     from stt_server.env import env_first
 except ImportError:
     print(
@@ -50,8 +51,6 @@ _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
 _BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron|kyutai)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
-# Exactly the hosts the server accepts for a TCP bind (stt_server/server.py).
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
 
@@ -93,7 +92,22 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
     return value
 
 
+def check_abspath(argv: list[str]) -> None:
+    """``--check-abspath NAME VALUE``: exit 0 if VALUE passes the plist's
+    absolute-path allowlist, else 2 naming NAME. The installer's preflight calls
+    this before it creates any directory, so ``_ABSPATH_RE`` stays the one rule."""
+    if len(argv) != 4:
+        print("usage: render_stt_plist.py --check-abspath NAME VALUE", file=sys.stderr)
+        sys.exit(2)
+    _require(
+        argv[2], argv[3], _ABSPATH_RE, "absolute path; letters, digits, space and . _ / + - @ only"
+    )
+    sys.exit(0)
+
+
 def main() -> None:
+    if sys.argv[1:2] == ["--check-abspath"]:
+        check_abspath(sys.argv)
     # The label is optional; an unset value uses the default single-agent
     # label (pipecat.stt-server). Canonical PIPECAT_STT_LABEL wins;
     # KODA_STT_LABEL is a deprecated alias.
@@ -125,9 +139,10 @@ def main() -> None:
         transport_args = ["--socket-path", socket_path]
     else:
         host = host_raw or "127.0.0.1"
-        if host not in _LOOPBACK_HOSTS:
+        # The server's own bind allowlist (stt_server.auth.LOOPBACK_HOSTS).
+        if host not in LOOPBACK_HOSTS:
             print(
-                f"error: HOST={host!r} rejected (loopback only: 127.0.0.1, ::1, localhost)",
+                f"error: HOST={host!r} rejected (loopback only: {', '.join(sorted(LOOPBACK_HOSTS))})",
                 file=sys.stderr,
             )
             sys.exit(2)

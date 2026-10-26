@@ -35,7 +35,8 @@ from .backend import EchoBackend
 # imports no backend module, so the serve path stays lean at every launch.
 from .backends import BACKENDS, import_backend
 from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
-from .env import check_token_chars, env_first, read_token_file
+from .auth import check_token_chars, read_token_file
+from .env import env_first
 from .errors import ConfigError
 from .server import serve
 

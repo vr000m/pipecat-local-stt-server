@@ -25,7 +25,7 @@
 #                       else can write to. Its content must be one token of
 #                       visible ASCII (UTF-8, surrounding whitespace stripped; an
 #                       empty file, internal whitespace or non-ASCII is refused,
-#                       by the server's own stt_server.env.read_token_file).
+#                       by the server's own stt_server.auth.read_token_file).
 #   PIPECAT_STT_UNLOAD_WAIT  seconds (integer 0..86400, read as decimal so "08"
 #                       is 8; larger values are refused, not wrapped) to wait for
 #                       launchd to finish tearing the old job down before
@@ -239,7 +239,7 @@ installed_auth_state() {
 # symlink) lets someone else set it; so does a parent directory someone else can
 # write to; a missing path crash-loops the agent under KeepAlive. Content policy
 # (empty = auth disabled, internal whitespace or non-ASCII = never matches a
-# header, non-UTF-8) is the server's own stt_server.env.read_token_file, called
+# header, non-UTF-8) is the server's own stt_server.auth.read_token_file, called
 # below so the two cannot drift.
 validate_token_file() {
     local f="$1" owner mode dir me sticky
@@ -295,28 +295,20 @@ validate_token_file() {
         echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is unreadable" >&2
         exit 1
     fi
+    # The renderer enforces its plist allowlist after the directories exist; ask
+    # it now (its own --check-abspath mode, one regex) so a refused path fails
+    # before any mkdir.
+    if ! "$PYTHON" -I "$RENDER_PY" --check-abspath PIPECAT_STT_AUTH_TOKEN_FILE "$f"; then
+        exit 1
+    fi
     if ! "$PYTHON" -I -c '
 import sys
 try:
-    from stt_server.env import read_token_file
+    from stt_server.auth import read_token_file
 except ImportError:
     print(
         "error: cannot import stt_server - run with the project venv interpreter "
         "(PIPECAT_STT_PYTHON, default .venv/bin/python after uv sync)",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-# The renderer writes this path into the plist and enforces its own allowlist
-# after the directories exist; load its regex so the two cannot drift.
-import importlib.util
-
-spec = importlib.util.spec_from_file_location("render_stt_plist", sys.argv[2])
-renderer = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(renderer)
-if not renderer._ABSPATH_RE.fullmatch(sys.argv[1]):
-    print(
-        f"error: PIPECAT_STT_AUTH_TOKEN_FILE {sys.argv[1]!r} has characters the plist "
-        "allowlist refuses (letters, digits, space and . _ / + - @ only)",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -325,7 +317,7 @@ try:
 except ValueError as exc:
     print(f"error: PIPECAT_STT_AUTH_TOKEN_FILE: {exc}", file=sys.stderr)
     sys.exit(1)
-' "$f" "$RENDER_PY"; then
+' "$f"; then
         exit 1
     fi
 }

@@ -58,6 +58,7 @@ from .backend import (
     TranscriptionBackend,
     abort_backend,
 )
+from .auth import LOOPBACK_HOSTS
 from .errors import ConfigError
 
 # OpenAI Realtime groups errors into a coarse "type" field (e.g.
@@ -358,8 +359,10 @@ class ServerConfig:
     def __post_init__(self) -> None:
         if self.socket_path is None and (self.host is None or self.port is None):
             raise ConfigError("ServerConfig requires socket_path or host+port")
-        if self.host is not None and self.host not in ("127.0.0.1", "::1", "localhost"):
-            raise ConfigError("V1 only permits loopback binds (127.0.0.1/::1/localhost)")
+        if self.host is not None and self.host not in LOOPBACK_HOSTS:
+            raise ConfigError(
+                f"V1 only permits loopback binds ({'/'.join(sorted(LOOPBACK_HOSTS))})"
+            )
 
 
 @dataclass
