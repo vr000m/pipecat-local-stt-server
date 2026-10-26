@@ -197,9 +197,9 @@ if [[ "$cmd" == "install" && ! -x "$PYTHON" ]]; then
 fi
 
 # scripts/read_stt_plist.py is the one reader of the installed plist (the justfile
-# calls it too). It is stdlib only: install, which already requires $PYTHON, runs
-# it there; every other subcommand (uninstall) runs it under the system python3,
-# so it works with no venv.
+# calls it too). It and lock_free below are stdlib only: install, which already
+# requires $PYTHON, runs them there; every other subcommand (uninstall) runs them
+# under the system python3, so it works with no venv.
 if [[ "$cmd" == "install" ]]; then
     READER_PYTHON="$PYTHON"
 else
@@ -429,9 +429,10 @@ wait_unloaded() {
 # anything but a regular file), 1 when one holds it, 2 when the probe cannot
 # tell. Mirrors stt_server.server.socket_lock_held (a shared, non-blocking flock
 # for an instant, so it conflicts with a server's exclusive lock but never makes
-# a real starter fail, as that retries 250 ms), in stdlib python3 so an
-# uninstall needs no venv. It is deliberately stricter than socket_lock_held,
-# which answers "not held" for a file another user owns or one it cannot open
+# a real starter fail, as that retries 250 ms), stdlib only and run under
+# $READER_PYTHON, so install needs no system python3 and uninstall no venv. It
+# is deliberately stricter than socket_lock_held, which answers "not held" for
+# a file another user owns or one it cannot open
 # (start() reports those): here every error is 2, "cannot tell", and the caller
 # then leaves the socket alone (fails closed). The caller passes
 # "$sock.lock", the server's _lock_path rule. Both the name rule and the lock
@@ -439,7 +440,7 @@ wait_unloaded() {
 # acquire_socket_lock by tests/test_install_migration.py
 # (test_socket_cleanup_respects_a_held_lock).
 lock_free() {
-    python3 -I -c '
+    "$READER_PYTHON" -I -c '
 import errno, fcntl, os, stat, sys
 try:
     try:

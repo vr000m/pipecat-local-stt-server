@@ -95,8 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory outside the `wheel`/`admin` rule is refused, since anyone who can
   write there can create the name once it is gone (macOS empties `/tmp` at boot)
   and the server re-opens the path at every start.
-- `install` runs the plist reader under its venv python (it needs no system
-  `python3`); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
+- `install` runs the plist reader and the socket lock probe under its venv
+  python (it needs no system `python3`, also when it retires an old socket); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
   --strict`) fails on a malformed plist by itself, so it no longer relies on the
   `--has-auth` read having run first.
 - `uninstall` waits for launchd to drop the job for a TCP agent too, and prints

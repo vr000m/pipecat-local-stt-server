@@ -1871,6 +1871,21 @@ def test_endpoint_read_alone_refuses_a_malformed_plist(tmp_path: Path, held_sock
     assert sock.exists() and lock.exists(), "an unreadable plist names no socket to remove"
 
 
+# Every stdlib helper an install runs (the plist reader and the lock_free probe)
+# runs under $PYTHON, so a socket->TCP install, the main 0.4.x upgrade path,
+# needs no system python3: with python3 broken it still retires the old socket.
+def test_install_socket_cleanup_needs_no_system_python3(tmp_path: Path, held_sockets):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock)])
+    _write_executable(stub_dir / "python3", "#!/usr/bin/env bash\nexit 127\n")
+    r = _run_install(tmp_path, stub_dir)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "could not tell" not in r.stderr, r.stderr
+    assert not sock.exists() and lock.exists()
+
+
 def test_install_reads_the_plist_under_its_own_python(tmp_path: Path):
     """install already requires $PYTHON, so it needs no system python3 for the
     reader; uninstall keeps python3 (no venv needed)."""
