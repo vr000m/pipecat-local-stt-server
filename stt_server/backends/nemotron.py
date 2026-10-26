@@ -50,7 +50,7 @@ from ..protocol import (
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
 from ..snapshot import SnapshotSpec, download_phase
-from . import DEFAULT_NEMOTRON_MODEL
+from . import DEFAULT_NEMOTRON_MODEL, pinned_revision
 from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.nemotron")
@@ -228,7 +228,9 @@ class NemotronBackend(DecodeGuardMixin):
                 # Fetch-and-load only (not the decode): a bare network error
                 # here is a model download failure.
                 with download_phase():
-                    self._model = load(self._model_id)
+                    # ``revision=None`` is mlx_audio's own default (the repo's
+                    # ``main``); a pinned default loads its recorded commit.
+                    self._model = load(self._model_id, revision=pinned_revision(self._model_id))
             return self._model
 
     async def start(self) -> None:
@@ -300,6 +302,7 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     return [
         SnapshotSpec(
             model or DEFAULT_NEMOTRON_MODEL,
+            revision=pinned_revision(model or DEFAULT_NEMOTRON_MODEL),
             allow_patterns=_MLX_AUDIO_ALLOW_PATTERNS,
             required=("config.json", "*.safetensors"),
         )

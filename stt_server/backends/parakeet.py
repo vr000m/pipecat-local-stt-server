@@ -31,7 +31,7 @@ from ..protocol import (
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
 from ..snapshot import SnapshotSpec, download_phase
-from . import DEFAULT_PARAKEET_MODEL
+from . import DEFAULT_PARAKEET_MODEL, pinned_revision
 from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.parakeet")
@@ -49,6 +49,11 @@ logger = logging.getLogger("stt_server.backends.parakeet")
 # 24-300 s danger zone without truncation.
 _CHUNK_DURATION_S = 120.0
 _OVERLAP_DURATION_S = 15.0
+
+
+# The two files ``parakeet_mlx.from_pretrained`` reads; prefetch and the pinned
+# snapshot resolution fetch exactly these.
+_WEIGHT_FILES = ("config.json", "model.safetensors")
 
 
 class _ParakeetStream:
@@ -215,8 +220,20 @@ class ParakeetBackend(DecodeGuardMixin):
                 # Fetch-and-load only (not the decode): a bare network error
                 # here is a model download failure.
                 with download_phase():
-                    self._model = from_pretrained(self._model_id)
+                    self._model = from_pretrained(self._model_path())
             return self._model
+
+    def _model_path(self) -> str:
+        """What ``from_pretrained`` loads. It has no revision argument and
+        fetches a bare repo id from ``main``, so a pinned default is resolved to
+        its snapshot directory (``from_pretrained`` reads a local directory when
+        the id is not a Hub repo). Any other model id passes through unchanged."""
+        revision = pinned_revision(self._model_id)
+        if revision is None:
+            return self._model_id
+        from huggingface_hub import snapshot_download  # type: ignore
+
+        return snapshot_download(self._model_id, revision=revision, allow_patterns=_WEIGHT_FILES)
 
     async def start(self) -> None:
         # ``abort()`` (run by the server when an earlier ``start()`` failed)
@@ -265,5 +282,12 @@ class ParakeetBackend(DecodeGuardMixin):
 def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend parakeet`` fetches:
     the two files ``parakeet_mlx.from_pretrained`` downloads."""
-    files = ("config.json", "model.safetensors")
-    return [SnapshotSpec(model or DEFAULT_PARAKEET_MODEL, allow_patterns=files, required=files)]
+    repo = model or DEFAULT_PARAKEET_MODEL
+    return [
+        SnapshotSpec(
+            repo,
+            revision=pinned_revision(repo),
+            allow_patterns=_WEIGHT_FILES,
+            required=_WEIGHT_FILES,
+        )
+    ]

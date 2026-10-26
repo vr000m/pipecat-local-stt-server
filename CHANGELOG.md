@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The default Whisper (`mlx-community/whisper-large-v3-turbo`) and Kyutai
-  (`kyutai/stt-1b-en_fr-mlx`) weights are pinned to a Hub commit
+- The default weights of every Hub-backed backend (Whisper
+  `mlx-community/whisper-large-v3-turbo`, Kyutai `kyutai/stt-1b-en_fr-mlx`,
+  Parakeet `mlx-community/parakeet-tdt-0.6b-v3`, Nemotron
+  `mlx-community/nemotron-3.5-asr-streaming-0.6b`) are pinned to a Hub commit
   (`backends.PINNED_REVISIONS`), for serving and `prefetch`. Any other
   `--model` still follows the repo's `main`. The pins match the snapshots
   already cached on current installs.

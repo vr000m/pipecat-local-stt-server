@@ -114,10 +114,12 @@ class _FakeMLXAudioSTTModule(types.ModuleType):
         super().__init__("mlx_audio.stt")
         self.model = _FakeNemotronModel()
         self.load_calls: list[str] = []
+        self.load_kwargs: list[dict[str, Any]] = []
         self.raise_on_load: BaseException | None = None
 
     def load(self, model_id: str, *args: Any, **kwargs: Any) -> _FakeNemotronModel:
         self.load_calls.append(model_id)
+        self.load_kwargs.append(kwargs)
         if self.raise_on_load is not None:
             raise self.raise_on_load
         return self.model
@@ -530,3 +532,18 @@ async def test_close_waits_while_decode_in_flight(nemotron_mod, fake_nemotron):
     await asyncio.wait_for(backend.close(), timeout=3.5)
 
     await asyncio.wait_for(end_task, timeout=3.0)
+
+
+def test_default_model_loads_at_the_pinned_revision(nemotron_mod, fake_nemotron):
+    from stt_server.backends import DEFAULT_NEMOTRON_MODEL, PINNED_REVISIONS
+
+    nemotron_mod.NemotronBackend()._get_model()
+    assert fake_nemotron.load_calls == [DEFAULT_NEMOTRON_MODEL]
+    assert fake_nemotron.load_kwargs == [{"revision": PINNED_REVISIONS[DEFAULT_NEMOTRON_MODEL]}]
+    assert nemotron_mod.prefetch_specs(None)[0].revision == PINNED_REVISIONS[DEFAULT_NEMOTRON_MODEL]
+
+
+def test_other_models_load_unpinned(nemotron_mod, fake_nemotron):
+    nemotron_mod.NemotronBackend(model="x/y")._get_model()
+    assert fake_nemotron.load_kwargs == [{"revision": None}]
+    assert nemotron_mod.prefetch_specs("x/y")[0].revision is None
