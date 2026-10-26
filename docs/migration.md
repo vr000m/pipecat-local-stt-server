@@ -67,7 +67,10 @@ for the wire protocol, the import name or the Python client.
 
 2. **Reinstall the agent.** `just stt-install <backend>` writes the TCP plist,
    removes the old socket (and its lock) it was replacing, and prints a note.
-   The recipe always uses the canonical host and port; for a custom one run the
+   The socket is removed only once the old job is seen unloaded (up to
+   `PIPECAT_STT_UNLOAD_WAIT` seconds); otherwise a warning is printed and the
+   socket and lock are left in place. For a TCP agent the recipe uses the
+   canonical host and port; for a custom one run the
    installer directly, with the label and backend set so it does not replace the
    default whisper agent, e.g. `PIPECAT_STT_LABEL=pipecat.stt-server.alt
    PIPECAT_STT_BACKEND=mlx PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh
@@ -101,6 +104,14 @@ for the wire protocol, the import name or the Python client.
    (they would be written into the plist). Write the token to a file and set
    `PIPECAT_STT_AUTH_TOKEN_FILE=<absolute path>`. Loopback agents run without a
    token by default, as the TTS agents do.
+
+   **Reinstalling an agent that carried a token is refused.** If the installed
+   plist has a token (an env token from before 0.5.0, or
+   `--auth-token-file`), a TCP reinstall without `PIPECAT_STT_AUTH_TOKEN_FILE`
+   exits 1 rather than replace it with an unauthenticated listener. Set
+   `PIPECAT_STT_AUTH_TOKEN_FILE`, or run `uninstall` first to install without a
+   token. A socket reinstall is not refused (it warns that the socket agent
+   carries no token).
 
 **Rollback / keeping a socket agent:**
 

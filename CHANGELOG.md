@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > to TCP; set `PIPECAT_STT_SOCKET` to keep a socket agent
 > (`PIPECAT_STT_SOCKET=<path> just stt-install <backend>`). Point clients at
 > `STT_WS_HOST`/`STT_WS_PORT`. `PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN`
-> are now refused; use `PIPECAT_STT_AUTH_TOKEN_FILE`. Check any downstream
+> are now refused; use `PIPECAT_STT_AUTH_TOKEN_FILE`. A TCP reinstall of an
+> agent whose installed plist carried a token exits 1 unless
+> `PIPECAT_STT_AUTH_TOKEN_FILE` is set (run `uninstall` first to drop auth).
+> Check any downstream
 > installer invocations first. See `docs/migration.md`.
 
 ### Added
@@ -56,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`PIPECAT_STT_AUTH_TOKEN_FILE` is validated** in TCP mode: a regular file, not a
   symlink, owned by you, no group/other permission bits, and non-empty (an empty
   file would silently disable auth).
-- `PIPECAT_STT_UNLOAD_WAIT` must be a non-negative integer; anything else fails
+- `PIPECAT_STT_UNLOAD_WAIT` must be a non-negative integer (leading zeros are
+  read as decimal, so `08` is 8 seconds); anything else fails
   before any `launchctl` call. `PIPECAT_STT_BACKEND` is checked against the
   renderer's backend names before any directory is created (`whisper` is the
   justfile name; the installer name is `mlx`).
