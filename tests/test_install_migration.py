@@ -291,7 +291,12 @@ def test_new_label_not_booted_out_before_bootstrap(tmp_path: Path):
     # immediately precedes bootstrap — never the migration loop (which runs
     # before, and is separated from, the new agent's own bootout).
     new_bootout_indices = [i for i, ln in enumerate(lc) if ln == f"launchctl bootout {new_target}"]
-    assert new_bootout_indices == [bootstrap_idx - 1], (
+    # Only `print` polls of the new label (wait for teardown) may sit between the
+    # bootout and the bootstrap.
+    expect_idx = bootstrap_idx - 1
+    while expect_idx > 0 and lc[expect_idx] == f"launchctl print {new_target}":
+        expect_idx -= 1
+    assert new_bootout_indices == [expect_idx], (
         "the new label's only bootout must be the idempotency unload directly "
         f"before bootstrap; new-label bootout indices={new_bootout_indices}, "
         f"bootstrap_idx={bootstrap_idx}, launchctl lines={lc}"
@@ -1041,3 +1046,130 @@ def test_shutil_which_bash_available():
     """Sanity guard: the test harness needs a real ``bash`` to invoke the
     script — surface a clear failure rather than an opaque subprocess error."""
     assert shutil.which("bash") is not None, "bash not on PATH; cannot run install script"
+
+
+# ---------------------------------------------------------------------------
+# bootout is asynchronous: bootstrapping into the teardown window fails with
+# "Bootstrap failed: 5: Input/output error" and leaves the agent unloaded.
+# ---------------------------------------------------------------------------
+
+
+def _slow_teardown_launchctl(
+    stub_dir: Path, tmp_path: Path, *, still_loaded_polls: int, bootstrap_failures: int
+):
+    """Replace the stub launchctl with one that models async teardown.
+
+    After a ``bootout`` the service stays visible to ``print`` for
+    ``still_loaded_polls`` calls; the first ``bootstrap_failures`` bootstrap
+    calls exit 5 like launchd does in that window.
+    """
+    argv_log = tmp_path / "argv.log"
+    state = tmp_path / "lc_state"
+    state.mkdir()
+    (state / "polls").write_text("0")
+    (state / "boot_fail").write_text(str(bootstrap_failures))
+    _write_executable(
+        stub_dir / "launchctl",
+        f"""#!/usr/bin/env bash
+printf 'launchctl %s\\n' "$*" >> {argv_log!s}
+case "$1" in
+bootout) printf '{still_loaded_polls}' > {state!s}/polls; exit 0 ;;
+print)
+    n=$(cat {state!s}/polls)
+    if [[ "$n" -gt 0 ]]; then printf '%s' $((n - 1)) > {state!s}/polls; exit 0; fi
+    exit 1 ;;
+bootstrap)
+    f=$(cat {state!s}/boot_fail)
+    if [[ "$f" -gt 0 ]]; then
+        printf '%s' $((f - 1)) > {state!s}/boot_fail
+        echo "Bootstrap failed: 5: Input/output error" >&2
+        exit 5
+    fi
+    exit 0 ;;
+esac
+exit 0
+""",
+    )
+    return argv_log
+
+
+def _lc_lines(argv_log: Path) -> list[str]:
+    return [ln for ln in _argv_lines(argv_log) if ln.startswith("launchctl ")]
+
+
+def test_install_waits_for_bootout_teardown_before_bootstrap(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    argv_log = _slow_teardown_launchctl(
+        stub_dir, tmp_path, still_loaded_polls=3, bootstrap_failures=0
+    )
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "nemotron",
+            "PIPECAT_STT_LABEL": "pipecat.stt-server.nemotron",
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    lc = _lc_lines(argv_log)
+    target = f"gui/{FAKE_UID}/pipecat.stt-server.nemotron"
+    out = lc.index(f"launchctl bootout {target}")
+    boot = lc.index(
+        f"launchctl bootstrap gui/{FAKE_UID} {_agents(tmp_path / 'home') / 'pipecat.stt-server.nemotron.plist'}"
+    )
+    prints = [i for i, ln in enumerate(lc) if ln == f"launchctl print {target}" and out < i < boot]
+    # 3 polls saw it loaded, the 4th saw it gone: bootstrap came only after that.
+    assert len(prints) == 4, lc
+
+
+def test_install_retries_bootstrap_once_on_transient_failure(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    argv_log = _slow_teardown_launchctl(
+        stub_dir, tmp_path, still_loaded_polls=0, bootstrap_failures=1
+    )
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "nemotron",
+            "PIPECAT_STT_LABEL": "pipecat.stt-server.nemotron",
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "retrying" in r.stderr
+    assert len([ln for ln in _lc_lines(argv_log) if ln.startswith("launchctl bootstrap ")]) == 2
+    assert "installed and started" in r.stdout
+
+
+def test_install_fails_when_bootstrap_keeps_failing(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    argv_log = _slow_teardown_launchctl(
+        stub_dir, tmp_path, still_loaded_polls=0, bootstrap_failures=5
+    )
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "nemotron",
+            "PIPECAT_STT_LABEL": "pipecat.stt-server.nemotron",
+        },
+    )
+    assert r.returncode != 0
+    assert len([ln for ln in _lc_lines(argv_log) if ln.startswith("launchctl bootstrap ")]) == 2
+    assert "installed and started" not in r.stdout
+
+
+def test_wait_for_unload_is_bounded(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    _slow_teardown_launchctl(stub_dir, tmp_path, still_loaded_polls=10_000, bootstrap_failures=0)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "nemotron",
+            "PIPECAT_STT_LABEL": "pipecat.stt-server.nemotron",
+            "PIPECAT_STT_UNLOAD_WAIT": "1",
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "still loaded" in r.stderr

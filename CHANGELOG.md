@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the installer and renderer (an env token would land in the plist). Use
   `PIPECAT_STT_AUTH_TOKEN_FILE`.
 
+### Fixed
+
+- **Reinstalling a running agent could leave it unloaded** (`Bootstrap failed: 5:
+  Input/output error`). `launchctl bootout` returns before launchd has finished
+  tearing the old job down (a loaded ASR model takes seconds to exit), and the
+  installer bootstrapped straight into that window. The installer now waits
+  (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30) until the label is gone
+  and retries the bootstrap once. Existed before 0.5.0 (same bootout/bootstrap
+  sequence); reproduced on a nemotron reinstall.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added

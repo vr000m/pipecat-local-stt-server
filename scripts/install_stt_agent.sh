@@ -160,6 +160,21 @@ installed_socket_path() {
     printf '%s' "$json" | sed -e 's|\\/|/|g' -n -e 's/.*"--socket-path","\([^"]*\)".*/\1/p'
 }
 
+# Block until launchd no longer lists $LABEL (bounded; a stuck job only warns, the
+# bootstrap that follows then reports the real error). PIPECAT_STT_UNLOAD_WAIT is
+# the cap in seconds (default 30).
+wait_unloaded() {
+    local waited=0 cap="${PIPECAT_STT_UNLOAD_WAIT:-30}"
+    while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do
+        if [[ "$waited" -ge "$cap" ]]; then
+            echo "warning: $LABEL still loaded ${cap}s after bootout" >&2
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
 # Remove a socket and its .lock named by an INSTALLED plist. That plist is
 # untrusted input (anything that can write the user's LaunchAgents dir can name
 # any path in it), so this is deliberately conservative and NEVER aborts the
@@ -366,7 +381,17 @@ install)
         echo "note: endpoint changed from socket $old_socket to TCP $HOST:$PORT; removing the old socket"
         remove_socket_owned "$old_socket"
     fi
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
+    # bootout returns before launchd finishes tearing the old job down (a loaded
+    # ASR model takes seconds to exit). Bootstrapping into that window fails with
+    # "Bootstrap failed: 5: Input/output error" and leaves the agent unloaded, so
+    # wait until the label is gone, then retry the bootstrap once.
+    wait_unloaded
+    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"; then
+        echo "warning: launchctl bootstrap failed for $LABEL; retrying once" >&2
+        sleep 2
+        wait_unloaded
+        launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
+    fi
     launchctl enable "gui/$(id -u)/$LABEL"
     launchctl kickstart -k "gui/$(id -u)/$LABEL"
     echo "installed and started: $LABEL"
