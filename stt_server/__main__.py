@@ -29,13 +29,13 @@ import os
 import sys
 from pathlib import Path
 
+from .auth import check_token_chars, read_token_file
 from .backend import EchoBackend
 
 # The backend registry (``backends/__init__.py``) is stdlib-only: reading it
 # imports no backend module, so the serve path stays lean at every launch.
 from .backends import BACKENDS, import_backend
 from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
-from .auth import check_token_chars, read_token_file
 from .env import env_first
 from .errors import ConfigError
 from .server import serve
@@ -483,7 +483,7 @@ def _cmd_status(args: argparse.Namespace) -> None:
     except (FileNotFoundError, ConnectionRefusedError) as exc:
         print(f"stt_server: not reachable ({exc})", file=sys.stderr)
         raise SystemExit(1)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         print(f"stt_server: timed out after {args.timeout}s", file=sys.stderr)
         raise SystemExit(1)
     except OSError as exc:
@@ -548,10 +548,30 @@ def main() -> None:
     else:
         sub, rest = "serve", argv
 
+    parser = _build_parser()
+    if sub is None:
+        # Top-level --help path: argparse prints both subcommands and exits.
+        parser.parse_args(rest)
+        return
+    args = parser.parse_args([sub, *rest])
+    if args.cmd == "status":
+        _cmd_status(args)
+    elif args.cmd == "prefetch":
+        _cmd_prefetch(args)
+    else:
+        _cmd_serve(args)
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="stt_server")
     subparsers = parser.add_subparsers(dest="cmd")
 
-    p_serve = subparsers.add_parser("serve", help="run the server (default)")
+    # allow_abbrev=False: serve takes each flag only by its full name (or
+    # ``--flag=value``). scripts/read_stt_plist.py reads an installed plist's serve
+    # flags without argparse; with prefixes allowed, ``--auth-token /x`` would
+    # enable auth here while the reader saw no token (tests/test_justfile_recipes.py
+    # pins the reader to this parser).
+    p_serve = subparsers.add_parser("serve", help="run the server (default)", allow_abbrev=False)
     _add_endpoint_flags(p_serve)
     p_serve.add_argument("--backend", choices=BACKEND_CHOICES, default="echo")
     # Default is None so ``_resolve_model`` applies the backend's own default,
@@ -590,18 +610,7 @@ def main() -> None:
         "--timeout", type=float, default=3.0, help="overall probe timeout in seconds"
     )
     p_status.add_argument("--json", action="store_true", help="emit raw JSON instead of text")
-
-    if sub is None:
-        # Top-level --help path: argparse prints both subcommands and exits.
-        parser.parse_args(rest)
-        return
-    args = parser.parse_args([sub, *rest])
-    if args.cmd == "status":
-        _cmd_status(args)
-    elif args.cmd == "prefetch":
-        _cmd_prefetch(args)
-    else:
-        _cmd_serve(args)
+    return parser
 
 
 def _cmd_prefetch(args: argparse.Namespace) -> None:

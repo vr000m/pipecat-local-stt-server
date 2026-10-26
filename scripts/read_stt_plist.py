@@ -23,9 +23,14 @@ the plist is absent or readable without a token, and 2 means it could not tell
 the installer treats every status but 0 and 3 (python3 missing is 127) as an
 error, never as "no auth".
 
-ProgramArguments is walked element by element and a flag's VALUE is consumed in
-the step after the flag, so a value that looks like a flag (``--log-level
---socket-path``) is never read as one. The justfile (stt-list, stt-status,
+ProgramArguments is read with the server's own serve grammar (stt_server's
+argparse parser, which has ``allow_abbrev=False``): a flag is its full name only,
+its value is the next element or follows ``=`` in the same element
+(``--auth-token-file=/x``), the last occurrence wins, and a serve switch that
+takes no value (``--supervised``, ``--help``) never consumes the next element. A
+VALUE is consumed in the step after its flag, so a value that looks like a flag
+(``--log-level --socket-path``) is never read as one. tests/test_justfile_recipes.py
+checks this against the real parser. The justfile (stt-list, stt-status,
 stt-probe) and scripts/install_stt_agent.sh both call this, so they cannot
 disagree about what an installed plist says. Stdlib only: it must run under the
 system python3 when the project venv is absent.
@@ -37,6 +42,9 @@ import plistlib
 import sys
 
 _FLAGS = ("--host", "--port", "--socket-path", "--auth-token-file")
+# The serve flags that take no value; every other ``--flag`` takes one. Pinned to
+# the serve parser by tests/test_justfile_recipes.py.
+_SWITCHES = frozenset({"--supervised", "--help"})
 _ENV_TOKENS = ("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN")
 NO_AUTH = 3  # --has-auth exit status for "no token"; see the module docstring
 
@@ -79,7 +87,12 @@ def read_flags(plist: dict) -> dict[str, str]:
                 found[expect] = el
             expect = ""
         elif el.startswith("--"):
-            expect = el
+            name, eq, value = el.partition("=")
+            if eq:
+                if name in _FLAGS:
+                    found[name] = value
+            elif el not in _SWITCHES:
+                expect = el
     return found
 
 

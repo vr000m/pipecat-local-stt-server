@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`python3` missing) now fails an install instead of counting as "no auth", and
   makes `uninstall` leave any socket in place; `stt-list` shows blank fields and a
   one-line warning for it instead of a traceback.
+- **`serve` takes each flag by its full name only** (argparse `allow_abbrev=False`):
+  `--auth-token /x` or `--sock /x` now fails at startup instead of being read as
+  `--auth-token-file` / `--socket-path`. `--flag=value` still works. The plist
+  reader follows the same grammar: it reads `--auth-token-file=/x` (and the `=`
+  form of `--host`, `--port`, `--socket-path`) and no longer takes the element after
+  `--supervised` as its value, so a hand-edited plist that requires a token can no
+  longer read as "no token" and let a reinstall drop auth.
 - Socket cleanup on a transport change or `uninstall` leaves the socket and its
   `.lock` in place, with a warning, while any process holds the lock (a server
   started by hand can own the recorded path).

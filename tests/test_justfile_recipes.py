@@ -1007,6 +1007,95 @@ def test_plist_reader_state_space(tmp_path, state):
         assert "cannot read plist" in auth.stderr and "cannot read plist" in res.stderr
 
 
+# Reader <-> server flag grammar. Invariant: for every serve argv the server's
+# argparse parser accepts, the reader returns the same host, port, socket-path
+# and auth-token-file the server would use, and --has-auth is 0 exactly when the
+# server runs with a token file. An argv the parser rejects starts no listener,
+# so only acceptance is pinned for those (abbreviations must be rejected: the
+# reader matches full names only). State space: flag form {space, '=', empty
+# '=', abbreviated (space/'='), after a no-value switch, repeated (mixed forms,
+# last wins), value with '=', flag-like value} x the four endpoint flags.
+_GRAMMAR_CASES = {
+    # case: (serve argv tail, accepted by the serve parser)
+    "space-form": (["--host", "127.0.0.1", "--port", "9565"], True),
+    "eq-form": (["--host=::1", "--port=9765"], True),
+    "eq-socket": (["--socket-path=/h/s.sock"], True),
+    "token-space": (["--auth-token-file", "/h/tok"], True),
+    "token-eq": (["--auth-token-file=/h/tok"], True),
+    "token-eq-empty": (["--auth-token-file="], True),
+    "token-value-has-eq": (["--auth-token-file", "/h/a=b"], True),
+    "after-switch": (["--supervised", "--auth-token-file", "/h/tok"], True),
+    "switch-after": (["--auth-token-file=/h/tok", "--supervised", "--port", "9"], True),
+    "repeat-eq-last": (["--auth-token-file", "/h/a", "--auth-token-file=/h/b"], True),
+    "repeat-space-last": (["--auth-token-file=/h/a", "--auth-token-file", "/h/b"], True),
+    "among-others": (["--model", "m", "--auth-token-file", "/h/t", "--backend", "mlx"], True),
+    "eq-value-flag-like": (["--log-level=--socket-path", "--port", "9"], True),
+    "port-leading-zero": (["--port", "09565"], True),
+    "abbrev-token-space": (["--auth-token", "/h/tok"], False),
+    "abbrev-token-eq": (["--auth=/h/tok"], False),
+    "abbrev-socket": (["--sock", "/h/s.sock"], False),
+    "abbrev-port-eq": (["--po=9565"], False),
+    "flag-like-value": (["--log-level", "--socket-path", "/h/x.sock"], False),
+}
+
+
+def _serve_subparser():
+    import argparse
+
+    from stt_server.__main__ import _build_parser
+
+    sub = next(a for a in _build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+    return sub.choices["serve"]
+
+
+def _load_reader():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("read_stt_plist", READ_PLIST)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("case", sorted(_GRAMMAR_CASES))
+def test_plist_reader_matches_serve_parser(tmp_path, case):
+    from stt_server.__main__ import _build_parser
+
+    tail, accepted = _GRAMMAR_CASES[case]
+    try:
+        args = _build_parser().parse_args(["serve", *tail])
+    except SystemExit:
+        args = None
+    assert (args is not None) == accepted, f"{case}: serve parser acceptance changed"
+    if args is None:
+        return
+    plist = tmp_path / "a.plist"
+    plist.write_bytes(
+        plistlib.dumps({"Label": "x", "ProgramArguments": ["py", "-m", "stt_server", *tail]})
+    )
+    res = _read_plist(plist)
+    assert res.returncode == 0, res.stderr
+    host, port, sock, token = res.stdout.split("\n")[:4]
+    assert host == (args.host or "")
+    assert (int(port) if port else None) == args.port
+    assert sock == (args.socket_path or "")
+    assert token == (args.auth_token_file or "")
+    has_auth = _read_plist(plist, "--has-auth").returncode
+    assert has_auth == (0 if args.auth_token_file else 3), f"{case}: --has-auth disagrees"
+
+
+def test_plist_reader_switches_match_serve_parser():
+    """The reader's no-value switches are exactly the serve parser's, and the
+    parser takes full flag names only (the reader does no prefix matching)."""
+    serve = _serve_subparser()
+    reader = _load_reader()
+    assert serve.allow_abbrev is False
+    switches = {o for a in serve._actions if a.nargs == 0 for o in a.option_strings}
+    assert {o for o in switches if o.startswith("--")} == set(reader._SWITCHES)
+    takes_value = {o for a in serve._actions if a.nargs != 0 for o in a.option_strings}
+    assert set(reader._FLAGS) <= takes_value
+
+
 @pytest.mark.parametrize("state", ["truncated", "garbage", "wrong-type", "valid-token-file"])
 def test_stt_list_sweep_survives_malformed_plist(tmp_path, state):
     """stt-list exits 0 and shows the no-endpoint line for a malformed plist,
