@@ -152,8 +152,11 @@ is left in place with a warning, see [migration](migration.md)), unless the
 wrapper sets `PIPECAT_STT_SOCKET` (or `KODA_STT_SOCKET`). Koda's client falls
 back to its socket default, which then no longer exists. Either set the socket
 env on the wrapper to keep a socket agent, or point Koda's client at
-`STT_WS_HOST`/`STT_WS_PORT`. Whether the wrapper already exports either socket
-variable is unverified: the wrapper lives in the consumer repo, not here. See the
+`STT_WS_HOST`/`STT_WS_PORT`. The wrapper (checked against `koda` in the consumer repo,
+2026-10-26) exports neither `PIPECAT_STT_SOCKET` nor `KODA_STT_SOCKET`, so a bare
+`./koda stt install` flips to TCP; it does export `STT_WS_DEFAULT_SOCKET` (the old
+`stt.sock`), and an `STT_WS_SOCKET` line in Koda's `.env` outranks `STT_WS_HOST`/`PORT`,
+so remove or replace that line after a TCP reinstall. See the
 [migration guide](migration.md#upgrading-from-04x-to-050).
 Use `./koda stt status` for a wire-level health check.
 
