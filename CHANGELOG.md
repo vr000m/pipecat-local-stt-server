@@ -46,7 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the installer; it passes them to `render_stt_plist.py` as `HOST`, `PORT` and
   `AUTH_TOKEN_FILE`.
 - `PIPECAT_STT_PYTHON`: installer interpreter override (default
-  `.venv/bin/python`, or `.venv-kyutai/bin/python` for kyutai).
+  `.venv/bin/python`, or `.venv-kyutai/bin/python` for kyutai). `just
+  stt-install`/`stt-enable` check the backend extra under it when it is set (and
+  fail rather than sync the venv), so a custom interpreter without the extra no
+  longer passes the check and then crash-loops.
 - Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
   nemotron 9865 (parakeet and nemotron proposed, pending agreement with the menu
   bar app).

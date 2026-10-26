@@ -280,7 +280,10 @@ smoke-peercred:
 # onboarding is self-healing. `--inexact` is load-bearing: plain
 # `uv sync --extra X` prunes the OTHER backends' extras, breaking a multi-backend
 # host. We probe via the venv python directly — NOT `uv run`, which would itself
-# re-sync/prune before we could check. Set PIPECAT_STT_SKIP_DEP_SYNC=1 to manage
+# re-sync/prune before we could check. With PIPECAT_STT_PYTHON set (the
+# installer's interpreter override) it probes that interpreter instead and never
+# syncs; stt-enable reads the same variable, so export it as for the install.
+# Set PIPECAT_STT_SKIP_DEP_SYNC=1 to manage
 # extras yourself (the recipe tests set it so they never shell out to `uv sync`).
 _ensure-extra backend:
     #!/usr/bin/env bash
@@ -315,9 +318,19 @@ _ensure-extra backend:
       # exported for kyutai) — that would sync this extra into the wrong venv.
       sync=(env -u UV_PROJECT_ENVIRONMENT uv sync --extra "$extra" --inexact)
     fi
+    # The agent runs under the installer's interpreter: PIPECAT_STT_PYTHON when
+    # set and non-empty (the installer's own `${PIPECAT_STT_PYTHON:-default}`
+    # rule), else the venv above. Probe that one. A sync only fills the venv, so
+    # it cannot fix a custom interpreter: that case fails with the remedy.
+    default_py="$py"
+    py="${PIPECAT_STT_PYTHON:-$py}"
     if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
-      echo "_ensure-extra: '$extra' extra already present ($probe)"
+      echo "_ensure-extra: '$extra' extra already present ($probe, $py)"
       exit 0
+    fi
+    if [[ "$py" != "$default_py" ]]; then
+      echo "_ensure-extra: PIPECAT_STT_PYTHON=$py cannot run '$probe'; install the '$extra' extra into that interpreter, or unset PIPECAT_STT_PYTHON to use $default_py" >&2
+      exit 1
     fi
     echo "_ensure-extra: '$extra' import check failed ($probe) — installing (${sync[*]})…"
     if ! "${sync[@]}"; then

@@ -1526,6 +1526,47 @@ def test_nested_ensure_extra_inherits_venv_overrides(tmp_path, recipe, backend, 
     assert "-c" in _read(logs[key]), f"{recipe}: overridden {key} venv was not probed"
 
 
+# The preflight checks the interpreter the agent will run. Invariant: with
+# PIPECAT_STT_PYTHON set (the installer's override), `_ensure-extra` probes that
+# interpreter, never the default venv, and never runs a sync that could not fix
+# it; a failed probe fails the recipe. State space: recipe {_ensure-extra,
+# stt-install, stt-enable} x backend {whisper (shared venv), kyutai} x custom
+# probe {ok, fails}.
+@pytest.mark.parametrize("probe_ok", [True, False])
+@pytest.mark.parametrize("backend", ["whisper", "kyutai"])
+@pytest.mark.parametrize("recipe", ["_ensure-extra", "stt-install", "stt-enable"])
+def test_ensure_extra_probes_the_agent_interpreter_override(tmp_path, recipe, backend, probe_ok):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    label = EXPECTED[backend][0]
+    home = _home_with_agents(tmp_path, [label])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    # The default venvs would pass the probe: only the override may decide.
+    args, logs, _venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+    custom_log = tmp_path / "py-custom.log"
+    custom = tmp_path / "custom" / "python"
+    custom.parent.mkdir()
+    _write_executable(
+        custom,
+        f"#!/usr/bin/env bash\nprintf 'python %s\\n' \"$*\" >> {custom_log!s}\n"
+        f"exit {0 if probe_ok else 1}\n",
+    )
+    res = _run_just(
+        [*args, f"script={fake_script}", recipe, backend],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": "", "PIPECAT_STT_PYTHON": str(custom)},
+    )
+    assert "-c" in _read(custom_log), f"{recipe}: the override interpreter was not probed"
+    assert _read(logs["main"]) == "" and _read(logs["kyutai"]) == "", "default venv probed"
+    assert not any(ln.startswith("uv sync") for ln in _argv_lines(argv_log))
+    if probe_ok:
+        assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    else:
+        assert res.returncode != 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        assert "PIPECAT_STT_PYTHON" in res.stderr
+        assert not env_log.exists() or _read(env_log) == "", "installer ran after a failed probe"
+
+
 def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
