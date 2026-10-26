@@ -250,7 +250,7 @@ sequenceDiagram
 - [x] Phase 2: Installer
 - [x] Phase 3: Port table, justfile and mirror test
 - [x] Phase 4: Docs and release
-- [ ] Phase 5: Verify on this machine
+- [ ] Phase 5: Verify on this machine (automated part done 2026-10-26: full suite 760 passed / 3 skipped, ruff format+check clean with `.venv/bin/ruff`, validation probe of the live nemotron socket OK; manual steps and kyutai decode pending the user's go-ahead)
 
 ## Findings
 
