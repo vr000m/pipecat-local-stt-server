@@ -1708,6 +1708,80 @@ def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, c
 
 
 # ---------------------------------------------------------------------------
+# Token-file path: validated == opened. Invariant: the plist records the
+# symlink-free resolved path, and every directory on it passed the walk; a
+# group-writable directory passes only when root owns it with group wheel (0) or
+# admin (80), or it is sticky. State space: parent dir {user 0700, user 0770,
+# root 0755, root 0775 gid 0, root 0775 gid 80, root 0775 gid 20, root 1775
+# sticky gid 20, root 0777} x token path {plain, middle symlink}. Root
+# ownership and the gid are faked by a `stat` stub for that one directory.
+# ---------------------------------------------------------------------------
+
+_PARENT_CASES = {
+    # case: (mode, fake root gid or None for the real (user) owner, accepted)
+    "user-0700": (0o700, None, True),
+    "user-0770": (0o770, None, False),
+    "root-0755": (0o755, "0", True),
+    "root-0775-gid0": (0o775, "0", True),
+    "root-0775-gid80": (0o775, "80", True),
+    "root-0775-gid20": (0o775, "20", False),
+    "root-1775-sticky-gid20": (0o1775, "20", True),
+    "root-0777": (0o777, "0", False),
+}
+
+
+def _fake_root_stat(stub_dir: Path) -> None:
+    _write_executable(
+        stub_dir / "stat",
+        """#!/usr/bin/env bash
+if [[ "$1" == "-f" && -n "${FAKE_ROOT_DIR:-}" && "$3" == "$FAKE_ROOT_DIR" ]]; then
+    case "$2" in
+    %u) echo 0; exit 0 ;;
+    %g) echo "$FAKE_ROOT_GID"; exit 0 ;;
+    esac
+fi
+exec /usr/bin/stat "$@"
+""",
+    )
+
+
+@pytest.mark.parametrize("via", ["plain", "middle-symlink"])
+@pytest.mark.parametrize("case", sorted(_PARENT_CASES))
+def test_token_file_parent_and_resolved_path_state_space(tmp_path: Path, case: str, via: str):
+    mode, gid, accepted = _PARENT_CASES[case]
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    _fake_root_stat(stub_dir)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    real = shared / "token.txt"
+    real.write_text(SECRET + "\n")
+    real.chmod(0o600)
+    shared.chmod(mode)
+    given = real
+    if via == "middle-symlink":
+        (tmp_path / "link").symlink_to(shared)
+        given = tmp_path / "link" / "token.txt"
+    env = {"PIPECAT_STT_AUTH_TOKEN_FILE": str(given)}
+    if gid is not None:
+        env.update(FAKE_ROOT_DIR=os.path.realpath(shared), FAKE_ROOT_GID=gid)
+    try:
+        r = _run_install(tmp_path, stub_dir, env_overrides=env)
+    finally:
+        shared.chmod(0o700)
+    assert SECRET not in r.stdout + r.stderr
+    if accepted:
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        recorded = _flag(_rendered(tmp_path / "home")["ProgramArguments"], "--auth-token-file")
+        assert recorded == os.path.realpath(given), "the plist must carry the validated path"
+        assert ("resolves to" in r.stdout) == (via == "middle-symlink")
+    else:
+        assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "writable by others" in r.stderr
+        assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
+# ---------------------------------------------------------------------------
 # Socket cleanup vs a held lock. Invariant: the installer never unlinks a socket
 # or .lock while a process holds that .lock, even after launchd stopped listing
 # the job (a server started by hand can own the path). State space: lock
