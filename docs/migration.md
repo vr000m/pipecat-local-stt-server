@@ -53,7 +53,7 @@ numbers are proposed, pending agreement with the menu bar app. Nothing changes
 for the wire protocol, the import name or the Python client.
 
 1. **Check downstream installer invocations first.** A reinstall without
-   `PIPECAT_STT_SOCKET` flips that agent to TCP and removes its old socket, so
+   `PIPECAT_STT_SOCKET` flips that agent to TCP and removes its old socket (once the old job has unloaded; see step 2), so
    check how any consumer (Koda, onoats) invokes the installer before
    upgrading; this repo does not know their commands.
    - **Breaking for Koda:** `./koda stt install` shells into

@@ -142,11 +142,13 @@ deprecated aliases): `PIPECAT_STT_SOCKET`, `PIPECAT_STT_BACKEND`,
 `PIPECAT_STT_PYTHON` (interpreter; default `.venv/bin/python`, or
 `.venv-kyutai/bin/python` for kyutai), `PIPECAT_STT_UNLOAD_WAIT` (seconds to wait
 for launchd to unload the old job before bootstrap and before socket cleanup;
-non-negative decimal integer, default 30; "08" is 8). Agents default to loopback TCP;
+decimal integer from 0 to 86400, default 30; "08" is 8; larger values are refused). Agents default to loopback TCP;
 `PIPECAT_STT_SOCKET` opts into a Unix socket.
 
 **Breaking change in 0.5.0.** A reinstall through `./koda stt install` on a
-0.5.0 checkout creates a **TCP** agent and removes the old socket, unless the
+0.5.0 checkout creates a **TCP** agent and removes the old socket (once launchd
+shows the old job unloaded, up to `PIPECAT_STT_UNLOAD_WAIT` seconds; otherwise it
+is left in place with a warning, see [migration](migration.md)), unless the
 wrapper sets `PIPECAT_STT_SOCKET` (or `KODA_STT_SOCKET`). Koda's client falls
 back to its socket default, which then no longer exists. Either set the socket
 env on the wrapper to keep a socket agent, or point Koda's client at

@@ -227,7 +227,7 @@ by `PIPECAT_STT_LABEL` — there is no registry or "all" mode. To run any
 subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against a
 non-default agent you must re-export its `PIPECAT_STT_LABEL` (and
 `PIPECAT_STT_BACKEND` when it is not the default); `uninstall` removes the socket
-named in the *installed* plist, not the env. A default-env invocation always
+named in the *installed* plist, not the env (once the job has unloaded, as above). A default-env invocation always
 targets the default `pipecat.stt-server` agent. Prefer the `just` recipes, which carry
 the label for you. See the recipe in the `install_stt_agent.sh` header.
 
