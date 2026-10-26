@@ -247,7 +247,7 @@ sequenceDiagram
 ## Progress
 
 - [x] Phase 1: Renderer
-- [ ] Phase 2: Installer
+- [x] Phase 2: Installer
 - [ ] Phase 3: Port table, justfile and mirror test
 - [ ] Phase 4: Docs and release
 - [ ] Phase 5: Verify on this machine
@@ -256,6 +256,7 @@ sequenceDiagram
 
 - (append findings here as work proceeds)
 - Phase 1 reviewer (advisory, Minor, unfixed): (a) `scripts/render_stt_plist.py` module docstring (lines ~11-13) still describes env tokens via `env_first`; reword. (b) `_require` uses `re.match` with `$`, which accepts a trailing newline (AUTH_TOKEN_FILE/SOCKET_PATH/PYTHON); use `fullmatch` and add a trailing-newline test case.
+- Phase 2 reviewer (advisory, Minor, unfixed): (a) `remove_socket_owned` (`scripts/install_stt_agent.sh` ~149-160) deletes whatever `--socket-path` the installed plist names after only an owner check; add `-S` / regular-file / no-symlink checks and validate_socket_path's lexical rules (warn and skip). (b) Socket mode silently drops `PIPECAT_STT_AUTH_TOKEN_FILE`/`HOST`/`PORT`; warn on stderr. (c) `test_env_auth_token_never_reaches_plist` should also assert the secret is absent from stderr. (d) No test for ambient `SOCKET_PATH`/`HOST`/`PORT`/`AUTH_TOKEN_FILE` leaking into the renderer.
 
 ### Review Waivers
 

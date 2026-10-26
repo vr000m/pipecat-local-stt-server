@@ -10,12 +10,22 @@
 # deprecated aliases:
 #   PIPECAT_STT_LABEL   (KODA_STT_LABEL)   launchd label / plist filename
 #                       (default: pipecat.stt-server)
-#   PIPECAT_STT_SOCKET  (KODA_STT_SOCKET)  path to the UDS socket
-#                       (default: $HOME/Library/Caches/pipecat-stt/stt.sock)
-#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron (default: mlx)
+#   PIPECAT_STT_SOCKET  (KODA_STT_SOCKET)  path to a UDS socket. When non-empty the
+#                       agent is a UDS agent (legacy transport); when unset/empty
+#                       the agent listens on loopback TCP (the default).
+#   PIPECAT_STT_HOST    loopback host for TCP mode (default: 127.0.0.1)
+#   PIPECAT_STT_PORT    TCP port (default: backend canonical port — whisper/mlx
+#                       9565, kyutai 9665, parakeet 9765, nemotron 9865; the echo
+#                       backend has none and requires an explicit port)
+#   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
+#                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused.
+#   PIPECAT_STT_PYTHON  interpreter (default: .venv/bin/python, or
+#                       .venv-kyutai/bin/python for the kyutai backend)
+#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai (default: mlx)
 #   PIPECAT_STT_MODEL   (KODA_STT_MODEL)   model id (default: backend-aware — Whisper repo for
 #                       mlx/echo, mlx-community/parakeet-tdt-0.6b-v3 for parakeet,
-#                       mlx-community/nemotron-3.5-asr-streaming-0.6b for nemotron)
+#                       mlx-community/nemotron-3.5-asr-streaming-0.6b for nemotron,
+#                       kyutai/stt-1b-en_fr-mlx for kyutai)
 #
 # Two-agent install recipe (run Whisper and Parakeet ASR side by side):
 #
@@ -51,10 +61,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RENDER_PY="$REPO_ROOT/scripts/render_stt_plist.py"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/pipecat-stt}}"
-# Default socket lives under the user's Caches dir (not /tmp, which is
-# world-writable and lets a local attacker pre-create the path to DoS
-# the agent). Override via PIPECAT_STT_SOCKET (or legacy KODA_STT_SOCKET).
-SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-$HOME/Library/Caches/pipecat-stt/stt.sock}}"
+# Transport: socket mode only when PIPECAT_STT_SOCKET (or the deprecated
+# KODA_STT_SOCKET alias) is non-empty; otherwise loopback TCP. Empty string
+# counts as unset. When using a socket, keep it under the user's Caches dir
+# (not /tmp, which is world-writable and lets a local attacker pre-create the
+# path to DoS the agent).
+SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-}}"
 BACKEND="${PIPECAT_STT_BACKEND:-${KODA_STT_BACKEND:-mlx}}"
 # Backend-aware MODEL default. render_stt_plist.py validates MODEL and
 # exits when unset, so supply a sensible default per backend here: the
@@ -68,10 +80,25 @@ if [[ "$BACKEND" == "parakeet" ]]; then
     DEFAULT_MODEL="mlx-community/parakeet-tdt-0.6b-v3"
 elif [[ "$BACKEND" == "nemotron" ]]; then
     DEFAULT_MODEL="mlx-community/nemotron-3.5-asr-streaming-0.6b"
+elif [[ "$BACKEND" == "kyutai" ]]; then
+    DEFAULT_MODEL="kyutai/stt-1b-en_fr-mlx"
 else
     DEFAULT_MODEL="mlx-community/whisper-large-v3-turbo"
 fi
 MODEL="${PIPECAT_STT_MODEL:-${KODA_STT_MODEL:-$DEFAULT_MODEL}}"
+
+# TCP transport settings (used only when SOCKET_PATH is empty). Canonical
+# ports are kept in step with the menu bar app; echo has none.
+HOST="${PIPECAT_STT_HOST:-127.0.0.1}"
+AUTH_TOKEN_FILE="${PIPECAT_STT_AUTH_TOKEN_FILE:-}"
+case "$BACKEND" in
+mlx | whisper) CANONICAL_PORT=9565 ;;
+kyutai) CANONICAL_PORT=9665 ;;
+parakeet) CANONICAL_PORT=9765 ;;
+nemotron) CANONICAL_PORT=9865 ;;
+*) CANONICAL_PORT="" ;;
+esac
+PORT="${PIPECAT_STT_PORT:-$CANONICAL_PORT}"
 
 # Derive a per-agent log basename. Two explicit literal branches keep this in
 # lockstep with render_stt_plist.py's _log_basename(): the new default maps to
@@ -87,14 +114,51 @@ else
     LOG_BASENAME="${LABEL//./-}"
 fi
 
-# Resolve the python interpreter from the project venv.
-PYTHON="$REPO_ROOT/.venv/bin/python"
-if [[ ! -x "$PYTHON" ]]; then
-    echo "error: $PYTHON not found — run 'uv sync' first" >&2
+cmd="${1:-install}"
+
+# Resolve the python interpreter. Only the install subcommand needs it (to run
+# the renderer), so uninstall/status/logs do not require e.g. .venv-kyutai.
+if [[ "$BACKEND" == "kyutai" ]]; then
+    DEFAULT_PYTHON="$REPO_ROOT/.venv-kyutai/bin/python"
+else
+    DEFAULT_PYTHON="$REPO_ROOT/.venv/bin/python"
+fi
+PYTHON="${PIPECAT_STT_PYTHON:-$DEFAULT_PYTHON}"
+if [[ "$cmd" == "install" && ! -x "$PYTHON" ]]; then
+    if [[ "$BACKEND" == "kyutai" ]]; then
+        echo "error: $PYTHON not found — create the kyutai venv first ('just _ensure-extra kyutai' creates .venv-kyutai)" >&2
+    else
+        echo "error: $PYTHON not found — run 'uv sync' first" >&2
+    fi
     exit 1
 fi
 
-cmd="${1:-install}"
+# Print the --socket-path argument of an installed plist (empty if the plist is
+# absent, unreadable, or a TCP agent). Used to decide socket cleanup from the
+# transport actually installed, not from the caller's env.
+installed_socket_path() {
+    [[ -f "$PLIST_DST" ]] || return 0
+    local json
+    json="$(plutil -extract ProgramArguments json -o - "$PLIST_DST" 2>/dev/null)" || return 0
+    # plutil's JSON escapes '/' as '\/'; unescape before extracting the value.
+    printf '%s' "$json" | sed -e 's|\\/|/|g' -n -e 's/.*"--socket-path","\([^"]*\)".*/\1/p'
+}
+
+# Remove a socket and its .lock, only if owned by the current user — avoids
+# nuking an unrelated file someone pre-created at a world-writable path.
+remove_socket_owned() {
+    local sock="$1" f owner
+    for f in "$sock" "$sock.lock"; do
+        if [[ -e "$f" ]]; then
+            owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
+            if [[ "$owner" == "$(id -u)" ]]; then
+                rm -f "$f"
+            else
+                echo "warning: $f not owned by current user, leaving it" >&2
+            fi
+        fi
+    done
+}
 
 # Validate the literal socket path against the SAME rules the server enforces in
 # _enforce_socket_dir_secure() (stt_server/server.py) BEFORE creating or
@@ -153,23 +217,33 @@ validate_socket_path() {
 }
 
 render_plist() {
-    # Validate (and refuse) BEFORE mutating any filesystem state — the socket
-    # dir chmod below must never tighten a directory the server will then reject.
-    validate_socket_path "$SOCKET_PATH"
+    # Never forward a raw token: the renderer refuses it (it would land in the
+    # plist, which is world-readable). Fail clearly instead.
+    if [[ -n "${PIPECAT_STT_AUTH_TOKEN:-}${KODA_STT_AUTH_TOKEN:-}" ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN / KODA_STT_AUTH_TOKEN would be written into the plist; write the token to a file and set PIPECAT_STT_AUTH_TOKEN_FILE instead" >&2
+        exit 1
+    fi
+    if [[ -n "$SOCKET_PATH" ]]; then
+        # Validate (and refuse) BEFORE mutating any filesystem state — the socket
+        # dir chmod below must never tighten a directory the server will then reject.
+        validate_socket_path "$SOCKET_PATH"
+    elif [[ -z "$PORT" ]]; then
+        echo "error: backend '$BACKEND' has no canonical port; set PIPECAT_STT_PORT" >&2
+        exit 1
+    fi
     mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
-    # Create the socket's parent directory owner-only (0700) from birth so
-    # there is no window under a permissive umask (commonly 0755) in which
-    # another local user could pre-create a socket at the same path. The server
-    # now *refuses to start* (see _enforce_socket_dir_secure in
-    # stt_server/server.py) if any ancestor through the trusted root is
-    # group/other-writable, so 0700 here is load-bearing, not just hygiene.
-    #
-    # Upgrade note: installs predating this change created the dir at the
-    # install shell umask (commonly 0755). The trailing `chmod 700` repairs such
-    # a pre-existing dir in place so upgrades do not trip the new startup check;
-    # `mkdir -m 700` covers the fresh-install path with no race window.
-    mkdir -m 700 -p "$(dirname "$SOCKET_PATH")"
-    chmod 700 "$(dirname "$SOCKET_PATH")"
+    if [[ -n "$SOCKET_PATH" ]]; then
+        # Create the socket's parent directory owner-only (0700) from birth so
+        # there is no window under a permissive umask (commonly 0755) in which
+        # another local user could pre-create a socket at the same path. The server
+        # *refuses to start* (see _enforce_socket_dir_secure in
+        # stt_server/server.py) if any ancestor through the trusted root is
+        # group/other-writable, so 0700 here is load-bearing, not just hygiene.
+        # The trailing `chmod 700` repairs a pre-existing 0755 dir in place.
+        # shellcheck disable=SC2174
+        mkdir -m 700 -p "$(dirname "$SOCKET_PATH")"
+        chmod 700 "$(dirname "$SOCKET_PATH")"
+    fi
     # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
     # allowlist validation handle hostile values instead of sed string
     # substitution (which would allow <string> breakout + RCE).
@@ -177,16 +251,19 @@ render_plist() {
     # Contract: $LABEL is already alias-resolved here, and we inject it under
     # the *canonical* PIPECAT_STT_LABEL key. render_stt_plist.py re-resolves
     # PIPECAT_STT_LABEL-first, so the canonical name wins over any stray
-    # KODA_STT_LABEL in the environment. The double-resolution is safe only as
-    # long as the resolved value keeps being passed under the canonical key —
-    # do not switch this to the deprecated alias key.
+    # KODA_STT_LABEL in the environment. Do not switch this to the alias key.
     #
-    # The env-prefix assignments below intentionally re-export the same-named
-    # shell vars into the renderer subprocess; the command word "$PYTHON" uses
-    # the parent shell's value (identical), so SC2097/SC2098 are false positives
-    # for this env-passing idiom.
-    # shellcheck disable=SC2097,SC2098
-    PYTHON="$PYTHON" REPO_ROOT="$REPO_ROOT" SOCKET_PATH="$SOCKET_PATH" \
+    # Transport vars are exported conditionally: the renderer treats SOCKET_PATH
+    # together with HOST/PORT as an error, and ambient HOST/PORT/SOCKET_PATH in
+    # the caller's env must not leak through, so clear what does not apply.
+    local -a transport_env
+    if [[ -n "$SOCKET_PATH" ]]; then
+        transport_env=(SOCKET_PATH="$SOCKET_PATH" HOST= PORT= AUTH_TOKEN_FILE=)
+    else
+        transport_env=(SOCKET_PATH= HOST="$HOST" PORT="$PORT" AUTH_TOKEN_FILE="$AUTH_TOKEN_FILE")
+    fi
+    env "${transport_env[@]}" \
+        PYTHON="$PYTHON" REPO_ROOT="$REPO_ROOT" \
         BACKEND="$BACKEND" MODEL="$MODEL" HOME="$HOME" LOG_DIR="$LOG_DIR" \
         PLIST_DST="$PLIST_DST" PIPECAT_STT_LABEL="$LABEL" \
         "$PYTHON" "$RENDER_PY"
@@ -194,6 +271,8 @@ render_plist() {
 
 case "$cmd" in
 install)
+    # Capture the previously installed transport BEFORE the plist is rewritten.
+    old_socket="$(installed_socket_path)"
     render_plist
     # Migrate v0.1.x installs: retire the legacy koda.stt-server agents that a
     # previous default install left behind, so launchd does not double-run the
@@ -219,25 +298,28 @@ install)
     fi
     # Bootstrap (idempotent: unload first if already loaded).
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    if [[ -n "$old_socket" && -z "$SOCKET_PATH" ]]; then
+        echo "note: endpoint changed from socket $old_socket to TCP $HOST:$PORT; removing the old socket"
+        remove_socket_owned "$old_socket"
+    fi
     launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
     launchctl enable "gui/$(id -u)/$LABEL"
     launchctl kickstart -k "gui/$(id -u)/$LABEL"
     echo "installed and started: $LABEL"
-    echo "  socket: $SOCKET_PATH"
+    if [[ -n "$SOCKET_PATH" ]]; then
+        echo "  socket: $SOCKET_PATH"
+    else
+        echo "  endpoint: $HOST:$PORT"
+    fi
     echo "  logs:   $LOG_DIR"
     ;;
 uninstall)
+    # Socket cleanup follows the transport recorded in the INSTALLED plist.
+    old_socket="$(installed_socket_path)"
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST_DST"
-    # Only remove the socket if it's owned by the current user — avoids
-    # nuking an unrelated file someone pre-created at a world-writable path.
-    if [[ -e "$SOCKET_PATH" ]]; then
-        owner=$(stat -f "%u" "$SOCKET_PATH" 2>/dev/null || echo "")
-        if [[ "$owner" == "$(id -u)" ]]; then
-            rm -f "$SOCKET_PATH"
-        else
-            echo "warning: socket at $SOCKET_PATH not owned by current user, leaving it" >&2
-        fi
+    if [[ -n "$old_socket" ]]; then
+        remove_socket_owned "$old_socket"
     fi
     echo "uninstalled: $LABEL"
     ;;

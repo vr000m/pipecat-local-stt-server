@@ -29,9 +29,11 @@ Asserted contracts (plan Phase 2 + Acceptance Criteria):
 from __future__ import annotations
 
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -119,8 +121,9 @@ def _run_install(
     stub_dir: Path,
     *,
     env_overrides: dict[str, str] | None = None,
+    cmd: str = "install",
 ) -> subprocess.CompletedProcess:
-    """Run ``install_stt_agent.sh install`` in a hermetic temp ``HOME``.
+    """Run ``install_stt_agent.sh <cmd>`` (default ``install``) in a hermetic temp ``HOME``.
 
     PATH is the stub dir prepended to the real PATH so ``launchctl``/``id``
     resolve to the stubs while ``bash``/``python`` still resolve normally.
@@ -136,7 +139,7 @@ def _run_install(
         env.update(env_overrides)
 
     return subprocess.run(
-        ["bash", str(SCRIPT), "install"],
+        ["bash", str(SCRIPT), cmd],
         capture_output=True,
         text=True,
         timeout=60,
@@ -528,6 +531,311 @@ def test_install_refuses_symlinked_socket_parent_without_mutating(tmp_path: Path
     assert link.is_symlink(), "the socket-parent symlink must be left in place"
     mode = stat.S_IMODE(realdir.stat().st_mode)
     assert mode == 0o755, f"install chmod'd the symlink target to {oct(mode)}; must not mutate"
+
+
+# ---------------------------------------------------------------------------
+# (8) Loopback-TCP default transport (plan Phase 2). ``install`` with no
+#     transport env yields a TCP agent on the backend's canonical port;
+#     ``PIPECAT_STT_SOCKET`` opts back into the socket agent.
+# ---------------------------------------------------------------------------
+
+SOCKET_SNAPSHOT = REPO_ROOT / "tests" / "snapshots" / "pipecat-stt.plist"
+KYUTAI_DEFAULT_PYTHON = REPO_ROOT / ".venv-kyutai" / "bin" / "python"
+
+# backend -> canonical port (kyutai/echo need an explicit model: the model
+# default is not under test here and the renderer requires a valid one).
+CANONICAL_PORTS = {"mlx": 9565, "parakeet": 9765, "nemotron": 9865, "kyutai": 9665}
+
+
+def _agents(home: Path) -> Path:
+    return home / "Library" / "LaunchAgents"
+
+
+def _rendered(home: Path, label: str = NEW_LABEL) -> dict:
+    path = _agents(home) / f"{label}.plist"
+    assert path.is_file(), f"expected rendered plist at {path}"
+    return plistlib.loads(path.read_bytes())
+
+
+def _flag(args: list[str], name: str) -> str:
+    return args[args.index(name) + 1]
+
+
+def _stub_python(tmp_path: Path) -> Path:
+    """A stand-in interpreter path that delegates to the real test interpreter.
+
+    The installer runs ``"$PYTHON" scripts/render_stt_plist.py``, so the stub
+    must actually execute; the rendered plist still records the stub path.
+    """
+    py = tmp_path / "fakepy" / "python"
+    py.parent.mkdir(exist_ok=True)
+    _write_executable(py, f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
+    return py
+
+
+def _backend_env(backend: str, tmp_path: Path) -> dict[str, str]:
+    env = {"PIPECAT_STT_BACKEND": backend}
+    if backend == "kyutai":
+        env["PIPECAT_STT_PYTHON"] = str(_stub_python(tmp_path))
+        env["PIPECAT_STT_MODEL"] = "kyutai/stt-test"
+    return env
+
+
+@pytest.mark.parametrize("backend", sorted(CANONICAL_PORTS))
+def test_default_install_is_tcp_on_canonical_port(tmp_path: Path, backend: str):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    r = _run_install(tmp_path, stub_dir, env_overrides=_backend_env(backend, tmp_path))
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+
+    args = _rendered(home)["ProgramArguments"]
+    assert _flag(args, "--host") == "127.0.0.1"
+    assert _flag(args, "--port") == str(CANONICAL_PORTS[backend])
+    assert "--socket-path" not in args
+    assert not (home / "Library" / "Caches" / "pipecat-stt").exists(), (
+        "TCP install must not create the socket cache dir"
+    )
+
+
+def test_explicit_port_and_host_override_defaults(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_PORT": "9999", "PIPECAT_STT_HOST": "localhost"},
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(tmp_path / "home")["ProgramArguments"]
+    assert _flag(args, "--host") == "localhost"
+    assert _flag(args, "--port") == "9999"
+
+
+def test_non_loopback_host_fails_without_plist(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_HOST": "0.0.0.0"})
+    assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+
+
+def test_echo_backend_requires_explicit_port(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_BACKEND": "echo"})
+    assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "PIPECAT_STT_PORT" in (r.stderr + r.stdout)
+    assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+
+
+def test_echo_backend_with_explicit_port_works(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_BACKEND": "echo", "PIPECAT_STT_PORT": "9123"},
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(tmp_path / "home")["ProgramArguments"]
+    assert _flag(args, "--port") == "9123"
+    assert _flag(args, "--backend") == "echo"
+
+
+def _normalise(obj, home: Path):
+    """Map real install paths onto the snapshot's fixed ``/Users/test`` paths."""
+    text = plistlib.dumps(obj).decode()
+    text = text.replace(str(VENV_PYTHON), "/usr/bin/python3")
+    text = text.replace(str(REPO_ROOT), "/Users/test/pipecat-local-stt-server")
+    text = text.replace(str(home), "/Users/test")
+    return plistlib.loads(text.encode())
+
+
+def test_socket_opt_in_renders_socket_snapshot(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": str(sock)})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+
+    plist = _rendered(home)
+    args = plist["ProgramArguments"]
+    assert "--host" not in args and "--port" not in args
+    assert _normalise(plist, home) == plistlib.loads(SOCKET_SNAPSHOT.read_bytes())
+
+
+def test_empty_socket_env_means_tcp(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": ""})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(home)["ProgramArguments"]
+    assert _flag(args, "--port") == "9565"
+    assert "--socket-path" not in args
+    assert not (home / "Library" / "Caches" / "pipecat-stt").exists()
+
+
+def _seed_plist(home: Path, extra_args: list[str]) -> None:
+    agents = _agents(home)
+    agents.mkdir(parents=True, exist_ok=True)
+    plist = {
+        "Label": NEW_LABEL,
+        "ProgramArguments": [
+            str(VENV_PYTHON),
+            "-m",
+            "stt_server",
+            *extra_args,
+            "--backend",
+            "mlx",
+        ],
+    }
+    (agents / f"{NEW_LABEL}.plist").write_bytes(plistlib.dumps(plist))
+
+
+def _seed_socket_files(home: Path) -> tuple[Path, Path]:
+    cache = home / "Library" / "Caches" / "pipecat-stt"
+    cache.mkdir(parents=True, mode=0o700, exist_ok=True)
+    sock = cache / "stt.sock"
+    lock = cache / "stt.sock.lock"
+    sock.write_text("")
+    lock.write_text("")
+    return sock, lock
+
+
+def test_socket_to_tcp_reinstall_notes_and_removes_old_socket(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home)
+    _seed_plist(home, ["--socket-path", str(sock)])
+
+    r = _run_install(tmp_path, stub_dir)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    low = r.stdout.lower()
+    assert "endpoint" in low and "chang" in low, f"expected endpoint-changed note; {r.stdout!r}"
+    assert not sock.exists(), "old socket must be removed on socket->TCP"
+    assert not lock.exists(), "old .lock must be removed on socket->TCP"
+    assert "--port" in _rendered(home)["ProgramArguments"]
+
+
+def test_tcp_to_tcp_reinstall_prints_no_note(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    _seed_plist(home, ["--host", "127.0.0.1", "--port", "9565"])
+
+    r = _run_install(tmp_path, stub_dir)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "chang" not in r.stdout.lower(), f"unexpected endpoint-changed note: {r.stdout!r}"
+
+
+def test_socket_to_socket_reinstall_keeps_socket_behaviour(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home)
+    _seed_plist(home, ["--socket-path", str(sock)])
+
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": str(sock)})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "chang" not in r.stdout.lower(), f"unexpected endpoint-changed note: {r.stdout!r}"
+    args = _rendered(home)["ProgramArguments"]
+    assert _flag(args, "--socket-path") == str(sock)
+    assert "--port" not in args
+    assert sock.exists() and lock.exists(), "socket->socket must not delete the endpoint files"
+
+
+def test_uninstall_cleans_socket_from_installed_plist_not_env(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home)
+    _seed_plist(home, ["--socket-path", str(sock)])
+
+    # Caller env carries NO PIPECAT_STT_SOCKET.
+    r = _run_install(tmp_path, stub_dir, cmd="uninstall")
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
+    assert not sock.exists(), "uninstall must remove the socket named in the installed plist"
+    assert not lock.exists(), "uninstall must remove the .lock named in the installed plist"
+
+
+def test_uninstall_tcp_plist_creates_no_socket_dir(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    _seed_plist(home, ["--host", "127.0.0.1", "--port", "9565"])
+
+    r = _run_install(tmp_path, stub_dir, cmd="uninstall")
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
+    assert not (home / "Library" / "Caches" / "pipecat-stt").exists()
+
+
+def test_kyutai_uses_pipecat_stt_python(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    py = _stub_python(tmp_path)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "kyutai",
+            "PIPECAT_STT_MODEL": "kyutai/stt-test",
+            "PIPECAT_STT_PYTHON": str(py),
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert _rendered(tmp_path / "home")["ProgramArguments"][0] == str(py)
+
+
+@pytest.mark.skipif(KYUTAI_DEFAULT_PYTHON.exists(), reason="real .venv-kyutai present")
+def test_kyutai_default_python_is_kyutai_venv(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_BACKEND": "kyutai", "PIPECAT_STT_MODEL": "kyutai/stt-test"},
+    )
+    assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert str(KYUTAI_DEFAULT_PYTHON) in r.stderr
+
+
+@pytest.mark.skipif(KYUTAI_DEFAULT_PYTHON.exists(), reason="real .venv-kyutai present")
+@pytest.mark.parametrize("cmd", ["uninstall", "status", "logs"])
+def test_non_install_commands_do_not_need_interpreter(tmp_path: Path, cmd: str):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    # ``logs`` would block on ``tail -F``; stub it so the command returns.
+    _write_executable(stub_dir / "tail", "#!/usr/bin/env bash\nexit 0\n")
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        cmd=cmd,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "kyutai",
+            "PIPECAT_STT_PYTHON": str(tmp_path / "does-not-exist" / "python"),
+        },
+    )
+    assert r.returncode == 0, f"{cmd}: stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "not found" not in r.stderr
+
+
+SECRET = "s3cr3t-token-value-xyz"
+
+
+def test_env_auth_token_never_reaches_plist(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    for name in ("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"):
+        r = _run_install(tmp_path, stub_dir, env_overrides={name: SECRET})
+        plist_path = _agents(tmp_path / "home") / f"{NEW_LABEL}.plist"
+        if plist_path.exists():
+            assert SECRET.encode() not in plist_path.read_bytes(), name
+        else:
+            assert r.returncode != 0, f"{name}: no plist yet exit 0"
+        assert SECRET not in r.stdout, f"{name}: token leaked to stdout"
+        plist_path.unlink(missing_ok=True)
+
+
+def test_auth_token_file_forwarded_in_tcp_mode(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    tok = tmp_path / "token.txt"
+    tok.write_text(SECRET)
+    tok.chmod(0o600)
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_AUTH_TOKEN_FILE": str(tok)})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(tmp_path / "home")["ProgramArguments"]
+    assert _flag(args, "--auth-token-file") == str(tok)
+    assert "--port" in args
 
 
 def test_shutil_which_bash_available():
