@@ -205,6 +205,17 @@ default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
 `kyutai/stt-1b-en_fr-mlx` for `kyutai`). Pointing a
 backend at a mismatched repo fails fast at decode.
 
+Each of those four default models is pinned to a Hugging Face commit, so a push
+to the repo's `main` cannot change the weights under a running install. The pins
+live in one table, `PINNED_REVISIONS` in `stt_server/backends/__init__.py`, and
+both `serve` and `prefetch` use them. Any other `--model` value (another repo id
+or a local path) is not pinned and follows that repo's `main`. To move a pin,
+change its commit SHA in that table, re-run the live decode tests against it, and
+run `prefetch` so the new snapshot is cached before the agent restarts. On a
+cancelled stream (barge-in) only Kyutai stops its decode early, at the next 80 ms
+frame, and skips a decode still queued behind another; the other backends finish
+a decode once it has started.
+
 Each Unix socket gets a sibling `<socket>.lock` file (e.g. `parakeet.sock.lock`,
 mode `0600`). The server holds an `flock` on it for its lifetime, so a second
 server for the same socket fails at once with `EADDRINUSE`. The kernel releases

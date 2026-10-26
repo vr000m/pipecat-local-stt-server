@@ -28,9 +28,9 @@ opt-in: set `PIPECAT_STT_SOCKET` when running `just stt-install` (see
 Why these numbers: the sibling TTS server uses 8665-9365 (its kokoro agent is
 8765, so do not copy a TTS port into an STT example), and the macOS menu bar app
 owns 9465-9665 (Apple Speech 9465 is the app's own and is not an agent).
-Whisper 9565 and kyutai 9665 are the menu bar app's existing numbers. **Parakeet
-9765 and Nemotron 9865 are proposed numbers, pending agreement with the menu bar
-app.** The menu bar app does not yet adopt an occupied port, so an agent and the
+Whisper 9565 and kyutai 9665 are the menu bar app's existing numbers; Parakeet
+9765 and Nemotron 9865 were confirmed by the menu bar app side on 2026-10-26.
+The menu bar app does not yet adopt an occupied port, so an agent and the
 app contend for the same port if both are running.
 
 For a TCP agent, `just stt-install` / `just stt-uninstall` always use the

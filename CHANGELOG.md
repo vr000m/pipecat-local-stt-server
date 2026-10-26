@@ -51,8 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail rather than sync the venv), so a custom interpreter without the extra no
   longer passes the check and then crash-loops.
 - Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
-  nemotron 9865 (parakeet and nemotron proposed, pending agreement with the menu
-  bar app).
+  nemotron 9865 (parakeet and nemotron confirmed with the menu bar app side on
+  2026-10-26).
 
 ### Changed
 

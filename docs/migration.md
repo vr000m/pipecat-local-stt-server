@@ -48,8 +48,8 @@ To upgrade an existing v0.1.x install:
 
 0.5.0 changes the default LaunchAgent transport from a Unix socket to loopback
 TCP, on the ports in the [per-backend table](operations.md#per-backend-port-convention)
-(whisper 9565, kyutai 9665, parakeet 9765, nemotron 9865). Parakeet and Nemotron
-numbers are proposed, pending agreement with the menu bar app. Nothing changes
+(whisper 9565, kyutai 9665, parakeet 9765, nemotron 9865; the menu bar app side
+confirmed the Parakeet and Nemotron numbers on 2026-10-26). Nothing changes
 for the wire protocol, the import name or the Python client.
 
 1. **Check downstream installer invocations first.** A reinstall without
