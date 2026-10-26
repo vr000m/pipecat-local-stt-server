@@ -1407,3 +1407,52 @@ def test_branch_diff_does_not_touch_koda_surface():
         f"branch modifies the Koda-consumed IMPORTED surface (would require a "
         f"coordinated client pin bump): {forbidden}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Structural guard: a nested `just` does not inherit command-line overrides
+# (`just la_dir=X recipe`), so each nested call must forward every top-level
+# variable its callee reads, or the callee silently uses the real path.
+# ---------------------------------------------------------------------------
+
+
+def _justfile_recipes() -> tuple[set[str], dict[str, list[str]]]:
+    text = (REPO_ROOT / "justfile").read_text()
+    variables = set(re.findall(r"^([A-Za-z_]\w*)\s*:=", text, re.M))
+    recipes: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in text.splitlines():
+        header = re.match(r"^([A-Za-z_][\w-]*)\b[^:\n]*:(?!=)", line)
+        if header:
+            current = recipes.setdefault(header.group(1), [])
+        elif line and not line[0].isspace():
+            current = None
+        elif current is not None and not line.lstrip().startswith("#"):
+            current.append(line)
+    return variables, recipes
+
+
+def test_nested_just_calls_forward_the_variables_their_callee_reads():
+    variables, recipes = _justfile_recipes()
+
+    def reads(recipe: str) -> set[str]:
+        body = "\n".join(recipes[recipe])
+        return {v for v in variables if re.search(rf"{{{{[^}}]*\b{v}\b[^}}]*}}}}", body)}
+
+    nested = 0
+    for caller, body in recipes.items():
+        for line in body:
+            if re.match(r"\s*(echo|printf)\b", line):
+                continue  # a message that names a recipe, not a call
+            for m in re.finditer(r"\bjust((?:\s+\w+=(?:\S+))*)\s+([A-Za-z_][\w-]*)", line):
+                callee = m.group(2)
+                if callee not in recipes:
+                    continue
+                nested += 1
+                forwarded = set(re.findall(r"(\w+)=", m.group(1)))
+                missing = reads(callee) - forwarded
+                assert not missing, (
+                    f"{caller}: nested `just {callee}` does not forward {sorted(missing)}; "
+                    "an override given to the caller would be lost"
+                )
+    assert nested >= 5, "scan found too few nested just calls; the pattern is stale"

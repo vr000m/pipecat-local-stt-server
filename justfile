@@ -34,6 +34,11 @@ kyutai_venv := justfile_directory() / ".venv-kyutai"
 # Shared venv for the non-kyutai extras; tests override it on the command line
 # like kyutai_venv.
 venv := justfile_directory() / ".venv"
+# "socket" when the caller asked for a Unix-socket agent (the installer's own
+# PIPECAT_STT_SOCKET / KODA_STT_SOCKET alias pair), else "tcp". stt-install and
+# stt-uninstall pass the canonical HOST/PORT only for "tcp"; kept in one place so
+# a new socket alias is a one-line change here.
+agent_transport := if env_var_or_default('PIPECAT_STT_SOCKET', '') + env_var_or_default('KODA_STT_SOCKET', '') == '' { "tcp" } else { "socket" }
 
 # Default: show the recipe list.
 default:
@@ -355,7 +360,7 @@ stt-install backend:
     # Canonical HOST/PORT only for a TCP agent: in socket mode the installer would
     # warn that it ignores PIPECAT_STT_HOST/PORT the caller never set.
     tcp=()
-    if [[ -z "${PIPECAT_STT_SOCKET:-}${KODA_STT_SOCKET:-}" ]]; then
+    if [[ "{{agent_transport}}" == tcp ]]; then
       tcp=(PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port")
     fi
     env ${tcp[@]+"${tcp[@]}"} PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
@@ -371,7 +376,7 @@ stt-uninstall backend:
     # system bash has no `mapfile`.
     { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
     tcp=()
-    if [[ -z "${PIPECAT_STT_SOCKET:-}${KODA_STT_SOCKET:-}" ]]; then
+    if [[ "{{agent_transport}}" == tcp ]]; then
       tcp=(PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port")
     fi
     env ${tcp[@]+"${tcp[@]}"} PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
