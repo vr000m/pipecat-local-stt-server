@@ -616,8 +616,14 @@ render_plist() {
         ;;
     esac
     # Never forward a raw token: the renderer refuses it (it would land in the
-    # plist, which is world-readable). Fail clearly instead.
-    if [[ -n "${PIPECAT_STT_AUTH_TOKEN:-}${KODA_STT_AUTH_TOKEN:-}" ]]; then
+    # plist, which is world-readable). Fail clearly instead. Only lengths are
+    # expanded, never the value: under `bash -x` a test like [[ -n "$TOKEN" ]]
+    # prints the token to stderr. ${VAR+x} guards `set -u` without expanding it
+    # (bash 3.2 has no [[ -v ]]).
+    local raw_token_len=0
+    if [[ -n "${PIPECAT_STT_AUTH_TOKEN+x}" ]]; then raw_token_len=$((raw_token_len + ${#PIPECAT_STT_AUTH_TOKEN})); fi
+    if [[ -n "${KODA_STT_AUTH_TOKEN+x}" ]]; then raw_token_len=$((raw_token_len + ${#KODA_STT_AUTH_TOKEN})); fi
+    if ((raw_token_len > 0)); then
         echo "error: PIPECAT_STT_AUTH_TOKEN / KODA_STT_AUTH_TOKEN would be written into the plist; write the token to a file and set PIPECAT_STT_AUTH_TOKEN_FILE instead" >&2
         exit 1
     fi

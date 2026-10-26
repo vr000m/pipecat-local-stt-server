@@ -124,6 +124,7 @@ def _run_install(
     *,
     env_overrides: dict[str, str] | None = None,
     cmd: str = "install",
+    bash_flags: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Run ``install_stt_agent.sh <cmd>`` (default ``install``) in a hermetic temp ``HOME``.
 
@@ -141,7 +142,7 @@ def _run_install(
         env.update(env_overrides)
 
     return subprocess.run(
-        ["bash", str(SCRIPT), cmd],
+        ["bash", *bash_flags, str(SCRIPT), cmd],
         capture_output=True,
         text=True,
         timeout=60,
@@ -974,6 +975,26 @@ def test_env_auth_token_never_reaches_plist(tmp_path: Path):
         assert SECRET not in r.stdout, f"{name}: token leaked to stdout"
         assert SECRET not in r.stderr, f"{name}: token leaked to stderr"
         plist_path.unlink(missing_ok=True)
+
+
+# A raw token in the env never reaches a trace either. Invariant: under `bash -x`
+# (which prints every expanded test and command) the installer never expands a
+# raw token's value; it refuses a non-empty one and ignores an empty or unset one.
+# State space: name {PIPECAT_STT_AUTH_TOKEN, KODA_STT_AUTH_TOKEN} x value {set,
+# empty, unset} (the other name unset).
+@pytest.mark.parametrize("value", ["set", "empty", "unset"])
+@pytest.mark.parametrize("name", ["PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"])
+def test_raw_token_never_appears_under_xtrace(tmp_path: Path, name: str, value: str):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    env = {} if value == "unset" else {name: SECRET if value == "set" else ""}
+    r = _run_install(tmp_path, stub_dir, env_overrides=env, bash_flags=("-x",))
+    assert "+ " in r.stderr, "the run must actually be traced"
+    assert SECRET not in r.stdout + r.stderr, f"{name}={value}: token value traced"
+    if value == "set":
+        assert r.returncode != 0 and "PIPECAT_STT_AUTH_TOKEN_FILE instead" in r.stderr
+        assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+    else:
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr[-2000:]!r}"
 
 
 def test_ambient_socket_path_does_not_leak_into_tcp_install(tmp_path: Path):

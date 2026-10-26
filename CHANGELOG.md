@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new file at the same path.
 - The installer's token-file check refuses a path outside the plist allowlist
   before it creates any directory.
+- The installer's raw-token refusal tests only the token's length, so running it
+  under `bash -x` no longer prints a `PIPECAT_STT_AUTH_TOKEN` /
+  `KODA_STT_AUTH_TOKEN` value to stderr.
 - **Loopback TCP without a token logs INFO, not a warning.** That is the default
   agent setup, and non-loopback binds are refused, so there was nothing to warn
   about. The message names `--auth-token-file`, not the env token.
