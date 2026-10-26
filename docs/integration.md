@@ -113,7 +113,7 @@ Enable via `STT_SERVICE=websocket` in `.env`. Client env vars:
 | Variable | Default | Description |
 |---|---|---|
 | `STT_WS_SOCKET` | *(unset)* | UDS path. Koda's `./koda stt` wrapper exports a `STT_WS_DEFAULT_SOCKET` fallback that still points at the old (v0.1.x) Caches socket path; after the 0.2.0 rename, re-point that wrapper default at `~/Library/Caches/pipecat-stt/stt.sock` (or set `STT_WS_SOCKET` directly). See the [migration guide](migration.md). |
-| `STT_WS_HOST` / `STT_WS_PORT` | *(unset)* | Loopback TCP target |
+| `STT_WS_HOST` / `STT_WS_PORT` | *(unset)* | Loopback TCP target. Use these for the 0.5.0 default LaunchAgents (e.g. `127.0.0.1` / `9565` for whisper; ports in the [operations table](operations.md#per-backend-port-convention)). A bare `just stt-install` binds TCP and the library has no built-in default, so an env-less client resolves nothing: set both. |
 | `STT_WS_URI` | *(unset)* | Full `ws://` or `wss://` URI. Pairing `STT_WS_TOKEN` with `ws://` to a non-loopback host emits a cleartext-token WARNING. |
 | `STT_WS_TOKEN` | *(unset)* | Bearer token; only enforced when the server was started with a matching token. Configure one for any TCP deployment. |
 | `STT_WS_DEFAULT_SOCKET` | *(unset)* | Consumer-supplied fallback UDS path when no other target is configured — the library ships no built-in default. |
@@ -136,6 +136,9 @@ via `scripts/render_stt_plist.py` (stdlib `plistlib` + allowlist
 validation — do not reintroduce `sed` templating). Overrides (canonical
 `PIPECAT_STT_*` names; legacy `KODA_STT_*` names still honoured as
 deprecated aliases): `PIPECAT_STT_SOCKET`, `PIPECAT_STT_BACKEND`,
-`PIPECAT_STT_MODEL`, `PIPECAT_STT_LOG_DIR`, `PIPECAT_STT_AUTH_TOKEN`.
+`PIPECAT_STT_MODEL`, `PIPECAT_STT_LOG_DIR`, `PIPECAT_STT_HOST`,
+`PIPECAT_STT_PORT`, `PIPECAT_STT_AUTH_TOKEN_FILE` (a token file path;
+`PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN` are refused). Agents default to
+loopback TCP; `PIPECAT_STT_SOCKET` opts into a Unix socket.
 Use `./koda stt status` for a wire-level health check.
 

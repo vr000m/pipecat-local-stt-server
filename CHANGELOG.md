@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
+> **UPGRADE NOTE.** The default LaunchAgent transport changed from a Unix socket
+> to loopback TCP. Reinstalling an agent (`just stt-install <backend>`) flips it
+> to TCP; set `PIPECAT_STT_SOCKET` to keep a socket agent
+> (`PIPECAT_STT_SOCKET=<path> just stt-install <backend>`). Point clients at
+> `STT_WS_HOST`/`STT_WS_PORT`. `PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN`
+> are now refused; use `PIPECAT_STT_AUTH_TOKEN_FILE`. Check any downstream
+> installer invocations first. See `docs/migration.md`.
+
+### Added
+
+- **Kyutai LaunchAgent** (`just stt-install kyutai`, port 9665) with its own
+  `.venv-kyutai` (`uv sync --python 3.12 --extra kyutai`), since its extra
+  conflicts with the other MLX extras.
+- **`just stt-probe`**: a wire status probe for any endpoint (`--host/--port`,
+  `--socket-path`, `--uri`), including servers a supervising app started.
+- `PIPECAT_STT_HOST`, `PIPECAT_STT_PORT` and `PIPECAT_STT_AUTH_TOKEN_FILE` for
+  the installer and renderer.
+- Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
+  nemotron 9865 (parakeet and nemotron proposed, pending agreement with the menu
+  bar app).
+
+### Changed
+
+- **Agents default to loopback TCP** instead of a Unix socket. `PIPECAT_STT_SOCKET`
+  (or `KODA_STT_SOCKET`), when non-empty, is an explicit opt-in to a socket agent
+  whose plist is byte-identical to before. Loopback TCP has no peer-uid check.
+- `just stt-status` takes a backend name (canonical port) or a socket path;
+  `just stt-list` reads each agent's live endpoint from its plist.
+- `stt-install`/`stt-uninstall` always use the canonical host and port; use the
+  installer script directly for a custom one.
+
+### Removed
+
+- **Breaking:** `PIPECAT_STT_AUTH_TOKEN` and `KODA_STT_AUTH_TOKEN` are refused by
+  the installer and renderer (an env token would land in the plist). Use
+  `PIPECAT_STT_AUTH_TOKEN_FILE`.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added
@@ -538,6 +577,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.5.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.0
 [0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0
 [0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
 [0.3.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.2
