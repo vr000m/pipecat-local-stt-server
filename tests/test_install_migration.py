@@ -1467,6 +1467,25 @@ def _token_case(tmp_path: Path, stub_dir: Path, case: str) -> Path:
         good.write_text("" if case == "empty" else "  \n\t\n")
         good.chmod(0o600)
         return good
+    if case in ("internal-newline", "internal-space", "non-ascii", "non-utf8"):
+        # Content the server's strict reader refuses: it can never match a header.
+        payload = {
+            "internal-newline": f"{SECRET}\nmore\n".encode(),
+            "internal-space": f"{SECRET} more\n".encode(),
+            "non-ascii": f"{SECRET}\u00f6\n".encode(),
+            "non-utf8": SECRET.encode() + b"\xff\xfe\n",
+        }[case]
+        good.write_bytes(payload)
+        good.chmod(0o600)
+        return good
+    if case in ("parent-group-writable", "parent-other-writable"):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        shared.chmod(0o770 if case == "parent-group-writable" else 0o707)
+        moved = shared / "token.txt"
+        moved.write_text(SECRET + "\n")
+        moved.chmod(0o600)
+        return moved
     if case == "other-owner":
         # The file is owned by the real uid; make `id -u` report someone else.
         _write_executable(
@@ -1489,6 +1508,12 @@ def _token_case(tmp_path: Path, stub_dir: Path, case: str) -> Path:
         "other-readable",
         "empty",
         "whitespace",
+        "internal-newline",
+        "internal-space",
+        "non-ascii",
+        "non-utf8",
+        "parent-group-writable",
+        "parent-other-writable",
         "other-owner",
     ],
 )

@@ -21,6 +21,7 @@ it does not emit the plist to stdout, so each test points ``PLIST_DST`` at a
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import plistlib
 import shlex
@@ -593,3 +594,24 @@ def test_render_label_pipecat_wins_over_koda(tmp_path: Path):
     )
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert plistlib.loads(dst.read_bytes())["Label"] == "koda.stt-server.parakeet"
+
+
+def test_renderer_loopback_hosts_match_the_servers():
+    """The renderer keeps its own copy of the server's TCP bind allowlist (it must
+    not import the server); this pins the two together."""
+    from stt_server.errors import ConfigError
+    from stt_server.server import ServerConfig
+
+    spec = importlib.util.spec_from_file_location(
+        "render_stt_plist_under_test",
+        Path(__file__).resolve().parents[1] / "scripts" / "render_stt_plist.py",
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for host in sorted(mod._LOOPBACK_HOSTS):
+        ServerConfig(host=host, port=9999)
+    for host in ("0.0.0.0", "::", "192.168.1.5", "example.com", "127.0.0.2"):
+        assert host not in mod._LOOPBACK_HOSTS
+        with pytest.raises(ConfigError):
+            ServerConfig(host=host, port=9999)

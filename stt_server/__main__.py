@@ -35,7 +35,7 @@ from .backend import EchoBackend
 # imports no backend module, so the serve path stays lean at every launch.
 from .backends import BACKENDS, import_backend
 from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
-from .env import env_first
+from .env import env_first, read_token_file
 from .errors import ConfigError
 from .server import serve
 
@@ -113,7 +113,9 @@ def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str 
     # PIPECAT_STT_AUTH_TOKEN wins, KODA_STT_AUTH_TOKEN is still honoured.
     # The two paths stay strictly separate — never read STT_WS_TOKEN here.
     if token_file:
-        return Path(token_file).read_text(encoding="utf-8").strip() or None
+        # Serve is strict: an explicit token file that is empty or unusable must
+        # fail startup, not silently run unauthenticated. The probe stays lenient.
+        return read_token_file(token_file, strict=not client)
     if client:
         client_val = (os.environ.get("STT_WS_TOKEN") or "").strip()
         return client_val or None

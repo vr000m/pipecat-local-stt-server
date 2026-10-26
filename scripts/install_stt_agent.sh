@@ -217,12 +217,16 @@ installed_has_auth() {
     [[ -n "$(installed_arg --auth-token-file)" ]]
 }
 
-# Refuse a token file the server would mis-handle: it reads the file and strips
-# it, so an empty file silently disables auth; a group/other-readable file leaks
-# the bearer; a file owned by another user (or a symlink) lets someone else set
-# it; a missing path crash-loops the agent under KeepAlive.
+# Refuse a token file the server would mis-handle. File-system policy lives here:
+# a group/other-readable file leaks the bearer; a file owned by another user (or a
+# symlink) lets someone else set it; so does a parent directory someone else can
+# write to; a missing path crash-loops the agent under KeepAlive. Content policy
+# (empty = auth disabled, internal whitespace or non-ASCII = never matches a
+# header, non-UTF-8) is the server's own stt_server.env.read_token_file, called
+# below so the two cannot drift.
 validate_token_file() {
-    local f="$1" owner mode
+    local f="$1" owner mode dir me sticky
+    me="$(id -u)"
     if [[ -L "$f" ]]; then
         echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is a symlink; point it at the real file" >&2
         exit 1
@@ -232,7 +236,7 @@ validate_token_file() {
         exit 1
     fi
     owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
-    if [[ "$owner" != "$(id -u)" ]]; then
+    if [[ "$owner" != "$me" ]]; then
         echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is not owned by the current user" >&2
         exit 1
     fi
@@ -241,8 +245,42 @@ validate_token_file() {
         echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has mode $mode; it must not be group/other accessible (chmod 600 it)" >&2
         exit 1
     fi
-    if [[ ! -r "$f" ]] || ! grep -q '[^[:space:]]' "$f" 2>/dev/null; then
-        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is unreadable or empty (an empty token disables auth)" >&2
+    # Walk the resolved parents (symlinks followed): each must belong to this user
+    # or root and not be writable by anyone else, else that party could swap the
+    # file. A sticky directory (e.g. /tmp) only lets owners rename their own files.
+    dir="$(cd -P "$(dirname "$f")" 2>/dev/null && pwd -P)" || dir=""
+    if [[ -z "$dir" ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has an unreadable parent directory" >&2
+        exit 1
+    fi
+    while :; do
+        owner=$(stat -f "%u" "$dir" 2>/dev/null || echo "")
+        mode=$(stat -f "%Lp" "$dir" 2>/dev/null || echo "777")
+        sticky=$(stat -f "%Sp" "$dir" 2>/dev/null | grep -c 't$' || true)
+        if [[ "$owner" != "$me" && "$owner" != 0 ]]; then
+            echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is owned by another user" >&2
+            exit 1
+        fi
+        if [[ "$sticky" != 1 ]] && { (((8#$mode & 8#002) != 0)) || { [[ "$owner" != 0 ]] && (((8#$mode & 8#020) != 0)); }; }; then
+            echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is writable by others (mode $mode)" >&2
+            exit 1
+        fi
+        [[ "$dir" == "/" ]] && break
+        dir="$(dirname "$dir")"
+    done
+    if [[ ! -r "$f" ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is unreadable" >&2
+        exit 1
+    fi
+    if ! "$PYTHON" -I -c '
+import sys
+from stt_server.env import read_token_file
+try:
+    read_token_file(sys.argv[1], strict=True)
+except ValueError as exc:
+    print(f"error: PIPECAT_STT_AUTH_TOKEN_FILE: {exc}", file=sys.stderr)
+    sys.exit(1)
+' "$f"; then
         exit 1
     fi
 }

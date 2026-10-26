@@ -788,6 +788,38 @@ def test_resolve_auth_token_probe_ignores_pipecat_server_token(monkeypatch):
     assert _resolve_auth_token(None, client=True) is None
 
 
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"  \n\t\n", b"two\nlines\n", b"has space\n", "t\u00f6ken\n".encode(), b"\xff\xfe\n"],
+)
+def test_resolve_auth_token_serve_refuses_unusable_token_file(tmp_path: Path, content: bytes):
+    """An explicit token file that would disable auth or can never match an
+    Authorization header must fail startup, not run an unauthenticated listener."""
+    from stt_server.__main__ import _resolve_auth_token
+    from stt_server.errors import ConfigError
+
+    tok = tmp_path / "tok"
+    tok.write_bytes(content)
+    with pytest.raises(ConfigError):
+        _resolve_auth_token(str(tok), client=False)
+
+
+def test_resolve_auth_token_probe_stays_lenient_on_empty_token_file(tmp_path: Path):
+    from stt_server.__main__ import _resolve_auth_token
+
+    tok = tmp_path / "tok"
+    tok.write_text("  \n")
+    assert _resolve_auth_token(str(tok), client=True) is None
+
+
+def test_resolve_auth_token_serve_strips_token_file(tmp_path: Path):
+    from stt_server.__main__ import _resolve_auth_token
+
+    tok = tmp_path / "tok"
+    tok.write_text("  s3cret-Token_1\n")
+    assert _resolve_auth_token(str(tok), client=False) == "s3cret-Token_1"
+
+
 def test_resolve_auth_token_file_wins_in_client_mode(monkeypatch, tmp_path: Path):
     from stt_server.__main__ import _resolve_auth_token
 
