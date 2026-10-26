@@ -21,9 +21,10 @@
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
 #                       file must be a regular file (not a symlink) owned by you,
 #                       with no group/other permission bits, and non-empty.
-#   PIPECAT_STT_UNLOAD_WAIT  seconds (non-negative integer) to wait for launchd to
-#                       finish tearing the old job down before bootstrap, and
-#                       before uninstall removes a socket (default 30)
+#   PIPECAT_STT_UNLOAD_WAIT  seconds (non-negative integer, read as decimal so
+#                       "08" is 8) to wait for launchd to finish tearing the old
+#                       job down before bootstrap, and before uninstall removes
+#                       a socket (default 30)
 #   PIPECAT_STT_PYTHON  interpreter (default: .venv/bin/python, or
 #                       .venv-kyutai/bin/python for the kyutai backend)
 #   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai (default: mlx)
@@ -147,6 +148,11 @@ UNLOAD_WAIT="${PIPECAT_STT_UNLOAD_WAIT:-30}"
 if [[ ("$cmd" == "install" || "$cmd" == "uninstall") && ! "$UNLOAD_WAIT" =~ ^[0-9]+$ ]]; then
     echo "error: PIPECAT_STT_UNLOAD_WAIT='$UNLOAD_WAIT' must be a non-negative integer (seconds)" >&2
     exit 1
+fi
+# Normalise to a plain decimal: bash arithmetic reads a leading 0 as octal ("08"
+# is a base error, "010" is 8), so "08" must mean 8 seconds, not break the cap.
+if [[ "$cmd" == "install" || "$cmd" == "uninstall" ]]; then
+    UNLOAD_WAIT=$((10#$UNLOAD_WAIT))
 fi
 
 # Resolve the python interpreter. Only the install subcommand needs it (to run

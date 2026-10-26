@@ -1206,6 +1206,54 @@ def test_invalid_unload_wait_fails_before_bootout(tmp_path: Path, cmd: str, valu
     assert (_agents(home) / f"{NEW_LABEL}.plist").read_bytes() == before
 
 
+# Accepted values are read as DECIMAL: bash arithmetic treats a leading 0 as
+# octal ("08" is a base error that left the cap never firing; "010" was 8), so
+# the script normalises with 10#. Observable: after bootout the old job stays
+# loaded, and the number of `launchctl print` polls grows by exactly the cap.
+# `sleep` is stubbed to a no-op and the stub launchctl reports "unloaded" after
+# 200 prints, so a broken cap shows up as a wrong count instead of a hang.
+def _count_wait_polls(tmp_path: Path, value: str) -> int:
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    _write_executable(stub_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+    state = tmp_path / "print_count"
+    state.write_text("0")
+    _write_executable(
+        stub_dir / "launchctl",
+        f"""#!/usr/bin/env bash
+printf 'launchctl %s\\n' "$*" >> {argv_log!s}
+if [[ "$1" == "print" ]]; then
+    n=$(( $(cat {state!s}) + 1 )); printf '%s' "$n" > {state!s}
+    if [[ "$n" -le 200 ]]; then exit 0; fi
+    exit 1
+fi
+exit 0
+""",
+    )
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_BACKEND": "nemotron",
+            "PIPECAT_STT_LABEL": "pipecat.stt-server.nemotron",
+            "PIPECAT_STT_UNLOAD_WAIT": value,
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "value too great for base" not in r.stderr
+    return int(state.read_text())
+
+
+@pytest.mark.parametrize(
+    "value,seconds",
+    [("0", 0), ("5", 5), ("08", 8), ("09", 9), ("010", 10), ("30", 30), ("", 30)],
+)
+def test_unload_wait_is_decimal(tmp_path: Path, value: str, seconds: int):
+    (tmp_path / "base").mkdir()
+    (tmp_path / "case").mkdir()
+    base = _count_wait_polls(tmp_path / "base", "0")
+    assert _count_wait_polls(tmp_path / "case", value) - base == seconds
+
+
 # ---------------------------------------------------------------------------
 # Socket cleanup contract: a <socket>.lock is unlinked only once the job that
 # may hold it is confirmed gone from launchd, and only after a successful

@@ -142,7 +142,7 @@ deprecated aliases): `PIPECAT_STT_SOCKET`, `PIPECAT_STT_BACKEND`,
 `PIPECAT_STT_PYTHON` (interpreter; default `.venv/bin/python`, or
 `.venv-kyutai/bin/python` for kyutai), `PIPECAT_STT_UNLOAD_WAIT` (seconds to wait
 for launchd to unload the old job before bootstrap and before socket cleanup;
-non-negative integer, default 30). Agents default to loopback TCP;
+non-negative decimal integer, default 30; "08" is 8). Agents default to loopback TCP;
 `PIPECAT_STT_SOCKET` opts into a Unix socket.
 
 **Breaking change in 0.5.0.** A reinstall through `./koda stt install` on a
