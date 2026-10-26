@@ -348,6 +348,34 @@ wait_unloaded() {
     return 0
 }
 
+# Exit 0 when no process holds the flock on lock file $1 (or there is no plain
+# file there, which no server can hold: it opens the lock O_NOFOLLOW and refuses
+# anything but a regular file), 1 when one holds it, 2 when the probe cannot
+# tell. Mirrors stt_server.server.socket_lock_held (a shared, non-blocking flock
+# for an instant, so it conflicts with a server's exclusive lock but never makes
+# a real starter fail, as that retries 250 ms), in stdlib python3 so an
+# uninstall needs no venv.
+lock_free() {
+    python3 -I -c '
+import errno, fcntl, os, stat, sys
+try:
+    try:
+        st = os.lstat(sys.argv[1])
+    except FileNotFoundError:
+        sys.exit(0)
+    if not stat.S_ISREG(st.st_mode):
+        sys.exit(0)
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError as exc:
+        sys.exit(1 if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK) else 2)
+    sys.exit(0)
+except Exception:
+    sys.exit(2)
+' "$1" 2>/dev/null
+}
+
 # Remove a socket and its .lock named by an INSTALLED plist. That plist is
 # untrusted input (anything that can write the user's LaunchAgents dir can name
 # any path in it), so this is deliberately conservative and NEVER aborts the
@@ -360,7 +388,13 @@ wait_unloaded() {
 #   * the socket is a real socket (-S) and not a symlink; the .lock is a regular
 #     file and not a symlink (so a plist naming a file, directory or symlink
 #     never deletes it);
-#   * the entry is owned by the current user.
+#   * the entry is owned by the current user;
+#   * no process holds the .lock (lock_free above). launchd no longer listing the
+#     old job is not enough: a server started by hand can own the recorded path,
+#     and unlinking a held lock lets a second server lock a new inode on the same
+#     socket. A held lock (or a probe that cannot tell) leaves BOTH in place. A
+#     server that starts in the instant between the probe and the unlink is not
+#     covered.
 remove_socket_owned() {
     local sock="$1" dir home="${HOME%/}" f owner kind
     dir="$(dirname "$sock")"
@@ -392,6 +426,15 @@ remove_socket_owned() {
         [[ "$parent" == "$component" ]] && break
         component="$parent"
     done
+    local lock_rc=0
+    lock_free "$sock.lock" || lock_rc=$?
+    if [[ "$lock_rc" -eq 1 ]]; then
+        echo "warning: $sock.lock is held by a running server; leaving $sock and its .lock" >&2
+        return 0
+    elif [[ "$lock_rc" -ne 0 ]]; then
+        echo "warning: could not tell whether $sock.lock is held; leaving $sock and its .lock" >&2
+        return 0
+    fi
     for kind in sock lock; do
         if [[ "$kind" == sock ]]; then
             f="$sock"

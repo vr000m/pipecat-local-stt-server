@@ -1705,3 +1705,42 @@ def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, c
             assert sock.exists() and lock.exists(), "no trusted socket path: leave files alone"
     if state != "reader-crash":
         assert "Traceback" not in out
+
+
+# ---------------------------------------------------------------------------
+# Socket cleanup vs a held lock. Invariant: the installer never unlinks a socket
+# or .lock while a process holds that .lock, even after launchd stopped listing
+# the job (a server started by hand can own the path). State space: lock
+# {absent, free, held} x cmd {install socket->TCP, uninstall}.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd", ["install", "uninstall"])
+@pytest.mark.parametrize("lock_state", ["absent", "free", "held"])
+def test_socket_cleanup_respects_a_held_lock(
+    tmp_path: Path, held_sockets, lock_state: str, cmd: str
+):
+    import fcntl
+
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    if lock_state == "absent":
+        lock.unlink()
+    _seed_plist(home, ["--socket-path", str(sock)])
+    fd = None
+    if lock_state == "held":
+        fd = os.open(lock, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        r = _run_install(tmp_path, stub_dir, cmd=cmd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    if lock_state == "held":
+        assert sock.exists() and lock.exists(), "a held lock leaves BOTH in place"
+        assert "held by a running server" in r.stderr
+    else:
+        assert not sock.exists() and not lock.exists()
+        assert "held" not in r.stderr
