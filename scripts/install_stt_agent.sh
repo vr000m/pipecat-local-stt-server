@@ -503,7 +503,9 @@ except Exception:
 # return 0). The same lexical rules as validate_socket_path (absolute, no '..'
 # component, under $HOME), plus no symlinked directory component from the
 # socket's parent up to and including $HOME (the lexical check alone would
-# follow one out of $HOME). Used by remove_socket_owned.
+# follow one out of $HOME). Shared by remove_socket_owned and
+# manual_socket_cleanup, so the command printed for a manual cleanup is offered
+# only for a path the installer itself would clean.
 socket_path_unsafe() {
     local sock="$1" dir home="${HOME%/}" component parent
     dir="$(dirname "$sock")"
@@ -583,13 +585,19 @@ remove_socket_owned() {
 # Print, on stderr, how to remove a stale socket $1 by hand once its job is gone.
 # Used when the wait for unload timed out: the plist that named the socket is
 # then gone (uninstall) or replaced (install), so no later run can find it. The
-# command removes the path only if it is still a socket, and never the .lock;
-# the lsof condition stands in for the lock check (a process holding the .lock
-# has it open).
+# command is offered only for a path socket_path_unsafe accepts (the plist is
+# untrusted input; remove_socket_owned refuses the others too). It removes the
+# path only if it is still a socket, not a symlink (test -S follows one) and
+# owned by the user running it, and never the .lock; the lsof condition stands
+# in for the lock check (a process holding the .lock has it open).
 manual_socket_cleanup() {
-    local q
+    local q reason
     printf -v q '%q' "$1"
-    echo "warning: no later run will remove it (no installed plist names it any more); once the old server has exited ('lsof -- $q.lock' lists no process), remove it with: test -S $q && rm -f -- $q" >&2
+    if ! reason="$(socket_path_unsafe "$1")"; then
+        echo "warning: the recorded socket path $q $reason; it looks unsafe, so no removal command is offered (check it by hand)" >&2
+        return 0
+    fi
+    echo "warning: no later run will remove it (no installed plist names it any more); once the old server has exited ('lsof -- $q.lock' lists no process), remove it with: test -S $q && ! test -L $q && test -O $q && rm -f -- $q" >&2
 }
 
 # Validate the literal socket path against the SAME rules the server enforces in

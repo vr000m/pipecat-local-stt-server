@@ -157,8 +157,11 @@ for a TCP agent too (its server can own the port until it exits): it prints
 warning and `uninstall incomplete (still loaded): <label>` (exit 0 either way).
 When a wait times out, no later run can find the old socket (its plist is gone or
 replaced), so the warning prints the command to remove it once the old server has
-exited (`lsof -- <socket>.lock` lists no process): `test -S <socket> && rm -f --
-<socket>`.
+exited (`lsof -- <socket>.lock` lists no process): `test -S <socket> && ! test -L
+<socket> && test -O <socket> && rm -f -- <socket>`, with the path shell-quoted. It
+is printed only for a path the installer would clean itself (absolute, no `..`,
+under `$HOME`, no symlinked directory); for any other recorded path the warning
+says it looks unsafe and offers no command.
 
 ### Single-server lock file
 

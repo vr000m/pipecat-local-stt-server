@@ -176,6 +176,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check, the socket checks (a real socket, not a symlink, owned by you) and the
   unlink now run in one step while the installer holds a shared lock on the
   `.lock`; a starter waits for it (its 250 ms lock retry) and binds after.
+- The manual socket-removal command printed after a timed-out wait applies the
+  installer's own path guards: it is offered only for an absolute, `..`-free
+  path under `$HOME` with no symlinked directory (otherwise the warning says the
+  recorded path looks unsafe), and it removes the path only if it is still a
+  socket, not a symlink, and owned by you (`test -S P && ! test -L P && test -O P
+  && rm -f -- P`).
 
 ## [0.4.0] - 2026-10-25
 

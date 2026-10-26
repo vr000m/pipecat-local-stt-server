@@ -2232,3 +2232,59 @@ def test_socket_cleanup_lock_target_state_space(
         assert not os.path.lexists(lock), "the installer never creates the lock"
     else:
         assert os.stat(lock).st_ino == lock_ino, "the .lock is never unlinked"
+
+
+# A timed-out wait prints a manual removal command. The plist is untrusted, so
+# the command is offered only for a path the installer itself would clean
+# (absolute, no '..', under $HOME, no symlinked component), shell-quoted, and it
+# re-checks at run time that the path is still a socket, not a symlink, and owned
+# by the user. State space: recorded path {relative, '..', outside $HOME,
+# symlinked parent} -> no command; {shell metacharacters} -> a command that
+# removes exactly that socket, and that leaves it alone once it is a symlink.
+@pytest.mark.parametrize("cmd", ["uninstall", "install"])
+@pytest.mark.parametrize("case", ["relative", "dotdot", "outside-home", "symlinked-parent"])
+def test_timed_out_cleanup_offers_no_command_for_an_unsafe_path(
+    tmp_path: Path, held_sockets, case: str, cmd: str
+):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    _slow_teardown_launchctl(stub_dir, tmp_path, still_loaded_polls=10_000, bootstrap_failures=0)
+    home = tmp_path / "home"
+    if case == "relative":
+        named = "relative.sock"
+    else:
+        named = _cleanup_cases(tmp_path, held_sockets)[case][0]
+    _seed_plist(home, ["--socket-path", named])
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides={"PIPECAT_STT_UNLOAD_WAIT": "0"})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "remove it with: " not in r.stderr, r.stderr
+    assert "looks unsafe" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("cmd", ["uninstall", "install"])
+def test_timed_out_cleanup_command_is_quoted_and_rechecks(tmp_path: Path, held_sockets, cmd: str):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    _slow_teardown_launchctl(stub_dir, tmp_path, still_loaded_polls=10_000, bootstrap_failures=0)
+    home = tmp_path / "home"
+    cache = _cache_dir(home)
+    sock = cache / "it's a $(touch pwned) b;c.sock"
+    held_sockets.append(_bind_socket(sock))
+    _seed_plist(home, ["--socket-path", str(sock)])
+    env = {"PIPECAT_STT_UNLOAD_WAIT": "0"}
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides=env)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    marker = "remove it with: "
+    assert marker in r.stderr, r.stderr
+    command = r.stderr.split(marker, 1)[1].splitlines()[0]
+    # Once the path is a symlink (to a live socket), the command must not act.
+    real = cache / "real.sock"
+    held_sockets.append(_bind_socket(real))
+    sock.unlink()
+    sock.symlink_to(real)
+    subprocess.run(["bash", "-c", command], cwd=tmp_path)
+    assert os.path.lexists(sock) and real.exists(), "the command followed a symlink"
+    sock.unlink()
+    held_sockets.append(_bind_socket(sock))
+    subprocess.run(["bash", "-c", command], cwd=tmp_path, check=True)
+    assert not os.path.lexists(sock), "the printed command must remove the stale socket"
+    assert real.exists()
+    assert not list(tmp_path.rglob("pwned")), "the recorded path was expanded by the shell"
