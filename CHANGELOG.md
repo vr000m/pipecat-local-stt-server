@@ -47,9 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when no plist exists; a path is probed as `--socket-path`. `just stt-list`
   reads each agent's live endpoint from its plist.
 - `stt-install`/`stt-uninstall` always use the canonical host and port for a TCP
-  agent; use the installer script directly for a custom one. With
-  `PIPECAT_STT_SOCKET` set they pass no host/port, so the socket rollback no
-  longer warns about ignored TCP settings.
+  agent; use the installer script directly for a custom one. The recipes strip an
+  ambient `PIPECAT_STT_HOST`/`PIPECAT_STT_PORT` and leave the transport to the
+  installer, so the socket rollback (`PIPECAT_STT_SOCKET` set) no longer warns
+  about ignored TCP settings and the socket-vs-TCP rule lives in one place.
 - **`serve --auth-token-file` is strict.** An empty or whitespace-only file, a
   token with internal whitespace, a newline or a non-ASCII character, or a
   non-UTF-8 file now stops the server at startup instead of silently running

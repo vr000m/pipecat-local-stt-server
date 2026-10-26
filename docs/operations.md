@@ -34,9 +34,10 @@ app.** The menu bar app does not yet adopt an occupied port, so an agent and the
 app contend for the same port if both are running.
 
 For a TCP agent, `just stt-install` / `just stt-uninstall` always use the
-canonical host and port from this table (the installer is handed
-`PIPECAT_STT_HOST`/`PIPECAT_STT_PORT` by the recipe; in socket mode, i.e. with
-`PIPECAT_STT_SOCKET`/`KODA_STT_SOCKET` set, they pass neither). For a custom host or port, run the installer directly, e.g.
+canonical host and port from this table (the recipe strips an ambient
+`PIPECAT_STT_HOST`/`PIPECAT_STT_PORT`; the installer owns the socket-vs-TCP rule and
+applies its canonical defaults, and with `PIPECAT_STT_SOCKET`/`KODA_STT_SOCKET` set it
+installs a socket agent and has no TCP settings to ignore). For a custom host or port, run the installer directly, e.g.
 `PIPECAT_STT_LABEL=pipecat.stt-server.alt PIPECAT_STT_BACKEND=mlx
 PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh install`. The installer
 defaults the port to the backend's canonical one when `PIPECAT_STT_PORT` is

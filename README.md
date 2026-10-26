@@ -131,7 +131,8 @@ just smoke-peercred        # local UDS peer-cred smoke (cross-uid leg needs a 2n
 the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)
 (the justfile map is a checked mirror of that table — a test fails CI on drift).
 For a TCP agent `stt-install`/`stt-uninstall` always use that canonical host and
-port (socket mode passes neither); for a custom one run the installer directly with a distinct label and backend, or it
+port (the recipes strip an ambient `PIPECAT_STT_HOST`/`PORT` and the installer applies its
+defaults); for a custom one run the installer directly with a distinct label and backend, or it
 replaces the default whisper agent (`PIPECAT_STT_LABEL=pipecat.stt-server.alt
 PIPECAT_STT_BACKEND=mlx PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh
 install`; see [Operations](docs/operations.md#per-backend-port-convention)).

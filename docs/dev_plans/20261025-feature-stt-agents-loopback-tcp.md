@@ -250,7 +250,7 @@ sequenceDiagram
 - [x] Phase 2: Installer
 - [x] Phase 3: Port table, justfile and mirror test
 - [x] Phase 4: Docs and release
-- [x] Phase 5: Verify on this machine (2026-10-26: full suite 963 passed / 7 skipped after the review-gauntlet fixes (801 at the first Phase 5 run), ruff format+check clean, all four agents running as loopback TCP agents reporting their live backend in `just stt-list`; the explicit `TranscriptionClient` decode check is recorded below for the three agents reinstalled first, and the fourth is reported decoding live by the user, not re-run here; token-file auth, port-collision restart loop, socket rollback and login persistence deferred, not checked live)
+- [x] Phase 5: Verify on this machine (2026-10-26: full suite 918 passed / 7 skipped after the review-gauntlet fixes (a 54-cell transport scraper test was replaced by 9 cases) (801 at the first Phase 5 run), ruff format+check clean, all four agents running as loopback TCP agents reporting their live backend in `just stt-list`; the explicit `TranscriptionClient` decode check is recorded below for the three agents reinstalled first, and the fourth is reported decoding live by the user, not re-run here; token-file auth, port-collision restart loop, socket rollback and login persistence deferred, not checked live)
 
 ## Findings
 
@@ -276,3 +276,4 @@ sequenceDiagram
 ## Final Results
 
 - (fill on completion)
+- Review-gauntlet round 4 (2026-10-26): the architecture lens flagged the justfile's second copy of the installer's socket-alias rule (reworked in rounds 1-3). Decided by the user: remove it. `stt-install`/`stt-uninstall` now run the installer under `env -u PIPECAT_STT_HOST -u PIPECAT_STT_PORT`, so the installer alone decides socket vs TCP and defaults to the canonical host/port; Phase 3 (f) still holds (recipes use the canonical values, a custom host/port needs the installer script). The justfile alias-pair scraper test is replaced by a test that the justfile no longer mentions the alias pair.
