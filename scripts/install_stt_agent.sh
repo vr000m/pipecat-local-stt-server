@@ -18,9 +18,12 @@
 #                       9565, kyutai 9665, parakeet 9765, nemotron 9865; the echo
 #                       backend has none and requires an explicit port)
 #   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
-#                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused.
-#   PIPECAT_STT_UNLOAD_WAIT  seconds to wait for launchd to finish tearing the old job
-#                       down before bootstrap (default 30)
+#                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
+#                       file must be a regular file (not a symlink) owned by you,
+#                       with no group/other permission bits, and non-empty.
+#   PIPECAT_STT_UNLOAD_WAIT  seconds (non-negative integer) to wait for launchd to
+#                       finish tearing the old job down before bootstrap, and
+#                       before uninstall removes a socket (default 30)
 #   PIPECAT_STT_PYTHON  interpreter (default: .venv/bin/python, or
 #                       .venv-kyutai/bin/python for the kyutai backend)
 #   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai (default: mlx)
@@ -54,7 +57,8 @@
 #     scripts/install_stt_agent.sh install
 #   # A socket install ignores PIPECAT_STT_HOST/PORT/AUTH_TOKEN_FILE (warned on
 #   # stderr). Consumers must then point at the socket (e.g. STT_WS_SOCKET); a
-#   # TCP install removes a previously installed socket endpoint.
+#   # TCP install (or one onto a different socket path) removes a previously
+#   # installed socket endpoint once the old job has unloaded.
 #
 # Auth token: pass a FILE (PIPECAT_STT_AUTH_TOKEN_FILE=/abs/path, TCP mode).
 # A raw PIPECAT_STT_AUTH_TOKEN / KODA_STT_AUTH_TOKEN in the environment is
@@ -109,8 +113,10 @@ MODEL="${PIPECAT_STT_MODEL:-${KODA_STT_MODEL:-$DEFAULT_MODEL}}"
 # ports are kept in step with the menu bar app; echo has none.
 HOST="${PIPECAT_STT_HOST:-127.0.0.1}"
 AUTH_TOKEN_FILE="${PIPECAT_STT_AUTH_TOKEN_FILE:-}"
+# Keys are exactly the renderer's backend names (_BACKEND_RE); the justfile maps
+# its user-facing 'whisper' to 'mlx' before calling this script.
 case "$BACKEND" in
-mlx | whisper) CANONICAL_PORT=9565 ;;
+mlx) CANONICAL_PORT=9565 ;;
 kyutai) CANONICAL_PORT=9665 ;;
 parakeet) CANONICAL_PORT=9765 ;;
 nemotron) CANONICAL_PORT=9865 ;;
@@ -134,6 +140,15 @@ fi
 
 cmd="${1:-install}"
 
+# Validate the unload-wait cap up front, before any launchctl call: it is used in
+# an arithmetic comparison, where a non-numeric value aborts under `set -u` after
+# the job was already booted out, and a negative one would skip the wait.
+UNLOAD_WAIT="${PIPECAT_STT_UNLOAD_WAIT:-30}"
+if [[ ("$cmd" == "install" || "$cmd" == "uninstall") && ! "$UNLOAD_WAIT" =~ ^[0-9]+$ ]]; then
+    echo "error: PIPECAT_STT_UNLOAD_WAIT='$UNLOAD_WAIT' must be a non-negative integer (seconds)" >&2
+    exit 1
+fi
+
 # Resolve the python interpreter. Only the install subcommand needs it (to run
 # the renderer), so uninstall/status/logs do not require e.g. .venv-kyutai.
 if [[ "$BACKEND" == "kyutai" ]]; then
@@ -151,30 +166,86 @@ if [[ "$cmd" == "install" && ! -x "$PYTHON" ]]; then
     exit 1
 fi
 
-# Print the --socket-path argument of an installed plist (empty if the plist is
-# absent, unreadable, or a TCP agent). Used to decide socket cleanup from the
-# transport actually installed, not from the caller's env.
-installed_socket_path() {
+# Print the value of FLAG (e.g. --socket-path) in the installed plist's
+# ProgramArguments (empty if the plist is absent/unreadable or has no such flag).
+# Same algorithm as the justfile's _plist_endpoint: walk the array element by
+# element via plutil, and consume a flag's VALUE in the step after the flag, so a
+# value that looks like a flag is never read as one. Used to decide socket
+# cleanup from the transport actually installed, not from the caller's env.
+installed_arg() {
+    local flag="$1" el expect="" i=0 val=""
     [[ -f "$PLIST_DST" ]] || return 0
-    local json
-    json="$(plutil -extract ProgramArguments json -o - "$PLIST_DST" 2>/dev/null)" || return 0
-    # plutil's JSON escapes '/' as '\/'; unescape before extracting the value.
-    printf '%s' "$json" | sed -e 's|\\/|/|g' -n -e 's/.*"--socket-path","\([^"]*\)".*/\1/p'
+    while el=$(plutil -extract "ProgramArguments.$i" raw -o - "$PLIST_DST" 2>/dev/null); do
+        if [[ -n "$expect" ]]; then
+            if [[ "$expect" == "$flag" ]]; then val="$el"; fi
+            expect=""
+        elif [[ "$el" == --* ]]; then
+            expect="$el"
+        fi
+        i=$((i + 1))
+    done
+    printf '%s' "$val"
 }
 
-# Block until launchd no longer lists $LABEL (bounded; a stuck job only warns, the
-# bootstrap that follows then reports the real error). PIPECAT_STT_UNLOAD_WAIT is
-# the cap in seconds (default 30).
+# Succeed when the INSTALLED agent requires a token: a non-empty env token in its
+# EnvironmentVariables (pre-0.5.0 plists) or an --auth-token-file argument. The
+# token value is never printed.
+installed_has_auth() {
+    [[ -f "$PLIST_DST" ]] || return 1
+    local k v
+    for k in PIPECAT_STT_AUTH_TOKEN KODA_STT_AUTH_TOKEN; do
+        v="$(plutil -extract "EnvironmentVariables.$k" raw -o - "$PLIST_DST" 2>/dev/null)" || continue
+        if [[ -n "$v" ]]; then return 0; fi
+    done
+    [[ -n "$(installed_arg --auth-token-file)" ]]
+}
+
+# Refuse a token file the server would mis-handle: it reads the file and strips
+# it, so an empty file silently disables auth; a group/other-readable file leaks
+# the bearer; a file owned by another user (or a symlink) lets someone else set
+# it; a missing path crash-loops the agent under KeepAlive.
+validate_token_file() {
+    local f="$1" owner mode
+    if [[ -L "$f" ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is a symlink; point it at the real file" >&2
+        exit 1
+    fi
+    if [[ ! -f "$f" ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is not an existing regular file" >&2
+        exit 1
+    fi
+    owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is not owned by the current user" >&2
+        exit 1
+    fi
+    mode=$(stat -f "%Lp" "$f" 2>/dev/null || echo "777")
+    if (((8#$mode & 8#077) != 0)); then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has mode $mode; it must not be group/other accessible (chmod 600 it)" >&2
+        exit 1
+    fi
+    if [[ ! -r "$f" ]] || ! grep -q '[^[:space:]]' "$f" 2>/dev/null; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' is unreadable or empty (an empty token disables auth)" >&2
+        exit 1
+    fi
+}
+
+# Block until launchd no longer lists $LABEL. Bounded by PIPECAT_STT_UNLOAD_WAIT
+# seconds (default 30): returns 0 once the job is gone, 1 (with a warning) if it
+# is still loaded at the cap. Callers that unlink a socket's .lock must only do
+# so after a 0 return: the old server holds that lock until it exits, and
+# unlinking a held lock lets a second server lock a new inode on the same socket.
 wait_unloaded() {
-    local waited=0 cap="${PIPECAT_STT_UNLOAD_WAIT:-30}"
+    local waited=0 cap="$UNLOAD_WAIT"
     while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do
         if [[ "$waited" -ge "$cap" ]]; then
             echo "warning: $LABEL still loaded ${cap}s after bootout" >&2
-            return 0
+            return 1
         fi
         sleep 1
         waited=$((waited + 1))
     done
+    return 0
 }
 
 # Remove a socket and its .lock named by an INSTALLED plist. That plist is
@@ -184,6 +255,8 @@ wait_unloaded() {
 # warning, and the function always returns 0. It acts only when:
 #   * the path is absolute, has no '..' component, and lives under $HOME (the
 #     same lexical rules as validate_socket_path, but warn-and-skip, not exit);
+#   * no directory component from the socket's parent up to and including $HOME
+#     is a symlink (the lexical check alone would follow one out of $HOME);
 #   * the socket is a real socket (-S) and not a symlink; the .lock is a regular
 #     file and not a symlink (so a plist naming a file, directory or symlink
 #     never deletes it);
@@ -208,6 +281,17 @@ remove_socket_owned() {
         echo "warning: installed socket path '$sock' is not under \$HOME ($home); leaving it" >&2
         return 0
     fi
+    local component="$dir" parent
+    while :; do
+        if [[ -L "$component" ]]; then
+            echo "warning: installed socket path '$sock' has a symlinked directory component '$component'; leaving it" >&2
+            return 0
+        fi
+        [[ "$component" == "$home" ]] && break
+        parent="$(dirname "$component")"
+        [[ "$parent" == "$component" ]] && break
+        component="$parent"
+    done
     for kind in sock lock; do
         if [[ "$kind" == sock ]]; then
             f="$sock"
@@ -289,6 +373,14 @@ validate_socket_path() {
 }
 
 render_plist() {
+    # Same names as the renderer's _BACKEND_RE; fail here, before any mkdir.
+    case "$BACKEND" in
+    echo | mlx | parakeet | nemotron | kyutai) : ;;
+    *)
+        echo "error: unknown backend '$BACKEND' (valid: echo|mlx|parakeet|nemotron|kyutai)" >&2
+        exit 2
+        ;;
+    esac
     # Never forward a raw token: the renderer refuses it (it would land in the
     # plist, which is world-readable). Fail clearly instead.
     if [[ -n "${PIPECAT_STT_AUTH_TOKEN:-}${KODA_STT_AUTH_TOKEN:-}" ]]; then
@@ -308,9 +400,14 @@ render_plist() {
         if ((${#ignored[@]} > 0)); then
             echo "warning: socket mode (PIPECAT_STT_SOCKET set): ignoring ${ignored[*]} (TCP-only settings; unset PIPECAT_STT_SOCKET for a TCP agent)" >&2
         fi
-    elif [[ -z "$PORT" ]]; then
-        echo "error: backend '$BACKEND' has no canonical port; set PIPECAT_STT_PORT" >&2
-        exit 1
+    else
+        if [[ -z "$PORT" ]]; then
+            echo "error: backend '$BACKEND' has no canonical port; set PIPECAT_STT_PORT" >&2
+            exit 1
+        fi
+        if [[ -n "$AUTH_TOKEN_FILE" ]]; then
+            validate_token_file "$AUTH_TOKEN_FILE"
+        fi
     fi
     mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
     if [[ -n "$SOCKET_PATH" ]]; then
@@ -353,7 +450,19 @@ render_plist() {
 case "$cmd" in
 install)
     # Capture the previously installed transport BEFORE the plist is rewritten.
-    old_socket="$(installed_socket_path)"
+    old_socket="$(installed_arg --socket-path)"
+    # Never silently downgrade a secured agent: an installed plist that carried a
+    # token (a pre-0.5.0 env token, or --auth-token-file) must not be replaced by
+    # an unauthenticated TCP listener just because the caller did not re-export
+    # the token file. Uninstalling first is the explicit opt-out.
+    if installed_has_auth; then
+        if [[ -z "$SOCKET_PATH" && -z "$AUTH_TOKEN_FILE" ]]; then
+            echo "error: the installed $LABEL agent requires an auth token, but PIPECAT_STT_AUTH_TOKEN_FILE is not set; this install would replace it with an unauthenticated TCP listener. Set PIPECAT_STT_AUTH_TOKEN_FILE (see docs/operations.md), or run 'uninstall' first to install without a token" >&2
+            exit 1
+        elif [[ -n "$SOCKET_PATH" ]]; then
+            echo "warning: the installed $LABEL agent required an auth token; a socket agent carries none (the socket's peer-uid check still applies)" >&2
+        fi
+    fi
     render_plist
     # Migrate v0.1.x installs: retire the legacy koda.stt-server agents that a
     # previous default install left behind, so launchd does not double-run the
@@ -379,20 +488,34 @@ install)
     fi
     # Bootstrap (idempotent: unload first if already loaded).
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    if [[ -n "$old_socket" && -z "$SOCKET_PATH" ]]; then
-        echo "note: endpoint changed from socket $old_socket to TCP $HOST:$PORT; removing the old socket"
-        remove_socket_owned "$old_socket"
-    fi
     # bootout returns before launchd finishes tearing the old job down (a loaded
     # ASR model takes seconds to exit). Bootstrapping into that window fails with
     # "Bootstrap failed: 5: Input/output error" and leaves the agent unloaded, so
     # wait until the label is gone, then retry the bootstrap once.
-    wait_unloaded
+    old_gone=0
+    if wait_unloaded; then old_gone=1; fi
     if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"; then
         echo "warning: launchctl bootstrap failed for $LABEL; retrying once" >&2
         sleep 2
-        wait_unloaded
+        if wait_unloaded; then old_gone=1; fi
         launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
+    fi
+    # Old socket cleanup runs only after the new job bootstrapped (a failed
+    # bootstrap exits above under set -e, leaving the old socket and .lock in
+    # place) and only once the old job was seen gone, so its .lock is never
+    # unlinked while the old server may still hold it. Any change of socket path
+    # (socket->TCP or socket A->socket B) retires the old one.
+    if [[ -n "$old_socket" && "$old_socket" != "$SOCKET_PATH" ]]; then
+        if [[ -z "$SOCKET_PATH" ]]; then
+            echo "note: endpoint changed from socket $old_socket to TCP $HOST:$PORT; removing the old socket"
+        else
+            echo "note: endpoint changed from socket $old_socket to socket $SOCKET_PATH; removing the old socket"
+        fi
+        if [[ "$old_gone" -eq 1 ]]; then
+            remove_socket_owned "$old_socket"
+        else
+            echo "warning: old job may still hold $old_socket.lock; leaving $old_socket and its .lock" >&2
+        fi
     fi
     launchctl enable "gui/$(id -u)/$LABEL"
     launchctl kickstart -k "gui/$(id -u)/$LABEL"
@@ -406,11 +529,17 @@ install)
     ;;
 uninstall)
     # Socket cleanup follows the transport recorded in the INSTALLED plist.
-    old_socket="$(installed_socket_path)"
+    old_socket="$(installed_arg --socket-path)"
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST_DST"
     if [[ -n "$old_socket" ]]; then
-        remove_socket_owned "$old_socket"
+        # bootout is asynchronous: the server holds <socket>.lock until it exits,
+        # so remove the socket and lock only once launchd no longer lists the job.
+        if wait_unloaded; then
+            remove_socket_owned "$old_socket"
+        else
+            echo "warning: $LABEL may still hold $old_socket.lock; leaving $old_socket and its .lock" >&2
+        fi
     fi
     echo "uninstalled: $LABEL"
     ;;

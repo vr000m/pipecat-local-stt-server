@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import re
 import shutil
 import socket
 import stat
@@ -845,6 +846,16 @@ def _cleanup_cases(tmp_path: Path, held: list[socket.socket]) -> dict[str, tuple
     lock_target.write_text("keep")
     (cache / "ll.sock.lock").symlink_to(lock_target)
     cases["lock-is-symlink"] = (str(locklink_sock), [cache / "ll.sock.lock", lock_target])
+
+    # Lexically under $HOME, but a directory component is a symlink that leads
+    # outside it: the socket and lock entries themselves are real and owned.
+    far = tmp_path / "far"
+    far.mkdir()
+    far_sock = far / "f.sock"
+    held.append(_bind_socket(far_sock))
+    (far / "f.sock.lock").write_text("")
+    (cache / "linkdir").symlink_to(far)
+    cases["symlinked-parent"] = (str(cache / "linkdir" / "f.sock"), [far_sock, far / "f.sock.lock"])
     return cases
 
 
@@ -859,6 +870,7 @@ def _cleanup_cases(tmp_path: Path, held: list[socket.socket]) -> dict[str, tuple
         "outside-home",
         "lock-is-directory",
         "lock-is-symlink",
+        "symlinked-parent",
     ],
 )
 def test_socket_cleanup_never_deletes_non_socket_targets(
@@ -1173,3 +1185,279 @@ def test_wait_for_unload_is_bounded(tmp_path: Path):
     )
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert "still loaded" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# PIPECAT_STT_UNLOAD_WAIT is validated before any launchctl call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd", ["install", "uninstall"])
+@pytest.mark.parametrize("value", ["abc", "-1", "1.5", " 3"])
+def test_invalid_unload_wait_fails_before_bootout(tmp_path: Path, cmd: str, value: str):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    _seed_plist(home, ["--host", "127.0.0.1", "--port", "9565"])
+    before = (_agents(home) / f"{NEW_LABEL}.plist").read_bytes()
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides={"PIPECAT_STT_UNLOAD_WAIT": value})
+    assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "PIPECAT_STT_UNLOAD_WAIT" in r.stderr
+    assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+    assert (_agents(home) / f"{NEW_LABEL}.plist").read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Socket cleanup contract: a <socket>.lock is unlinked only once the job that
+# may hold it is confirmed gone from launchd, and only after a successful
+# bootstrap on install. State space: cmd {install socket->TCP, install
+# socket A->B, uninstall} x old job {gone, still loaded} x bootstrap {ok, fails}.
+# ---------------------------------------------------------------------------
+
+
+def _second_socket(home: Path) -> Path:
+    return home / "Library" / "Caches" / "pipecat-stt" / "other.sock"
+
+
+@pytest.mark.parametrize(
+    "mode,still_loaded,bootstrap_failures,expect_removed,expect_rc0",
+    [
+        ("to-tcp", False, 0, True, True),
+        ("to-tcp", True, 0, False, True),
+        ("to-tcp", False, 5, False, False),
+        ("to-other-socket", False, 0, True, True),
+        ("to-other-socket", True, 0, False, True),
+        ("to-other-socket", False, 5, False, False),
+        ("uninstall", False, 0, True, True),
+        ("uninstall", True, 0, False, True),
+    ],
+)
+def test_socket_lock_unlinked_only_after_old_job_gone(
+    tmp_path: Path,
+    held_sockets,
+    mode: str,
+    still_loaded: bool,
+    bootstrap_failures: int,
+    expect_removed: bool,
+    expect_rc0: bool,
+):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    _slow_teardown_launchctl(
+        stub_dir,
+        tmp_path,
+        still_loaded_polls=10_000 if still_loaded else 0,
+        bootstrap_failures=bootstrap_failures,
+    )
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock)])
+    env = {"PIPECAT_STT_UNLOAD_WAIT": "0"}
+    cmd = "install"
+    if mode == "to-other-socket":
+        env["PIPECAT_STT_SOCKET"] = str(_second_socket(home))
+    elif mode == "uninstall":
+        cmd = "uninstall"
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides=env)
+    assert (r.returncode == 0) == expect_rc0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    if expect_removed:
+        assert not sock.exists() and not lock.exists(), f"{mode}: old endpoint left behind"
+    else:
+        assert sock.exists() and lock.exists(), f"{mode}: old socket/.lock removed too early"
+
+
+def test_socket_a_to_socket_b_reinstall_notes_change(tmp_path: Path, held_sockets):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock)])
+    other = _second_socket(home)
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": str(other)})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "endpoint changed" in r.stdout and str(other) in r.stdout
+    assert not sock.exists() and not lock.exists()
+    assert _flag(_rendered(home)["ProgramArguments"], "--socket-path") == str(other)
+
+
+# ---------------------------------------------------------------------------
+# A reinstall never silently drops auth from a secured agent.
+# State space: installed auth {none, PIPECAT env token, KODA env token, empty env
+# token, --auth-token-file} x new transport {TCP no token file, TCP token file,
+# socket}. Refused iff installed auth present AND new is TCP without a file.
+# ---------------------------------------------------------------------------
+
+
+def _seed_plist_with_auth(home: Path, auth: str, token_file: Path) -> Path:
+    agents = _agents(home)
+    agents.mkdir(parents=True, exist_ok=True)
+    args = [str(VENV_PYTHON), "-m", "stt_server", "--host", "127.0.0.1", "--port", "9565"]
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
+    if auth == "env-pipecat":
+        env["PIPECAT_STT_AUTH_TOKEN"] = SECRET
+    elif auth == "env-koda":
+        env["KODA_STT_AUTH_TOKEN"] = SECRET
+    elif auth == "env-empty":
+        env["PIPECAT_STT_AUTH_TOKEN"] = ""
+    elif auth == "token-file":
+        args += ["--auth-token-file", str(token_file)]
+    path = agents / f"{NEW_LABEL}.plist"
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": NEW_LABEL,
+                "ProgramArguments": [*args, "--backend", "mlx"],
+                "EnvironmentVariables": env,
+            }
+        )
+    )
+    return path
+
+
+def _good_token_file(tmp_path: Path) -> Path:
+    tok = tmp_path / "token.txt"
+    tok.write_text(SECRET + "\n")
+    tok.chmod(0o600)
+    return tok
+
+
+@pytest.mark.parametrize("new", ["tcp-no-file", "tcp-file", "socket"])
+@pytest.mark.parametrize("auth", ["none", "env-pipecat", "env-koda", "env-empty", "token-file"])
+def test_reinstall_never_silently_drops_auth(tmp_path: Path, auth: str, new: str):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    tok = _good_token_file(tmp_path)
+    plist_path = _seed_plist_with_auth(home, auth, tok)
+    before = plist_path.read_bytes()
+    env: dict[str, str] = {}
+    if new == "tcp-file":
+        env["PIPECAT_STT_AUTH_TOKEN_FILE"] = str(tok)
+    elif new == "socket":
+        env["PIPECAT_STT_SOCKET"] = str(home / "Library" / "Caches" / "pipecat-stt" / "stt.sock")
+    r = _run_install(tmp_path, stub_dir, env_overrides=env)
+    had_auth = auth in ("env-pipecat", "env-koda", "token-file")
+    refused = had_auth and new == "tcp-no-file"
+    assert SECRET not in r.stdout and SECRET not in r.stderr, "token value leaked"
+    if refused:
+        assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "PIPECAT_STT_AUTH_TOKEN_FILE" in r.stderr
+        assert plist_path.read_bytes() == before, "refused install must not rewrite the plist"
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+    else:
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert SECRET.encode() not in plist_path.read_bytes()
+        if had_auth and new == "socket":
+            assert "auth token" in r.stderr
+
+
+def test_uninstall_then_install_is_the_opt_out(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    _seed_plist_with_auth(home, "env-pipecat", _good_token_file(tmp_path))
+    assert _run_install(tmp_path, stub_dir, cmd="uninstall").returncode == 0
+    r = _run_install(tmp_path, stub_dir)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "--auth-token-file" not in _rendered(home)["ProgramArguments"]
+
+
+# ---------------------------------------------------------------------------
+# Token-file validation (TCP mode): regular, not a symlink, owned by the user,
+# no group/other bits, non-empty. Socket mode ignores the file (covered above).
+# ---------------------------------------------------------------------------
+
+
+def _token_case(tmp_path: Path, stub_dir: Path, case: str) -> Path:
+    good = _good_token_file(tmp_path)
+    if case == "ok":
+        return good
+    if case == "missing":
+        return tmp_path / "nope.txt"
+    if case == "directory":
+        d = tmp_path / "tokdir"
+        d.mkdir(mode=0o700)
+        return d
+    if case == "symlink":
+        link = tmp_path / "toklink"
+        link.symlink_to(good)
+        return link
+    if case in ("group-readable", "other-readable"):
+        good.chmod(0o640 if case == "group-readable" else 0o604)
+        return good
+    if case in ("empty", "whitespace"):
+        good.write_text("" if case == "empty" else "  \n\t\n")
+        good.chmod(0o600)
+        return good
+    if case == "other-owner":
+        # The file is owned by the real uid; make `id -u` report someone else.
+        _write_executable(
+            stub_dir / "id",
+            '#!/usr/bin/env bash\nif [[ "$1" == "-u" ]]; then echo 99999; exit 0; fi\n'
+            'exec /usr/bin/id "$@"\n',
+        )
+        return good
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ok",
+        "missing",
+        "directory",
+        "symlink",
+        "group-readable",
+        "other-readable",
+        "empty",
+        "whitespace",
+        "other-owner",
+    ],
+)
+def test_token_file_validated_in_tcp_mode(tmp_path: Path, case: str):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    tok = _token_case(tmp_path, stub_dir, case)
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_AUTH_TOKEN_FILE": str(tok)})
+    plist = _agents(tmp_path / "home") / f"{NEW_LABEL}.plist"
+    assert SECRET not in r.stdout and SECRET not in r.stderr
+    if case == "ok":
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert _flag(_rendered(tmp_path / "home")["ProgramArguments"], "--auth-token-file") == str(
+            tok
+        )
+    else:
+        assert r.returncode != 0, f"{case}: stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "PIPECAT_STT_AUTH_TOKEN_FILE" in r.stderr
+        assert not plist.exists(), f"{case}: plist written despite a bad token file"
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
+# ---------------------------------------------------------------------------
+# Installer <-> renderer backend contract: the installer accepts exactly the
+# renderer's _BACKEND_RE names and rejects anything else before any mkdir.
+# ---------------------------------------------------------------------------
+
+
+def _renderer_backends() -> set[str]:
+    src = (REPO_ROOT / "scripts" / "render_stt_plist.py").read_text()
+    m = re.search(r'_BACKEND_RE = re\.compile\(r"\^\(([^)]*)\)\$"\)', src)
+    assert m, "could not parse _BACKEND_RE"
+    return set(m.group(1).split("|"))
+
+
+@pytest.mark.parametrize("backend", sorted(_renderer_backends() | {"whisper", "bogus", "MLX"}))
+def test_installer_backend_allowlist_equals_renderer(tmp_path: Path, backend: str):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    log_dir = tmp_path / "logs"
+    env = {
+        "PIPECAT_STT_BACKEND": backend,
+        "PIPECAT_STT_PYTHON": str(_stub_python(tmp_path)),
+        "PIPECAT_STT_MODEL": "test/model",
+        "PIPECAT_STT_PORT": "9123",
+        "PIPECAT_STT_LOG_DIR": str(log_dir),
+    }
+    r = _run_install(tmp_path, stub_dir, env_overrides=env)
+    if backend in _renderer_backends():
+        assert r.returncode == 0, f"{backend}: stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert _flag(_rendered(tmp_path / "home")["ProgramArguments"], "--backend") == backend
+    else:
+        assert r.returncode != 0
+        assert "unknown backend" in r.stderr, r.stderr
+        assert not log_dir.exists(), f"{backend}: LOG_DIR created before the backend was rejected"
+        assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
