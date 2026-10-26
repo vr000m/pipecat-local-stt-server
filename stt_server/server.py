@@ -1020,16 +1020,15 @@ class TranscriptionServer:
             "stt_server listening on %s",
             self._config.socket_path or f"{self._config.host}:{self._config.port}",
         )
-        # TCP without a token accepts unauthed clients. UDS mode is protected
-        # by the 0o600 file permission and the local trust boundary; TCP has
-        # neither. Make the gap loud so operators notice before shipping.
+        # Loopback TCP without a token is the default agent setup (the same as
+        # the TTS agents), so this is informational. ServerConfig refuses any
+        # non-loopback host, so there is no remote-exposure case to warn about.
+        # Unlike a UDS (0o600 file), loopback TCP has no peer-uid check.
         if self._config.socket_path is None and not self._config.auth_token:
-            logger.warning(
-                "stt_server: TCP listener is running without --auth-token; "
-                "any local process that can reach %s:%s can connect. "
-                "Configure PIPECAT_STT_AUTH_TOKEN (or the deprecated "
-                "KODA_STT_AUTH_TOKEN, or --auth-token-file) for "
-                "any non-experimental deployment.",
+            logger.info(
+                "stt_server: loopback TCP listener has no auth token; any local "
+                "process that can reach %s:%s can connect. Use --auth-token-file "
+                "to require one.",
                 self._config.host,
                 self._config.port,
             )

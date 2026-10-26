@@ -66,7 +66,7 @@ uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock 
 
 # Loopback TCP — minimal form. Pick any free port; there is no default port,
 # so --host and --port are both required for TCP. On loopback an auth token is
-# optional (the server logs a warning and serves anyway — fine for local
+# optional (the server logs an info line and serves anyway — fine for local
 # experiments). The listener comes up on 127.0.0.1:<port>.
 uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 

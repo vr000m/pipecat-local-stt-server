@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ambient `PIPECAT_STT_HOST`/`PIPECAT_STT_PORT` and leave the transport to the
   installer, so the socket rollback (`PIPECAT_STT_SOCKET` set) no longer warns
   about ignored TCP settings and the socket-vs-TCP rule lives in one place.
+- **Loopback TCP without a token logs INFO, not a warning.** That is the default
+  agent setup, and non-loopback binds are refused, so there was nothing to warn
+  about. The message names `--auth-token-file`, not the env token.
 - **`serve --auth-token-file` is strict.** An empty or whitespace-only file, a
   token with internal whitespace, a newline or a non-ASCII character, or a
   non-UTF-8 file now stops the server at startup instead of silently running

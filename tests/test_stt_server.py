@@ -602,28 +602,30 @@ async def test_client_uri_overrides_socket_path():
 # ---------------------------------------------------------------------------
 # Auth contract — pins doc claims in README / AGENTS.md / architecture.md:
 #   "STT_WS_TOKEN is enforced only when the server was started with a token;
-#    TCP without a token logs a warning at startup."
+#    TCP without a token logs an info line at startup (loopback only)."
 # Prevents silent drift between the documented trust model and behavior.
 # ---------------------------------------------------------------------------
 
 
-async def test_tcp_without_token_emits_startup_warning(caplog):
-    caplog.set_level("WARNING", logger="stt_server.server")
+async def test_tcp_without_token_logs_info_not_warning(caplog):
+    caplog.set_level("INFO", logger="stt_server")
     srv = TranscriptionServer(
         EchoBackend(),
         ServerConfig(host="127.0.0.1", port=0, reject_browser_origins=False),
     )
     await srv.start()
     try:
-        assert any(
-            "TCP listener is running without --auth-token" in rec.message for rec in caplog.records
-        ), "TCP server without token must warn at startup"
+        recs = [r for r in caplog.records if "loopback TCP listener has no auth token" in r.message]
+        assert recs, "TCP server without token must say so at startup"
+        assert all(r.levelname == "INFO" for r in recs), "loopback default must not warn"
+        assert "--auth-token-file" in recs[0].message
+        assert "PIPECAT_STT_AUTH_TOKEN" not in recs[0].message
     finally:
         await srv.shutdown()
 
 
 async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
-    caplog.set_level("WARNING", logger="stt_server.server")
+    caplog.set_level("INFO", logger="stt_server")
     # Binds under a system temp dir (root-owned ancestor) which R1 rejects;
     # this test exercises the UDS-vs-TCP token warning, not ancestor-dir
     # enforcement, so neutralise the check via the Phase-4-sanctioned seam.
@@ -637,8 +639,7 @@ async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
         await srv.start()
         try:
             assert not any(
-                "TCP listener is running without --auth-token" in rec.message
-                for rec in caplog.records
+                "loopback TCP listener has no auth token" in rec.message for rec in caplog.records
             ), "UDS mode is protected by file perms; must not warn about missing token"
         finally:
             await srv.shutdown()
