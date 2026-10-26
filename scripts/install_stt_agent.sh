@@ -74,6 +74,9 @@
 # Auth token: pass a FILE (PIPECAT_STT_AUTH_TOKEN_FILE=/abs/path, TCP mode).
 # A raw PIPECAT_STT_AUTH_TOKEN / KODA_STT_AUTH_TOKEN in the environment is
 # REFUSED (the install fails) because it would be written into the plist.
+# A reinstall over an agent whose installed plist requires a token (an env token,
+# or --auth-token-file /x or --auth-token-file=/x: read with the server's own
+# full-name-only grammar) fails unless PIPECAT_STT_AUTH_TOKEN_FILE is set.
 #
 # Operational constraint: this script manages exactly ONE agent per
 # invocation, identified by PIPECAT_STT_LABEL. There is no registry or "all"

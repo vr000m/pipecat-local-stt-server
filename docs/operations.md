@@ -102,9 +102,11 @@ them. The plist records the resolved path, the one that was checked, so a
 symlinked directory in the path you gave cannot be repointed later. The content must be what the server accepts: it reads the file as
 UTF-8 and strips surrounding whitespace, and the result must be one token of
 visible ASCII characters with no internal whitespace. An empty file would disable
-auth, and a token with a newline, a space or a non-ASCII character can never match
-an `Authorization` header, so both fail the install (the installer calls the
-server's own `stt_server.auth.read_token_file`, so the rules cannot drift). `serve`
+auth, and a token with a space, tab or newline left inside it after stripping, or a
+non-ASCII character, can never match an `Authorization` header, so both fail the
+install (the installer calls the server's own `stt_server.auth.read_token_file`, so
+the rules cannot drift). Leading and trailing whitespace, including the trailing
+newline an editor or `echo` adds, is stripped and fine. `serve`
 applies the same check at startup and exits rather than run unauthenticated; a
 missing file crash-loops the agent, so the installer refuses that too. The probe
 (`status`) stays lenient for a client-side token file.
@@ -112,7 +114,10 @@ missing file crash-loops the agent, so the installer refuses that too. The probe
 A reinstall never silently drops auth: if the installed plist carries a token (a
 pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
 `PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails. Set the token file, or run
-`uninstall` first to install without a token. An installed plist the installer
+`uninstall` first to install without a token. The installer reads the installed
+plist's flags with the server's own grammar (`serve` takes full flag names only),
+so `--auth-token-file /x` and `--auth-token-file=/x` both count as a token. An
+installed plist the installer
 cannot read (malformed, truncated, or the reader's interpreter missing: `install`
 runs it under the venv python, `uninstall` under the system `python3`) also fails the install,
 since it cannot tell whether that agent required a token; `uninstall` still

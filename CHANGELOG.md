@@ -91,7 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent setup, and non-loopback binds are refused, so there was nothing to warn
   about. The message names `--auth-token-file`, not the env token.
 - **`serve --auth-token-file` is strict.** An empty or whitespace-only file, a
-  token with internal whitespace, a newline or a non-ASCII character, or a
+  token with internal whitespace (a space, tab or newline inside it; a trailing
+  newline is stripped and fine) or a non-ASCII character, or a
   non-UTF-8 file now stops the server at startup instead of silently running
   without auth (an empty token disabled it) or never matching any client. The
   probe (`status`) stays lenient. The installer runs the same check
