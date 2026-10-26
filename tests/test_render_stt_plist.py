@@ -40,6 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "render_stt_plist.py"
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_stt_agent.sh"
 SNAPSHOT = Path(__file__).resolve().parent / "snapshots" / "pipecat-stt.plist"
+SNAPSHOT_TCP = Path(__file__).resolve().parent / "snapshots" / "pipecat-stt-tcp.plist"
+
+# TCP-mode baseline: SNAPSHOT_ENV minus SOCKET_PATH, plus PORT (HOST defaults
+# to 127.0.0.1). Matches tests/snapshots/pipecat-stt-tcp.plist.
+TCP_ENV: dict[str, str | None] = {"SOCKET_PATH": None, "PORT": "9565"}
 
 # The fixed env the committed snapshot was captured under. Keep these values
 # in lockstep with tests/snapshots/pipecat-stt.plist — they are the
@@ -57,7 +62,7 @@ SNAPSHOT_ENV = {
 _DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 
 
-def _run_render(env_overrides: dict[str, str], dst: Path) -> subprocess.CompletedProcess:
+def _run_render(env_overrides: dict[str, str | None], dst: Path) -> subprocess.CompletedProcess:
     """Run ``render_stt_plist.py`` in a clean env with ``PLIST_DST`` -> ``dst``.
 
     ``env`` is built from ``SNAPSHOT_ENV`` plus ``PLIST_DST`` and any
@@ -66,7 +71,11 @@ def _run_render(env_overrides: dict[str, str], dst: Path) -> subprocess.Complete
     """
     env = dict(SNAPSHOT_ENV)
     env["PLIST_DST"] = str(dst)
-    env.update(env_overrides)
+    env.update({k: v for k, v in env_overrides.items() if v is not None})
+    # A ``None`` override DROPS the key from the base env (absent != empty).
+    for k, v in env_overrides.items():
+        if v is None:
+            env.pop(k, None)
     # PATH is needed for the subprocess to launch; nothing else leaks in.
     env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
     return subprocess.run(
@@ -324,43 +333,205 @@ def test_model_rejected_when_invalid(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Auth-token env: canonical PIPECAT_STT_AUTH_TOKEN is rendered into the plist;
-# the legacy KODA_STT_AUTH_TOKEN input is still accepted. The server reads
-# PIPECAT_STT_AUTH_TOKEN-first, so the plist must carry the canonical key.
+# TCP default / socket opt-in
 # ---------------------------------------------------------------------------
 
 
-def test_render_writes_pipecat_auth_token_from_canonical(tmp_path: Path):
-    dst = tmp_path / "auth.plist"
-    r = _run_render({"PIPECAT_STT_AUTH_TOKEN": "pipecat-secret"}, dst)
+def test_tcp_snapshot_fixture_exists():
+    assert SNAPSHOT_TCP.is_file()
+
+
+def test_tcp_default_renders_byte_for_byte_equal_to_tcp_snapshot(tmp_path: Path):
+    dst = tmp_path / "tcp.plist"
+    r = _run_render(TCP_ENV, dst)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-    env = plistlib.loads(dst.read_bytes())["EnvironmentVariables"]
-    assert env.get("PIPECAT_STT_AUTH_TOKEN") == "pipecat-secret"
-    assert "KODA_STT_AUTH_TOKEN" not in env
+    assert dst.read_bytes() == SNAPSHOT_TCP.read_bytes()
 
 
-def test_render_accepts_legacy_koda_auth_token_input(tmp_path: Path):
-    # Legacy KODA_ input is honoured, but the rendered key is canonical.
-    dst = tmp_path / "auth-legacy.plist"
-    r = _run_render({"KODA_STT_AUTH_TOKEN": "koda-secret"}, dst)
+def test_tcp_args_have_host_port_and_no_socket_path(tmp_path: Path):
+    dst = tmp_path / "tcp.plist"
+    r = _run_render({**TCP_ENV, "HOST": "localhost", "PORT": "9570"}, dst)
+    assert r.returncode == 0, r.stderr
+    args = plistlib.loads(dst.read_bytes())["ProgramArguments"]
+    assert args[args.index("--host") + 1] == "localhost"
+    assert args[args.index("--port") + 1] == "9570"
+    assert "--socket-path" not in args
+    assert "--auth-token-file" not in args
+
+
+def test_socket_path_set_keeps_socket_plist_and_no_tcp_args(tmp_path: Path):
+    dst = tmp_path / "sock.plist"
+    r = _run_render({"PORT": None, "HOST": None}, dst)
+    assert r.returncode == 0, r.stderr
+    assert dst.read_bytes() == SNAPSHOT.read_bytes()
+    args = plistlib.loads(dst.read_bytes())["ProgramArguments"]
+    assert "--host" not in args and "--port" not in args
+
+
+def test_empty_socket_path_means_tcp(tmp_path: Path):
+    dst = tmp_path / "tcp.plist"
+    r = _run_render({"SOCKET_PATH": "", "PORT": "9565"}, dst)
+    assert r.returncode == 0, r.stderr
+    assert dst.read_bytes() == SNAPSHOT_TCP.read_bytes()
+
+
+def test_empty_host_defaults_to_loopback(tmp_path: Path):
+    dst = tmp_path / "tcp.plist"
+    r = _run_render({**TCP_ENV, "HOST": ""}, dst)
+    assert r.returncode == 0, r.stderr
+    assert dst.read_bytes() == SNAPSHOT_TCP.read_bytes()
+
+
+@pytest.mark.parametrize("extra", [{"HOST": "127.0.0.1"}, {"PORT": "9565"}])
+def test_socket_path_with_host_or_port_is_rejected(tmp_path: Path, extra: dict[str, str]):
+    dst = tmp_path / "both.plist"
+    r = _run_render(extra, dst)  # base env already has SOCKET_PATH
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not dst.exists()
+
+
+def test_socket_path_with_empty_host_and_port_is_socket_mode(tmp_path: Path):
+    dst = tmp_path / "sock.plist"
+    r = _run_render({"HOST": "", "PORT": ""}, dst)
+    assert r.returncode == 0, r.stderr
+    assert dst.read_bytes() == SNAPSHOT.read_bytes()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_loopback_hosts_accepted(tmp_path: Path, host: str):
+    dst = tmp_path / "h.plist"
+    r = _run_render({**TCP_ENV, "HOST": host}, dst)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-    env = plistlib.loads(dst.read_bytes())["EnvironmentVariables"]
-    assert env.get("PIPECAT_STT_AUTH_TOKEN") == "koda-secret"
-    assert "KODA_STT_AUTH_TOKEN" not in env
+    args = plistlib.loads(dst.read_bytes())["ProgramArguments"]
+    assert args[args.index("--host") + 1] == host
 
 
-def test_render_auth_token_pipecat_wins_over_koda(tmp_path: Path):
-    dst = tmp_path / "auth-both.plist"
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "127.0.0.2", "192.168.1.10", "127.0.0.1</string><x/>"],
+)
+def test_non_loopback_or_hostile_hosts_rejected(tmp_path: Path, host: str):
+    dst = tmp_path / "h.plist"
+    r = _run_render({**TCP_ENV, "HOST": host}, dst)
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not dst.exists()
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "-1", "abc", "", "9565</string>", "95 65"])
+def test_invalid_ports_rejected(tmp_path: Path, port: str):
+    dst = tmp_path / "p.plist"
+    r = _run_render({**TCP_ENV, "PORT": port}, dst)
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not dst.exists()
+
+
+def test_missing_port_in_tcp_mode_rejected(tmp_path: Path):
+    dst = tmp_path / "p.plist"
+    r = _run_render({"SOCKET_PATH": None, "PORT": None}, dst)
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not dst.exists()
+
+
+@pytest.mark.parametrize("port", ["1", "65535"])
+def test_port_bounds_accepted(tmp_path: Path, port: str):
+    dst = tmp_path / "p.plist"
+    r = _run_render({**TCP_ENV, "PORT": port}, dst)
+    assert r.returncode == 0, r.stderr
+    args = plistlib.loads(dst.read_bytes())["ProgramArguments"]
+    assert args[args.index("--port") + 1] == port
+
+
+# ---------------------------------------------------------------------------
+# kyutai backend
+# ---------------------------------------------------------------------------
+
+
+def test_kyutai_backend_accepted_with_model(tmp_path: Path):
+    dst = tmp_path / "kyutai.plist"
+    r = _run_render({**TCP_ENV, "BACKEND": "kyutai", "MODEL": "kyutai/stt-1b-en_fr-mlx"}, dst)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = plistlib.loads(dst.read_bytes())["ProgramArguments"]
+    assert args[args.index("--backend") + 1] == "kyutai"
+    assert args[args.index("--model") + 1] == "kyutai/stt-1b-en_fr-mlx"
+
+
+def test_kyutai_log_basename_follows_dot_to_dash_rule(tmp_path: Path):
+    dst = tmp_path / "kyutai.plist"
     r = _run_render(
         {
-            "PIPECAT_STT_AUTH_TOKEN": "pipecat-secret",
-            "KODA_STT_AUTH_TOKEN": "koda-secret",
+            **TCP_ENV,
+            "BACKEND": "kyutai",
+            "MODEL": "kyutai/stt-1b-en_fr-mlx",
+            "PIPECAT_STT_LABEL": "pipecat.stt-server.kyutai",
         },
         dst,
     )
+    assert r.returncode == 0, r.stderr
+    plist = plistlib.loads(dst.read_bytes())
+    assert Path(plist["StandardOutPath"]).name == "pipecat-stt-server-kyutai.log"
+    assert Path(plist["StandardErrorPath"]).name == "pipecat-stt-server-kyutai.err"
+
+
+# ---------------------------------------------------------------------------
+# AUTH_TOKEN_FILE: path-only; token values in env are refused
+# ---------------------------------------------------------------------------
+
+
+def test_auth_token_file_rendered_as_flag(tmp_path: Path):
+    dst = tmp_path / "auth.plist"
+    r = _run_render({**TCP_ENV, "AUTH_TOKEN_FILE": "/Users/test/.config/pipecat-stt/token"}, dst)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-    env = plistlib.loads(dst.read_bytes())["EnvironmentVariables"]
-    assert env.get("PIPECAT_STT_AUTH_TOKEN") == "pipecat-secret"
+    args = plistlib.loads(dst.read_bytes())["ProgramArguments"]
+    assert args[args.index("--auth-token-file") + 1] == "/Users/test/.config/pipecat-stt/token"
+
+
+def test_auth_token_file_omitted_by_default(tmp_path: Path):
+    dst = tmp_path / "noauth.plist"
+    r = _run_render(TCP_ENV, dst)
+    assert r.returncode == 0, r.stderr
+    assert "--auth-token-file" not in plistlib.loads(dst.read_bytes())["ProgramArguments"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "relative/token",
+        "token",
+        "/Users/test/tok;rm",
+        "/Users/test/t</string><x/>",
+        "/Users/test/$(id)",
+    ],
+)
+def test_bad_auth_token_file_rejected(tmp_path: Path, path: str):
+    dst = tmp_path / "auth.plist"
+    r = _run_render({**TCP_ENV, "AUTH_TOKEN_FILE": path}, dst)
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not dst.exists()
+
+
+@pytest.mark.parametrize("var", ["PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"])
+@pytest.mark.parametrize("base", [TCP_ENV, {}])
+def test_env_auth_token_refused(tmp_path: Path, var: str, base: dict[str, str | None]):
+    """A token value in the renderer's env is refused (it would land in the
+    world-readable plist); the message points at AUTH_TOKEN_FILE and the
+    secret never appears in output or on disk."""
+    secret = "s3cr3t-token-value-xyz"
+    dst = tmp_path / "token.plist"
+    r = _run_render({**base, var: secret}, dst)
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "AUTH_TOKEN_FILE" in r.stderr
+    assert secret not in r.stdout and secret not in r.stderr
+    assert not dst.exists()
+    for f in tmp_path.rglob("*"):
+        if f.is_file():
+            assert secret.encode() not in f.read_bytes()
+
+
+def test_empty_env_auth_token_is_ignored(tmp_path: Path):
+    dst = tmp_path / "empty-token.plist"
+    r = _run_render({**TCP_ENV, "PIPECAT_STT_AUTH_TOKEN": "", "KODA_STT_AUTH_TOKEN": ""}, dst)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert dst.read_bytes() == SNAPSHOT_TCP.read_bytes()
 
 
 def test_render_custom_label_via_pipecat_env(tmp_path: Path):

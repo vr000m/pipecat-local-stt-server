@@ -41,8 +41,11 @@ DEFAULT_LABEL = "pipecat.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
-_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron)$")
+_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron|kyutai)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
+# Exactly the hosts the server accepts for a TCP bind (stt_server/server.py).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
 
 def _log_basename(label: str) -> str:
@@ -96,11 +99,48 @@ def main() -> None:
 
     python = _require("PYTHON", os.environ.get("PYTHON"), _ABSPATH_RE, "absolute path")
     cwd = _require("REPO_ROOT", os.environ.get("REPO_ROOT"), _ABSPATH_RE, "absolute path")
-    socket_path = _require(
-        "SOCKET_PATH", os.environ.get("SOCKET_PATH"), _ABSPATH_RE, "absolute path"
-    )
+    # Empty strings count as unset. SOCKET_PATH and HOST/PORT are mutually
+    # exclusive; TCP is the default transport when SOCKET_PATH is unset.
+    socket_path_raw = os.environ.get("SOCKET_PATH") or None
+    host_raw = os.environ.get("HOST") or None
+    port_raw = os.environ.get("PORT") or None
+    if socket_path_raw is not None and (host_raw is not None or port_raw is not None):
+        print(
+            "error: SOCKET_PATH and HOST/PORT are mutually exclusive; set one transport",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    transport_args: list[str]
+    if socket_path_raw is not None:
+        socket_path = _require("SOCKET_PATH", socket_path_raw, _ABSPATH_RE, "absolute path")
+        transport_args = ["--socket-path", socket_path]
+    else:
+        host = host_raw or "127.0.0.1"
+        if host not in _LOOPBACK_HOSTS:
+            print(
+                f"error: HOST={host!r} rejected (loopback only: 127.0.0.1, ::1, localhost)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        port_s = _require("PORT", port_raw, _PORT_RE, "integer 1-65535")
+        port = int(port_s)
+        if not (1 <= port <= 65535):
+            print(f"error: PORT={port_s!r} out of range (1-65535)", file=sys.stderr)
+            sys.exit(2)
+        transport_args = ["--host", host, "--port", str(port)]
+    auth_token_file = os.environ.get("AUTH_TOKEN_FILE") or None
+    if auth_token_file is not None:
+        auth_token_file = _require("AUTH_TOKEN_FILE", auth_token_file, _ABSPATH_RE, "absolute path")
+    for tok_name in ("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"):
+        if os.environ.get(tok_name):
+            print(
+                f"error: {tok_name} is set, but the renderer never writes a secret into "
+                "the plist; write the token to a file and pass AUTH_TOKEN_FILE (path) instead",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     backend = _require(
-        "BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet|nemotron"
+        "BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet|nemotron|kyutai"
     )
     model = _require(
         "MODEL",
@@ -118,8 +158,7 @@ def main() -> None:
             python,
             "-m",
             "stt_server",
-            "--socket-path",
-            socket_path,
+            *transport_args,
             "--backend",
             backend,
             "--model",
@@ -141,19 +180,13 @@ def main() -> None:
         "StandardErrorPath": str(Path(log_dir) / f"{log_basename}.err"),
     }
 
-    # Accept the canonical PIPECAT_STT_AUTH_TOKEN first, then the deprecated
-    # KODA_STT_AUTH_TOKEN alias. The server reads PIPECAT_STT_AUTH_TOKEN-first,
-    # so render the canonical name into the plist EnvironmentVariables block.
-    auth_token = env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN")
-    if auth_token:
-        # Prefer env over --auth-token so the token never lands in `ps`.
-        plist["EnvironmentVariables"]["PIPECAT_STT_AUTH_TOKEN"] = auth_token
+    if auth_token_file:
+        plist["ProgramArguments"] += ["--auth-token-file", auth_token_file]
 
     out = Path(plist_dst)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Write under a restrictive umask so the plist containing
-    # PIPECAT_STT_AUTH_TOKEN is 0o600 from the start (no race where another
-    # local user could read it between create and chmod).
+    # Write under a restrictive umask so the plist is 0o600 from the start
+    # (no race between create and chmod).
     prev_umask = os.umask(0o077)
     try:
         with out.open("wb") as f:

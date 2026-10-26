@@ -246,7 +246,7 @@ sequenceDiagram
 
 ## Progress
 
-- [ ] Phase 1: Renderer
+- [x] Phase 1: Renderer
 - [ ] Phase 2: Installer
 - [ ] Phase 3: Port table, justfile and mirror test
 - [ ] Phase 4: Docs and release
@@ -255,6 +255,7 @@ sequenceDiagram
 ## Findings
 
 - (append findings here as work proceeds)
+- Phase 1 reviewer (advisory, Minor, unfixed): (a) `scripts/render_stt_plist.py` module docstring (lines ~11-13) still describes env tokens via `env_first`; reword. (b) `_require` uses `re.match` with `$`, which accepts a trailing newline (AUTH_TOKEN_FILE/SOCKET_PATH/PYTHON); use `fullmatch` and add a trailing-newline test case.
 
 ### Review Waivers
 
