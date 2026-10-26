@@ -21,10 +21,11 @@
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
 #                       file must be a regular file (not a symlink) owned by you,
 #                       with no group/other permission bits, and non-empty.
-#   PIPECAT_STT_UNLOAD_WAIT  seconds (non-negative integer, read as decimal so
-#                       "08" is 8) to wait for launchd to finish tearing the old
-#                       job down before bootstrap, and before uninstall removes
-#                       a socket (default 30)
+#   PIPECAT_STT_UNLOAD_WAIT  seconds (integer 0..86400, read as decimal so "08"
+#                       is 8; larger values are refused, not wrapped) to wait for
+#                       launchd to finish tearing the old job down before
+#                       bootstrap, and before uninstall removes a socket
+#                       (default 30)
 #   PIPECAT_STT_PYTHON  interpreter (default: .venv/bin/python, or
 #                       .venv-kyutai/bin/python for the kyutai backend)
 #   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai (default: mlx)
@@ -143,16 +144,26 @@ cmd="${1:-install}"
 
 # Validate the unload-wait cap up front, before any launchctl call: it is used in
 # an arithmetic comparison, where a non-numeric value aborts under `set -u` after
-# the job was already booted out, and a negative one would skip the wait.
+# the job was already booted out, a negative one would skip the wait, and a value
+# past bash's 64-bit range wraps negative under 10# (skipping the wait too). So the
+# accepted range is bounded explicitly: digits only, 0..UNLOAD_WAIT_MAX (a day).
+UNLOAD_WAIT_MAX=86400
 UNLOAD_WAIT="${PIPECAT_STT_UNLOAD_WAIT:-30}"
-if [[ ("$cmd" == "install" || "$cmd" == "uninstall") && ! "$UNLOAD_WAIT" =~ ^[0-9]+$ ]]; then
-    echo "error: PIPECAT_STT_UNLOAD_WAIT='$UNLOAD_WAIT' must be a non-negative integer (seconds)" >&2
-    exit 1
-fi
-# Normalise to a plain decimal: bash arithmetic reads a leading 0 as octal ("08"
-# is a base error, "010" is 8), so "08" must mean 8 seconds, not break the cap.
 if [[ "$cmd" == "install" || "$cmd" == "uninstall" ]]; then
-    UNLOAD_WAIT=$((10#$UNLOAD_WAIT))
+    if [[ ! "$UNLOAD_WAIT" =~ ^[0-9]+$ ]]; then
+        echo "error: PIPECAT_STT_UNLOAD_WAIT='$UNLOAD_WAIT' must be a non-negative integer (seconds)" >&2
+        exit 1
+    fi
+    # Strip leading zeros BEFORE any arithmetic: the length check then bounds the
+    # value without evaluating a possibly overflowing number, and "00000000000008"
+    # stays a valid 8. Bash arithmetic reads a leading 0 as octal ("08" is a base
+    # error, "010" is 8), so the trimmed digits are read with 10# (decimal).
+    trimmed_wait="${UNLOAD_WAIT#"${UNLOAD_WAIT%%[!0]*}"}"
+    if ((${#trimmed_wait} > ${#UNLOAD_WAIT_MAX})) || ((10#${trimmed_wait:-0} > UNLOAD_WAIT_MAX)); then
+        echo "error: PIPECAT_STT_UNLOAD_WAIT='$UNLOAD_WAIT' must be at most $UNLOAD_WAIT_MAX seconds" >&2
+        exit 1
+    fi
+    UNLOAD_WAIT=$((10#${trimmed_wait:-0}))
 fi
 
 # Resolve the python interpreter. Only the install subcommand needs it (to run

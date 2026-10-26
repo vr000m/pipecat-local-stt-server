@@ -59,9 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`PIPECAT_STT_AUTH_TOKEN_FILE` is validated** in TCP mode: a regular file, not a
   symlink, owned by you, no group/other permission bits, and non-empty (an empty
   file would silently disable auth).
-- `PIPECAT_STT_UNLOAD_WAIT` must be a non-negative integer (leading zeros are
-  read as decimal, so `08` is 8 seconds); anything else fails
-  before any `launchctl` call. `PIPECAT_STT_BACKEND` is checked against the
+- `PIPECAT_STT_UNLOAD_WAIT` must be an integer from 0 to 86400 (leading zeros are
+  read as decimal, so `08` is 8 seconds); anything else, including values large
+  enough to overflow bash arithmetic, fails before any `launchctl` call. `PIPECAT_STT_BACKEND` is checked against the
   renderer's backend names before any directory is created (`whisper` is the
   justfile name; the installer name is `mlx`).
 

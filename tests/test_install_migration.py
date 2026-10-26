@@ -1193,7 +1193,23 @@ def test_wait_for_unload_is_bounded(tmp_path: Path):
 
 
 @pytest.mark.parametrize("cmd", ["install", "uninstall"])
-@pytest.mark.parametrize("value", ["abc", "-1", "1.5", " 3"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "abc",
+        "-1",
+        "1.5",
+        " 3",
+        # Past the 86400 cap, including values that overflow bash's 64-bit
+        # arithmetic (10#9223372036854775808 wraps negative and would skip the wait).
+        "86401",
+        "100000",
+        "9223372036854775807",
+        "9223372036854775808",
+        "99999999999999999999",
+        "18446744073709551617",
+    ],
+)
 def test_invalid_unload_wait_fails_before_bootout(tmp_path: Path, cmd: str, value: str):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
@@ -1252,6 +1268,25 @@ def test_unload_wait_is_decimal(tmp_path: Path, value: str, seconds: int):
     (tmp_path / "case").mkdir()
     base = _count_wait_polls(tmp_path / "base", "0")
     assert _count_wait_polls(tmp_path / "case", value) - base == seconds
+
+
+@pytest.mark.parametrize(
+    "value,seconds",
+    [
+        ("86400", None),  # the upper bound itself is accepted
+        ("0000000000000000000000000000008", 8),  # overlong but small once zero-trimmed
+        ("00000000000000000000", 0),
+    ],
+)
+def test_unload_wait_bounds_accept_boundary_and_zero_padded(
+    tmp_path: Path, value: str, seconds: int | None
+):
+    (tmp_path / "base").mkdir()
+    (tmp_path / "case").mkdir()
+    base = _count_wait_polls(tmp_path / "base", "0")
+    polls = _count_wait_polls(tmp_path / "case", value) - base
+    if seconds is not None:
+        assert polls == seconds
 
 
 # ---------------------------------------------------------------------------
