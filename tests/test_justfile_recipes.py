@@ -130,6 +130,7 @@ exec /usr/bin/id "$@"
         f"""#!/usr/bin/env bash
 printf 'uv %s\\n' "$*" >> {argv_log!s}
 printf 'uvenv UV_PROJECT_ENVIRONMENT=%s\\n' "${{UV_PROJECT_ENVIRONMENT-<unset>}}" >> {argv_log!s}
+if [[ "$1" == "sync" ]]; then touch {stub_dir!s}/uv-synced; fi
 if [[ "$1" == "run" && "$2" == "--no-sync" && "$5" == "stt_server" && "$6" == "status" ]]; then
     if [[ {status_exit} -eq 0 ]]; then
         printf 'stt_server: ok\\n  backend: nemotron (model: x)\\n'
@@ -1460,9 +1461,13 @@ def test_stt_install_invokes_ensure_extra_then_delegates(tmp_path):
 # rather than hardcoding, then point them at a stub interpreter in tmp_path.
 
 
-def _venv_overrides(tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int):
+def _venv_overrides(
+    tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int, fixed_by_sync: bool = True
+):
     """Return (args, logs, venvs) overriding the venv locations with stubs whose
-    ``python`` logs its argv and exits ``probe_rc``.
+    ``python`` logs its argv and exits ``probe_rc``; with ``fixed_by_sync`` (the
+    default) it exits 0 once the stub ``uv sync`` has run, as a sync that
+    installed the extra would leave it.
 
     Exactly one kyutai and one shared-venv variable must be overridable;
     otherwise the shared-arm probe would depend on the real ``.venv`` and the
@@ -1489,9 +1494,12 @@ def _venv_overrides(tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int
         venv = tmp_path / f"stubvenv-{key}"
         (venv / "bin").mkdir(parents=True)
         log = tmp_path / f"py-{key}.log"
+        healed = (
+            f"[[ -e {stub_dir / 'uv-synced'!s} ]] && exit 0\n" if fixed_by_sync and probe_rc else ""
+        )
         _write_executable(
             venv / "bin" / "python",
-            f"#!/usr/bin/env bash\nprintf 'python %s\\n' \"$*\" >> {log!s}\nexit {probe_rc}\n",
+            f"#!/usr/bin/env bash\nprintf 'python %s\\n' \"$*\" >> {log!s}\n{healed}exit {probe_rc}\n",
         )
         value = str(venv / "bin" / "python") if variables[name].endswith("python") else str(venv)
         args.append(f"{name}={value}")
@@ -1595,6 +1603,40 @@ def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):
     assert _read(logs["main"]) == ""
     # `--inexact` is for the shared .venv arms only.
     assert not any(ln.startswith("uv sync") and "--inexact" in ln and "kyutai" in ln for ln in log)
+
+
+# A sync that exits 0 is not "ready" by itself. Invariant: `_ensure-extra`
+# reports ready only after the import probe passes; a probe that still fails
+# after a successful sync fails the recipe (and stt-install never reaches the
+# installer). State space: arm {shared .venv, kyutai} x probe after sync {passes,
+# still fails}.
+@pytest.mark.parametrize("fixed", [True, False])
+@pytest.mark.parametrize("backend,key", [("whisper", "main"), ("kyutai", "kyutai")])
+def test_ensure_extra_reprobes_after_sync(tmp_path, backend, key, fixed):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [EXPECTED[backend][0]])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    args, logs, _venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1, fixed_by_sync=fixed)
+    for recipe in ("_ensure-extra", "stt-install"):
+        (stub_dir / "uv-synced").unlink(missing_ok=True)  # each recipe starts unsynced
+        res = _run_just(
+            [*args, f"script={fake_script}", recipe, backend],
+            home=home,
+            stub_dir=stub_dir,
+            extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": ""},
+        )
+        assert any(ln.startswith("uv sync") for ln in _argv_lines(argv_log))
+        probes = [ln for ln in _read(logs[key]).splitlines() if " -c " in f" {ln} "]
+        if fixed:
+            assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+            assert "extra ready" in res.stdout
+        else:
+            assert res.returncode != 0, f"{recipe}: stdout={res.stdout!r} stderr={res.stderr!r}"
+            assert "still fails" in res.stderr, res.stderr
+            assert "extra ready" not in res.stdout
+            assert len(probes) >= 2, f"{recipe}: no probe after the sync; {probes}"
+            if recipe == "stt-install":
+                assert not env_log.exists() or _read(env_log) == "", "installer ran"
 
 
 def test_ensure_extra_kyutai_present_does_not_sync(tmp_path):

@@ -337,6 +337,13 @@ _ensure-extra backend:
       echo "_ensure-extra: '${sync[*]}' failed; install the '$extra' extra manually" >&2
       exit 1
     fi
+    # A sync that exits 0 has not necessarily made the import work (a wrong
+    # interpreter in the venv, a broken wheel, a partial install): only the
+    # probe decides "ready", or the agent would be installed to crash-loop.
+    if ! { [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; }; then
+      echo "_ensure-extra: '${sync[*]}' succeeded but '$probe' still fails under $py; install the '$extra' extra manually" >&2
+      exit 1
+    fi
     echo "_ensure-extra: '$extra' extra ready."
 
 # Install an agent — delegates to install_stt_agent.sh (no plist reimplementation).

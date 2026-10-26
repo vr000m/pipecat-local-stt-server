@@ -182,6 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recorded path looks unsafe), and it removes the path only if it is still a
   socket, not a symlink, and owned by you (`test -S P && ! test -L P && test -O P
   && rm -f -- P`).
+- `_ensure-extra` (run by `stt-install`/`stt-enable`) probes the interpreter
+  the agent will run: `PIPECAT_STT_PYTHON` when it is set and non-empty (the
+  installer's override), else the venv. A failed probe of that interpreter fails
+  the recipe with the remedy instead of syncing the venv, which could not fix it.
+- `_ensure-extra` re-runs the import probe after a successful `uv sync` and fails
+  if it still fails, instead of reporting the extra ready and letting the agent
+  crash-loop.
 
 ## [0.4.0] - 2026-10-25
 
