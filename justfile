@@ -106,7 +106,8 @@ stt-list:
       # Live backend probe: read the endpoint from the agent's OWN plist (four
       # lines: host/port/socket/auth-token-file), so custom labels, custom ports
       # and socket-mode agents are all probed, and a secured agent authenticates.
-      { read -r host; read -r port; read -r sock; read -r authfile; } < <(just _plist_endpoint "$plist")
+      # IFS= keeps leading/trailing whitespace in a path intact (bare `read -r` trims it).
+      { IFS= read -r host; IFS= read -r port; IFS= read -r sock; IFS= read -r authfile; } < <(just _plist_endpoint "$plist")
       # Empty-safe array expansion for bash 3.2 under `set -u`.
       auth=()
       [[ -n "$authfile" ]] && auth=(--auth-token-file "$authfile")
@@ -144,15 +145,26 @@ stt-list:
 
 # Wire status probe for one server (exits with the probe's own status).
 #
+# No target: delegates to `just stt-list`, which shows every installed agent's
+# live endpoint (exit 0).
+#
 # A target containing `/` or naming an existing socket file is a literal
 # --socket-path (probed first, so a socket file sharing a backend's name is never
-# reinterpreted). A bare backend name resolves to its canonical --host/--port from
-# `_resolve`. Note this probes the CANONICAL port; `stt-list` reads the live
-# endpoint from the plist for a customised install.
-stt-status target:
+# reinterpreted). NOTE: a bare socket FILENAME is resolved against this
+# justfile's directory (just's cwd), not the caller's; pass a path for anything else.
+#
+# A bare backend name probes that agent's ACTUAL endpoint: if its plist exists at
+# `la_dir/<label>.plist`, the endpoint is read from it (socket => --socket-path,
+# TCP => --host/--port, plus --auth-token-file when set), so a socket agent or a
+# custom-port install is probed where it really listens. Only when no plist exists
+# does it fall back to the backend's canonical host/port.
+stt-status target='':
     #!/usr/bin/env bash
     set -uo pipefail
     target={{quote(target)}}
+    if [[ -z "$target" ]]; then
+      exec just stt-list
+    fi
     # A deliberate single probe (unlike stt-list's fast sweep): a freshly installed
     # agent can take several seconds to load its model, so be forgiving.
     timeout=10
@@ -162,12 +174,30 @@ stt-status target:
     resolved=$(just _resolve "$target") || exit 1
     # One field per line; four reads keep this bash-3.2-compatible.
     { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
-    exec uv run python -m stt_server status --host "$host" --port "$port" --timeout "$timeout"
+    plist="{{la_dir}}/$label.plist"
+    auth=()
+    if [[ -f "$plist" ]]; then
+      # The installed plist is the source of truth for where the agent listens.
+      { IFS= read -r p_host; IFS= read -r p_port; IFS= read -r p_sock; IFS= read -r p_auth; } < <(just _plist_endpoint "$plist")
+      [[ -n "$p_auth" ]] && auth=(--auth-token-file "$p_auth")
+      if [[ -n "$p_sock" ]]; then
+        probe=(--socket-path "$p_sock")
+      elif [[ -n "$p_host" && -n "$p_port" ]]; then
+        probe=(--host "$p_host" --port "$p_port")
+      else
+        echo "stt-status: $plist has no serve endpoint (--socket-path or --host/--port)" >&2
+        exit 1
+      fi
+    else
+      probe=(--host "$host" --port "$port")
+    fi
+    exec uv run python -m stt_server status "${probe[@]}" "${auth[@]+"${auth[@]}"}" --timeout "$timeout"
 
 # Wire status probe for any endpoint: a server a supervising app started (TCP,
-# no plist, so the canonical-socket recipes above cannot see it) or any socket.
-# Flags go straight to `stt_server status`, so the endpoint rules live in one
-# place: `just stt-probe --host 127.0.0.1 --port 8765 [--auth-token-file F]`,
+# no plist, so `stt-list`/`stt-status` cannot see it) or any socket. The TCP
+# agents' own endpoints are covered by `stt-status`/`stt-list`; use this for
+# anything else. Flags go straight to `stt_server status`, so the endpoint rules
+# live in one place: `just stt-probe --host 127.0.0.1 --port 9565 [--auth-token-file F]`,
 # `just stt-probe --socket-path PATH`, `just stt-probe --uri ws://...`; add
 # `--json` for machine-readable output. An explicit endpoint is required, so a
 # stray STT_WS_* env var can never decide which server is probed.
@@ -290,10 +320,12 @@ _ensure-extra backend:
     if [[ "$extra" == "kyutai" ]]; then
       venv={{quote(kyutai_venv)}}
       py="$venv/bin/python"
-      sync=(env "UV_PROJECT_ENVIRONMENT=$venv" uv sync --python 3.12 --extra kyutai)
+      sync=(env "UV_PROJECT_ENVIRONMENT=$venv" uv sync --frozen --python 3.12 --extra kyutai)
     else
       py={{quote(venv)}}"/bin/python"
-      sync=(uv sync --extra "$extra" --inexact)
+      # `env -u`: never inherit an ambient UV_PROJECT_ENVIRONMENT (e.g. a shell
+      # exported for kyutai) — that would sync this extra into the wrong venv.
+      sync=(env -u UV_PROJECT_ENVIRONMENT uv sync --extra "$extra" --inexact)
     fi
     if [[ -x "$py" ]] && "$py" -c "$probe" >/dev/null 2>&1; then
       echo "_ensure-extra: '$extra' extra already present ($probe)"

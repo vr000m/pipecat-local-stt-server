@@ -8,9 +8,12 @@ Inputs are read from env vars (see ``scripts/install_stt_agent.sh``) and
 allowlist-validated before being placed in the plist. Unknown/invalid values
 fail loudly rather than silently producing a broken or malicious plist.
 
-May be run directly (not only via ``install_stt_agent.sh``); the label and
-auth token each accept the canonical ``PIPECAT_STT_*`` name or the deprecated
-``KODA_STT_*`` alias, resolved canonical-first by ``env_first``.
+May be run directly (not only via ``install_stt_agent.sh``). Only the label
+accepts the canonical ``PIPECAT_STT_LABEL`` name or the deprecated
+``KODA_STT_LABEL`` alias, resolved canonical-first by ``env_first``. The auth
+token is never read from the environment: ``PIPECAT_STT_AUTH_TOKEN`` /
+``KODA_STT_AUTH_TOKEN`` are REFUSED (a secret in the plist would be readable);
+``AUTH_TOKEN_FILE`` (a path to a token file) is the supported way.
 """
 
 from __future__ import annotations
@@ -75,7 +78,9 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
     if not value:
         print(f"error: {name} is required", file=sys.stderr)
         sys.exit(2)
-    if not pattern.match(value):
+    # fullmatch, not match: with ``$`` anchors, ``match`` accepts a trailing
+    # newline ("/a\n"), which would then land in the plist.
+    if not pattern.fullmatch(value):
         print(
             f"error: {name}={value!r} rejected by allowlist ({hint})",
             file=sys.stderr,
@@ -89,7 +94,7 @@ def main() -> None:
     # label (pipecat.stt-server). Canonical PIPECAT_STT_LABEL wins;
     # KODA_STT_LABEL is a deprecated alias.
     label = env_first("PIPECAT_STT_LABEL", "KODA_STT_LABEL") or DEFAULT_LABEL
-    if not _LABEL_RE.match(label):
+    if not _LABEL_RE.fullmatch(label):
         print(
             f"error: PIPECAT_STT_LABEL={label!r} rejected by allowlist (alphanumerics / . _ -)",
             file=sys.stderr,

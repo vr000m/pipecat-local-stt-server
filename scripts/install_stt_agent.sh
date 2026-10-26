@@ -27,30 +27,46 @@
 #                       mlx-community/nemotron-3.5-asr-streaming-0.6b for nemotron,
 #                       kyutai/stt-1b-en_fr-mlx for kyutai)
 #
-# Two-agent install recipe (run Whisper and Parakeet ASR side by side):
+# Two-agent install recipe (run Whisper and Parakeet ASR side by side). The
+# default transport is loopback TCP on the backend's canonical port:
 #
-#   # 1. Whisper agent — default env, uses the default label + socket so the
-#   #    bot's STT_WS_SOCKET default still resolves to it:
+#   # 1. Whisper agent — default env: label pipecat.stt-server, whisper (mlx)
+#   #    backend, TCP on 127.0.0.1:9565:
 #   scripts/install_stt_agent.sh install
 #
-#   # 2. Parakeet agent — distinct label, socket and backend:
+#   # 2. Parakeet agent — distinct label and backend; TCP on 127.0.0.1:9765
+#   #    (its canonical port, picked from the backend):
 #   #    Warm the ~1.5 GB Hugging Face model cache FIRST, otherwise the
 #   #    first launch downloads it under KeepAlive + ThrottleInterval=10
 #   #    and launchd may throttle-loop the agent before the download finishes.
 #   .venv/bin/python -c 'import parakeet_mlx; parakeet_mlx.from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")'
 #   PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
-#     PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
 #     PIPECAT_STT_BACKEND=parakeet \
 #     scripts/install_stt_agent.sh install
 #
-# Operational constraint: this script manages exactly ONE agent per
-# invocation, identified by PIPECAT_STT_LABEL (+ its socket). There is no
-# registry or "all" mode — to manage the Parakeet agent with any
-# subcommand (uninstall/start/stop/restart/status/logs) you MUST re-export
-# its PIPECAT_STT_LABEL (and PIPECAT_STT_SOCKET) env, e.g.:
+#   # Socket opt-in (legacy transport) for either agent: set PIPECAT_STT_SOCKET
+#   # to an absolute path under $HOME, e.g. for parakeet:
 #   PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
 #     PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
+#     PIPECAT_STT_BACKEND=parakeet \
+#     scripts/install_stt_agent.sh install
+#   # A socket install ignores PIPECAT_STT_HOST/PORT/AUTH_TOKEN_FILE (warned on
+#   # stderr). Consumers must then point at the socket (e.g. STT_WS_SOCKET); a
+#   # TCP install removes a previously installed socket endpoint.
+#
+# Auth token: pass a FILE (PIPECAT_STT_AUTH_TOKEN_FILE=/abs/path, TCP mode).
+# A raw PIPECAT_STT_AUTH_TOKEN / KODA_STT_AUTH_TOKEN in the environment is
+# REFUSED (the install fails) because it would be written into the plist.
+#
+# Operational constraint: this script manages exactly ONE agent per
+# invocation, identified by PIPECAT_STT_LABEL. There is no registry or "all"
+# mode — to manage the Parakeet agent with any subcommand
+# (uninstall/start/stop/restart/status/logs) you MUST re-export its
+# PIPECAT_STT_LABEL (and PIPECAT_STT_BACKEND when it is not the default), e.g.:
+#   PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
+#     PIPECAT_STT_BACKEND=parakeet \
 #     scripts/install_stt_agent.sh status
+# Uninstall removes the socket named in the INSTALLED plist, not the env.
 # A default-env invocation always targets the default pipecat.stt-server agent.
 set -euo pipefail
 
@@ -144,20 +160,59 @@ installed_socket_path() {
     printf '%s' "$json" | sed -e 's|\\/|/|g' -n -e 's/.*"--socket-path","\([^"]*\)".*/\1/p'
 }
 
-# Remove a socket and its .lock, only if owned by the current user — avoids
-# nuking an unrelated file someone pre-created at a world-writable path.
+# Remove a socket and its .lock named by an INSTALLED plist. That plist is
+# untrusted input (anything that can write the user's LaunchAgents dir can name
+# any path in it), so this is deliberately conservative and NEVER aborts the
+# caller (it runs after bootout, under `set -e`): every refusal or failure is a
+# warning, and the function always returns 0. It acts only when:
+#   * the path is absolute, has no '..' component, and lives under $HOME (the
+#     same lexical rules as validate_socket_path, but warn-and-skip, not exit);
+#   * the socket is a real socket (-S) and not a symlink; the .lock is a regular
+#     file and not a symlink (so a plist naming a file, directory or symlink
+#     never deletes it);
+#   * the entry is owned by the current user.
 remove_socket_owned() {
-    local sock="$1" f owner
-    for f in "$sock" "$sock.lock"; do
-        if [[ -e "$f" ]]; then
-            owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
-            if [[ "$owner" == "$(id -u)" ]]; then
-                rm -f "$f"
-            else
-                echo "warning: $f not owned by current user, leaving it" >&2
-            fi
+    local sock="$1" dir home="${HOME%/}" f owner kind
+    dir="$(dirname "$sock")"
+    case "$sock" in
+    /*) : ;;
+    *)
+        echo "warning: installed socket path '$sock' is not absolute; leaving it" >&2
+        return 0
+        ;;
+    esac
+    case "/$sock/" in
+    */../*)
+        echo "warning: installed socket path '$sock' contains '..' components; leaving it" >&2
+        return 0
+        ;;
+    esac
+    if [[ "$dir" != "$home" && "$dir" != "$home/"* ]]; then
+        echo "warning: installed socket path '$sock' is not under \$HOME ($home); leaving it" >&2
+        return 0
+    fi
+    for kind in sock lock; do
+        if [[ "$kind" == sock ]]; then
+            f="$sock"
+            [[ -S "$f" && ! -L "$f" ]] || {
+                [[ -e "$f" || -L "$f" ]] && echo "warning: $f is not a socket; leaving it" >&2
+                continue
+            }
+        else
+            f="$sock.lock"
+            [[ -f "$f" && ! -L "$f" ]] || {
+                [[ -e "$f" || -L "$f" ]] && echo "warning: $f is not a regular file; leaving it" >&2
+                continue
+            }
+        fi
+        owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
+        if [[ "$owner" == "$(id -u)" ]]; then
+            rm -f "$f" 2>/dev/null || echo "warning: could not remove $f" >&2
+        else
+            echo "warning: $f not owned by current user, leaving it" >&2
         fi
     done
+    return 0
 }
 
 # Validate the literal socket path against the SAME rules the server enforces in
@@ -227,6 +282,15 @@ render_plist() {
         # Validate (and refuse) BEFORE mutating any filesystem state — the socket
         # dir chmod below must never tighten a directory the server will then reject.
         validate_socket_path "$SOCKET_PATH"
+        # TCP-only settings have no meaning for a socket agent; say so rather
+        # than silently dropping them (the plist bytes are unaffected).
+        local -a ignored=()
+        [[ -n "${PIPECAT_STT_AUTH_TOKEN_FILE:-}" ]] && ignored+=(PIPECAT_STT_AUTH_TOKEN_FILE)
+        [[ -n "${PIPECAT_STT_HOST:-}" ]] && ignored+=(PIPECAT_STT_HOST)
+        [[ -n "${PIPECAT_STT_PORT:-}" ]] && ignored+=(PIPECAT_STT_PORT)
+        if ((${#ignored[@]} > 0)); then
+            echo "warning: socket mode (PIPECAT_STT_SOCKET set): ignoring ${ignored[*]} (TCP-only settings; unset PIPECAT_STT_SOCKET for a TCP agent)" >&2
+        fi
     elif [[ -z "$PORT" ]]; then
         echo "error: backend '$BACKEND' has no canonical port; set PIPECAT_STT_PORT" >&2
         exit 1

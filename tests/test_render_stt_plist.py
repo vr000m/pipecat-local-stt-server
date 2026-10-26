@@ -332,6 +332,46 @@ def test_model_rejected_when_invalid(tmp_path: Path):
     assert not dst.exists()
 
 
+@pytest.mark.parametrize(
+    ("var", "base"),
+    [
+        ("SOCKET_PATH", {}),
+        ("AUTH_TOKEN_FILE", TCP_ENV),
+        ("PYTHON", {}),
+        ("REPO_ROOT", {}),
+        ("MODEL", {}),
+        ("BACKEND", {}),
+        ("PIPECAT_STT_LABEL", {}),
+        ("PORT", TCP_ENV),
+        ("HOST", TCP_ENV),
+    ],
+)
+def test_trailing_newline_rejected_for_every_validated_value(
+    tmp_path: Path, var: str, base: dict[str, str | None]
+):
+    """Regression: ``_require`` used ``pattern.match`` with ``$`` anchors, which
+    accepts a trailing newline. Every validated value must reject it (exit 2,
+    no plist written)."""
+    valid = {
+        "SOCKET_PATH": SNAPSHOT_ENV["SOCKET_PATH"],
+        "AUTH_TOKEN_FILE": "/Users/test/.config/pipecat-stt/token",
+        "PYTHON": SNAPSHOT_ENV["PYTHON"],
+        "REPO_ROOT": SNAPSHOT_ENV["REPO_ROOT"],
+        "MODEL": SNAPSHOT_ENV["MODEL"],
+        "BACKEND": SNAPSHOT_ENV["BACKEND"],
+        "PIPECAT_STT_LABEL": "pipecat.stt-server",
+        "PORT": "9565",
+        "HOST": "127.0.0.1",
+    }[var]
+    dst = tmp_path / "nl.plist"
+    ok = _run_render({**base, var: valid}, dst)
+    assert ok.returncode == 0, f"control render failed: {ok.stderr!r}"
+    dst.unlink()
+    r = _run_render({**base, var: valid + "\n"}, dst)
+    assert r.returncode == 2, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not dst.exists()
+
+
 # ---------------------------------------------------------------------------
 # TCP default / socket opt-in
 # ---------------------------------------------------------------------------

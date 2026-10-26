@@ -138,7 +138,18 @@ validation — do not reintroduce `sed` templating). Overrides (canonical
 deprecated aliases): `PIPECAT_STT_SOCKET`, `PIPECAT_STT_BACKEND`,
 `PIPECAT_STT_MODEL`, `PIPECAT_STT_LOG_DIR`, `PIPECAT_STT_HOST`,
 `PIPECAT_STT_PORT`, `PIPECAT_STT_AUTH_TOKEN_FILE` (a token file path;
-`PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN` are refused). Agents default to
-loopback TCP; `PIPECAT_STT_SOCKET` opts into a Unix socket.
+`PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN` are refused),
+`PIPECAT_STT_PYTHON` (interpreter; default `.venv/bin/python`, or
+`.venv-kyutai/bin/python` for kyutai). Agents default to loopback TCP;
+`PIPECAT_STT_SOCKET` opts into a Unix socket.
+
+**Breaking change in 0.5.0.** A reinstall through `./koda stt install` on a
+0.5.0 checkout creates a **TCP** agent and removes the old socket, unless the
+wrapper sets `PIPECAT_STT_SOCKET` (or `KODA_STT_SOCKET`). Koda's client falls
+back to its socket default, which then no longer exists. Either set the socket
+env on the wrapper to keep a socket agent, or point Koda's client at
+`STT_WS_HOST`/`STT_WS_PORT`. Whether the wrapper already exports either socket
+variable is unverified: the wrapper lives in the consumer repo, not here. See the
+[migration guide](migration.md#upgrading-from-04x-to-050).
 Use `./koda stt status` for a wire-level health check.
 

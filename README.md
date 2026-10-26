@@ -17,8 +17,10 @@ monorepo. BSD-2-Clause.
 - `turn_detection: null` required; server VAD is not implemented in V1
 - commit-oriented decode (single large `delta` + `completed`)
 - local-only trust model:
-  - Unix domain socket by default for `serve`; the `just`/LaunchAgent agents
-    default to loopback TCP (no peer-uid check), with a socket opt-in
+  - `serve` has no default endpoint: pass `--socket-path` (Unix domain socket,
+    recommended: peer-uid check, no port) or `--host`/`--port`. The
+    `just`/LaunchAgent agents default to loopback TCP (no peer-uid check), with a
+    socket opt-in
   - optional loopback TCP (`127.0.0.1`) with optional bearer token
   - browser `Origin` headers rejected
 - backend interface (`TranscriptionBackend`) so MLX can be swapped later
@@ -110,7 +112,9 @@ idle ones. The repo-root `justfile` is a thin operator layer over `launchctl`
 ```bash
 just                       # list available recipes
 just stt-list              # every pipecat.stt-server* agent: state, pid, live backend
-just stt-status nemotron   # wire health probe for one backend (canonical port)
+just stt-status            # no argument: same as stt-list
+just stt-status nemotron   # wire health probe for one backend (installed plist's endpoint)
+just stt-status ~/Library/Caches/pipecat-stt/stt.sock   # a path is probed as --socket-path
 just stt-probe --host 127.0.0.1 --port 9565   # probe any endpoint (supervised or socket)
 just stt-disable whisper   # stop until next login (keeps the plist)
 just stt-enable whisper    # re-load it from the existing plist
@@ -123,15 +127,23 @@ just smoke-peercred        # local UDS peer-cred smoke (cross-uid leg needs a 2n
 the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)
 (the justfile map is a checked mirror of that table — a test fails CI on drift).
 `stt-install`/`stt-uninstall` always use that canonical host and port; for a
-custom one run `PIPECAT_STT_PORT=... scripts/install_stt_agent.sh install`.
+custom one run the installer directly with a distinct label and backend, or it
+replaces the default whisper agent (`PIPECAT_STT_LABEL=pipecat.stt-server.alt
+PIPECAT_STT_BACKEND=mlx PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh
+install`; see [Operations](docs/operations.md#per-backend-port-convention)).
 `stt-install` refuses `PIPECAT_STT_AUTH_TOKEN`; use `PIPECAT_STT_AUTH_TOKEN_FILE`
 (see [Operations](docs/operations.md#token-file-replaces-env-tokens)).
 
 `stt-install` / `stt-enable` also ensure the backend's optional Python extra is
-installed (`uv sync --extra <backend> --inexact`) so a freshly installed agent
-doesn't crash-loop on a missing import; set `PIPECAT_STT_SKIP_DEP_SYNC=1` to
+installed so a freshly installed agent doesn't crash-loop on a missing import
+(`uv sync --extra <backend> --inexact`, additive; kyutai instead syncs into its
+own `.venv-kyutai` with `--frozen --python 3.12` and no `--inexact`); set `PIPECAT_STT_SKIP_DEP_SYNC=1` to
 manage the extras yourself.
 
+`stt-status <backend>` reads the installed plist's endpoint (socket or TCP, plus
+`--auth-token-file`) and only falls back to the backend's canonical host and port
+when no plist exists, so it also works on a not-yet-migrated socket agent. A path
+(or an existing socket file in the repo directory) is probed as `--socket-path`.
 `stt-list` reads each agent's live endpoint from its plist: a TCP agent shows
 an `endpoint: host:port` line, a socket agent a `socket:` line in the same `~`-form a consumer's
 config uses (e.g. onoats' `config.toml` `[stt] ws_socket`; for a TCP agent use
@@ -146,8 +158,7 @@ stays gone. For cross-login suppression without removing the plist, use
 `launchctl disable gui/$(id -u)/<label>`.
 
 `stt-list` sweeps the `pipecat.stt-server*` label prefix, so a custom-labelled
-agent still shows up (without a live-backend line, since its socket is not
-derivable from its label). Legacy `koda.stt-server*` agents are **not** covered —
+agent still shows up, probed at the endpoint in its own plist. Legacy `koda.stt-server*` agents are **not** covered —
 check those manually during migration with `launchctl list | grep koda`.
 
 
@@ -158,7 +169,7 @@ A client (including the Pipecat service in the [integration
 guide](docs/integration.md#pipecat-integration)) only points at an *endpoint*
 and transcribes against whatever backend that server was started with. To run
 Whisper vs Parakeet you start a *different* server (or a second one on its own
-socket — see "Multi-backend operation"); no client code changes.
+endpoint — see "Multi-backend operation"); no client code changes.
 
 ```bash
 # Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo

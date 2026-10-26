@@ -335,7 +335,9 @@ def _readme_map() -> dict[str, tuple[str, int]]:
         if not ln.startswith("|"):
             break  # table ends at the first non-row line
         cells = [_cell(c) for c in ln.split("|")[1:-1]]
-        m = re.match(r"(whisper|parakeet|nemotron|kyutai)\b", cells[0])
+        # Any named row counts (not a hard-coded backend list): a docs-only new
+        # backend must show up in the table so the set-equality check catches it.
+        m = re.match(r"([A-Za-z][\w-]*)", cells[0])
         if not m:
             continue
         assert len(cells) >= 3, f"unexpected column count in port row: {cells}"
@@ -386,6 +388,43 @@ def _installer_default_port(tmp_path: Path, installer_backend: str) -> tuple[str
     return args[args.index("--host") + 1], args[args.index("--port") + 1]
 
 
+def _recipe_body(name: str) -> str:
+    """The text of one justfile recipe (its header line through the next
+    top-level, non-indented, non-comment line)."""
+    lines = JUSTFILE.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if re.match(rf"{re.escape(name)}\b.*:\s*$", ln))
+    body = [lines[start]]
+    for ln in lines[start + 1 :]:
+        if ln and not ln[0].isspace() and not ln.startswith("#"):
+            break
+        body.append(ln)
+    return "\n".join(body)
+
+
+def _case_arm_backends(recipe: str) -> set[str]:
+    return set(re.findall(r"^\s+(\w+)\)\s+(?:printf|extra=)", _recipe_body(recipe), re.MULTILINE))
+
+
+def _valid_line_backends(recipe: str) -> set[str]:
+    m = re.search(r"\(valid: ([^)]*)\)", _recipe_body(recipe))
+    assert m, f"no 'valid:' error line in {recipe}"
+    return {b.strip() for b in m.group(1).split(",")}
+
+
+def test_backend_set_is_derived_from_resolve_and_mirrored_everywhere():
+    """The authoritative backend set is `_resolve`'s case arms. Its `valid:` error
+    line, `_ensure-extra`'s arms, the docs port table, the test's BACKENDS and
+    EXPECTED must all equal it, so a backend added in only one place fails."""
+    from_resolve = _case_arm_backends("_resolve")
+    assert from_resolve, "could not parse _resolve case arms"
+    assert _valid_line_backends("_resolve") == from_resolve
+    assert _case_arm_backends("_ensure-extra") == from_resolve
+    assert _valid_line_backends("_ensure-extra") == from_resolve
+    assert set(_readme_map()) == from_resolve
+    assert set(BACKENDS) == from_resolve
+    assert set(EXPECTED) == from_resolve
+
+
 def test_port_table_covers_exactly_the_backends():
     table = _readme_map()
     assert set(table) == set(BACKENDS), f"port table backends: {set(table)}"
@@ -406,7 +445,7 @@ def test_port_table_matches_resolve(tmp_path, backend):
     assert r_host == "127.0.0.1"
 
 
-@pytest.mark.skipif(not VENV_PYTHON.exists(), reason="installer needs the project venv")
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_port_table_matches_installer_default(tmp_path, backend):
     _label, port = _readme_map()[backend]
@@ -489,6 +528,91 @@ def test_stt_status_propagates_probe_exit(tmp_path):
     home = _home_with_agents(tmp_path, [])
     res = _run_just(["stt-status", "whisper"], home=home, stub_dir=stub_dir)
     assert res.returncode == 1
+
+
+def test_stt_status_no_argument_delegates_to_stt_list(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path, print_loaded=True, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server.custom", backend="nemotron", port=9871)
+    res = _run_just(["stt-status"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    # stt-list output: the agent and its live endpoint.
+    assert "pipecat.stt-server.custom" in res.stdout
+    assert "127.0.0.1:9871" in res.stdout
+    # Probed via stt-list's plist sweep, not a single canonical probe.
+    call = _status_call(argv_log)
+    assert "--host 127.0.0.1 --port 9871" in call, call
+
+
+def test_stt_status_no_argument_with_no_agents_exits_zero(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["stt-status"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "no pipecat.stt-server* agents found" in res.stdout
+    assert not _uv_calls(argv_log)
+
+
+def test_stt_status_bare_name_with_socket_plist_probes_its_socket(tmp_path):
+    """Regression: an agent still installed as a socket agent must be probed at
+    its socket, not at the canonical TCP port (which nothing listens on)."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "nemotron.sock"
+    _render_plist(home, "pipecat.stt-server.nemotron", backend="nemotron", socket_path=sock)
+    res = _run_just(["stt-status", "nemotron"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    call = _status_call(argv_log)
+    assert f"--socket-path {sock}" in call, call
+    assert "--host" not in call and "--port" not in call and "9865" not in call
+    assert _timeout_of(call) > 3
+
+
+def test_stt_status_bare_name_with_tcp_plist_probes_plist_port(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server.nemotron", backend="nemotron", port=9871)
+    res = _run_just(["stt-status", "nemotron"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    call = _status_call(argv_log)
+    assert "--host 127.0.0.1 --port 9871" in call, call
+    assert "9865" not in call and "--auth-token-file" not in call
+    assert _timeout_of(call) > 3
+
+
+def test_stt_status_bare_name_forwards_auth_token_file(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    token = home / ".config" / "pipecat-stt" / "token"
+    _render_plist(
+        home, "pipecat.stt-server.parakeet", backend="parakeet", port=9765, auth_token_file=token
+    )
+    res = _run_just(["stt-status", "parakeet"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    call = _status_call(argv_log)
+    assert "--host 127.0.0.1 --port 9765" in call, call
+    assert f"--auth-token-file {token}" in call, call
+
+
+def test_stt_status_bare_name_without_plist_falls_back_to_canonical(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    # A plist for a DIFFERENT backend must not influence this one.
+    _render_plist(home, "pipecat.stt-server.parakeet", backend="parakeet", port=9999)
+    res = _run_just(["stt-status", "nemotron"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    call = _status_call(argv_log)
+    assert "--host 127.0.0.1 --port 9865" in call, call
+    assert "--auth-token-file" not in call
+
+
+def test_stt_status_bare_name_with_endpointless_plist_errors(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path, status_exit=0)
+    home = _home_with_agents(tmp_path, ["pipecat.stt-server.nemotron"])
+    res = _run_just(["stt-status", "nemotron"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 1
+    assert "no serve endpoint" in res.stderr
+    assert not _uv_calls(argv_log)
 
 
 # --------------------------------------------------------------------------- #
@@ -697,6 +821,33 @@ def test_plist_endpoint_helper_four_lines(tmp_path, kwargs, expected):
     lines += [""] * (4 - len(lines))
     want = [str(sock) if v == "SOCK" else str(token) if v == "TOKEN" else v for v in expected]
     assert lines[:4] == want
+
+
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
+def test_plist_endpoint_and_stt_list_keep_paths_with_spaces(tmp_path):
+    """Regression: bare ``read -r`` trims leading/trailing IFS whitespace, so a
+    socket / token-file path ending in a space was probed at the wrong path."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path, print_loaded=True, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "my pipecat" / "stt sock "
+    token = home / "my config" / "token "
+    plist = _render_plist(home, "pipecat.stt-server.spaced", port=9871, auth_token_file=token)
+    res = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.splitlines()[:4] == ["127.0.0.1", "9871", "", str(token)]
+    # stt-list: token-file forwarded verbatim (trailing space preserved).
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    call = _status_call(argv_log)
+    assert call.endswith(f"--auth-token-file {token}"), repr(call)
+    # Socket path with spaces, incl. a trailing one.
+    argv_log.unlink()
+    plist.unlink()
+    _render_plist(home, "pipecat.stt-server.spaced", socket_path=sock)
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    call = _status_call(argv_log)
+    assert call.endswith(f"--socket-path {sock}"), repr(call)
 
 
 # --------------------------------------------------------------------------- #
@@ -925,12 +1076,12 @@ def test_stt_install_invokes_ensure_extra_then_delegates(tmp_path):
 
 
 def _venv_overrides(tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int):
-    """Return (args, logs, forced) overriding the venv locations with stubs whose
+    """Return (args, logs, venvs) overriding the venv locations with stubs whose
     ``python`` logs its argv and exits ``probe_rc``.
 
-    ``forced`` is False when the shared ``.venv`` location is not an overridable
-    just variable: then the shared-arm probe result depends on the real venv, and
-    callers assert only what holds either way.
+    Exactly one kyutai and one shared-venv variable must be overridable;
+    otherwise the shared-arm probe would depend on the real ``.venv`` and the
+    tests would silently weaken, so this fails instead.
     """
     res = _run_just(["--evaluate"], home=home, stub_dir=stub_dir)
     assert res.returncode == 0, res.stderr
@@ -944,7 +1095,8 @@ def _venv_overrides(tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int
         if re.search(r"/\.venv(/bin/python)?$", v.rstrip("/")) and k not in kyutai
     ]
     assert len(kyutai) == 1, f"no overridable kyutai venv variable; got {variables}"
-    targets = [(kyutai[0], "kyutai")] + ([(main[0], "main")] if main else [])
+    assert len(main) == 1, f"expected exactly one overridable main-venv variable; got {variables}"
+    targets = [(kyutai[0], "kyutai"), (main[0], "main")]
     args: list[str] = []
     logs: dict[str, Path] = {}
     venvs: dict[str, Path] = {}
@@ -960,8 +1112,7 @@ def _venv_overrides(tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int
         args.append(f"{name}={value}")
         logs[key] = log
         venvs[key] = venv
-    logs.setdefault("main", tmp_path / "py-main.log")  # never written => stays empty
-    return args, logs, venvs, bool(main)
+    return args, logs, venvs
 
 
 def _read(path: Path) -> str:
@@ -971,7 +1122,7 @@ def _read(path: Path) -> str:
 def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
-    args, logs, venvs, _forced = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1)
+    args, logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1)
     res = _run_just(
         [*args, "_ensure-extra", "kyutai"],
         home=home,
@@ -983,6 +1134,8 @@ def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):
     syncs = [ln for ln in log if ln.startswith("uv sync")]
     assert len(syncs) == 1, log
     assert "--python 3.12" in syncs[0] and "--extra kyutai" in syncs[0], syncs
+    # --frozen: never let the sync rewrite uv.lock.
+    assert "--frozen" in syncs[0], syncs
     # The UV_PROJECT_ENVIRONMENT line logged right after the sync call.
     env_line = log[log.index(syncs[0]) + 1]
     assert env_line == f"uvenv UV_PROJECT_ENVIRONMENT={venvs['kyutai']}", env_line
@@ -999,7 +1152,7 @@ def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):
 def test_ensure_extra_kyutai_present_does_not_sync(tmp_path):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
-    args, logs, venvs, _forced = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+    args, logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
     res = _run_just(
         [*args, "_ensure-extra", "kyutai"],
         home=home,
@@ -1023,7 +1176,7 @@ def test_ensure_extra_kyutai_present_does_not_sync(tmp_path):
 def test_ensure_extra_shared_venv_arms_never_touch_kyutai_venv(tmp_path, backend, extra, probe):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
-    args, logs, venvs, forced = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1)
+    args, logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1)
     res = _run_just(
         [*args, "_ensure-extra", backend],
         home=home,
@@ -1039,10 +1192,53 @@ def test_ensure_extra_shared_venv_arms_never_touch_kyutai_venv(tmp_path, backend
     for sync in syncs:
         assert sync == f"uv sync --extra {extra} --inexact", sync
         assert log[log.index(sync) + 1] == "uvenv UV_PROJECT_ENVIRONMENT=<unset>"
-    if forced:
-        # Probe stub fails -> exactly one additive sync into the shared .venv.
-        assert len(syncs) == 1, log
-        assert probe in _read(logs["main"])
+    # Probe stub fails -> exactly one additive sync into the shared .venv.
+    assert len(syncs) == 1, log
+    assert probe in _read(logs["main"])
+
+
+@pytest.mark.parametrize("backend", ["whisper", "parakeet", "nemotron"])
+def test_ensure_extra_shared_arms_ignore_ambient_uv_project_environment(tmp_path, backend):
+    """Regression: an exported ``UV_PROJECT_ENVIRONMENT`` (e.g. left over from a
+    kyutai session) must NOT be inherited by the shared-venv sync, or the extra
+    lands in the wrong venv."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    args, logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1)
+    ambient = str(tmp_path / ".venv-kyutai")
+    res = _run_just(
+        [*args, "_ensure-extra", backend],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": "", "UV_PROJECT_ENVIRONMENT": ambient},
+    )
+    assert res.returncode == 0, res.stderr
+    log = _argv_lines(argv_log)
+    syncs = [ln for ln in log if ln.startswith("uv sync")]
+    assert len(syncs) == 1, log
+    env_line = log[log.index(syncs[0]) + 1]
+    assert env_line == "uvenv UV_PROJECT_ENVIRONMENT=<unset>", env_line
+    assert ambient not in "\n".join(log)
+
+
+def test_ensure_extra_kyutai_overrides_ambient_uv_project_environment(tmp_path):
+    """The kyutai arm still syncs only into its own venv, whatever is ambient."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    args, logs, venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=1)
+    ambient = str(tmp_path / "some-other-venv")
+    res = _run_just(
+        [*args, "_ensure-extra", "kyutai"],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": "", "UV_PROJECT_ENVIRONMENT": ambient},
+    )
+    assert res.returncode == 0, res.stderr
+    log = _argv_lines(argv_log)
+    syncs = [ln for ln in log if ln.startswith("uv sync")]
+    assert len(syncs) == 1, log
+    assert log[log.index(syncs[0]) + 1] == f"uvenv UV_PROJECT_ENVIRONMENT={venvs['kyutai']}"
+    assert _read(logs["main"]) == ""
 
 
 # --------------------------------------------------------------------------- #

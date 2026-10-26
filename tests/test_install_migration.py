@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import plistlib
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -688,20 +689,45 @@ def _seed_plist(home: Path, extra_args: list[str]) -> None:
     (agents / f"{NEW_LABEL}.plist").write_bytes(plistlib.dumps(plist))
 
 
-def _seed_socket_files(home: Path) -> tuple[Path, Path]:
+def _bind_socket(sock: Path) -> socket.socket:
+    """Bind a real AF_UNIX socket at ``sock``.
+
+    pytest tmp paths routinely exceed the ~104-byte ``sun_path`` limit, so bind
+    by a relative name from inside the directory. The returned socket must stay
+    referenced (closing it does not unlink the inode).
+    """
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    prev = os.getcwd()
+    os.chdir(sock.parent)
+    try:
+        s.bind(sock.name)
+    finally:
+        os.chdir(prev)
+    return s
+
+
+@pytest.fixture
+def held_sockets():
+    held: list[socket.socket] = []
+    yield held
+    for s in held:
+        s.close()
+
+
+def _seed_socket_files(home: Path, held: list[socket.socket]) -> tuple[Path, Path]:
     cache = home / "Library" / "Caches" / "pipecat-stt"
     cache.mkdir(parents=True, mode=0o700, exist_ok=True)
     sock = cache / "stt.sock"
     lock = cache / "stt.sock.lock"
-    sock.write_text("")
+    held.append(_bind_socket(sock))
     lock.write_text("")
     return sock, lock
 
 
-def test_socket_to_tcp_reinstall_notes_and_removes_old_socket(tmp_path: Path):
+def test_socket_to_tcp_reinstall_notes_and_removes_old_socket(tmp_path: Path, held_sockets):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
-    sock, lock = _seed_socket_files(home)
+    sock, lock = _seed_socket_files(home, held_sockets)
     _seed_plist(home, ["--socket-path", str(sock)])
 
     r = _run_install(tmp_path, stub_dir)
@@ -723,10 +749,10 @@ def test_tcp_to_tcp_reinstall_prints_no_note(tmp_path: Path):
     assert "chang" not in r.stdout.lower(), f"unexpected endpoint-changed note: {r.stdout!r}"
 
 
-def test_socket_to_socket_reinstall_keeps_socket_behaviour(tmp_path: Path):
+def test_socket_to_socket_reinstall_keeps_socket_behaviour(tmp_path: Path, held_sockets):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
-    sock, lock = _seed_socket_files(home)
+    sock, lock = _seed_socket_files(home, held_sockets)
     _seed_plist(home, ["--socket-path", str(sock)])
 
     r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": str(sock)})
@@ -738,10 +764,10 @@ def test_socket_to_socket_reinstall_keeps_socket_behaviour(tmp_path: Path):
     assert sock.exists() and lock.exists(), "socket->socket must not delete the endpoint files"
 
 
-def test_uninstall_cleans_socket_from_installed_plist_not_env(tmp_path: Path):
+def test_uninstall_cleans_socket_from_installed_plist_not_env(tmp_path: Path, held_sockets):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
-    sock, lock = _seed_socket_files(home)
+    sock, lock = _seed_socket_files(home, held_sockets)
     _seed_plist(home, ["--socket-path", str(sock)])
 
     # Caller env carries NO PIPECAT_STT_SOCKET.
@@ -761,6 +787,105 @@ def test_uninstall_tcp_plist_creates_no_socket_dir(tmp_path: Path):
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
     assert not (home / "Library" / "Caches" / "pipecat-stt").exists()
+
+
+def _cache_dir(home: Path) -> Path:
+    cache = home / "Library" / "Caches" / "pipecat-stt"
+    cache.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return cache
+
+
+def _cleanup_cases(tmp_path: Path, held: list[socket.socket]) -> dict[str, tuple[str, list[Path]]]:
+    """Build hostile ``--socket-path`` targets; each case maps to
+    ``(path named in the plist, paths that must survive)``."""
+    home = tmp_path / "home"
+    cache = _cache_dir(home)
+    cases: dict[str, tuple[str, list[Path]]] = {}
+
+    reg = cache / "regular.sock"
+    reg.write_text("precious")
+    cases["regular-file"] = (str(reg), [reg])
+
+    d = cache / "dir.sock"
+    d.mkdir()
+    (d / "inner").write_text("x")
+    cases["directory"] = (str(d), [d, d / "inner"])
+
+    sub = cache / "sub"
+    sub.mkdir()
+    real = cache / "dotdot.sock"
+    held.append(_bind_socket(real))
+    cases["dotdot"] = (f"{sub}/../dotdot.sock", [real])
+
+    target = cache / "target.sock"
+    held.append(_bind_socket(target))
+    link = cache / "link.sock"
+    link.symlink_to(target)
+    cases["symlink"] = (str(link), [link, target])
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    out_sock = outside / "o.sock"
+    held.append(_bind_socket(out_sock))
+    cases["outside-home"] = (str(out_sock), [out_sock])
+
+    lockdir_sock = cache / "ld.sock"
+    held.append(_bind_socket(lockdir_sock))
+    (cache / "ld.sock.lock").mkdir()
+    cases["lock-is-directory"] = (str(lockdir_sock), [cache / "ld.sock.lock"])
+
+    locklink_sock = cache / "ll.sock"
+    held.append(_bind_socket(locklink_sock))
+    lock_target = cache / "lock-target"
+    lock_target.write_text("keep")
+    (cache / "ll.sock.lock").symlink_to(lock_target)
+    cases["lock-is-symlink"] = (str(locklink_sock), [cache / "ll.sock.lock", lock_target])
+    return cases
+
+
+@pytest.mark.parametrize("cmd", ["uninstall", "install"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "regular-file",
+        "directory",
+        "dotdot",
+        "symlink",
+        "outside-home",
+        "lock-is-directory",
+        "lock-is-symlink",
+    ],
+)
+def test_socket_cleanup_never_deletes_non_socket_targets(
+    tmp_path: Path, held_sockets, case: str, cmd: str
+):
+    """The installed plist is untrusted input: a ``--socket-path`` naming a
+    regular file, a directory, a ``..`` path, a symlink, a path outside $HOME,
+    or a socket whose ``.lock`` is a directory/symlink must NOT be deleted, and
+    the command must still succeed (a refusal is a warning, never an abort)."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    named, must_survive = _cleanup_cases(tmp_path, held_sockets)[case]
+    _seed_plist(home, ["--socket-path", named])
+
+    r = _run_install(tmp_path, stub_dir, cmd=cmd)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    for path in must_survive:
+        assert os.path.lexists(path), f"{case}: {path} was deleted"
+    assert "warning" in r.stderr, f"{case}: expected a skip warning; {r.stderr!r}"
+    if cmd == "uninstall":
+        assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
+
+
+def test_socket_cleanup_still_removes_real_socket_and_lock(tmp_path: Path, held_sockets):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock)])
+    r = _run_install(tmp_path, stub_dir, cmd="uninstall")
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not sock.exists() and not lock.exists()
+    assert "warning" not in r.stderr
 
 
 def test_kyutai_uses_pipecat_stt_python(tmp_path: Path):
@@ -823,7 +948,81 @@ def test_env_auth_token_never_reaches_plist(tmp_path: Path):
         else:
             assert r.returncode != 0, f"{name}: no plist yet exit 0"
         assert SECRET not in r.stdout, f"{name}: token leaked to stdout"
+        assert SECRET not in r.stderr, f"{name}: token leaked to stderr"
         plist_path.unlink(missing_ok=True)
+
+
+def test_ambient_socket_path_does_not_leak_into_tcp_install(tmp_path: Path):
+    """A raw ``SOCKET_PATH`` in the caller's env (the renderer's own input
+    name) must not turn a TCP install into a socket one."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    ambient = tmp_path / "home" / "Library" / "Caches" / "pipecat-stt" / "ambient.sock"
+    r = _run_install(tmp_path, stub_dir, env_overrides={"SOCKET_PATH": str(ambient)})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(tmp_path / "home")["ProgramArguments"]
+    assert "--socket-path" not in args
+    assert _flag(args, "--port") == "9565"
+    assert str(ambient) not in plistlib.dumps(_rendered(tmp_path / "home")).decode()
+
+
+def test_ambient_tcp_vars_do_not_leak_into_socket_install(tmp_path: Path):
+    """Raw ``HOST``/``PORT``/``AUTH_TOKEN_FILE`` in the caller's env must not
+    reach a socket plist; it carries only the selected transport."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_SOCKET": str(sock),
+            "HOST": "127.0.0.1",
+            "PORT": "7777",
+            "AUTH_TOKEN_FILE": str(tmp_path / "ambient-token"),
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(home)["ProgramArguments"]
+    assert _flag(args, "--socket-path") == str(sock)
+    for flag in ("--host", "--port", "--auth-token-file"):
+        assert flag not in args, f"ambient var leaked as {flag}"
+    assert "ambient-token" not in plistlib.dumps(_rendered(home)).decode()
+    assert "ignoring" not in r.stderr, "ambient raw vars are not installer inputs; no warning"
+
+
+def test_socket_mode_warns_about_ignored_tcp_settings(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    tok = tmp_path / "token.txt"
+    tok.write_text(SECRET)
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_SOCKET": str(sock),
+            "PIPECAT_STT_AUTH_TOKEN_FILE": str(tok),
+            "PIPECAT_STT_HOST": "localhost",
+            "PIPECAT_STT_PORT": "9999",
+        },
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    for name in ("PIPECAT_STT_AUTH_TOKEN_FILE", "PIPECAT_STT_HOST", "PIPECAT_STT_PORT"):
+        assert name in r.stderr, f"{name} not named in warning: {r.stderr!r}"
+    assert SECRET not in r.stderr
+    plist = _rendered(home)
+    args = plist["ProgramArguments"]
+    assert "--host" not in args and "--port" not in args and "--auth-token-file" not in args
+    # Plist bytes are unchanged by the warning: same as the socket snapshot.
+    assert _normalise(plist, home) == plistlib.loads(SOCKET_SNAPSHOT.read_bytes())
+
+
+def test_socket_mode_without_tcp_settings_prints_no_warning(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    sock = tmp_path / "home" / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": str(sock)})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "ignoring" not in r.stderr
 
 
 def test_auth_token_file_forwarded_in_tcp_mode(tmp_path: Path):
