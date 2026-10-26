@@ -1614,3 +1614,94 @@ def test_installer_backend_allowlist_equals_renderer(tmp_path: Path, backend: st
         assert not log_dir.exists(), f"{backend}: LOG_DIR created before the backend was rejected"
         assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
         assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
+# ---------------------------------------------------------------------------
+# Installed-plist reader <-> installer guard. Invariant: the installer reads an
+# installed plist as "no auth" only when it is absent or parsed cleanly without
+# a token; every other reader outcome aborts an install (plist untouched, no
+# launchctl call) and makes an uninstall skip socket cleanup, with a warning.
+# State space: plist {absent, valid-no-auth, valid-env-token, valid-token-file,
+# truncated, garbage, wrong-type, reader-crash} x cmd {install, uninstall}. The
+# stt-list/stt-status sweep is covered in tests/test_justfile_recipes.py.
+# ---------------------------------------------------------------------------
+
+_PLIST_MALFORMED = ("truncated", "garbage", "wrong-type", "reader-crash")
+
+
+def _seed_plist_state(home: Path, stub_dir: Path, state: str, sock: Path, tok: Path) -> Path:
+    path = _agents(home) / f"{NEW_LABEL}.plist"
+    _agents(home).mkdir(parents=True, exist_ok=True)
+    if state == "absent":
+        return path
+    if state in ("valid-no-auth", "valid-env-token", "valid-token-file", "reader-crash"):
+        auth = {"valid-no-auth": "none", "valid-env-token": "env-pipecat"}.get(state, "token-file")
+        _seed_plist_with_auth(home, auth, tok)
+        if state == "reader-crash":
+            # The reader dies the way a traceback (or a broken python3 shim) does:
+            # exit 1, which must never read as "no token".
+            _write_executable(stub_dir / "python3", "#!/usr/bin/env bash\nexit 1\n")
+        return path
+    full = plistlib.dumps(
+        {
+            "Label": NEW_LABEL,
+            "ProgramArguments": [str(VENV_PYTHON), "-m", "stt_server", "--socket-path", str(sock)],
+            "EnvironmentVariables": {"PIPECAT_STT_AUTH_TOKEN": SECRET},
+        }
+    )
+    if state == "truncated":
+        path.write_bytes(full[: len(full) // 2])
+    elif state == "garbage":
+        path.write_text("not a plist")
+    elif state == "wrong-type":
+        path.write_bytes(plistlib.dumps(["--auth-token-file", str(tok)]))
+    else:
+        raise AssertionError(state)
+    return path
+
+
+@pytest.mark.parametrize("cmd", ["install", "uninstall"])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "absent",
+        "valid-no-auth",
+        "valid-env-token",
+        "valid-token-file",
+        "truncated",
+        "garbage",
+        "wrong-type",
+        "reader-crash",
+    ],
+)
+def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, cmd: str):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    plist = _seed_plist_state(home, stub_dir, state, sock, _good_token_file(tmp_path))
+    before = plist.read_bytes() if plist.exists() else None
+    r = _run_install(tmp_path, stub_dir, cmd=cmd)
+    out = r.stdout + r.stderr
+    assert SECRET not in out, "token value leaked"
+    malformed = state in _PLIST_MALFORMED
+    if cmd == "install":
+        if malformed:
+            assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            assert "cannot read the installed plist" in r.stderr
+            assert plist.read_bytes() == before, "an unreadable plist must not be replaced"
+            assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+        elif state in ("valid-env-token", "valid-token-file"):
+            assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            assert "PIPECAT_STT_AUTH_TOKEN_FILE" in r.stderr
+            assert plist.read_bytes() == before
+        else:
+            assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+            assert "--port" in _rendered(home)["ProgramArguments"]
+    else:
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert not plist.exists(), "uninstall still removes the agent's plist"
+        assert ("without socket cleanup" in r.stderr) == malformed, r.stderr
+        if malformed:
+            assert sock.exists() and lock.exists(), "no trusted socket path: leave files alone"
+    if state != "reader-crash":
+        assert "Traceback" not in out

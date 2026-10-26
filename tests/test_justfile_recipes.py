@@ -933,7 +933,96 @@ def test_plist_reader_garbage_plist_is_empty_not_an_error(tmp_path):
     res = _read_plist(bad)
     assert res.returncode == 0
     assert res.stdout == "\n\n\n\n"
-    assert _read_plist(bad, "--has-auth").returncode == 1
+    # Garbage is an error for the auth guard, never "no token" (exit 3).
+    assert _read_plist(bad, "--has-auth").returncode == 2
+
+
+# Reader contract (scripts/read_stt_plist.py): the four-line form is a sweep and
+# exits 0 for every state, blank fields for an absent or malformed plist; the
+# --has-auth form exits 0 (token), 3 (absent, or readable without a token) or 2
+# (malformed: it cannot tell). State space: absent, valid-no-auth,
+# valid-env-token, valid-token-file, truncated XML, garbage, wrong top-level
+# type, wrong ProgramArguments type, wrong EnvironmentVariables type, directory.
+_READER_STATES = {
+    # state: (four-line output, --has-auth status)
+    "absent": (["", "", "", ""], 3),
+    "valid-no-auth": (["127.0.0.1", "9765", "", ""], 3),
+    "valid-env-token": (["127.0.0.1", "9765", "", ""], 0),
+    "valid-token-file": (["127.0.0.1", "9765", "", "/h/tok"], 0),
+    "truncated": (["", "", "", ""], 2),
+    "garbage": (["", "", "", ""], 2),
+    "wrong-type": (["", "", "", ""], 2),
+    "wrong-type-args": (["", "", "", ""], 2),
+    "wrong-type-env": (["", "", "", ""], 2),
+    "directory": (["", "", "", ""], 2),
+}
+
+
+def _reader_state_plist(path: Path, state: str) -> Path:
+    args = ["py", "-m", "stt_server", "--host", "127.0.0.1", "--port", "9765"]
+    env: dict = {"PATH": "/usr/bin"}
+    full: dict = {"Label": "x", "ProgramArguments": args, "EnvironmentVariables": env}
+    if state == "absent":
+        return path
+    if state == "valid-env-token":
+        env["PIPECAT_STT_AUTH_TOKEN"] = "s3cret"
+    elif state == "valid-token-file":
+        args += ["--auth-token-file", "/h/tok"]
+    elif state == "truncated":
+        # A token-carrying plist cut off mid-write: plistlib raises ExpatError.
+        env["PIPECAT_STT_AUTH_TOKEN"] = "s3cret"
+        blob = plistlib.dumps(full)
+        path.write_bytes(blob[: len(blob) // 2])
+        return path
+    elif state == "garbage":
+        path.write_text("not a plist")
+        return path
+    elif state == "wrong-type":
+        path.write_bytes(plistlib.dumps(["py", "--auth-token-file", "/h/tok"]))
+        return path
+    elif state == "wrong-type-args":
+        full["ProgramArguments"] = "py --auth-token-file /h/tok"
+    elif state == "wrong-type-env":
+        full["EnvironmentVariables"] = ["PIPECAT_STT_AUTH_TOKEN=s3cret"]
+    elif state == "directory":
+        path.mkdir()
+        return path
+    path.write_bytes(plistlib.dumps(full))
+    return path
+
+
+@pytest.mark.parametrize("state", sorted(_READER_STATES))
+def test_plist_reader_state_space(tmp_path, state):
+    want_lines, want_auth = _READER_STATES[state]
+    plist = _reader_state_plist(tmp_path / "a.plist", state)
+    res = _read_plist(plist)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split("\n")[:4] == want_lines
+    assert "Traceback" not in res.stderr
+    auth = _read_plist(plist, "--has-auth")
+    assert auth.returncode == want_auth, auth.stderr
+    assert "Traceback" not in auth.stderr
+    assert "s3cret" not in res.stderr + auth.stderr, "token value leaked"
+    if want_auth == 2:
+        assert "cannot read plist" in auth.stderr and "cannot read plist" in res.stderr
+
+
+@pytest.mark.parametrize("state", ["truncated", "garbage", "wrong-type", "valid-token-file"])
+def test_stt_list_sweep_survives_malformed_plist(tmp_path, state):
+    """stt-list exits 0 and shows the no-endpoint line for a malformed plist,
+    with a one-line warning and no traceback; a readable one still shows its
+    endpoint."""
+    home = _home_with_agents(tmp_path, [])
+    _reader_state_plist(home / "Library" / "LaunchAgents" / "pipecat.stt-server.x.plist", state)
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "Traceback" not in res.stderr
+    if state == "valid-token-file":
+        assert "endpoint: 127.0.0.1:9765" in res.stdout
+    else:
+        assert "no serve endpoint found in plist" in res.stdout
+        assert "cannot read plist" in res.stderr
 
 
 @pytest.mark.parametrize(
@@ -941,10 +1030,10 @@ def test_plist_reader_garbage_plist_is_empty_not_an_error(tmp_path):
     [
         ({"PIPECAT_STT_AUTH_TOKEN": "x"}, ["py"], 0),
         ({"KODA_STT_AUTH_TOKEN": "x"}, ["py"], 0),
-        ({"PIPECAT_STT_AUTH_TOKEN": ""}, ["py"], 1),
+        ({"PIPECAT_STT_AUTH_TOKEN": ""}, ["py"], 3),
         ({}, ["py", "--auth-token-file", "/h/tok"], 0),
-        ({}, ["py", "--log-level", "--auth-token-file"], 1),
-        ({}, ["py", "--port", "9"], 1),
+        ({}, ["py", "--log-level", "--auth-token-file"], 3),
+        ({}, ["py", "--port", "9"], 3),
     ],
 )
 def test_plist_reader_has_auth(tmp_path, env, args, want):

@@ -190,14 +190,15 @@ if [[ "$cmd" == "install" && ! -x "$PYTHON" ]]; then
 fi
 
 # Print the value of FLAG (e.g. --socket-path) in the installed plist's
-# ProgramArguments (empty if the plist is absent/unreadable or has no such flag).
+# ProgramArguments (empty if the plist is absent or has no such flag).
 # scripts/read_stt_plist.py is the one reader of the installed plist (the justfile
 # calls it too), run under the system python3 so an uninstall works with no venv.
 # Used to decide socket cleanup from the transport actually installed, not from
-# the caller's env.
+# the caller's env. Callers check installed_auth_state first: a malformed plist
+# also reads as empty here, which must never be taken as "no socket".
 installed_arg() {
     local flag="$1" host port sock authfile
-    [[ -f "$PLIST_DST" ]] || return 0
+    [[ -e "$PLIST_DST" || -L "$PLIST_DST" ]] || return 0
     {
         IFS= read -r host
         IFS= read -r port
@@ -212,12 +213,25 @@ installed_arg() {
     esac
 }
 
-# Succeed when the INSTALLED agent requires a token: a non-empty env token in its
-# EnvironmentVariables (pre-0.5.0 plists) or an --auth-token-file argument. The
-# token value is never printed.
-installed_has_auth() {
-    [[ -f "$PLIST_DST" ]] || return 1
-    python3 -I "$READ_PLIST_PY" --has-auth "$PLIST_DST"
+# Classify the INSTALLED plist by its return status. The token value is never
+# printed.
+#   0  it requires a token: a non-empty env token in its EnvironmentVariables
+#      (pre-0.5.0 plists) or an --auth-token-file argument;
+#   1  there is no plist, or it was read and carries no token (the reader's
+#      exit 3: never 1, which a Python traceback or a broken shim exits with);
+#   2  a plist is there but could not be read (malformed, unreadable, wrong
+#      shape), or the reader itself failed (any status but 0 or 3: python3
+#      missing, a crash). This is never "no auth": install aborts, uninstall
+#      skips socket cleanup.
+installed_auth_state() {
+    local rc=0
+    [[ -e "$PLIST_DST" || -L "$PLIST_DST" ]] || return 1
+    python3 -I "$READ_PLIST_PY" --has-auth "$PLIST_DST" || rc=$?
+    case "$rc" in
+    0) return 0 ;;
+    3) return 1 ;;
+    *) return 2 ;;
+    esac
 }
 
 # Refuse a token file the server would mis-handle. File-system policy lives here:
@@ -535,13 +549,22 @@ render_plist() {
 
 case "$cmd" in
 install)
+    # Never replace a plist we cannot read: it may require a token (dropping it
+    # would leave an unauthenticated listener) and may name a socket we would
+    # then never clean up. Uninstalling first is the explicit way past it.
+    auth_state=0
+    installed_auth_state || auth_state=$?
+    if [[ "$auth_state" -eq 2 ]]; then
+        echo "error: cannot read the installed plist $PLIST_DST (malformed or unreadable, or python3 is missing), so this install cannot tell whether $LABEL requires an auth token or owns a socket. Fix or remove that plist, or run 'uninstall' first" >&2
+        exit 1
+    fi
     # Capture the previously installed transport BEFORE the plist is rewritten.
     old_socket="$(installed_arg --socket-path)"
     # Never silently downgrade a secured agent: an installed plist that carried a
     # token (a pre-0.5.0 env token, or --auth-token-file) must not be replaced by
     # an unauthenticated TCP listener just because the caller did not re-export
     # the token file. Uninstalling first is the explicit opt-out.
-    if installed_has_auth; then
+    if [[ "$auth_state" -eq 0 ]]; then
         if [[ -z "$SOCKET_PATH" && -z "$AUTH_TOKEN_FILE" ]]; then
             echo "error: the installed $LABEL agent requires an auth token, but PIPECAT_STT_AUTH_TOKEN_FILE is not set; this install would replace it with an unauthenticated TCP listener. Set PIPECAT_STT_AUTH_TOKEN_FILE (see docs/operations.md), or run 'uninstall' first to install without a token" >&2
             exit 1
@@ -614,8 +637,17 @@ install)
     echo "  logs:   $LOG_DIR"
     ;;
 uninstall)
-    # Socket cleanup follows the transport recorded in the INSTALLED plist.
-    old_socket="$(installed_arg --socket-path)"
+    # Socket cleanup follows the transport recorded in the INSTALLED plist. An
+    # unreadable plist names no socket we can trust, so uninstall still removes
+    # the agent but leaves any socket in place.
+    auth_state=0
+    installed_auth_state || auth_state=$?
+    if [[ "$auth_state" -eq 2 ]]; then
+        echo "warning: cannot read the installed plist $PLIST_DST; uninstalling $LABEL without socket cleanup (remove its socket and .lock by hand if it had one)" >&2
+        old_socket=""
+    else
+        old_socket="$(installed_arg --socket-path)"
+    fi
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST_DST"
     if [[ -n "$old_socket" ]]; then
