@@ -163,7 +163,9 @@ stt-status target='':
     set -uo pipefail
     target={{quote(target)}}
     if [[ -z "$target" ]]; then
-      exec just stt-list
+      # Forward the overridable variable stt-list reads; a nested `just` would
+      # otherwise fall back to the real ~/Library/LaunchAgents.
+      exec just la_dir={{quote(la_dir)}} stt-list
     fi
     # A deliberate single probe (unlike stt-list's fast sweep): a freshly installed
     # agent can take several seconds to load its model, so be forgiving.
@@ -259,7 +261,7 @@ stt-enable backend:
     # Self-heal a pruned venv before re-loading: if a bare `uv run`/`uv sync`
     # stripped this backend's extra since install, bootstrapping the plist would
     # just resume the crash-loop. (Skipped under PIPECAT_STT_SKIP_DEP_SYNC.)
-    just _ensure-extra "$backend" || exit 1
+    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" || exit 1
     # Guard each state change: set -uo pipefail does NOT abort on a failed
     # simple command, so an unguarded failure would be masked by the success
     # echo (exit 0 while the agent never started).
@@ -349,9 +351,14 @@ stt-install backend:
     # One field per line; four reads keep this bash-3.2-compatible — macOS
     # system bash has no `mapfile`.
     { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
-    just _ensure-extra "$backend" || exit 1
-    PIPECAT_STT_LABEL="$label" PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port" \
-      PIPECAT_STT_BACKEND="$bk" \
+    just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" || exit 1
+    # Canonical HOST/PORT only for a TCP agent: in socket mode the installer would
+    # warn that it ignores PIPECAT_STT_HOST/PORT the caller never set.
+    tcp=()
+    if [[ -z "${PIPECAT_STT_SOCKET:-}${KODA_STT_SOCKET:-}" ]]; then
+      tcp=(PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port")
+    fi
+    env ${tcp[@]+"${tcp[@]}"} PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" install
 
 # Uninstall an agent (removes the plist) — delegates to install_stt_agent.sh.
@@ -363,6 +370,9 @@ stt-uninstall backend:
     # One field per line; four reads keep this bash-3.2-compatible — macOS
     # system bash has no `mapfile`.
     { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
-    PIPECAT_STT_LABEL="$label" PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port" \
-      PIPECAT_STT_BACKEND="$bk" \
+    tcp=()
+    if [[ -z "${PIPECAT_STT_SOCKET:-}${KODA_STT_SOCKET:-}" ]]; then
+      tcp=(PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port")
+    fi
+    env ${tcp[@]+"${tcp[@]}"} PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" uninstall

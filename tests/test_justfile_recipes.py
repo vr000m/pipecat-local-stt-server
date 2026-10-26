@@ -544,6 +544,19 @@ def test_stt_status_no_argument_delegates_to_stt_list(tmp_path):
     assert "--host 127.0.0.1 --port 9871" in call, call
 
 
+def test_stt_status_no_argument_forwards_la_dir_override(tmp_path):
+    """`just la_dir=X stt-status` must sweep X, not the real LaunchAgents dir."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path, print_loaded=True, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    other = tmp_path / "other-home"
+    _render_plist(other, "pipecat.stt-server.elsewhere", backend="nemotron", port=9872)
+    la_dir = other / "Library" / "LaunchAgents"
+    res = _run_just([f"la_dir={la_dir}", "stt-status"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert "pipecat.stt-server.elsewhere" in res.stdout, res.stdout
+    assert "no pipecat.stt-server* agents found" not in res.stdout
+
+
 def test_stt_status_no_argument_with_no_agents_exits_zero(tmp_path):
     stub_dir, argv_log = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
@@ -850,6 +863,63 @@ def test_plist_endpoint_and_stt_list_keep_paths_with_spaces(tmp_path):
     assert call.endswith(f"--socket-path {sock}"), repr(call)
 
 
+def _installer_reader(plist: Path, flag: str) -> str:
+    """Run the installer's OWN ``installed_arg`` function against ``plist``."""
+    src = INSTALLER.read_text()
+    m = re.search(r"^installed_arg\(\) \{\n.*?^\}\n", src, re.MULTILINE | re.DOTALL)
+    assert m, "installed_arg() not found in the installer"
+    res = subprocess.run(
+        ["bash", "-c", m.group(0) + 'installed_arg "$1"', "_", flag],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PLIST_DST": str(plist)},
+    )
+    assert res.returncode == 0, res.stderr
+    return res.stdout
+
+
+@pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
+@pytest.mark.parametrize(
+    "case",
+    ["tcp", "socket", "token", "spaces", "quote-in-path", "flag-like-value", "absent", "no-args"],
+)
+def test_plist_readers_agree(tmp_path, case):
+    """Contract: the two readers of the renderer's ProgramArguments (installer
+    ``installed_arg``, justfile ``_plist_endpoint``) return the same host, port,
+    socket-path and auth-token-file for every plist shape."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    agents = home / "Library" / "LaunchAgents"
+    label = "pipecat.stt-server.x"
+    plist = agents / f"{label}.plist"
+    if case == "tcp":
+        _render_plist(home, label, port=9871)
+    elif case == "socket":
+        _render_plist(home, label, socket_path=home / "s.sock")
+    elif case == "token":
+        _render_plist(home, label, port=9765, auth_token_file=home / "tok")
+    elif case == "spaces":
+        _render_plist(home, label, socket_path=home / "my dir" / "s sock ")
+    else:
+        pa = {
+            "quote-in-path": ["py", "--socket-path", '/h/a"b/s.sock'],
+            "flag-like-value": ["py", "--log-level", "--socket-path", "/h/x.sock"],
+            "absent": None,
+            "no-args": [],
+        }[case]
+        if pa is not None:
+            plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": pa}))
+    res = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    just_vals = (res.stdout.splitlines() + [""] * 4)[:4]
+    inst_vals = [
+        _installer_reader(plist, f)
+        for f in ("--host", "--port", "--socket-path", "--auth-token-file")
+    ]
+    assert inst_vals == just_vals, f"{case}: installer {inst_vals} != justfile {just_vals}"
+
+
 # --------------------------------------------------------------------------- #
 # stt-disable: bootout, keep plist, idempotent
 # --------------------------------------------------------------------------- #
@@ -997,8 +1067,9 @@ def test_install_uninstall_delegate_exact_env(tmp_path, recipe, cmd, backend):
     assert "SOCKET= " in logged
 
 
+@pytest.mark.parametrize("sock_var", ["PIPECAT_STT_SOCKET", "KODA_STT_SOCKET"])
 @pytest.mark.parametrize("recipe", ["stt-install", "stt-uninstall"])
-def test_install_uninstall_socket_mode_only_when_caller_sets_it(tmp_path, recipe):
+def test_install_uninstall_socket_mode_only_when_caller_sets_it(tmp_path, recipe, sock_var):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
     fake_script, env_log = _delegation_stub(tmp_path)
@@ -1007,13 +1078,38 @@ def test_install_uninstall_socket_mode_only_when_caller_sets_it(tmp_path, recipe
         [f"script={fake_script}", recipe, "parakeet"],
         home=home,
         stub_dir=stub_dir,
-        extra_env={"PIPECAT_STT_SOCKET": str(sock)},
+        extra_env={sock_var: str(sock)},
     )
     assert res.returncode == 0, res.stderr
     logged = env_log.read_text().strip()
-    assert f"SOCKET={sock} " in logged
+    if sock_var == "PIPECAT_STT_SOCKET":
+        assert f"SOCKET={sock} " in logged
     assert "LABEL=pipecat.stt-server.parakeet " in logged
     assert "BACKEND=parakeet" in logged
+    # Socket mode: no canonical HOST/PORT, so the installer has no TCP-only
+    # settings to warn about ignoring.
+    assert "PIPECAT_STT_HOST= " in logged and "PIPECAT_STT_PORT= " in logged, logged
+
+
+@pytest.mark.skipif(not VENV_PYTHON.exists(), reason="installer needs .venv/bin/python")
+def test_stt_install_socket_rollback_prints_no_ignored_settings_warning(tmp_path):
+    """The documented rollback `PIPECAT_STT_SOCKET=<path> just stt-install <backend>`
+    through the REAL installer must not warn about HOST/PORT the caller never set."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    res = _run_just(
+        ["stt-install", "whisper"],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SOCKET": str(sock)},
+    )
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "ignoring" not in res.stderr, res.stderr
+    args = plistlib.loads(
+        (home / "Library" / "LaunchAgents" / "pipecat.stt-server.plist").read_bytes()
+    )["ProgramArguments"]
+    assert args[args.index("--socket-path") + 1] == str(sock)
 
 
 def test_install_unknown_backend_does_not_delegate(tmp_path):
@@ -1117,6 +1213,28 @@ def _venv_overrides(tmp_path: Path, stub_dir: Path, home: Path, *, probe_rc: int
 
 def _read(path: Path) -> str:
     return path.read_text() if path.exists() else ""
+
+
+@pytest.mark.parametrize("recipe", ["stt-install", "stt-enable"])
+@pytest.mark.parametrize("backend,key", [("whisper", "main"), ("kyutai", "kyutai")])
+def test_nested_ensure_extra_inherits_venv_overrides(tmp_path, recipe, backend, key):
+    """stt-install / stt-enable re-invoke `just _ensure-extra`; the caller's
+    `venv=` / `kyutai_venv=` overrides must reach it, or the probe silently
+    checks (and may sync) the real venvs."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    label = EXPECTED[backend][0]
+    home = _home_with_agents(tmp_path, [label])
+    fake_script, _env_log = _delegation_stub(tmp_path)
+    args, logs, _venvs = _venv_overrides(tmp_path, stub_dir, home, probe_rc=0)
+    res = _run_just(
+        [*args, f"script={fake_script}", recipe, backend],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_SKIP_DEP_SYNC": ""},
+    )
+    assert res.returncode == 0, f"stdout={res.stdout!r} stderr={res.stderr!r}"
+    assert "already present" in res.stdout, res.stdout
+    assert "-c" in _read(logs[key]), f"{recipe}: overridden {key} venv was not probed"
 
 
 def test_ensure_extra_kyutai_syncs_into_its_own_venv(tmp_path):
