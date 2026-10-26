@@ -183,9 +183,13 @@ def test_transcribe_stops_at_the_next_frame_once_cancelled(monkeypatch):
 def test_cancel_during_decode_frees_the_decode_lock_for_the_next_stream(monkeypatch):
     backend = K.KyutaiBackend(model="fake")
     started, release = threading.Event(), threading.Event()
+    received: list = []
 
     def blocking_transcribe(pcm, cancel=None):
+        received.append(cancel)
         started.set()
+        if cancel is None:
+            return ""
         # Stands in for the frame loop: runs until it sees the cancel event.
         while not cancel.is_set():
             release.wait(0.01)
@@ -197,8 +201,8 @@ def test_cancel_during_decode_frees_the_decode_lock_for_the_next_stream(monkeypa
         first = await backend.open_stream()
         await first.feed(b"\x01\x00" * 10)
         task = asyncio.ensure_future(first.end())
-        while not started.is_set():
-            await asyncio.sleep(0.005)
+        await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+        assert received[0] is not None, "the stream must hand its cancel event to _transcribe"
         await first.cancel()
         task.cancel()
         # The abandoned decode ends promptly, so the backend goes idle.
