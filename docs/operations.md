@@ -145,10 +145,10 @@ check and lock file described below. It ignores `PIPECAT_STT_HOST`, `PORT` and
 `AUTH_TOKEN_FILE` (the installer warns on stderr). Reinstalling a previously-socket agent
 without `PIPECAT_STT_SOCKET` switches it to TCP and removes the old socket; a
 reinstall onto a different socket path removes the old one too. The old socket
-and `.lock` are removed only after the new agent bootstrapped and launchd no longer
-lists the old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30), and only
-while no process holds the `.lock` (a server started by hand can own the path);
-otherwise they are left in place with a warning. `uninstall` waits the same way,
+is removed only after the new agent bootstrapped and launchd no longer lists the
+old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30), and only while no
+process holds its `.lock` (a server started by hand can own the path); otherwise
+it is left in place with a warning. The `.lock` is never removed (see below). `uninstall` waits the same way,
 for a TCP agent too (its server can own the port until it exits): it prints
 `uninstalled: <label>` only once launchd no longer lists the job, and otherwise a
 warning and `uninstall incomplete (still loaded): <label>` (exit 0 either way).
@@ -172,12 +172,14 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   cannot go stale.
 - The server never unlinks it: deleting it while a server runs, or between two
   starters, would let two servers own one socket. Leaving it behind is
-  harmless. Clients never open it. The installer is the one exception: on a
-  transport change and on `uninstall` of a socket agent it removes the socket
-  and its `.lock`, but only once launchd no longer lists the old job and no
-  process holds the lock. A held lock (or one it cannot check) leaves both in
-  place, with a warning. A server started in the same instant as that check is
-  not covered.
+  harmless. Clients never open it. The installer never unlinks it either: its
+  check drops the lock when it exits, so unlinking the file afterwards would let
+  a starter that just locked it run beside a later one that creates a new file.
+  On a transport change and on `uninstall` of a socket agent it removes only the
+  stale socket, once launchd no longer lists the old job and no process holds
+  the lock. A held lock (or one it cannot check) leaves the socket in place,
+  with a warning. A server started in the same instant as that check can lose
+  its socket (it runs unreachable until restarted); that window is not covered.
 - `serve --supervised` checks it before binding (a held lock is reported as
   `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
   a contended lock for 250 ms, so the check never makes a real start fail. It

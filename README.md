@@ -208,9 +208,10 @@ backend at a mismatched repo fails fast at decode.
 Each Unix socket gets a sibling `<socket>.lock` file (e.g. `parakeet.sock.lock`,
 mode `0600`). The server holds an `flock` on it for its lifetime, so a second
 server for the same socket fails at once with `EADDRINUSE`. The kernel releases
-it when the process exits. The server never deletes the file, so leaving it is safe;
-the installer removes it together with its socket on a transport change, once the old
-job has unloaded and no process holds the lock. See
+it when the process exits. Neither the server nor the installer deletes the file,
+so every server locks the same one; leaving it is safe. On a transport change or
+`uninstall` the installer removes only the old socket, once the old job has
+unloaded and no process holds the lock. See
 [Operations: single-server lock file](docs/operations.md#single-server-lock-file).
 
 Nemotron's runtime dependency is `mlx-audio>=0.4.4` — the first PyPI release

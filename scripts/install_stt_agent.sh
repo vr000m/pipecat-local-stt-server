@@ -409,9 +409,8 @@ except ValueError as exc:
 
 # Block until launchd no longer lists $LABEL. Bounded by PIPECAT_STT_UNLOAD_WAIT
 # seconds (default 30): returns 0 once the job is gone, 1 (with a warning) if it
-# is still loaded at the cap. Callers that unlink a socket's .lock must only do
-# so after a 0 return: the old server holds that lock until it exits, and
-# unlinking a held lock lets a second server lock a new inode on the same socket.
+# is still loaded at the cap. Callers that remove the old job's socket must only
+# do so after a 0 return: the old server owns it until it exits.
 wait_unloaded() {
     local waited=0 cap="$UNLOAD_WAIT"
     while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do
@@ -434,7 +433,7 @@ wait_unloaded() {
 # uninstall needs no venv. It is deliberately stricter than socket_lock_held,
 # which answers "not held" for a file another user owns or one it cannot open
 # (start() reports those): here every error is 2, "cannot tell", and the caller
-# then leaves the socket and .lock alone (fails closed). The caller passes
+# then leaves the socket alone (fails closed). The caller passes
 # "$sock.lock", the server's _lock_path rule. Both the name rule and the lock
 # conflict are pinned against the server's own _lock_path and
 # acquire_socket_lock by tests/test_install_migration.py
@@ -460,7 +459,8 @@ except Exception:
 ' "$1" 2>/dev/null
 }
 
-# Remove a socket and its .lock named by an INSTALLED plist. That plist is
+# Remove the stale socket named by an INSTALLED plist (never its .lock, see
+# below). That plist is
 # untrusted input (anything that can write the user's LaunchAgents dir can name
 # any path in it), so this is deliberately conservative and NEVER aborts the
 # caller (it runs after bootout, under `set -e`): every refusal or failure is a
@@ -469,18 +469,23 @@ except Exception:
 #     same lexical rules as validate_socket_path, but warn-and-skip, not exit);
 #   * no directory component from the socket's parent up to and including $HOME
 #     is a symlink (the lexical check alone would follow one out of $HOME);
-#   * the socket is a real socket (-S) and not a symlink; the .lock is a regular
-#     file and not a symlink (so a plist naming a file, directory or symlink
-#     never deletes it);
-#   * the entry is owned by the current user;
+#   * the socket is a real socket (-S) and not a symlink (so a plist naming a
+#     file, directory or symlink never deletes it);
+#   * the socket is owned by the current user;
 #   * no process holds the .lock (lock_free above). launchd no longer listing the
-#     old job is not enough: a server started by hand can own the recorded path,
-#     and unlinking a held lock lets a second server lock a new inode on the same
-#     socket. A held lock (or a probe that cannot tell) leaves BOTH in place. A
-#     server that starts in the instant between the probe and the unlink is not
-#     covered.
+#     old job is not enough: a server started by hand can own the recorded path.
+#     A held lock (or a probe that cannot tell) leaves the socket in place. A
+#     server that starts in the instant between the probe and the unlink can
+#     lose its socket (it then runs unreachable until restarted); that window
+#     is not covered.
+# The .lock itself is never removed, like the server never removes it
+# (acquire_socket_lock in stt_server/server.py): every starter must flock the
+# same inode. The probe drops its lock when it exits, so unlinking the .lock
+# after it would let a starter that just locked the old inode run beside a
+# later one that creates a new inode at the same path. A leftover .lock is
+# harmless; the next server reuses it.
 remove_socket_owned() {
-    local sock="$1" dir home="${HOME%/}" f owner kind
+    local sock="$1" dir home="${HOME%/}" f owner
     dir="$(dirname "$sock")"
     case "$sock" in
     /*) : ;;
@@ -513,33 +518,23 @@ remove_socket_owned() {
     local lock_rc=0
     lock_free "$sock.lock" || lock_rc=$?
     if [[ "$lock_rc" -eq 1 ]]; then
-        echo "warning: $sock.lock is held by a running server; leaving $sock and its .lock" >&2
+        echo "warning: $sock.lock is held by a running server; leaving $sock" >&2
         return 0
     elif [[ "$lock_rc" -ne 0 ]]; then
-        echo "warning: could not tell whether $sock.lock is held; leaving $sock and its .lock" >&2
+        echo "warning: could not tell whether $sock.lock is held; leaving $sock" >&2
         return 0
     fi
-    for kind in sock lock; do
-        if [[ "$kind" == sock ]]; then
-            f="$sock"
-            [[ -S "$f" && ! -L "$f" ]] || {
-                [[ -e "$f" || -L "$f" ]] && echo "warning: $f is not a socket; leaving it" >&2
-                continue
-            }
-        else
-            f="$sock.lock"
-            [[ -f "$f" && ! -L "$f" ]] || {
-                [[ -e "$f" || -L "$f" ]] && echo "warning: $f is not a regular file; leaving it" >&2
-                continue
-            }
-        fi
-        owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
-        if [[ "$owner" == "$(id -u)" ]]; then
-            rm -f "$f" 2>/dev/null || echo "warning: could not remove $f" >&2
-        else
-            echo "warning: $f not owned by current user, leaving it" >&2
-        fi
-    done
+    f="$sock"
+    if [[ ! -S "$f" || -L "$f" ]]; then
+        if [[ -e "$f" || -L "$f" ]]; then echo "warning: $f is not a socket; leaving it" >&2; fi
+        return 0
+    fi
+    owner=$(stat -f "%u" "$f" 2>/dev/null || echo "")
+    if [[ "$owner" == "$(id -u)" ]]; then
+        rm -f "$f" 2>/dev/null || echo "warning: could not remove $f" >&2
+    else
+        echo "warning: $f not owned by current user, leaving it" >&2
+    fi
     return 0
 }
 
@@ -740,10 +735,11 @@ install)
         launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
     fi
     # Old socket cleanup runs only after the new job bootstrapped (a failed
-    # bootstrap exits above under set -e, leaving the old socket and .lock in
-    # place) and only once the old job was seen gone, so its .lock is never
-    # unlinked while the old server may still hold it. Any change of socket path
-    # (socket->TCP or socket A->socket B) retires the old one.
+    # bootstrap exits above under set -e, leaving the old socket in place) and
+    # only once the old job was seen gone, so a socket the old server still owns
+    # is never removed. Any change of socket path (socket->TCP or socket
+    # A->socket B) retires the old socket; its .lock stays (see
+    # remove_socket_owned).
     if [[ -n "$old_socket" && "$old_socket" != "$SOCKET_PATH" ]]; then
         if [[ -z "$SOCKET_PATH" ]]; then
             echo "note: endpoint changed from socket $old_socket to TCP $HOST:$PORT; removing the old socket"
@@ -753,7 +749,7 @@ install)
         if [[ "$old_gone" -eq 1 ]]; then
             remove_socket_owned "$old_socket"
         else
-            echo "warning: old job may still hold $old_socket.lock; leaving $old_socket and its .lock" >&2
+            echo "warning: old job may still hold $old_socket.lock; leaving $old_socket" >&2
         fi
     fi
     launchctl enable "gui/$(id -u)/$LABEL"
@@ -772,7 +768,7 @@ uninstall)
     # the agent but leaves any socket in place.
     old_socket=""
     if ! old_socket="$(installed_arg --socket-path)"; then
-        echo "warning: cannot read the installed plist $PLIST_DST; uninstalling $LABEL without socket cleanup (remove its socket and .lock by hand if it had one)" >&2
+        echo "warning: cannot read the installed plist $PLIST_DST; uninstalling $LABEL without socket cleanup (remove its socket by hand if it had one, once no server runs)" >&2
         old_socket=""
     fi
     # bootout fails when the job is not loaded, which is fine; whether it worked
@@ -780,8 +776,8 @@ uninstall)
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST_DST"
     # bootout is asynchronous, for a TCP agent too: until the job is gone its
-    # server can still own its port (or hold <socket>.lock). So every uninstall
-    # waits, and the socket and lock go only once launchd no longer lists the job.
+    # server can still own its port (or its socket). So every uninstall waits, and
+    # the socket goes only once launchd no longer lists the job (its .lock stays).
     # Still loaded at the cap: say so instead of claiming a clean uninstall (the
     # exit status stays 0, as before).
     if wait_unloaded; then
@@ -789,7 +785,7 @@ uninstall)
         echo "uninstalled: $LABEL"
     else
         if [[ -n "$old_socket" ]]; then
-            echo "warning: $LABEL may still hold $old_socket.lock; leaving $old_socket and its .lock" >&2
+            echo "warning: $LABEL may still hold $old_socket.lock; leaving $old_socket" >&2
         fi
         echo "warning: $LABEL is still loaded, so its endpoint may still be in use; its plist is removed but the uninstall is incomplete. Check 'launchctl print gui/$(id -u)/$LABEL' and re-run uninstall" >&2
         echo "uninstall incomplete (still loaded): $LABEL"

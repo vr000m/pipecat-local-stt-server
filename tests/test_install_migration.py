@@ -741,7 +741,7 @@ def test_socket_to_tcp_reinstall_notes_and_removes_old_socket(tmp_path: Path, he
     low = r.stdout.lower()
     assert "endpoint" in low and "chang" in low, f"expected endpoint-changed note; {r.stdout!r}"
     assert not sock.exists(), "old socket must be removed on socket->TCP"
-    assert not lock.exists(), "old .lock must be removed on socket->TCP"
+    assert lock.exists(), "the .lock is never unlinked (every starter must lock one inode)"
     assert "--port" in _rendered(home)["ProgramArguments"]
 
 
@@ -781,7 +781,7 @@ def test_uninstall_cleans_socket_from_installed_plist_not_env(tmp_path: Path, he
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
     assert not sock.exists(), "uninstall must remove the socket named in the installed plist"
-    assert not lock.exists(), "uninstall must remove the .lock named in the installed plist"
+    assert lock.exists(), "uninstall never unlinks the .lock (every starter must lock one inode)"
 
 
 def test_uninstall_tcp_plist_creates_no_socket_dir(tmp_path: Path):
@@ -877,9 +877,10 @@ def test_socket_cleanup_never_deletes_non_socket_targets(
     tmp_path: Path, held_sockets, case: str, cmd: str
 ):
     """The installed plist is untrusted input: a ``--socket-path`` naming a
-    regular file, a directory, a ``..`` path, a symlink, a path outside $HOME,
-    or a socket whose ``.lock`` is a directory/symlink must NOT be deleted, and
-    the command must still succeed (a refusal is a warning, never an abort)."""
+    regular file, a directory, a ``..`` path, a symlink or a path outside $HOME
+    must NOT be deleted, a ``.lock`` that is a directory/symlink is never
+    touched, and the command must still succeed (a refusal is a warning, never
+    an abort)."""
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
     named, must_survive = _cleanup_cases(tmp_path, held_sockets)[case]
@@ -889,19 +890,25 @@ def test_socket_cleanup_never_deletes_non_socket_targets(
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     for path in must_survive:
         assert os.path.lexists(path), f"{case}: {path} was deleted"
-    assert "warning" in r.stderr, f"{case}: expected a skip warning; {r.stderr!r}"
+    if case.startswith("lock-is-"):
+        # The installer never touches the .lock path, whatever it is, so nothing
+        # there is refused; the socket beside it is a real, owned, unlocked one
+        # (no server can lock a non-regular .lock) and goes.
+        assert not os.path.lexists(named), f"{case}: the stale socket was left"
+    else:
+        assert "warning" in r.stderr, f"{case}: expected a skip warning; {r.stderr!r}"
     if cmd == "uninstall":
         assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
 
 
-def test_socket_cleanup_still_removes_real_socket_and_lock(tmp_path: Path, held_sockets):
+def test_socket_cleanup_still_removes_real_socket_and_keeps_lock(tmp_path: Path, held_sockets):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
     sock, lock = _seed_socket_files(home, held_sockets)
     _seed_plist(home, ["--socket-path", str(sock)])
     r = _run_install(tmp_path, stub_dir, cmd="uninstall")
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-    assert not sock.exists() and not lock.exists()
+    assert not sock.exists() and lock.exists()
     assert "warning" not in r.stderr
 
 
@@ -1290,9 +1297,9 @@ def test_unload_wait_bounds_accept_boundary_and_zero_padded(
 
 
 # ---------------------------------------------------------------------------
-# Socket cleanup contract: a <socket>.lock is unlinked only once the job that
-# may hold it is confirmed gone from launchd, and only after a successful
-# bootstrap on install. State space: cmd {install socket->TCP, install
+# Socket cleanup contract: the old socket is removed only once the job that may
+# own it is confirmed gone from launchd, and only after a successful bootstrap
+# on install; its <socket>.lock is never unlinked. State space: cmd {install socket->TCP, install
 # socket A->B, uninstall} x old job {gone, still loaded} x bootstrap {ok, fails}.
 # ---------------------------------------------------------------------------
 
@@ -1314,7 +1321,7 @@ def _second_socket(home: Path) -> Path:
         ("uninstall", True, 0, False, True),
     ],
 )
-def test_socket_lock_unlinked_only_after_old_job_gone(
+def test_old_socket_removed_only_after_old_job_gone(
     tmp_path: Path,
     held_sockets,
     mode: str,
@@ -1342,9 +1349,10 @@ def test_socket_lock_unlinked_only_after_old_job_gone(
     r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides=env)
     assert (r.returncode == 0) == expect_rc0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     if expect_removed:
-        assert not sock.exists() and not lock.exists(), f"{mode}: old endpoint left behind"
+        assert not sock.exists(), f"{mode}: old socket left behind"
     else:
-        assert sock.exists() and lock.exists(), f"{mode}: old socket/.lock removed too early"
+        assert sock.exists(), f"{mode}: old socket removed too early"
+    assert lock.exists(), f"{mode}: the .lock is never unlinked"
 
 
 # Uninstall reports what launchd says, for every transport. Invariant: "uninstalled"
@@ -1394,7 +1402,7 @@ def test_socket_a_to_socket_b_reinstall_notes_change(tmp_path: Path, held_socket
     r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_SOCKET": str(other)})
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     assert "endpoint changed" in r.stdout and str(other) in r.stdout
-    assert not sock.exists() and not lock.exists()
+    assert not sock.exists() and lock.exists()
     assert _flag(_rendered(home)["ProgramArguments"], "--socket-path") == str(other)
 
 
@@ -1965,9 +1973,11 @@ def test_token_file_acl_state_space(tmp_path: Path, case: str):
 
 
 # ---------------------------------------------------------------------------
-# Socket cleanup vs a held lock. Invariant: the installer never unlinks a socket
-# or .lock while a process holds that .lock, even after launchd stopped listing
-# the job (a server started by hand can own the path). State space: lock
+# Socket cleanup vs the server's lock protocol. Invariant: the installer never
+# unlinks <socket>.lock (the server never does either), so every starter flocks
+# the same inode and at most one server runs per socket; it removes the stale
+# socket only while no process holds that lock, even after launchd stopped
+# listing the job (a server started by hand can own the path). State space: lock
 # {absent, free, held} x cmd {install socket->TCP, uninstall}.
 # ---------------------------------------------------------------------------
 
@@ -1989,6 +1999,7 @@ def test_socket_cleanup_respects_a_held_lock(
     assert _lock_path(sock) == f"{sock}.lock" == str(lock), "installer's lock name rule"
     if lock_state == "absent":
         lock.unlink()
+    lock_ino = os.stat(lock).st_ino if lock.exists() else None
     _seed_plist(home, ["--socket-path", str(sock)])
     fd = None
     if lock_state == "held":
@@ -2000,8 +2011,14 @@ def test_socket_cleanup_respects_a_held_lock(
             os.close(fd)
     assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
     if lock_state == "held":
-        assert sock.exists() and lock.exists(), "a held lock leaves BOTH in place"
+        assert sock.exists(), "a held lock leaves the socket in place"
         assert "held by a running server" in r.stderr
     else:
-        assert not sock.exists() and not lock.exists()
+        assert not sock.exists(), "a stale socket is removed"
         assert "held" not in r.stderr
+    if lock_state == "absent":
+        assert not os.path.lexists(lock), "the installer never creates the lock"
+    else:
+        # Same inode as before: a starter that locked it during cleanup and any
+        # later starter contend on one file, never on two.
+        assert lock.exists() and os.stat(lock).st_ino == lock_ino, "the .lock is never unlinked"

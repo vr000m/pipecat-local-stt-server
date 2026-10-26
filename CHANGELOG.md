@@ -100,9 +100,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `uninstalled: <label>` only once it is gone; a job still loaded after
   `PIPECAT_STT_UNLOAD_WAIT` gets a warning and `uninstall incomplete (still
   loaded)` instead (exit status unchanged, 0).
-- Socket cleanup on a transport change or `uninstall` leaves the socket and its
-  `.lock` in place, with a warning, while any process holds the lock (a server
-  started by hand can own the recorded path).
+- Socket cleanup on a transport change or `uninstall` leaves the socket in
+  place, with a warning, while any process holds its `.lock` (a server started
+  by hand can own the recorded path). The installer never removes the `.lock`
+  itself, as the server never does: unlinking it after the check could let a
+  starter that just locked the old file run beside a later one that creates a
+  new file at the same path.
 - The installer's token-file check refuses a path outside the plist allowlist
   before it creates any directory.
 - **Loopback TCP without a token logs INFO, not a warning.** That is the default
@@ -143,15 +146,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Old socket cleanup waits for the old server.** The installer removes the old
-  socket and `.lock` only after the new agent bootstrapped and launchd no longer
-  lists the old job; `uninstall` waits for the job to unload first. A server holds
-  its `.lock` until it exits, so unlinking it during the asynchronous `bootout`
-  teardown could let a second server own the same socket. A failed bootstrap now
-  leaves the old socket and `.lock` in place. A reinstall from one socket path to
+  socket only after the new agent bootstrapped and launchd no longer lists the
+  old job; `uninstall` waits for the job to unload first, since the old server
+  owns its socket until it exits. A failed bootstrap now leaves the old socket in
+  place. The `.lock` beside it is left in place in every case. A reinstall from one socket path to
   another also retires the old socket (it was orphaned before).
 - `just stt-status` (no argument) forwards a `la_dir=` override to `stt-list`, and
   `stt-install`/`stt-enable` forward `venv=`/`kyutai_venv=` to `_ensure-extra`.
-- **Reinstalling over a socket agent no longer risks deleting the wrong file.** The installer removes the old socket and `.lock` only when the installed plist names an absolute path under `$HOME` without `..` or a symlinked directory component, the socket is a real socket (not a symlink), and the lock is a regular file (not a symlink), owner-checked; anything else is left in place with a warning. The renderer's validators use `fullmatch`, so a trailing newline is rejected.
+- **Reinstalling over a socket agent no longer risks deleting the wrong file.** The installer removes the old socket only when the installed plist names an absolute path under `$HOME` without `..` or a symlinked directory component and the socket is a real socket (not a symlink), owner-checked; anything else is left in place with a warning. It never removes the `.lock`. The renderer's validators use `fullmatch`, so a trailing newline is rejected.
 - **Reinstalling a running agent could leave it unloaded** (`Bootstrap failed: 5:
   Input/output error`). `launchctl bootout` returns before launchd has finished
   tearing the old job down (a loaded ASR model takes seconds to exit), and the
