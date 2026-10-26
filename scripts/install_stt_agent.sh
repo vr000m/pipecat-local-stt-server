@@ -206,30 +206,21 @@ else
     READER_PYTHON="python3"
 fi
 
-# Print the value of FLAG (e.g. --socket-path) in the installed plist's
-# ProgramArguments (empty if the plist is absent or has no such flag). Used to
-# decide socket cleanup from the transport actually installed, not from the
-# caller's env. Returns 2 (printing nothing; the reader's error is on stderr)
-# when a plist is there but cannot be read, or the reader failed: the reader's
-# --strict form, so a malformed plist never reads as "no socket", whatever the
-# caller checked before. Call it as `if ! v="$(installed_arg FLAG)"; then ...`.
-installed_arg() {
-    local flag="$1" out rc=0 host="" port="" sock="" authfile=""
+# Print the value of field NAME (e.g. socket-path; the reader's --field names) in
+# the installed plist (empty if the plist is absent or does not carry it). Used
+# to decide socket cleanup from the transport actually installed, not from the
+# caller's env. One keyed read per field: nothing here depends on the order of
+# the reader's output. Returns 2 (printing nothing; the reader's error is on
+# stderr) when a plist is there but cannot be read, or the reader failed: the
+# reader's --strict form, so a malformed plist never reads as "no socket",
+# whatever the caller checked before. Call it as
+# `if ! v="$(installed_field NAME)"; then ...`.
+installed_field() {
+    local name="$1" out rc=0
     [[ -e "$PLIST_DST" || -L "$PLIST_DST" ]] || return 0
-    out="$("$READER_PYTHON" -I "$READ_PLIST_PY" --strict "$PLIST_DST")" || rc=$?
+    out="$("$READER_PYTHON" -I "$READ_PLIST_PY" --strict --field "$name" "$PLIST_DST")" || rc=$?
     [[ "$rc" -eq 0 ]] || return 2
-    {
-        IFS= read -r host || true
-        IFS= read -r port || true
-        IFS= read -r sock || true
-        IFS= read -r authfile || true
-    } <<<"$out"
-    case "$flag" in
-        --host) printf '%s' "$host" ;;
-        --port) printf '%s' "$port" ;;
-        --socket-path) printf '%s' "$sock" ;;
-        --auth-token-file) printf '%s' "$authfile" ;;
-    esac
+    printf '%s' "$out"
 }
 
 # Classify the INSTALLED plist by its return status. The token value is never
@@ -749,7 +740,7 @@ install)
     # Each read fails on its own for a plist it cannot read, so neither depends
     # on the other having run first.
     old_socket=""
-    if [[ "$auth_state" -eq 2 ]] || ! old_socket="$(installed_arg --socket-path)"; then
+    if [[ "$auth_state" -eq 2 ]] || ! old_socket="$(installed_field socket-path)"; then
         echo "error: cannot read the installed plist $PLIST_DST (malformed or unreadable, or the plist reader failed under $READER_PYTHON), so this install cannot tell whether $LABEL requires an auth token or owns a socket. Fix or remove that plist, or run 'uninstall' first" >&2
         exit 1
     fi
@@ -836,7 +827,7 @@ uninstall)
     # unreadable plist names no socket we can trust, so uninstall still removes
     # the agent but leaves any socket in place.
     old_socket=""
-    if ! old_socket="$(installed_arg --socket-path)"; then
+    if ! old_socket="$(installed_field socket-path)"; then
         echo "warning: cannot read the installed plist $PLIST_DST; uninstalling $LABEL without socket cleanup (remove its socket by hand if it had one, once no server runs)" >&2
         old_socket=""
     fi

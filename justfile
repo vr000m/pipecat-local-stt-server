@@ -60,14 +60,20 @@ _resolve backend:
       *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
     esac
 
-# Extract the serve endpoint from an installed agent's plist ProgramArguments.
-# Emits FOUR lines — host, port, socket-path, auth-token-file — each empty when
-# the flag is absent. The plist is the source of truth, so stt-list never
-# re-encodes the _resolve map and stays correct for custom labels/transports.
-# scripts/read_stt_plist.py is the one reader (the installer calls it too); it
-# runs under the system python3, so a pruned or missing venv cannot break it.
-_plist_endpoint plist:
-    @python3 -I "{{justfile_directory()}}/scripts/read_stt_plist.py" {{quote(plist)}}
+# Print one field of an installed agent's plist: host, port, socket-path,
+# auth-token-file (its serve flags) or interpreter (ProgramArguments[0]), exactly,
+# empty when the plist does not carry it. One keyed field per call, so no recipe
+# depends on the order of anything the reader prints. The plist is the source of
+# truth, so stt-list never re-encodes the _resolve map and stays correct for
+# custom labels/transports. scripts/read_stt_plist.py is the one reader (the
+# installer calls it too); it runs under the system python3, so a pruned or
+# missing venv cannot break it. `strict=1` is the reader's --strict form: a
+# malformed plist exits 2 instead of reading as empty.
+_plist_field plist field strict='':
+    #!/usr/bin/env bash
+    mode=()
+    [[ -n {{quote(strict)}} ]] && mode=(--strict)
+    exec python3 -I "{{justfile_directory()}}/scripts/read_stt_plist.py" "${mode[@]+"${mode[@]}"}" --field {{quote(field)}} {{quote(plist)}}
 
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
@@ -89,11 +95,14 @@ stt-list:
       else
         printf 'stopped  %-32s (plist present, not loaded)\n' "$label"
       fi
-      # Live backend probe: read the endpoint from the agent's OWN plist (four
-      # lines: host/port/socket/auth-token-file), so custom labels, custom ports
-      # and socket-mode agents are all probed, and a secured agent authenticates.
-      # IFS= keeps leading/trailing whitespace in a path intact (bare `read -r` trims it).
-      { IFS= read -r host; IFS= read -r port; IFS= read -r sock; IFS= read -r authfile; } < <(just _plist_endpoint "$plist")
+      # Live backend probe: read the endpoint from the agent's OWN plist, one
+      # keyed field at a time, so custom labels, custom ports and socket-mode
+      # agents are all probed, and a secured agent authenticates. A malformed
+      # plist reads as empty with a warning; only the first read shows it.
+      host=$(just _plist_field "$plist" host)
+      port=$(just _plist_field "$plist" port 2>/dev/null)
+      sock=$(just _plist_field "$plist" socket-path 2>/dev/null)
+      authfile=$(just _plist_field "$plist" auth-token-file 2>/dev/null)
       # Empty-safe array expansion for bash 3.2 under `set -u`.
       auth=()
       [[ -n "$authfile" ]] && auth=(--auth-token-file "$authfile")
@@ -166,7 +175,11 @@ stt-status target='':
     auth=()
     if [[ -f "$plist" ]]; then
       # The installed plist is the source of truth for where the agent listens.
-      { IFS= read -r p_host; IFS= read -r p_port; IFS= read -r p_sock; IFS= read -r p_auth; } < <(just _plist_endpoint "$plist")
+      # One keyed field per read; a malformed plist warns once and reads empty.
+      p_host=$(just _plist_field "$plist" host)
+      p_port=$(just _plist_field "$plist" port 2>/dev/null)
+      p_sock=$(just _plist_field "$plist" socket-path 2>/dev/null)
+      p_auth=$(just _plist_field "$plist" auth-token-file 2>/dev/null)
       [[ -n "$p_auth" ]] && auth=(--auth-token-file "$p_auth")
       if [[ -n "$p_sock" ]]; then
         probe=(--socket-path "$p_sock")

@@ -1731,8 +1731,8 @@ _PLIST_MALFORMED = ("truncated", "garbage", "wrong-type", "reader-crash")
 def _reader_python(stub_dir: Path, *, has_auth: str = "", sweep: str = "") -> Path:
     """An interpreter (stub_dir/readerpy) that runs the real venv python, except
     that a scripts/read_stt_plist.py call runs the given bash instead: ``has_auth``
-    for ``--has-auth``, ``sweep`` for the four-line forms (``--strict`` or not),
-    ``$STRICT`` set to 1 for ``--strict``. Empty means "run the real reader".
+    for ``--has-auth``, ``sweep`` for the ``--field NAME`` forms (``--strict`` or
+    not), ``$STRICT`` set to 1 for ``--strict``. Empty means "run the real reader".
     install runs the reader under $PYTHON, so tests pass this as
     PIPECAT_STT_PYTHON."""
     py = stub_dir / "readerpy"
@@ -1837,12 +1837,12 @@ def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, c
         assert "Traceback" not in out
 
 
-# The two reads of the installed plist (--has-auth, then the endpoint lines) are
+# The two reads of the installed plist (--has-auth, then the socket-path field) are
 # separate, so the plist can turn malformed between them. Invariant: whichever
 # read fails, a plist the installer cannot read is never taken as "no socket":
 # install aborts with the plist untouched and no launchctl call; uninstall warns
 # and leaves the socket. The second read is made to see a malformed plist (the
-# sweep answers blank lines and exit 0, --strict exits 2) after --has-auth read
+# sweep answers an empty value and exit 0, --strict exits 2) after --has-auth read
 # it cleanly.
 @pytest.mark.parametrize("cmd", ["install", "uninstall"])
 def test_endpoint_read_alone_refuses_a_malformed_plist(tmp_path: Path, held_sockets, cmd: str):
@@ -1854,7 +1854,7 @@ def test_endpoint_read_alone_refuses_a_malformed_plist(tmp_path: Path, held_sock
     before = plist.read_bytes()
     malformed_now = (
         'if [[ "$STRICT" == 1 ]]; then echo "error: cannot read plist" >&2; exit 2; fi; '
-        "printf '\\n\\n\\n\\n'; exit 0"
+        "exit 0"
     )
     py = _reader_python(stub_dir, sweep=malformed_now)
     shutil.copy(py, stub_dir / "python3")

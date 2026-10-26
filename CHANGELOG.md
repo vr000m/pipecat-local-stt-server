@@ -79,7 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A plist it cannot read (truncated, garbage, wrong shape) or a failed reader
   (its interpreter missing) now fails an install instead of counting as "no auth", and
   makes `uninstall` leave any socket in place; `stt-list` shows blank fields and a
-  one-line warning for it instead of a traceback.
+  one-line warning for it instead of a traceback. The reader answers one field by
+  name (`--field host|port|socket-path|auth-token-file|interpreter`, the last being
+  `ProgramArguments[0]`), so no caller splits its output by line position; the
+  earlier four positional lines are gone (a call without `--field` is a usage
+  error, exit 2), and a newline inside a plist value can no longer shift one field
+  into another.
 - **`serve` takes each flag by its full name only** (argparse `allow_abbrev=False`):
   `--auth-token /x` or `--sock /x` now fails at startup instead of being read as
   `--auth-token-file` / `--socket-path`. `--flag=value` still works. The plist
@@ -97,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the server re-opens the path at every start.
 - `install` runs the plist reader and the socket cleanup's lock step under its venv
   python (it needs no system `python3`, also when it retires an old socket); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
-  --strict`) fails on a malformed plist by itself, so it no longer relies on the
+  --strict --field socket-path`) fails on a malformed plist by itself, so it no longer relies on the
   `--has-auth` read having run first.
 - `uninstall` waits for launchd to drop the job for a TCP agent too, and prints
   `uninstalled: <label>` only once it is gone; a job still loaded after

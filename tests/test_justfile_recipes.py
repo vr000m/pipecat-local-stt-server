@@ -17,7 +17,8 @@ Asserted contracts (dev plan Phases 1-3 + Acceptance Criteria):
 - ``stt-status``: bare backend -> ``--host/--port``; a path -> ``--socket-path``;
   longer probe timeout; stale ``STT_WS_*`` env is ignored.
 - ``stt-list`` reads host/port/socket/auth-token-file from RENDERED plists
-  (``_plist_endpoint``), probes TCP/socket/token-file agents, always exits 0.
+  (``_plist_field``, one keyed field per read), probes TCP/socket/token-file
+  agents, always exits 0.
 - ``stt-probe`` requires an explicit endpoint and forwards ``--json``.
 - ``stt-disable`` boots out AND keeps the plist; idempotent when not loaded.
 - ``stt-enable`` with no plist fails with an actionable message.
@@ -828,16 +829,49 @@ def test_stt_list_empty(tmp_path):
     assert not _uv_calls(argv_log)
 
 
+READ_PLIST = REPO_ROOT / "scripts" / "read_stt_plist.py"
+# Every field the reader serves, by name (scripts/read_stt_plist.py FIELDS).
+FIELDS = ("host", "port", "socket-path", "auth-token-file", "interpreter")
+
+
+def _read_plist(plist: Path, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-I", str(READ_PLIST), *extra, str(plist)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _read_field(plist: Path, name: str, *, strict: bool = False) -> subprocess.CompletedProcess:
+    return _read_plist(plist, *(["--strict"] if strict else []), "--field", name)
+
+
+def _read_fields(plist: Path, *, strict: bool = False) -> dict[str, subprocess.CompletedProcess]:
+    return {name: _read_field(plist, name, strict=strict) for name in FIELDS}
+
+
+def _fields(**kw: str) -> dict[str, str]:
+    """An expected field map: every field empty unless given (``socket_path=``
+    stands for ``socket-path``, and so on)."""
+    want = dict.fromkeys(FIELDS, "")
+    want.update({k.replace("_", "-"): v for k, v in kw.items()})
+    return want
+
+
 @pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
 @pytest.mark.parametrize(
     "kwargs,expected",
     [
-        ({"port": 9871}, ["127.0.0.1", "9871", "", ""]),
-        ({"socket": True}, ["", "", "SOCK", ""]),
-        ({"port": 9765, "token": True}, ["127.0.0.1", "9765", "", "TOKEN"]),
+        ({"port": 9871}, {"host": "127.0.0.1", "port": "9871"}),
+        ({"socket": True}, {"socket_path": "SOCK"}),
+        (
+            {"port": 9765, "token": True},
+            {"host": "127.0.0.1", "port": "9765", "auth_token_file": "TOKEN"},
+        ),
     ],
 )
-def test_plist_endpoint_helper_four_lines(tmp_path, kwargs, expected):
+def test_plist_field_helper_is_keyed(tmp_path, kwargs, expected):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
     sock = home / "s.sock"
@@ -849,12 +883,14 @@ def test_plist_endpoint_helper_four_lines(tmp_path, kwargs, expected):
         socket_path=sock if kwargs.get("socket") else None,
         auth_token_file=token if kwargs.get("token") else None,
     )
-    res = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
-    assert res.returncode == 0, res.stderr
-    lines = res.stdout.splitlines()
-    lines += [""] * (4 - len(lines))
-    want = [str(sock) if v == "SOCK" else str(token) if v == "TOKEN" else v for v in expected]
-    assert lines[:4] == want
+    subst = {"SOCK": str(sock), "TOKEN": str(token)}
+    want = _fields(interpreter=sys.executable, **{k: subst.get(v, v) for k, v in expected.items()})
+    got = {}
+    for name in FIELDS:
+        res = _run_just(["_plist_field", str(plist), name], home=home, stub_dir=stub_dir)
+        assert res.returncode == 0, res.stderr
+        got[name] = res.stdout
+    assert got == want
 
 
 @pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
@@ -866,9 +902,9 @@ def test_plist_endpoint_and_stt_list_keep_paths_with_spaces(tmp_path):
     sock = home / "Library" / "Caches" / "my pipecat" / "stt sock "
     token = home / "my config" / "token "
     plist = _render_plist(home, "pipecat.stt-server.spaced", port=9871, auth_token_file=token)
-    res = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
+    res = _run_just(["_plist_field", str(plist), "auth-token-file"], home=home, stub_dir=stub_dir)
     assert res.returncode == 0, res.stderr
-    assert res.stdout.splitlines()[:4] == ["127.0.0.1", "9871", "", str(token)]
+    assert res.stdout == str(token)
     # stt-list: token-file forwarded verbatim (trailing space preserved).
     res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
     assert res.returncode == 0, res.stderr
@@ -884,98 +920,150 @@ def test_plist_endpoint_and_stt_list_keep_paths_with_spaces(tmp_path):
     assert call.endswith(f"--socket-path {sock}"), repr(call)
 
 
-READ_PLIST = REPO_ROOT / "scripts" / "read_stt_plist.py"
-
-
-def _read_plist(plist: Path, *extra: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, "-I", str(READ_PLIST), *extra, str(plist)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-
-def _plist_shape(home: Path, case: str) -> tuple[Path, list[str]]:
-    """Render/write one plist shape; return it and the four expected lines."""
+def _plist_shape(home: Path, case: str) -> tuple[Path, dict[str, str]]:
+    """Render/write one plist shape; return it and its expected field map."""
     label = "pipecat.stt-server.x"
     plist = home / "Library" / "LaunchAgents" / f"{label}.plist"
+    py = sys.executable
     if case == "tcp":
         _render_plist(home, label, port=9871)
-        return plist, ["127.0.0.1", "9871", "", ""]
+        return plist, _fields(host="127.0.0.1", port="9871", interpreter=py)
     if case == "socket":
         _render_plist(home, label, socket_path=home / "s.sock")
-        return plist, ["", "", str(home / "s.sock"), ""]
+        return plist, _fields(socket_path=str(home / "s.sock"), interpreter=py)
     if case == "token":
         _render_plist(home, label, port=9765, auth_token_file=home / "tok")
-        return plist, ["127.0.0.1", "9765", "", str(home / "tok")]
+        return plist, _fields(
+            host="127.0.0.1", port="9765", auth_token_file=str(home / "tok"), interpreter=py
+        )
     if case == "spaces":
         sock = home / "my dir" / "s sock "
         _render_plist(home, label, socket_path=sock)
-        return plist, ["", "", str(sock), ""]
+        return plist, _fields(socket_path=str(sock), interpreter=py)
     args = {
         "quote-in-path": ["py", "--socket-path", '/h/a"b/s.sock'],
         "flag-like-value": ["py", "--log-level", "--socket-path", "/h/x.sock"],
+        # A hostile value holding a newline cannot become another field.
+        "newline-in-value": ["/p y\n", "--host", "127.0.0.1\nsocket-path=/evil", "--port", "9"],
         "no-args": [],
     }.get(case)
     if args is not None:
         plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": args}))
     want = {
-        "quote-in-path": ["", "", '/h/a"b/s.sock', ""],
+        "quote-in-path": _fields(socket_path='/h/a"b/s.sock', interpreter="py"),
         # --socket-path is the VALUE of --log-level here, so it is not a flag.
-        "flag-like-value": ["", "", "", ""],
-    }.get(case, ["", "", "", ""])
+        "flag-like-value": _fields(interpreter="py"),
+        "newline-in-value": _fields(
+            host="127.0.0.1\nsocket-path=/evil", port="9", interpreter="/p y\n"
+        ),
+    }.get(case, _fields())
     return plist, want
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["tcp", "socket", "token", "spaces", "quote-in-path", "flag-like-value", "absent", "no-args"],
-)
+_SHAPES = [
+    "tcp",
+    "socket",
+    "token",
+    "spaces",
+    "quote-in-path",
+    "flag-like-value",
+    "newline-in-value",
+    "absent",
+    "no-args",
+]
+
+
+@pytest.mark.parametrize("case", _SHAPES)
 def test_plist_reader_shapes(tmp_path, case):
     """The one reader of the renderer's ProgramArguments (justfile
-    ``_plist_endpoint`` and the installer both call it) gives host, port,
-    socket-path and auth-token-file for every plist shape."""
+    ``_plist_field`` and the installer both call it) gives every field, by name,
+    for every plist shape, in both the sweep and the --strict form."""
     home = _home_with_agents(tmp_path, [])
     plist, want = _plist_shape(home, case)
-    res = _read_plist(plist)
-    assert res.returncode == 0, res.stderr
-    assert res.stdout.split("\n")[:4] == want
-    # The justfile recipe is a pass-through to the same reader.
     stub_dir, _ = _make_stub_dir(tmp_path)
-    via_just = _run_just(["_plist_endpoint", str(plist)], home=home, stub_dir=stub_dir)
-    assert via_just.returncode == 0, via_just.stderr
-    assert via_just.stdout == res.stdout
+    for strict in (False, True):
+        got = _read_fields(plist, strict=strict)
+        assert all(r.returncode == 0 for r in got.values()), {k: r.stderr for k, r in got.items()}
+        assert {k: r.stdout for k, r in got.items()} == want, f"strict={strict}"
+    # The justfile recipe is a pass-through to the same reader, field by field.
+    for name in FIELDS:
+        via_just = _run_just(["_plist_field", str(plist), name], home=home, stub_dir=stub_dir)
+        assert via_just.returncode == 0, via_just.stderr
+        assert via_just.stdout == want[name], name
+
+
+def test_plist_reader_refuses_the_positional_forms(tmp_path):
+    """The four-line positional protocol is gone: a call without ``--field NAME``
+    (or with an unknown NAME) is a usage error, never a line-ordered dump."""
+    plist, _want = _plist_shape(_home_with_agents(tmp_path, []), "quote-in-path")
+    for extra in (
+        [],
+        ["--strict"],
+        ["--field"],
+        ["--field", "bogus"],
+        ["--strict", "--field", "x"],
+    ):
+        res = _read_plist(plist, *extra)
+        assert res.returncode == 2, (extra, res.stdout)
+        assert res.stdout == "", extra
+
+
+def test_consumers_read_the_plist_by_field_name():
+    """No consumer may split the reader's output by position: every call site in
+    the justfile and the installer names one field (``--field`` / ``_plist_field
+    PLIST NAME``), and none reads several lines from one call."""
+    installer = INSTALLER.read_text()
+    calls = [
+        ln for ln in installer.splitlines() if "$READ_PLIST_PY" in ln and "READ_PLIST_PY=" not in ln
+    ]
+    assert calls, "installer no longer calls the reader?"
+    for ln in calls:
+        assert "--field" in ln or "--has-auth" in ln, ln
+    just_calls = [ln for ln in JUSTFILE.read_text().splitlines() if "_plist_field" in ln]
+    for ln in just_calls:
+        if ln.lstrip().startswith("#") or ln.startswith("_plist_field"):
+            continue
+        assert re.search(
+            r'_plist_field "\$plist" (host|port|socket-path|auth-token-file|interpreter)\b', ln
+        ), ln
+    reader_line = next(
+        ln for ln in JUSTFILE.read_text().splitlines() if "read_stt_plist.py" in ln and "exec" in ln
+    )
+    assert "--field" in reader_line, reader_line
+    assert "_plist_endpoint" not in JUSTFILE.read_text() + installer
 
 
 def test_plist_reader_garbage_plist_is_empty_not_an_error(tmp_path):
     bad = tmp_path / "bad.plist"
     bad.write_text("not a plist")
-    res = _read_plist(bad)
-    assert res.returncode == 0
-    assert res.stdout == "\n\n\n\n"
+    for name, res in _read_fields(bad).items():
+        assert res.returncode == 0, name
+        assert res.stdout == "", name
     # Garbage is an error for the auth guard, never "no token" (exit 3).
     assert _read_plist(bad, "--has-auth").returncode == 2
 
 
-# Reader contract (scripts/read_stt_plist.py): the four-line form is a sweep and
-# exits 0 for every state, blank fields for an absent or malformed plist; the
+# Reader contract (scripts/read_stt_plist.py): the --field form is a sweep and
+# exits 0 for every state, an empty value for an absent or malformed plist; the
 # --has-auth form exits 0 (token), 3 (absent, or readable without a token) or 2
 # (malformed: it cannot tell). State space: absent, valid-no-auth,
 # valid-env-token, valid-token-file, truncated XML, garbage, wrong top-level
-# type, wrong ProgramArguments type, wrong EnvironmentVariables type, directory.
+# type, wrong ProgramArguments type, a non-string argument, wrong
+# EnvironmentVariables type, directory; x every field.
+_VALID = {"host": "127.0.0.1", "port": "9765", "interpreter": "py"}
 _READER_STATES = {
-    # state: (four-line output, --has-auth status)
-    "absent": (["", "", "", ""], 3),
-    "valid-no-auth": (["127.0.0.1", "9765", "", ""], 3),
-    "valid-env-token": (["127.0.0.1", "9765", "", ""], 0),
-    "valid-token-file": (["127.0.0.1", "9765", "", "/h/tok"], 0),
-    "truncated": (["", "", "", ""], 2),
-    "garbage": (["", "", "", ""], 2),
-    "wrong-type": (["", "", "", ""], 2),
-    "wrong-type-args": (["", "", "", ""], 2),
-    "wrong-type-env": (["", "", "", ""], 2),
-    "directory": (["", "", "", ""], 2),
+    # state: (fields, --has-auth status)
+    "absent": (_fields(), 3),
+    "valid-no-auth": (_fields(**_VALID), 3),
+    "valid-env-token": (_fields(**_VALID), 0),
+    "valid-token-file": (_fields(**_VALID, auth_token_file="/h/tok"), 0),
+    "truncated": (_fields(), 2),
+    "garbage": (_fields(), 2),
+    "wrong-type": (_fields(), 2),
+    "wrong-type-args": (_fields(), 2),
+    "wrong-type-arg-element": (_fields(), 2),
+    "wrong-type-env": (_fields(), 2),
+    "directory": (_fields(), 2),
 }
 
 
@@ -1003,6 +1091,9 @@ def _reader_state_plist(path: Path, state: str) -> Path:
         return path
     elif state == "wrong-type-args":
         full["ProgramArguments"] = "py --auth-token-file /h/tok"
+    elif state == "wrong-type-arg-element":
+        # launchd takes strings only; a dict has no interpreter path to report.
+        full["ProgramArguments"] = [{"py": 1}, "--auth-token-file", "/h/tok"]
     elif state == "wrong-type-env":
         full["EnvironmentVariables"] = ["PIPECAT_STT_AUTH_TOKEN=s3cret"]
     elif state == "directory":
@@ -1014,36 +1105,41 @@ def _reader_state_plist(path: Path, state: str) -> Path:
 
 @pytest.mark.parametrize("state", sorted(_READER_STATES))
 def test_plist_reader_state_space(tmp_path, state):
-    want_lines, want_auth = _READER_STATES[state]
+    want, want_auth = _READER_STATES[state]
     plist = _reader_state_plist(tmp_path / "a.plist", state)
-    res = _read_plist(plist)
-    assert res.returncode == 0, res.stderr
-    assert res.stdout.split("\n")[:4] == want_lines
-    assert "Traceback" not in res.stderr
+    got = _read_fields(plist)
+    for name, res in got.items():
+        assert res.returncode == 0, (name, res.stderr)
+        assert res.stdout == want[name], name
+        assert "Traceback" not in res.stderr
+        assert "s3cret" not in res.stderr, "token value leaked"
+        if want_auth == 2:
+            assert "cannot read plist" in res.stderr, name
     auth = _read_plist(plist, "--has-auth")
     assert auth.returncode == want_auth, auth.stderr
     assert "Traceback" not in auth.stderr
-    assert "s3cret" not in res.stderr + auth.stderr, "token value leaked"
+    assert "s3cret" not in auth.stderr, "token value leaked"
     if want_auth == 2:
-        assert "cannot read plist" in auth.stderr and "cannot read plist" in res.stderr
+        assert "cannot read plist" in auth.stderr
 
 
 @pytest.mark.parametrize("state", sorted(_READER_STATES))
 def test_plist_reader_strict_form_state_space(tmp_path, state):
-    """``--strict`` (the installer's form) gives the sweep's four lines for an
-    absent or readable plist, and exits 2 with no output for a malformed one,
-    so a malformed plist can never read as "no socket"."""
-    want_lines, want_auth = _READER_STATES[state]
+    """``--strict`` (the installer's and stt-enable's form) gives the sweep's
+    value for an absent or readable plist, and exits 2 with no output for a
+    malformed one, for every field, so a malformed plist can never read as "no
+    socket" (or "no interpreter")."""
+    want, want_auth = _READER_STATES[state]
     plist = _reader_state_plist(tmp_path / "a.plist", state)
-    res = _read_plist(plist, "--strict")
-    assert "Traceback" not in res.stderr and "s3cret" not in res.stderr
-    if want_auth == 2:
-        assert res.returncode == 2, res.stderr
-        assert res.stdout == ""
-        assert "cannot read plist" in res.stderr
-    else:
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.split("\n")[:4] == want_lines
+    for name, res in _read_fields(plist, strict=True).items():
+        assert "Traceback" not in res.stderr and "s3cret" not in res.stderr
+        if want_auth == 2:
+            assert res.returncode == 2, (name, res.stderr)
+            assert res.stdout == ""
+            assert "cannot read plist" in res.stderr
+        else:
+            assert res.returncode == 0, (name, res.stderr)
+            assert res.stdout == want[name], name
 
 
 # Reader <-> server flag grammar. Invariant: for every serve argv the server's
@@ -1112,9 +1208,12 @@ def test_plist_reader_matches_serve_parser(tmp_path, case):
     plist.write_bytes(
         plistlib.dumps({"Label": "x", "ProgramArguments": ["py", "-m", "stt_server", *tail]})
     )
-    res = _read_plist(plist)
-    assert res.returncode == 0, res.stderr
-    host, port, sock, token = res.stdout.split("\n")[:4]
+    got = _read_fields(plist)
+    assert all(r.returncode == 0 for r in got.values()), {k: r.stderr for k, r in got.items()}
+    host, port, sock, token = (
+        got[n].stdout for n in ("host", "port", "socket-path", "auth-token-file")
+    )
+    assert got["interpreter"].stdout == "py"
     assert host == (args.host or "")
     assert (int(port) if port else None) == args.port
     assert sock == (args.socket_path or "")
