@@ -428,7 +428,14 @@ wait_unloaded() {
 # tell. Mirrors stt_server.server.socket_lock_held (a shared, non-blocking flock
 # for an instant, so it conflicts with a server's exclusive lock but never makes
 # a real starter fail, as that retries 250 ms), in stdlib python3 so an
-# uninstall needs no venv.
+# uninstall needs no venv. It is deliberately stricter than socket_lock_held,
+# which answers "not held" for a file another user owns or one it cannot open
+# (start() reports those): here every error is 2, "cannot tell", and the caller
+# then leaves the socket and .lock alone (fails closed). The caller passes
+# "$sock.lock", the server's _lock_path rule. Both the name rule and the lock
+# conflict are pinned against the server's own _lock_path and
+# acquire_socket_lock by tests/test_install_migration.py
+# (test_socket_cleanup_respects_a_held_lock).
 lock_free() {
     python3 -I -c '
 import errno, fcntl, os, stat, sys

@@ -1967,18 +1967,22 @@ def test_token_file_acl_state_space(tmp_path: Path, case: str):
 def test_socket_cleanup_respects_a_held_lock(
     tmp_path: Path, held_sockets, lock_state: str, cmd: str
 ):
-    import fcntl
+    # The lock is taken the way a live server takes it (stt_server.server's
+    # acquire_socket_lock, at its _lock_path), not by a hand-rolled flock, so the
+    # installer's lock_free probe is pinned to the server's real lock: same file
+    # name rule ("$sock.lock") and a conflicting lock mode.
+    from stt_server.server import _lock_path, acquire_socket_lock
 
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"
     sock, lock = _seed_socket_files(home, held_sockets)
+    assert _lock_path(sock) == f"{sock}.lock" == str(lock), "installer's lock name rule"
     if lock_state == "absent":
         lock.unlink()
     _seed_plist(home, ["--socket-path", str(sock)])
     fd = None
     if lock_state == "held":
-        fd = os.open(lock, os.O_RDWR)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd = acquire_socket_lock(sock)
     try:
         r = _run_install(tmp_path, stub_dir, cmd=cmd)
     finally:
