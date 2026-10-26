@@ -1,6 +1,6 @@
 # Task: STT LaunchAgents on loopback TCP ports (TTS parity)
 
-**Status**: Not Started
+**Status**: In Progress
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: High
@@ -204,25 +204,25 @@ sequenceDiagram
 
 ### Test Approach
 
-- [ ] Renderer: TCP default and socket opt-in snapshots; exclusivity; empty-string semantics; loopback accept/reject set; kyutai allowed; invalid port; token-file path validation; env token refused
-- [ ] Installer: default TCP per backend (port read from the rendered plist); socket opt-in through the real installer; no socket dir in TCP mode; seeded socket plist triggers the note and cleanup; legacy `koda.*` migration unchanged; kyutai via `PIPECAT_STT_PYTHON`
-- [ ] Justfile (stubbed `uv`/`launchctl`): `_resolve` four fields; five callers; `stt-status` target resolution; `stt-list` against rendered TCP, socket and token-file plists; `stt-probe` requires an explicit endpoint; `_ensure-extra` kyutai arm logs `UV_PROJECT_ENVIRONMENT` and `--python 3.12`
-- [ ] Mirror test: operations.md port table equals `_resolve` and the installer default
-- [ ] Docs test: no-uid-check caveat and restart-loop note present
-- [ ] Guard: `test_branch_diff_does_not_touch_koda_surface` still passes
+- [x] Renderer: TCP default and socket opt-in snapshots; exclusivity; empty-string semantics; loopback accept/reject set; kyutai allowed; invalid port; token-file path validation; env token refused
+- [x] Installer: default TCP per backend (port read from the rendered plist); socket opt-in through the real installer; no socket dir in TCP mode; seeded socket plist triggers the note and cleanup; legacy `koda.*` migration unchanged; kyutai via `PIPECAT_STT_PYTHON`
+- [x] Justfile (stubbed `uv`/`launchctl`): `_resolve` four fields; five callers; `stt-status` target resolution; `stt-list` against rendered TCP, socket and token-file plists; `stt-probe` requires an explicit endpoint; `_ensure-extra` kyutai arm logs `UV_PROJECT_ENVIRONMENT` and `--python 3.12`
+- [x] Mirror test: operations.md port table equals `_resolve` and the installer default
+- [x] Docs test: no-uid-check caveat and restart-loop note present
+- [x] Guard: `test_branch_diff_does_not_touch_koda_surface` still passes
 
 ### Test Results
 
-- [ ] All existing tests pass, including the rewritten tilde-form test (no deselect)
-- [ ] New tests added and passing
-- [ ] Manual verification complete (Phase 5)
+- [x] All existing tests pass, including the rewritten tilde-form test (no deselect)
+- [x] New tests added and passing
+- [ ] Manual verification complete (Phase 5): agents reinstalled and decoding live; `stt-list`/`stt-status` verified by the user after migration; token-file auth, port-collision loop, socket rollback and login persistence not yet checked live
 
 ### Edge Cases Tested
 
-- [ ] Both `SOCKET_PATH` and `HOST`/`PORT` set
-- [ ] Empty-string `PIPECAT_STT_SOCKET`
-- [ ] Reinstall over an existing socket agent (note printed, socket and lock removed)
-- [ ] Kyutai install does not modify `.venv`; mlx install does not modify `.venv-kyutai`
+- [x] Both `SOCKET_PATH` and `HOST`/`PORT` set
+- [x] Empty-string `PIPECAT_STT_SOCKET`
+- [x] Reinstall over an existing socket agent (note printed, socket and lock removed)
+- [x] Kyutai install does not modify `.venv`; mlx install does not modify `.venv-kyutai`
 - [ ] Port already bound at kickstart: manual only (launchd-level; server-level `EADDRINUSE` is covered by `tests/test_supervised_cli.py`)
 
 ## Acceptance Criteria
@@ -239,10 +239,10 @@ sequenceDiagram
 
 1. Parakeet 9765 and Nemotron 9865 are proposals. Agree them with the menu bar app side before release.
 2. Koda and onoats: how do they invoke the installer? A bare `just stt-install` flips their agent to TCP. Check before merge, or ship their config change first.
-3. onoats' config loader: does it take host and port? Unverified; blocks the onoats lines in `docs/migration.md`.
-4. Does `moshi_mlx` load as an agent under `stt_server` from `.venv-kyutai`? Verified only to resolve; Phase 5 decides, with "experimental" as the fallback.
+3. ~~onoats' config loader~~ RESOLVED 2026-10-26: verified against onoats-bot `1a7b8c7` (see Findings); it reads `STT_WS_HOST`/`STT_WS_PORT`, and a leftover `ws_socket` outranks them.
+4. ~~Does `moshi_mlx` load as an agent from `.venv-kyutai`?~~ RESOLVED 2026-10-26: it loads and decodes live; no "experimental" fallback needed.
 
-<!-- reviewed: 2026-10-26 @ d034778002cd36e25a6affd86027dd555c657c51 -->
+<!-- reviewed: 2026-10-26 @ 806e7fcf835d25e85e9d75f6e640ccf0c52fe2a6 -->
 
 ## Progress
 
@@ -255,6 +255,7 @@ sequenceDiagram
 ## Findings
 
 - (append findings here as work proceeds)
+- 2026-10-26: the user ran `just stt-list`, `just stt-status` (no argument) and `just stt-status kyutai` after reinstalling all three agents: TCP endpoints 9565/9865/9665 with live backends mlx/nemotron/kyutai; the no-argument form behaves as `stt-list`.
 - Phase 1 reviewer (advisory, Minor, unfixed): (a) `scripts/render_stt_plist.py` module docstring (lines ~11-13) still describes env tokens via `env_first`; reword. (b) `_require` uses `re.match` with `$`, which accepts a trailing newline (AUTH_TOKEN_FILE/SOCKET_PATH/PYTHON); use `fullmatch` and add a trailing-newline test case.
 - Phase 2 reviewer (advisory, Minor, unfixed): (a) `remove_socket_owned` (`scripts/install_stt_agent.sh` ~149-160) deletes whatever `--socket-path` the installed plist names after only an owner check; add `-S` / regular-file / no-symlink checks and validate_socket_path's lexical rules (warn and skip). (b) Socket mode silently drops `PIPECAT_STT_AUTH_TOKEN_FILE`/`HOST`/`PORT`; warn on stderr. (c) `test_env_auth_token_never_reaches_plist` should also assert the secret is absent from stderr. (d) No test for ambient `SOCKET_PATH`/`HOST`/`PORT`/`AUTH_TOKEN_FILE` leaking into the renderer.
 - Phase 3 reviewer (advisory, all Minor, unfixed): (a) `_ensure-extra` shared arm does not clear an inherited `UV_PROJECT_ENVIRONMENT` (pin it or `env -u`; test with ambient value). (b) Mirror test uses a hard-coded `BACKENDS` tuple; derive it from `_resolve` and assert equality with the docs rows. (c) `test_port_table_matches_installer_default` skips without `.venv/bin/python` though it uses a `sys.executable` wrapper; drop the skipif. (d) `_venv_overrides` `forced=False` escape hatch silently weakens the shared-venv test; assert exactly one main-venv variable. (e) `stt-list` uses `read -r` without `IFS=`; paths with edge whitespace; add a spaces test. (f) `stt-install`/`stt-uninstall` always overwrite caller `PIPECAT_STT_HOST`/`PORT` with the `_resolve` values (matches the plan; docs must say custom ports need the installer script directly, or honour `${PIPECAT_STT_PORT:-$port}`). (g) Stale wording: `docs/operations.md` intro (lines ~9-11, 'separate socket'), `stt-probe` comment uses TTS port 8765 and 'canonical-socket recipes', `README.md:44` still says kyutai 'is not wired into' the tooling (Phase 4). (h) `stt-status` `-S` branch resolves bare socket names against the repo root.

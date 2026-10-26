@@ -72,7 +72,9 @@ uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 
 # Loopback TCP with auth (recommended for anything non-experimental — use
 # --auth-token-file or PIPECAT_STT_AUTH_TOKEN env; legacy KODA_STT_AUTH_TOKEN
-# still honoured; --auth-token on argv is visible via `ps` and marked DEPRECATED)
+# still honoured; --auth-token on argv is visible via `ps` and marked DEPRECATED).
+# The LaunchAgent installer and renderer refuse both env tokens: use
+# PIPECAT_STT_AUTH_TOKEN_FILE there.
 uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
 ```
 

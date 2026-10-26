@@ -19,6 +19,8 @@
 #                       backend has none and requires an explicit port)
 #   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused.
+#   PIPECAT_STT_UNLOAD_WAIT  seconds to wait for launchd to finish tearing the old job
+#                       down before bootstrap (default 30)
 #   PIPECAT_STT_PYTHON  interpreter (default: .venv/bin/python, or
 #                       .venv-kyutai/bin/python for the kyutai backend)
 #   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai (default: mlx)

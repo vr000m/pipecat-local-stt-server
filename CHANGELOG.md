@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reinstalling over a socket agent no longer risks deleting the wrong file.** The installer removes the old socket and `.lock` only when the installed plist names an absolute path under `$HOME` without `..`, the socket is a real socket (not a symlink), and the lock is a regular file (not a symlink), owner-checked; anything else is left in place with a warning. The renderer's validators use `fullmatch`, so a trailing newline is rejected.
 - **Reinstalling a running agent could leave it unloaded** (`Bootstrap failed: 5:
   Input/output error`). `launchctl bootout` returns before launchd has finished
   tearing the old job down (a loaded ASR model takes seconds to exit), and the
