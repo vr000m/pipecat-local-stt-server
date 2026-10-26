@@ -43,8 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installed plist, falling back to the backend's canonical host and port only
   when no plist exists; a path is probed as `--socket-path`. `just stt-list`
   reads each agent's live endpoint from its plist.
-- `stt-install`/`stt-uninstall` always use the canonical host and port; use the
-  installer script directly for a custom one.
+- `stt-install`/`stt-uninstall` always use the canonical host and port for a TCP
+  agent; use the installer script directly for a custom one. With
+  `PIPECAT_STT_SOCKET` set they pass no host/port, so the socket rollback no
+  longer warns about ignored TCP settings.
+- **The installer refuses to drop auth on reinstall.** If the installed plist
+  carries a token (a pre-0.5.0 `PIPECAT_STT_AUTH_TOKEN`/`KODA_STT_AUTH_TOKEN` in
+  `EnvironmentVariables`, or `--auth-token-file`) and a TCP install sets no
+  `PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails instead of leaving an
+  unauthenticated listener. Set the token file, or `uninstall` first to install
+  without one.
+- **`PIPECAT_STT_AUTH_TOKEN_FILE` is validated** in TCP mode: a regular file, not a
+  symlink, owned by you, no group/other permission bits, and non-empty (an empty
+  file would silently disable auth).
+- `PIPECAT_STT_UNLOAD_WAIT` must be a non-negative integer; anything else fails
+  before any `launchctl` call. `PIPECAT_STT_BACKEND` is checked against the
+  renderer's backend names before any directory is created (`whisper` is the
+  justfile name; the installer name is `mlx`).
 
 ### Removed
 
@@ -54,7 +69,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Reinstalling over a socket agent no longer risks deleting the wrong file.** The installer removes the old socket and `.lock` only when the installed plist names an absolute path under `$HOME` without `..`, the socket is a real socket (not a symlink), and the lock is a regular file (not a symlink), owner-checked; anything else is left in place with a warning. The renderer's validators use `fullmatch`, so a trailing newline is rejected.
+- **Old socket cleanup waits for the old server.** The installer removes the old
+  socket and `.lock` only after the new agent bootstrapped and launchd no longer
+  lists the old job; `uninstall` waits for the job to unload first. A server holds
+  its `.lock` until it exits, so unlinking it during the asynchronous `bootout`
+  teardown could let a second server own the same socket. A failed bootstrap now
+  leaves the old socket and `.lock` in place. A reinstall from one socket path to
+  another also retires the old socket (it was orphaned before).
+- `just stt-status` (no argument) forwards a `la_dir=` override to `stt-list`, and
+  `stt-install`/`stt-enable` forward `venv=`/`kyutai_venv=` to `_ensure-extra`.
+- **Reinstalling over a socket agent no longer risks deleting the wrong file.** The installer removes the old socket and `.lock` only when the installed plist names an absolute path under `$HOME` without `..` or a symlinked directory component, the socket is a real socket (not a symlink), and the lock is a regular file (not a symlink), owner-checked; anything else is left in place with a warning. The renderer's validators use `fullmatch`, so a trailing newline is rejected.
 - **Reinstalling a running agent could leave it unloaded** (`Bootstrap failed: 5:
   Input/output error`). `launchctl bootout` returns before launchd has finished
   tearing the old job down (a loaded ASR model takes seconds to exit), and the

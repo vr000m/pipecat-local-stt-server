@@ -86,6 +86,16 @@ PIPECAT_STT_AUTH_TOKEN_FILE=$HOME/.config/pipecat-stt-token \
   PIPECAT_STT_BACKEND=mlx scripts/install_stt_agent.sh install
 ```
 
+In TCP mode the installer checks the file before writing the plist: a regular
+file (not a symlink), owned by you, with no group/other permission bits, and
+non-empty. Anything else fails the install, since an empty file disables auth and a
+missing one crash-loops the agent.
+
+A reinstall never silently drops auth: if the installed plist carries a token (a
+pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
+`PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails. Set the token file, or run
+`uninstall` first to install without a token.
+
 The plist then passes `--auth-token-file <path>` to the server. `just
 stt-install` forwards the caller's environment, so exporting
 `PIPECAT_STT_AUTH_TOKEN_FILE` before the recipe has the same effect. Clients
@@ -103,7 +113,11 @@ PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/stt.sock" just stt-install 
 Socket mode keeps the directory validation, `0700` socket directory, peer-uid
 check and lock file described below. It ignores `PIPECAT_STT_HOST`, `PORT` and
 `AUTH_TOKEN_FILE` (the installer warns on stderr). Reinstalling a previously-socket agent
-without `PIPECAT_STT_SOCKET` switches it to TCP and removes the old socket.
+without `PIPECAT_STT_SOCKET` switches it to TCP and removes the old socket; a
+reinstall onto a different socket path removes the old one too. The old socket
+and `.lock` are removed only after the new agent bootstrapped and launchd no longer
+lists the old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30); otherwise
+they are left in place with a warning. `uninstall` waits the same way.
 
 ### Single-server lock file
 
