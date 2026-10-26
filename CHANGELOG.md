@@ -74,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delete_child`, `writesecurity`, ...) on a directory of its resolved path, fails
   the install; deny entries pass. A sticky directory is detected from the numeric
   mode, so mode 1770 (`drwxrwx--T`) counts as sticky, like `t`.
+- `uninstall` waits for launchd to drop the job for a TCP agent too, and prints
+  `uninstalled: <label>` only once it is gone; a job still loaded after
+  `PIPECAT_STT_UNLOAD_WAIT` gets a warning and `uninstall incomplete (still
+  loaded)` instead (exit status unchanged, 0).
 - Socket cleanup on a transport change or `uninstall` leaves the socket and its
   `.lock` in place, with a warning, while any process holds the lock (a server
   started by hand can own the recorded path).

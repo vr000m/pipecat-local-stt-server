@@ -139,7 +139,10 @@ reinstall onto a different socket path removes the old one too. The old socket
 and `.lock` are removed only after the new agent bootstrapped and launchd no longer
 lists the old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30), and only
 while no process holds the `.lock` (a server started by hand can own the path);
-otherwise they are left in place with a warning. `uninstall` waits the same way.
+otherwise they are left in place with a warning. `uninstall` waits the same way,
+for a TCP agent too (its server can own the port until it exits): it prints
+`uninstalled: <label>` only once launchd no longer lists the job, and otherwise a
+warning and `uninstall incomplete (still loaded): <label>` (exit 0 either way).
 
 ### Single-server lock file
 

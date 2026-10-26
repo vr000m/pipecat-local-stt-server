@@ -1347,6 +1347,44 @@ def test_socket_lock_unlinked_only_after_old_job_gone(
         assert sock.exists() and lock.exists(), f"{mode}: old socket/.lock removed too early"
 
 
+# Uninstall reports what launchd says, for every transport. Invariant: "uninstalled"
+# is printed only once launchd no longer lists the job (a TCP agent's server can
+# own its port until then); still loaded at the cap is a warning and an
+# "uninstall incomplete" line, exit 0. State space: installed transport {tcp,
+# socket} x old job {gone, still loaded}.
+@pytest.mark.parametrize("still_loaded", [False, True])
+@pytest.mark.parametrize("transport", ["tcp", "socket"])
+def test_uninstall_waits_for_unload_on_every_transport(
+    tmp_path: Path, held_sockets, transport: str, still_loaded: bool
+):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    argv_log = _slow_teardown_launchctl(
+        stub_dir, tmp_path, still_loaded_polls=10_000 if still_loaded else 0, bootstrap_failures=0
+    )
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    if transport == "tcp":
+        _seed_plist(home, ["--host", "127.0.0.1", "--port", "9565"])
+    else:
+        _seed_plist(home, ["--socket-path", str(sock)])
+    r = _run_install(
+        tmp_path, stub_dir, cmd="uninstall", env_overrides={"PIPECAT_STT_UNLOAD_WAIT": "0"}
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert not (_agents(home) / f"{NEW_LABEL}.plist").exists()
+    lc = _lc_lines(argv_log)
+    out = lc.index(f"launchctl bootout gui/{FAKE_UID}/{NEW_LABEL}")
+    assert f"launchctl print gui/{FAKE_UID}/{NEW_LABEL}" in lc[out:], "uninstall must wait"
+    if still_loaded:
+        assert "uninstalled:" not in r.stdout
+        assert "uninstall incomplete" in r.stdout and "still loaded" in r.stderr
+        assert sock.exists() and lock.exists()
+    else:
+        assert f"uninstalled: {NEW_LABEL}" in r.stdout
+        assert "incomplete" not in r.stdout + r.stderr
+        assert sock.exists() == (transport == "tcp")
+
+
 def test_socket_a_to_socket_b_reinstall_notes_change(tmp_path: Path, held_sockets):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = tmp_path / "home"

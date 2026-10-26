@@ -755,18 +755,25 @@ uninstall)
     else
         old_socket="$(installed_arg --socket-path)"
     fi
+    # bootout fails when the job is not loaded, which is fine; whether it worked
+    # is judged by launchd no longer listing the job, below.
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
     rm -f "$PLIST_DST"
-    if [[ -n "$old_socket" ]]; then
-        # bootout is asynchronous: the server holds <socket>.lock until it exits,
-        # so remove the socket and lock only once launchd no longer lists the job.
-        if wait_unloaded; then
-            remove_socket_owned "$old_socket"
-        else
+    # bootout is asynchronous, for a TCP agent too: until the job is gone its
+    # server can still own its port (or hold <socket>.lock). So every uninstall
+    # waits, and the socket and lock go only once launchd no longer lists the job.
+    # Still loaded at the cap: say so instead of claiming a clean uninstall (the
+    # exit status stays 0, as before).
+    if wait_unloaded; then
+        [[ -n "$old_socket" ]] && remove_socket_owned "$old_socket"
+        echo "uninstalled: $LABEL"
+    else
+        if [[ -n "$old_socket" ]]; then
             echo "warning: $LABEL may still hold $old_socket.lock; leaving $old_socket and its .lock" >&2
         fi
+        echo "warning: $LABEL is still loaded, so its endpoint may still be in use; its plist is removed but the uninstall is incomplete. Check 'launchctl print gui/$(id -u)/$LABEL' and re-run uninstall" >&2
+        echo "uninstall incomplete (still loaded): $LABEL"
     fi
-    echo "uninstalled: $LABEL"
     ;;
 start)
     # Ensure running. ``launchctl kickstart`` without ``-k`` is a no-op when
