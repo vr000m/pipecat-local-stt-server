@@ -112,6 +112,29 @@ stt-status backend:
     { read -r label; read -r sock; read -r bk; } <<<"$resolved"
     exec uv run python -m stt_server status --socket-path "$sock"
 
+# Wire status probe for any endpoint: a server a supervising app started (TCP,
+# no plist, so the canonical-socket recipes above cannot see it) or any socket.
+# Flags go straight to `stt_server status`, so the endpoint rules live in one
+# place: `just stt-probe --host 127.0.0.1 --port 8765 [--auth-token-file F]`,
+# `just stt-probe --socket-path PATH`, `just stt-probe --uri ws://...`; add
+# `--json` for machine-readable output. An explicit endpoint is required, so a
+# stray STT_WS_* env var can never decide which server is probed.
+[positional-arguments]
+stt-probe *args:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    explicit=0
+    for a in "$@"; do
+      case "$a" in
+        --socket-path|--socket-path=*|--host|--host=*|--port|--port=*|--uri|--uri=*) explicit=1 ;;
+      esac
+    done
+    if [[ "$explicit" -eq 0 ]]; then
+      echo "stt-probe: pass an endpoint: --socket-path PATH, --host H --port N, or --uri URI" >&2
+      exit 2
+    fi
+    exec uv run python -m stt_server status "$@"
+
 # Stop an agent until next login (launchctl bootout; plist kept). Idempotent.
 stt-disable backend:
     #!/usr/bin/env bash
