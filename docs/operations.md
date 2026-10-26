@@ -91,12 +91,15 @@ PIPECAT_STT_AUTH_TOKEN_FILE=$HOME/.config/pipecat-stt/token \
 In TCP mode the installer checks the file before writing the plist: a regular
 file (not a symlink), owned by you, with no group/other permission bits, in a
 directory chain (symlinks resolved) that only you or root own and that no one else
-can write to. The content must be what the server accepts: it reads the file as
+can write to. A group-writable directory passes only when root owns it and its
+group is `wheel` or `admin` (whose members can act as root anyway), or it is
+sticky. The plist records the resolved path, the one that was checked, so a
+symlinked directory in the path you gave cannot be repointed later. The content must be what the server accepts: it reads the file as
 UTF-8 and strips surrounding whitespace, and the result must be one token of
 visible ASCII characters with no internal whitespace. An empty file would disable
 auth, and a token with a newline, a space or a non-ASCII character can never match
 an `Authorization` header, so both fail the install (the installer calls the
-server's own `stt_server.env.read_token_file`, so the rules cannot drift). `serve`
+server's own `stt_server.auth.read_token_file`, so the rules cannot drift). `serve`
 applies the same check at startup and exits rather than run unauthenticated; a
 missing file crash-loops the agent, so the installer refuses that too. The probe
 (`status`) stays lenient for a client-side token file.
@@ -104,7 +107,10 @@ missing file crash-loops the agent, so the installer refuses that too. The probe
 A reinstall never silently drops auth: if the installed plist carries a token (a
 pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
 `PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails. Set the token file, or run
-`uninstall` first to install without a token.
+`uninstall` first to install without a token. An installed plist the installer
+cannot read (malformed, truncated, or `python3` missing) also fails the install,
+since it cannot tell whether that agent required a token; `uninstall` still
+removes such an agent but leaves any socket in place, with a warning.
 
 The plist then passes `--auth-token-file <path>` to the server. `just
 stt-install` forwards the caller's environment, so exporting
@@ -126,8 +132,9 @@ check and lock file described below. It ignores `PIPECAT_STT_HOST`, `PORT` and
 without `PIPECAT_STT_SOCKET` switches it to TCP and removes the old socket; a
 reinstall onto a different socket path removes the old one too. The old socket
 and `.lock` are removed only after the new agent bootstrapped and launchd no longer
-lists the old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30); otherwise
-they are left in place with a warning. `uninstall` waits the same way.
+lists the old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30), and only
+while no process holds the `.lock` (a server started by hand can own the path);
+otherwise they are left in place with a warning. `uninstall` waits the same way.
 
 ### Single-server lock file
 
@@ -146,9 +153,14 @@ live server whose listen backlog is full is never mistaken for a stale socket.
 - The kernel releases the lock when the server process exits for any reason
   (including `SIGKILL` and the immediate exit on a stop during startup), so it
   cannot go stale.
-- It is never unlinked: deleting it while a server runs, or between two
+- The server never unlinks it: deleting it while a server runs, or between two
   starters, would let two servers own one socket. Leaving it behind is
-  harmless. Clients never open it.
+  harmless. Clients never open it. The installer is the one exception: on a
+  transport change and on `uninstall` of a socket agent it removes the socket
+  and its `.lock`, but only once launchd no longer lists the old job and no
+  process holds the lock. A held lock (or one it cannot check) leaves both in
+  place, with a warning. A server started in the same instant as that check is
+  not covered.
 - `serve --supervised` checks it before binding (a held lock is reported as
   `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
   a contended lock for 250 ms, so the check never makes a real start fail. It

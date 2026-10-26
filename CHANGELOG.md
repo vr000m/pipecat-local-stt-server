@@ -58,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer prune an agent's backend extras.
 - The installer and the justfile read an installed plist through one helper,
   `scripts/read_stt_plist.py` (stdlib `plistlib`), instead of two `plutil` loops.
+  A plist it cannot read (truncated, garbage, wrong shape) or a failed reader
+  (`python3` missing) now fails an install instead of counting as "no auth", and
+  makes `uninstall` leave any socket in place; `stt-list` shows blank fields and a
+  one-line warning for it instead of a traceback.
+- Socket cleanup on a transport change or `uninstall` leaves the socket and its
+  `.lock` in place, with a warning, while any process holds the lock (a server
+  started by hand can own the recorded path).
 - The installer's token-file check refuses a path outside the plist allowlist
   before it creates any directory.
 - **Loopback TCP without a token logs INFO, not a warning.** That is the default
@@ -68,9 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-UTF-8 file now stops the server at startup instead of silently running
   without auth (an empty token disabled it) or never matching any client. The
   probe (`status`) stays lenient. The installer runs the same check
-  (`stt_server.env.read_token_file`) before writing the plist, and now also
+  (`stt_server.auth.read_token_file`) before writing the plist, and now also
   requires the token file's parent directories (symlinks resolved) to belong to
-  you or root and not be writable by others.
+  you or root and not be writable by others (group write only on a root-owned
+  directory of group `wheel` or `admin`, or a sticky one). The plist records the
+  resolved path, the one that was checked.
 - **The installer refuses to drop auth on reinstall.** If the installed plist
   carries a token (a pre-0.5.0 `PIPECAT_STT_AUTH_TOKEN`/`KODA_STT_AUTH_TOKEN` in
   `EnvironmentVariables`, or `--auth-token-file`) and a TCP install sets no

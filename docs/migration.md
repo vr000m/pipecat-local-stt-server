@@ -55,21 +55,26 @@ for the wire protocol, the import name or the Python client.
 1. **Check downstream installer invocations first.** A reinstall without
    `PIPECAT_STT_SOCKET` flips that agent to TCP and removes its old socket (once the old job has unloaded; see step 2), so
    check how any consumer (Koda, onoats) invokes the installer before
-   upgrading; this repo does not know their commands.
+   upgrading. onoats never runs it (it only runs `launchctl kickstart` when
+   `[stt].launchd_label` is set); Koda's wrapper does (below).
    - **Breaking for Koda:** `./koda stt install` shells into
      `scripts/install_stt_agent.sh` (per [integration](integration.md#reference-consumer-koda)).
      After a 0.5.0 checkout, running it creates a TCP agent and removes the old
      socket unless the wrapper sets `PIPECAT_STT_SOCKET`/`KODA_STT_SOCKET`. Koda's
      client falls back to its socket default, which then no longer exists. Either
      set the socket env on the wrapper, or point Koda's client at
-     `STT_WS_HOST`/`STT_WS_PORT`. Whether the wrapper sets either variable is
-     unverified: the wrapper is not in this repo.
+     `STT_WS_HOST`/`STT_WS_PORT`. The wrapper (checked against `koda` in the
+     consumer repo, 2026-10-26; see [integration](integration.md#reference-consumer-koda))
+     exports neither `PIPECAT_STT_SOCKET` nor `KODA_STT_SOCKET`, so a bare
+     `./koda stt install` flips to TCP. It does export `STT_WS_DEFAULT_SOCKET`
+     (the old `stt.sock`), and an `STT_WS_SOCKET` line in Koda's `.env` outranks
+     `STT_WS_HOST`/`PORT`, so remove or replace that line after a TCP reinstall.
 
 2. **Reinstall the agent.** `just stt-install <backend>` writes the TCP plist,
    removes the old socket (and its lock) it was replacing, and prints a note.
    The socket is removed only once the old job is seen unloaded (up to
-   `PIPECAT_STT_UNLOAD_WAIT` seconds); otherwise a warning is printed and the
-   socket and lock are left in place. For a TCP agent the recipe uses the
+   `PIPECAT_STT_UNLOAD_WAIT` seconds) and no process holds its lock; otherwise
+   a warning is printed and the socket and lock are left in place. For a TCP agent the recipe uses the
    canonical host and port; for a custom one run the
    installer directly, with the label and backend set so it does not replace the
    default whisper agent, e.g. `PIPECAT_STT_LABEL=pipecat.stt-server.alt
