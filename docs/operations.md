@@ -113,7 +113,8 @@ A reinstall never silently drops auth: if the installed plist carries a token (a
 pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
 `PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails. Set the token file, or run
 `uninstall` first to install without a token. An installed plist the installer
-cannot read (malformed, truncated, or `python3` missing) also fails the install,
+cannot read (malformed, truncated, or the reader's interpreter missing: `install`
+runs it under the venv python, `uninstall` under the system `python3`) also fails the install,
 since it cannot tell whether that agent required a token; `uninstall` still
 removes such an agent but leaves any socket in place, with a warning.
 

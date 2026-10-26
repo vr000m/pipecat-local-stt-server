@@ -1667,6 +1667,34 @@ def test_installer_backend_allowlist_equals_renderer(tmp_path: Path, backend: st
 _PLIST_MALFORMED = ("truncated", "garbage", "wrong-type", "reader-crash")
 
 
+def _reader_python(stub_dir: Path, *, has_auth: str = "", sweep: str = "") -> Path:
+    """An interpreter (stub_dir/readerpy) that runs the real venv python, except
+    that a scripts/read_stt_plist.py call runs the given bash instead: ``has_auth``
+    for ``--has-auth``, ``sweep`` for the four-line forms (``--strict`` or not),
+    ``$STRICT`` set to 1 for ``--strict``. Empty means "run the real reader".
+    install runs the reader under $PYTHON, so tests pass this as
+    PIPECAT_STT_PYTHON."""
+    py = stub_dir / "readerpy"
+    _write_executable(
+        py,
+        f"""#!/usr/bin/env bash
+for a in "$@"; do
+    if [[ "$a" == */read_stt_plist.py ]]; then
+        STRICT=0
+        case " $* " in *" --strict "*) STRICT=1 ;; esac
+        case " $* " in
+        *" --has-auth "*) {has_auth or ":"} ;;
+        *) {sweep or ":"} ;;
+        esac
+        break
+    fi
+done
+exec "{VENV_PYTHON}" "$@"
+""",
+    )
+    return py
+
+
 def _seed_plist_state(home: Path, stub_dir: Path, state: str, sock: Path, tok: Path) -> Path:
     path = _agents(home) / f"{NEW_LABEL}.plist"
     _agents(home).mkdir(parents=True, exist_ok=True)
@@ -1677,8 +1705,10 @@ def _seed_plist_state(home: Path, stub_dir: Path, state: str, sock: Path, tok: P
         _seed_plist_with_auth(home, auth, tok)
         if state == "reader-crash":
             # The reader dies the way a traceback (or a broken python3 shim) does:
-            # exit 1, which must never read as "no token".
+            # exit 1, which must never read as "no token". uninstall runs it under
+            # python3; install under $PYTHON (see _reader_python).
             _write_executable(stub_dir / "python3", "#!/usr/bin/env bash\nexit 1\n")
+            _reader_python(stub_dir, has_auth="exit 1", sweep="exit 1")
         return path
     full = plistlib.dumps(
         {
@@ -1718,7 +1748,8 @@ def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, c
     sock, lock = _seed_socket_files(home, held_sockets)
     plist = _seed_plist_state(home, stub_dir, state, sock, _good_token_file(tmp_path))
     before = plist.read_bytes() if plist.exists() else None
-    r = _run_install(tmp_path, stub_dir, cmd=cmd)
+    env = {"PIPECAT_STT_PYTHON": str(stub_dir / "readerpy")} if state == "reader-crash" else {}
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides=env)
     out = r.stdout + r.stderr
     assert SECRET not in out, "token value leaked"
     malformed = state in _PLIST_MALFORMED
@@ -1743,6 +1774,52 @@ def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, c
             assert sock.exists() and lock.exists(), "no trusted socket path: leave files alone"
     if state != "reader-crash":
         assert "Traceback" not in out
+
+
+# The two reads of the installed plist (--has-auth, then the endpoint lines) are
+# separate, so the plist can turn malformed between them. Invariant: whichever
+# read fails, a plist the installer cannot read is never taken as "no socket":
+# install aborts with the plist untouched and no launchctl call; uninstall warns
+# and leaves the socket. The second read is made to see a malformed plist (the
+# sweep answers blank lines and exit 0, --strict exits 2) after --has-auth read
+# it cleanly.
+@pytest.mark.parametrize("cmd", ["install", "uninstall"])
+def test_endpoint_read_alone_refuses_a_malformed_plist(tmp_path: Path, held_sockets, cmd: str):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock)])
+    plist = _agents(home) / f"{NEW_LABEL}.plist"
+    before = plist.read_bytes()
+    malformed_now = (
+        'if [[ "$STRICT" == 1 ]]; then echo "error: cannot read plist" >&2; exit 2; fi; '
+        "printf '\\n\\n\\n\\n'; exit 0"
+    )
+    py = _reader_python(stub_dir, sweep=malformed_now)
+    shutil.copy(py, stub_dir / "python3")
+    r = _run_install(tmp_path, stub_dir, cmd=cmd, env_overrides={"PIPECAT_STT_PYTHON": str(py)})
+    if cmd == "install":
+        assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "cannot read the installed plist" in r.stderr
+        assert plist.read_bytes() == before
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+    else:
+        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "without socket cleanup" in r.stderr
+        assert not plist.exists()
+    assert sock.exists() and lock.exists(), "an unreadable plist names no socket to remove"
+
+
+def test_install_reads_the_plist_under_its_own_python(tmp_path: Path):
+    """install already requires $PYTHON, so it needs no system python3 for the
+    reader; uninstall keeps python3 (no venv needed)."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    _seed_plist(home, ["--host", "127.0.0.1", "--port", "9565"])
+    _write_executable(stub_dir / "python3", "#!/usr/bin/env bash\nexit 127\n")
+    r = _run_install(tmp_path, stub_dir)
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "--port" in _rendered(home)["ProgramArguments"]
 
 
 # ---------------------------------------------------------------------------

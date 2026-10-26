@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The installer and the justfile read an installed plist through one helper,
   `scripts/read_stt_plist.py` (stdlib `plistlib`), instead of two `plutil` loops.
   A plist it cannot read (truncated, garbage, wrong shape) or a failed reader
-  (`python3` missing) now fails an install instead of counting as "no auth", and
+  (its interpreter missing) now fails an install instead of counting as "no auth", and
   makes `uninstall` leave any socket in place; `stt-list` shows blank fields and a
   one-line warning for it instead of a traceback.
 - **`serve` takes each flag by its full name only** (argparse `allow_abbrev=False`):
@@ -74,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delete_child`, `writesecurity`, ...) on a directory of its resolved path, fails
   the install; deny entries pass. A sticky directory is detected from the numeric
   mode, so mode 1770 (`drwxrwx--T`) counts as sticky, like `t`.
+- `install` runs the plist reader under its venv python (it needs no system
+  `python3`); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
+  --strict`) fails on a malformed plist by itself, so it no longer relies on the
+  `--has-auth` read having run first.
 - `uninstall` waits for launchd to drop the job for a TCP agent too, and prints
   `uninstalled: <label>` only once it is gone; a job still loaded after
   `PIPECAT_STT_UNLOAD_WAIT` gets a warning and `uninstall incomplete (still

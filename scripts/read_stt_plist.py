@@ -3,6 +3,7 @@
 
 Usage:
     read_stt_plist.py PLIST             # four lines: host, port, socket-path, auth-token-file
+    read_stt_plist.py --strict PLIST    # the same four lines; exit 2 (no output) if malformed
     read_stt_plist.py --has-auth PLIST  # exit 0: requires a token; 3: no token; else: error
 
 A plist is in one of three states:
@@ -16,11 +17,14 @@ A plist is in one of three states:
 The four-line form is a sweep: it exits 0 in all three states, printing empty
 lines for an absent or malformed plist (a malformed one also gets a one-line
 warning on stderr, never a traceback), so callers can loop over many plists.
+``--strict`` is the same read for one plist whose answer matters (the
+installer): a malformed plist exits 2 with an error and prints nothing, so it can
+never read as "no socket".
 ``--has-auth`` must not guess: exit 0 means the agent requires a token, 3 means
 the plist is absent or readable without a token, and 2 means it could not tell
 (a malformed plist, a usage error, or an unexpected crash). "No token" is 3, not
 1, because 1 is what a Python traceback or a broken interpreter shim exits with;
-the installer treats every status but 0 and 3 (python3 missing is 127) as an
+the installer treats every status but 0 and 3 (an interpreter missing is 127) as an
 error, never as "no auth".
 
 ProgramArguments is read with the server's own serve grammar (stt_server's
@@ -110,6 +114,14 @@ def main(argv: list[str]) -> int:
         except MalformedPlist as exc:
             print(f"error: cannot read plist {argv[2]}: {exc}", file=sys.stderr)
             return 2
+    if len(argv) == 3 and argv[1] == "--strict":
+        try:
+            flags = read_flags(_load(argv[2]))
+        except MalformedPlist as exc:
+            print(f"error: cannot read plist {argv[2]}: {exc}", file=sys.stderr)
+            return 2
+        sys.stdout.write("".join(f"{flags.get(f, '')}\n" for f in _FLAGS))
+        return 0
     if len(argv) != 2 or argv[1].startswith("--"):
         print(__doc__, file=sys.stderr)
         return 2

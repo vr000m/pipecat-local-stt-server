@@ -1007,6 +1007,24 @@ def test_plist_reader_state_space(tmp_path, state):
         assert "cannot read plist" in auth.stderr and "cannot read plist" in res.stderr
 
 
+@pytest.mark.parametrize("state", sorted(_READER_STATES))
+def test_plist_reader_strict_form_state_space(tmp_path, state):
+    """``--strict`` (the installer's form) gives the sweep's four lines for an
+    absent or readable plist, and exits 2 with no output for a malformed one,
+    so a malformed plist can never read as "no socket"."""
+    want_lines, want_auth = _READER_STATES[state]
+    plist = _reader_state_plist(tmp_path / "a.plist", state)
+    res = _read_plist(plist, "--strict")
+    assert "Traceback" not in res.stderr and "s3cret" not in res.stderr
+    if want_auth == 2:
+        assert res.returncode == 2, res.stderr
+        assert res.stdout == ""
+        assert "cannot read plist" in res.stderr
+    else:
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.split("\n")[:4] == want_lines
+
+
 # Reader <-> server flag grammar. Invariant: for every serve argv the server's
 # argparse parser accepts, the reader returns the same host, port, socket-path
 # and auth-token-file the server would use, and --has-auth is 0 exactly when the

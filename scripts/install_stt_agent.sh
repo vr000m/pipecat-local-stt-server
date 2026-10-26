@@ -193,22 +193,34 @@ if [[ "$cmd" == "install" && ! -x "$PYTHON" ]]; then
     exit 1
 fi
 
-# Print the value of FLAG (e.g. --socket-path) in the installed plist's
-# ProgramArguments (empty if the plist is absent or has no such flag).
 # scripts/read_stt_plist.py is the one reader of the installed plist (the justfile
-# calls it too), run under the system python3 so an uninstall works with no venv.
-# Used to decide socket cleanup from the transport actually installed, not from
-# the caller's env. Callers check installed_auth_state first: a malformed plist
-# also reads as empty here, which must never be taken as "no socket".
+# calls it too). It is stdlib only: install, which already requires $PYTHON, runs
+# it there; every other subcommand (uninstall) runs it under the system python3,
+# so it works with no venv.
+if [[ "$cmd" == "install" ]]; then
+    READER_PYTHON="$PYTHON"
+else
+    READER_PYTHON="python3"
+fi
+
+# Print the value of FLAG (e.g. --socket-path) in the installed plist's
+# ProgramArguments (empty if the plist is absent or has no such flag). Used to
+# decide socket cleanup from the transport actually installed, not from the
+# caller's env. Returns 2 (printing nothing; the reader's error is on stderr)
+# when a plist is there but cannot be read, or the reader failed: the reader's
+# --strict form, so a malformed plist never reads as "no socket", whatever the
+# caller checked before. Call it as `if ! v="$(installed_arg FLAG)"; then ...`.
 installed_arg() {
-    local flag="$1" host port sock authfile
+    local flag="$1" out rc=0 host="" port="" sock="" authfile=""
     [[ -e "$PLIST_DST" || -L "$PLIST_DST" ]] || return 0
+    out="$("$READER_PYTHON" -I "$READ_PLIST_PY" --strict "$PLIST_DST")" || rc=$?
+    [[ "$rc" -eq 0 ]] || return 2
     {
-        IFS= read -r host
-        IFS= read -r port
-        IFS= read -r sock
-        IFS= read -r authfile
-    } < <(python3 -I "$READ_PLIST_PY" "$PLIST_DST")
+        IFS= read -r host || true
+        IFS= read -r port || true
+        IFS= read -r sock || true
+        IFS= read -r authfile || true
+    } <<<"$out"
     case "$flag" in
         --host) printf '%s' "$host" ;;
         --port) printf '%s' "$port" ;;
@@ -224,13 +236,12 @@ installed_arg() {
 #   1  there is no plist, or it was read and carries no token (the reader's
 #      exit 3: never 1, which a Python traceback or a broken shim exits with);
 #   2  a plist is there but could not be read (malformed, unreadable, wrong
-#      shape), or the reader itself failed (any status but 0 or 3: python3
-#      missing, a crash). This is never "no auth": install aborts, uninstall
-#      skips socket cleanup.
+#      shape), or the reader itself failed (any status but 0 or 3: the
+#      interpreter missing, a crash). This is never "no auth": install aborts.
 installed_auth_state() {
     local rc=0
     [[ -e "$PLIST_DST" || -L "$PLIST_DST" ]] || return 1
-    python3 -I "$READ_PLIST_PY" --has-auth "$PLIST_DST" || rc=$?
+    "$READER_PYTHON" -I "$READ_PLIST_PY" --has-auth "$PLIST_DST" || rc=$?
     case "$rc" in
     0) return 0 ;;
     3) return 1 ;;
@@ -661,12 +672,14 @@ install)
     # then never clean up. Uninstalling first is the explicit way past it.
     auth_state=0
     installed_auth_state || auth_state=$?
-    if [[ "$auth_state" -eq 2 ]]; then
-        echo "error: cannot read the installed plist $PLIST_DST (malformed or unreadable, or python3 is missing), so this install cannot tell whether $LABEL requires an auth token or owns a socket. Fix or remove that plist, or run 'uninstall' first" >&2
+    # Capture the previously installed transport BEFORE the plist is rewritten.
+    # Each read fails on its own for a plist it cannot read, so neither depends
+    # on the other having run first.
+    old_socket=""
+    if [[ "$auth_state" -eq 2 ]] || ! old_socket="$(installed_arg --socket-path)"; then
+        echo "error: cannot read the installed plist $PLIST_DST (malformed or unreadable, or the plist reader failed under $READER_PYTHON), so this install cannot tell whether $LABEL requires an auth token or owns a socket. Fix or remove that plist, or run 'uninstall' first" >&2
         exit 1
     fi
-    # Capture the previously installed transport BEFORE the plist is rewritten.
-    old_socket="$(installed_arg --socket-path)"
     # Never silently downgrade a secured agent: an installed plist that carried a
     # token (a pre-0.5.0 env token, or --auth-token-file) must not be replaced by
     # an unauthenticated TCP listener just because the caller did not re-export
@@ -747,13 +760,10 @@ uninstall)
     # Socket cleanup follows the transport recorded in the INSTALLED plist. An
     # unreadable plist names no socket we can trust, so uninstall still removes
     # the agent but leaves any socket in place.
-    auth_state=0
-    installed_auth_state || auth_state=$?
-    if [[ "$auth_state" -eq 2 ]]; then
+    old_socket=""
+    if ! old_socket="$(installed_arg --socket-path)"; then
         echo "warning: cannot read the installed plist $PLIST_DST; uninstalling $LABEL without socket cleanup (remove its socket and .lock by hand if it had one)" >&2
         old_socket=""
-    else
-        old_socket="$(installed_arg --socket-path)"
     fi
     # bootout fails when the job is not loaded, which is fine; whether it worked
     # is judged by launchd no longer listing the job, below.
