@@ -34,11 +34,11 @@ kyutai_venv := justfile_directory() / ".venv-kyutai"
 # Shared venv for the non-kyutai extras; tests override it on the command line
 # like kyutai_venv.
 venv := justfile_directory() / ".venv"
-# NOTE: whether stt-install / stt-uninstall pass the canonical HOST/PORT is decided
-# INSIDE those recipes from the process environment (the installer's own
-# PIPECAT_STT_SOCKET / KODA_STT_SOCKET alias pair), never from a top-level
-# variable: every top-level variable is overridable on the command line
-# (`just var=x recipe`), which would give the transport two sources of truth.
+# NOTE: stt-install / stt-uninstall do NOT decide the transport. The installer owns
+# the socket-vs-TCP rule (its PIPECAT_STT_SOCKET / KODA_STT_SOCKET alias pair) and
+# defaults to 127.0.0.1 plus the backend's canonical port; the recipes only strip an
+# ambient PIPECAT_STT_HOST / PIPECAT_STT_PORT so those canonical values always apply.
+# Do not re-implement the rule here: a second copy can drift from the installer.
 
 # Default: show the recipe list.
 default:
@@ -355,18 +355,11 @@ stt-install backend:
     resolved=$(just _resolve "$backend") || exit 1
     # One field per line; four reads keep this bash-3.2-compatible — macOS
     # system bash has no `mapfile`.
-    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
+    { read -r label; read -r _host; read -r _port; read -r bk; } <<<"$resolved"
     just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" || exit 1
-    # Canonical HOST/PORT only for a TCP agent: in socket mode the installer would
-    # warn that it ignores PIPECAT_STT_HOST/PORT the caller never set.
-    # Same rule as the installer's SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-}}":
-    # socket mode iff either alias is non-empty. Read from the environment here, not
-    # from a justfile variable (see the NOTE near the top).
-    tcp=()
-    if [[ -z "${PIPECAT_STT_SOCKET:-}${KODA_STT_SOCKET:-}" ]]; then
-      tcp=(PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port")
-    fi
-    env ${tcp[@]+"${tcp[@]}"} PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
+    # Strip an ambient HOST/PORT so the installer's canonical defaults apply; the
+    # installer alone decides socket vs TCP (see the NOTE near the top).
+    env -u PIPECAT_STT_HOST -u PIPECAT_STT_PORT PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" install
 
 # Uninstall an agent (removes the plist) — delegates to install_stt_agent.sh.
@@ -377,13 +370,7 @@ stt-uninstall backend:
     resolved=$(just _resolve "$backend") || exit 1
     # One field per line; four reads keep this bash-3.2-compatible — macOS
     # system bash has no `mapfile`.
-    { read -r label; read -r host; read -r port; read -r bk; } <<<"$resolved"
-    # Same rule as the installer's SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-}}":
-    # socket mode iff either alias is non-empty. Read from the environment here, not
-    # from a justfile variable (see the NOTE near the top).
-    tcp=()
-    if [[ -z "${PIPECAT_STT_SOCKET:-}${KODA_STT_SOCKET:-}" ]]; then
-      tcp=(PIPECAT_STT_HOST="$host" PIPECAT_STT_PORT="$port")
-    fi
-    env ${tcp[@]+"${tcp[@]}"} PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
+    { read -r label; read -r _host; read -r _port; read -r bk; } <<<"$resolved"
+    # Same ambient HOST/PORT stripping as stt-install; the installer owns the transport.
+    env -u PIPECAT_STT_HOST -u PIPECAT_STT_PORT PIPECAT_STT_LABEL="$label" PIPECAT_STT_BACKEND="$bk" \
       "{{script}}" uninstall

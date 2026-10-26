@@ -1060,8 +1060,9 @@ def test_install_uninstall_delegate_exact_env(tmp_path, recipe, cmd, backend):
     assert logged.count("\n") == 0, "exactly one delegation expected"
     assert f"CMD={cmd}" in logged
     assert f"LABEL={label} " in logged
-    assert "PIPECAT_STT_HOST=127.0.0.1 " in logged
-    assert f"PIPECAT_STT_PORT={port} " in logged
+    # The recipe passes no HOST/PORT: the installer's own canonical defaults apply
+    # (pinned to the port table by the installer and mirror tests).
+    assert "PIPECAT_STT_HOST= PIPECAT_STT_PORT= " in logged, logged
     assert f"BACKEND={bk}" in logged
     # TCP is the default: no socket is passed unless the caller opts in.
     assert "SOCKET= " in logged
@@ -1091,60 +1092,53 @@ def test_install_uninstall_socket_mode_only_when_caller_sets_it(tmp_path, recipe
     assert "PIPECAT_STT_HOST= " in logged and "PIPECAT_STT_PORT= " in logged, logged
 
 
-# Contract: stt-install / stt-uninstall pass the canonical HOST/PORT to the installer
-# IFF the installer itself will resolve to TCP, i.e. its
-# SOCKET_PATH="${PIPECAT_STT_SOCKET:-${KODA_STT_SOCKET:-}}" is empty. There is exactly
-# one source of truth (the process environment); no justfile variable can desync it.
-# State space: PIPECAT_STT_SOCKET {unset, empty, set} x KODA_STT_SOCKET {unset, empty,
-# set} x command-line override of the former `agent_transport` variable {none, socket,
-# tcp} x {install, uninstall}. The override cells must be REJECTED by just (the
-# variable no longer exists), never silently honoured.
-def _installer_socket_path(env: dict[str, str]) -> str:
-    """Evaluate the REAL installer's SOCKET_PATH resolution line under `env`."""
-    text = (REPO_ROOT / "scripts" / "install_stt_agent.sh").read_text()
-    m = re.search(r"^SOCKET_PATH=.*$", text, re.MULTILINE)
-    assert m, "installer no longer defines SOCKET_PATH on one line; update this contract test"
-    out = subprocess.run(
-        ["/bin/bash", "-c", f'{m.group(0)}; printf %s "$SOCKET_PATH"'],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=True,
-    )
-    return out.stdout
-
-
-@pytest.mark.parametrize("override", [None, "agent_transport=socket", "agent_transport=tcp"])
+# Contract: stt-install / stt-uninstall never decide the transport. The installer owns
+# the socket-vs-TCP rule and its canonical host/port defaults; the recipes only strip an
+# ambient PIPECAT_STT_HOST / PIPECAT_STT_PORT so the canonical values always apply.
 @pytest.mark.parametrize(
-    "koda", [None, "", "/k.sock"], ids=["koda-unset", "koda-empty", "koda-set"]
+    "sock_env", [{}, {"PIPECAT_STT_SOCKET": "/p.sock"}, {"KODA_STT_SOCKET": ""}]
 )
-@pytest.mark.parametrize("pipecat", [None, "", "/p.sock"], ids=["pc-unset", "pc-empty", "pc-set"])
 @pytest.mark.parametrize("recipe", ["stt-install", "stt-uninstall"])
-def test_canonical_host_port_passed_iff_installer_resolves_tcp(
-    tmp_path, recipe, pipecat, koda, override
-):
+def test_recipes_strip_ambient_host_and_port(tmp_path, recipe, sock_env):
     stub_dir, _ = _make_stub_dir(tmp_path)
     home = _home_with_agents(tmp_path, [])
     fake_script, env_log = _delegation_stub(tmp_path)
-    extra_env = {}
-    if pipecat is not None:
-        extra_env["PIPECAT_STT_SOCKET"] = pipecat
-    if koda is not None:
-        extra_env["KODA_STT_SOCKET"] = koda
-    args = ([override] if override else []) + [f"script={fake_script}", recipe, "whisper"]
-    res = _run_just(args, home=home, stub_dir=stub_dir, extra_env=extra_env)
-    if override:
-        # The transport is not a command-line knob: just refuses, nothing is delegated.
-        assert res.returncode != 0, "a transport override must not be accepted"
-        assert not env_log.exists(), "a rejected override must not delegate"
-        return
+    res = _run_just(
+        [f"script={fake_script}", recipe, "whisper"],
+        home=home,
+        stub_dir=stub_dir,
+        extra_env={"PIPECAT_STT_HOST": "localhost", "PIPECAT_STT_PORT": "9999", **sock_env},
+    )
     assert res.returncode == 0, res.stderr
     logged = env_log.read_text().strip()
-    resolves_tcp = _installer_socket_path(extra_env) == ""
-    if resolves_tcp:
-        assert "PIPECAT_STT_HOST=127.0.0.1 PIPECAT_STT_PORT=9565 " in logged, logged
-    else:
-        assert "PIPECAT_STT_HOST= PIPECAT_STT_PORT= " in logged, logged
+    assert "PIPECAT_STT_HOST= PIPECAT_STT_PORT= " in logged, logged
+    assert "9999" not in logged and "localhost" not in logged, logged
+
+
+def test_recipes_do_not_reimplement_the_installers_socket_rule():
+    """The alias rule lives only in install_stt_agent.sh; a second copy in the
+    justfile drifted three times in review."""
+    code = [
+        ln
+        for ln in (REPO_ROOT / "justfile").read_text().splitlines()
+        if not ln.lstrip().startswith("#")
+    ]
+    offenders = [ln for ln in code if "PIPECAT_STT_SOCKET" in ln or "KODA_STT_SOCKET" in ln]
+    assert not offenders, offenders
+
+
+@pytest.mark.parametrize("recipe", ["stt-install", "stt-uninstall"])
+def test_transport_is_not_a_command_line_override(tmp_path, recipe):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    fake_script, env_log = _delegation_stub(tmp_path)
+    res = _run_just(
+        ["agent_transport=socket", f"script={fake_script}", recipe, "whisper"],
+        home=home,
+        stub_dir=stub_dir,
+    )
+    assert res.returncode != 0, "a transport override must not be accepted"
+    assert not env_log.exists(), "a rejected override must not delegate"
 
 
 def test_no_toplevel_variable_derives_from_transport_env():
