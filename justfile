@@ -4,11 +4,14 @@
 # the cross-agent "operate the listed servers" surface the script structurally
 # lacks (it manages exactly one agent per invocation, keyed by env vars).
 #
-# The backend -> (label, host, port, backend-name) map in `_resolve` is a CHECKED
-# MIRROR of the canonical "Per-backend port convention" table in
-# docs/operations.md. A test (tests/test_justfile_recipes.py) parses that table
-# and asserts this map equals it, so drift fails CI. `_resolve` prints FOUR
-# fields, one per line: label, host (always 127.0.0.1), port, backend-name.
+# `_resolve` maps a backend to (label, host, port, backend-name). The labels and
+# backend names live here; the PORT is not a justfile copy: it comes from the
+# installer, the one backend -> port map (`scripts/install_stt_agent.sh port
+# <backend-name>`, side-effect free). The "Per-backend port convention" table in
+# docs/operations.md is a CHECKED MIRROR: tests/test_justfile_recipes.py parses it
+# and asserts it equals `_resolve` and the installer, so drift fails CI.
+# `_resolve` prints FOUR fields, one per line: label, host (always 127.0.0.1),
+# port, backend-name.
 # Agents default to loopback TCP; a Unix socket is opt-in via PIPECAT_STT_SOCKET.
 #
 # stt-disable vs stt-uninstall: the rendered plist sets RunAtLoad=True +
@@ -53,12 +56,17 @@ _resolve backend:
     #!/usr/bin/env bash
     backend={{quote(backend)}}
     case "$backend" in
-      whisper)  printf '%s\n' "pipecat.stt-server"          "127.0.0.1" "9565" "mlx" ;;
-      parakeet) printf '%s\n' "pipecat.stt-server.parakeet" "127.0.0.1" "9765" "parakeet" ;;
-      nemotron) printf '%s\n' "pipecat.stt-server.nemotron" "127.0.0.1" "9865" "nemotron" ;;
-      kyutai)   printf '%s\n' "pipecat.stt-server.kyutai"   "127.0.0.1" "9665" "kyutai" ;;
+      whisper)  label="pipecat.stt-server";          bk="mlx" ;;
+      parakeet) label="pipecat.stt-server.parakeet"; bk="parakeet" ;;
+      nemotron) label="pipecat.stt-server.nemotron"; bk="nemotron" ;;
+      kyutai)   label="pipecat.stt-server.kyutai";   bk="kyutai" ;;
       *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
     esac
+    # The real installer (not the overridable `script`, which tests point at a
+    # delegation stub): its `port` subcommand prints the canonical port and calls
+    # neither launchctl nor anything that writes.
+    port=$("{{justfile_directory()}}/scripts/install_stt_agent.sh" port "$bk") || exit 1
+    printf '%s\n' "$label" "127.0.0.1" "$port" "$bk"
 
 # Print one field of an installed agent's plist: host, port, socket-path,
 # auth-token-file (its serve flags) or interpreter (ProgramArguments[0]), exactly,

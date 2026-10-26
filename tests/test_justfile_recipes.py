@@ -425,7 +425,9 @@ def _recipe_body(name: str) -> str:
 
 def _case_arm_backends(recipe: str) -> set[str]:
     return set(
-        re.findall(r"^\s+(\w+)\)\s+(?:printf|extra=|py=)", _recipe_body(recipe), re.MULTILINE)
+        re.findall(
+            r"^\s+(\w+)\)\s+(?:printf|extra=|py=|label=)", _recipe_body(recipe), re.MULTILINE
+        )
     )
 
 
@@ -481,6 +483,84 @@ def test_port_table_matches_installer_default(tmp_path, backend):
     host, rendered_port = _installer_default_port(tmp_path, installer_backend)
     assert host == "127.0.0.1"
     assert rendered_port == str(port), f"{backend}: installer default port drifted from the docs"
+
+
+def _installer_port(tmp_path: Path, *args: str, env: dict[str, str] | None = None):
+    """Run the REAL installer's ``port`` subcommand under stub launchctl/id/uv
+    (which log every call) in an empty temp HOME and cwd; return the result,
+    the stub log lines and every path that exists under HOME and cwd afterwards."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = tmp_path / "porthome"
+    cwd = tmp_path / "portcwd"
+    home.mkdir()
+    cwd.mkdir()
+    res = subprocess.run(
+        ["bash", str(INSTALLER), "port", *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            "HOME": str(home),
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            **(env or {}),
+        },
+        cwd=str(cwd),
+    )
+    left = sorted(str(p) for root in (home, cwd) for p in root.rglob("*"))
+    return res, _argv_lines(argv_log), left
+
+
+# One backend -> port map, in the installer. Invariant: the docs table, the
+# installer's `port` subcommand, `_resolve` and a really-rendered default plist
+# give the same port for every backend; `port` calls no launchctl (nor anything
+# the stubs log) and leaves HOME and cwd untouched; a backend with no canonical
+# port (echo, unknown) exits 1 with nothing on stdout. State space: backend
+# {the docs rows} + {echo, bogus, empty} x form {argument, PIPECAT_STT_BACKEND}.
+@pytest.mark.parametrize("form", ["arg", "env"])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_installer_port_subcommand_is_the_port_map_and_touches_nothing(tmp_path, backend, form):
+    _label, port = _readme_map()[backend]
+    bk = EXPECTED[backend][2]
+    args, env = ([bk], {}) if form == "arg" else ([], {"PIPECAT_STT_BACKEND": bk})
+    res, calls, left = _installer_port(tmp_path, *args, env=env)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == f"{port}\n", f"{backend}: installer port drifted from the docs table"
+    assert not calls, f"port ran a stubbed command: {calls}"
+    assert not left, f"port touched the filesystem: {left}"
+
+
+@pytest.mark.parametrize("backend", ["echo", "bogus", "MLX", "whisper"])
+def test_installer_port_subcommand_refuses_a_backend_without_one(tmp_path, backend):
+    res, calls, left = _installer_port(tmp_path, backend)
+    assert res.returncode == 1, (res.returncode, res.stdout)
+    assert res.stdout == ""
+    assert "no canonical port" in res.stderr
+    assert not calls and not left
+
+
+def test_justfile_keeps_no_port_map():
+    """The justfile asks the installer for every port: none of its code lines
+    carries a canonical port number, and _resolve calls the real installer's
+    `port` subcommand (never the overridable `script`). The installer holds the
+    map exactly once."""
+    ports = {str(p) for _label, p, _bk in EXPECTED.values()}
+    code = [ln for ln in JUSTFILE.read_text().splitlines() if not ln.lstrip().startswith("#")]
+    offenders = [ln for ln in code if any(re.search(rf"\b{p}\b", ln) for p in ports)]
+    assert not offenders, offenders
+    body = _recipe_body("_resolve")
+    assert 'scripts/install_stt_agent.sh" port "$bk"' in body, body
+    assert "{{script}}" not in body
+    inst = [ln for ln in INSTALLER.read_text().splitlines() if not ln.lstrip().startswith("#")]
+    for p in ports:
+        assert sum(bool(re.search(rf"\b{p}\b", ln)) for ln in inst) == 1, p
+
+
+def test_resolve_calls_no_launchctl(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    for backend in BACKENDS:
+        assert _run_just(["_resolve", backend], home=home, stub_dir=stub_dir).returncode == 0
+    assert not [ln for ln in _argv_lines(argv_log) if ln.startswith("launchctl")]
 
 
 def test_justfile_header_mentions_the_docs_port_table():

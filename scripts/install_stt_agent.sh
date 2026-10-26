@@ -4,6 +4,8 @@
 #
 # Usage:
 #   scripts/install_stt_agent.sh [install|uninstall|start|stop|restart|status|logs]
+#   scripts/install_stt_agent.sh port [BACKEND]   # print a backend's canonical port;
+#                                                 # touches neither launchctl nor files
 #
 # Environment overrides. The canonical PIPECAT_STT_* names take precedence;
 # the legacy KODA_STT_* names (shown in parentheses) are still honoured as
@@ -128,15 +130,22 @@ MODEL="${PIPECAT_STT_MODEL:-${KODA_STT_MODEL:-$DEFAULT_MODEL}}"
 # ports are kept in step with the menu bar app; echo has none.
 HOST="${PIPECAT_STT_HOST:-127.0.0.1}"
 AUTH_TOKEN_FILE="${PIPECAT_STT_AUTH_TOKEN_FILE:-}"
-# Keys are exactly the renderer's backend names (_BACKEND_RE); the justfile maps
-# its user-facing 'whisper' to 'mlx' before calling this script.
-case "$BACKEND" in
-mlx) CANONICAL_PORT=9565 ;;
-kyutai) CANONICAL_PORT=9665 ;;
-parakeet) CANONICAL_PORT=9765 ;;
-nemotron) CANONICAL_PORT=9865 ;;
-*) CANONICAL_PORT="" ;;
-esac
+# The ONE backend -> canonical port map. Keys are exactly the renderer's backend
+# names (_BACKEND_RE); the justfile maps its user-facing 'whisper' to 'mlx' and
+# asks this map through the `port` subcommand below instead of keeping its own,
+# and docs/operations.md's port table is checked against it
+# (tests/test_justfile_recipes.py). Prints the port; returns 1 for a backend
+# with none (echo, or an unknown name).
+canonical_port() {
+    case "$1" in
+    mlx) echo 9565 ;;
+    kyutai) echo 9665 ;;
+    parakeet) echo 9765 ;;
+    nemotron) echo 9865 ;;
+    *) return 1 ;;
+    esac
+}
+CANONICAL_PORT="$(canonical_port "$BACKEND")" || CANONICAL_PORT=""
 PORT="${PIPECAT_STT_PORT:-$CANONICAL_PORT}"
 
 # Derive a per-agent log basename. Two explicit literal branches keep this in
@@ -154,6 +163,18 @@ else
 fi
 
 cmd="${1:-install}"
+
+# `port [BACKEND]`: print BACKEND's canonical port (default: PIPECAT_STT_BACKEND,
+# else mlx) and exit, before anything below can call launchctl or touch the
+# filesystem; everything above this point only computes variables. Exit 1, with
+# nothing on stdout, for a backend that has no canonical port.
+if [[ "$cmd" == "port" ]]; then
+    if ! canonical_port "${2:-$BACKEND}"; then
+        echo "error: backend '${2:-$BACKEND}' has no canonical port (backends with one: mlx|kyutai|parakeet|nemotron)" >&2
+        exit 1
+    fi
+    exit 0
+fi
 
 # Validate the unload-wait cap up front, before any launchctl call: it is used in
 # an arithmetic comparison, where a non-numeric value aborts under `set -u` after
@@ -885,7 +906,7 @@ logs)
     tail -F "$LOG_DIR/$LOG_BASENAME.log" "$LOG_DIR/$LOG_BASENAME.err"
     ;;
 *)
-    echo "usage: $0 [install|uninstall|start|stop|restart|status|logs]" >&2
+    echo "usage: $0 [install|uninstall|start|stop|restart|status|logs|port [BACKEND]]" >&2
     exit 2
     ;;
 esac

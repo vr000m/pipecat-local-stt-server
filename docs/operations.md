@@ -41,7 +41,11 @@ installs a socket agent and has no TCP settings to ignore). For a custom host or
 `PIPECAT_STT_LABEL=pipecat.stt-server.alt PIPECAT_STT_BACKEND=mlx
 PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh install`. The installer
 defaults the port to the backend's canonical one when `PIPECAT_STT_PORT` is
-unset; the `echo` backend has no canonical port and requires one.
+unset; the `echo` backend has no canonical port and requires one. The installer
+holds the one backend-to-port map: `scripts/install_stt_agent.sh port <backend>`
+(installer backend names: `mlx`, `parakeet`, `nemotron`, `kyutai`) prints it
+without touching launchd or any file, the justfile asks it rather than keeping a
+copy, and a test checks this table against it.
 `just stt-status <backend>` probes the endpoint in the installed plist (socket
 or TCP, with its `--auth-token-file`) and falls back to the canonical port only
 when no plist exists; `just stt-list` shows each agent's live endpoint from its

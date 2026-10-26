@@ -56,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plist reader) and ignores the caller's `PIPECAT_STT_PYTHON`.
 - Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
   nemotron 9865 (parakeet and nemotron confirmed with the menu bar app side on
-  2026-10-26).
+  2026-10-26). The installer holds the only copy of this map;
+  `scripts/install_stt_agent.sh port <backend>` prints a backend's port without
+  calling `launchctl` or touching any file, and the justfile's `_resolve` asks it
+  instead of keeping its own.
 
 ### Changed
 
