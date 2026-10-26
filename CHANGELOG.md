@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The default Whisper (`mlx-community/whisper-large-v3-turbo`) and Kyutai
+  (`kyutai/stt-1b-en_fr-mlx`) weights are pinned to a Hub commit
+  (`backends.PINNED_REVISIONS`), for serving and `prefetch`. Any other
+  `--model` still follows the repo's `main`. The pins match the snapshots
+  already cached on current installs.
+
+### Fixed
+
+- Kyutai: a cancelled stream (barge-in) now stops its decode at the next 80 ms
+  frame, so the next client no longer waits for the abandoned decode to finish.
+
 ## [0.5.0] - 2026-10-26
 
 > **UPGRADE NOTE.** The default LaunchAgent transport changed from a Unix socket

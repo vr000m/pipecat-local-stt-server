@@ -6,6 +6,7 @@ conflicts with the other MLX extras, so CI's full-extras env skips it).
 from __future__ import annotations
 
 import asyncio
+import threading
 import importlib.util
 import subprocess
 import sys
@@ -54,7 +55,7 @@ def test_stream_contract(monkeypatch, text, kinds):
     backend = K.KyutaiBackend(model="fake")
     seen: list[bytes] = []
 
-    def fake_transcribe(pcm: bytes) -> str:
+    def fake_transcribe(pcm: bytes, **_kw) -> str:
         seen.append(pcm)
         return text
 
@@ -77,7 +78,9 @@ def test_stream_contract(monkeypatch, text, kinds):
 
 def test_cancelled_stream_yields_nothing(monkeypatch):
     backend = K.KyutaiBackend(model="fake")
-    monkeypatch.setattr(backend, "_transcribe", lambda pcm: pytest.fail("decoded after cancel"))
+    monkeypatch.setattr(
+        backend, "_transcribe", lambda pcm, **_kw: pytest.fail("decoded after cancel")
+    )
 
     async def run():
         stream = await backend.open_stream()
@@ -128,3 +131,134 @@ def test_live_decode_of_spoken_clip(tmp_path):
     first, second = asyncio.run(run())
     assert "weather" in first.lower()
     assert first == second
+
+
+def _fake_loaded_model(encoded: list[int], on_encode=None):
+    """A ``_get_model`` result whose Mimi counts the frames it is given."""
+    import types
+
+    import numpy as np
+
+    def encode_step(_x):
+        encoded.append(1)
+        if on_encode is not None:
+            on_encode(len(encoded))
+        return np.zeros((1, 1, 1))
+
+    mimi = types.SimpleNamespace(reset_all=lambda: None, encode_step=encode_step)
+    gen = types.SimpleNamespace(step=lambda _t: np.array([0]))
+    models = types.SimpleNamespace(LmGen=lambda **_k: gen)
+    utils = types.SimpleNamespace(Sampler=lambda **_k: None)
+    return {
+        "mx": types.SimpleNamespace(array=np.asarray),
+        "models": models,
+        "utils": utils,
+        "lm": types.SimpleNamespace(transformer_cache=[]),
+        "mimi": mimi,
+        "tokenizer": types.SimpleNamespace(id_to_piece=lambda _t: ""),
+        "prefix_samples": 0,
+        "flush_samples": 0,
+    }
+
+
+def test_transcribe_stops_at_the_next_frame_once_cancelled(monkeypatch):
+    import threading
+
+    backend = K.KyutaiBackend(model="fake")
+    cancel = threading.Event()
+    encoded: list[int] = []
+    model = _fake_loaded_model(encoded, on_encode=lambda n: cancel.set() if n == 2 else None)
+    monkeypatch.setattr(backend, "_get_model", lambda: model)
+    pcm = b"\x00\x00" * 16_000  # 1 s -> 12 frames of 80 ms
+
+    assert backend._transcribe(pcm, cancel=cancel) == ""
+    assert len(encoded) == 2
+
+    # Without a cancel event the same audio decodes every frame.
+    encoded.clear()
+    backend._transcribe(pcm)
+    assert len(encoded) == 12
+
+
+def test_cancel_during_decode_frees_the_decode_lock_for_the_next_stream(monkeypatch):
+    backend = K.KyutaiBackend(model="fake")
+    started, release = threading.Event(), threading.Event()
+
+    def blocking_transcribe(pcm, cancel=None):
+        started.set()
+        # Stands in for the frame loop: runs until it sees the cancel event.
+        while not cancel.is_set():
+            release.wait(0.01)
+        return ""
+
+    monkeypatch.setattr(backend, "_transcribe", blocking_transcribe)
+
+    async def run():
+        first = await backend.open_stream()
+        await first.feed(b"\x01\x00" * 10)
+        task = asyncio.ensure_future(first.end())
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        await first.cancel()
+        task.cancel()
+        # The abandoned decode ends promptly, so the backend goes idle.
+        await asyncio.wait_for(backend.idle(), timeout=2)
+        assert backend._thread_lock.acquire(blocking=False)
+        backend._thread_lock.release()
+
+    asyncio.run(run())
+
+
+def test_pinned_defaults_and_unpinned_overrides():
+    from stt_server import backends
+
+    assert (
+        backends.pinned_revision(backends.DEFAULT_KYUTAI_MODEL)
+        == (backends.PINNED_REVISIONS[backends.DEFAULT_KYUTAI_MODEL])
+    )
+    assert backends.pinned_revision("some/other-model") is None
+    assert backends.pinned_revision(None) is None
+    assert all(len(sha) == 40 for sha in backends.PINNED_REVISIONS.values())
+
+
+def test_kyutai_downloads_at_the_pinned_revision(monkeypatch, tmp_path):
+    from stt_server import backends
+
+    seen: list[tuple[str, str | None]] = []
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{not json")  # stops _get_model right after the config fetch
+
+    def fake_download(repo, name, revision=None):
+        seen.append((name, revision))
+        return str(cfg)
+
+    import sys
+    import types
+
+    core, nn = types.SimpleNamespace(), types.SimpleNamespace()
+    for name, mod in {
+        "mlx": types.SimpleNamespace(core=core, nn=nn),
+        "mlx.core": core,
+        "mlx.nn": nn,
+        "sentencepiece": types.SimpleNamespace(),
+        "moshi_mlx": types.SimpleNamespace(models=None, utils=None),
+        "huggingface_hub": types.SimpleNamespace(hf_hub_download=fake_download),
+    }.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    with pytest.raises(Exception):
+        K.KyutaiBackend(model=backends.DEFAULT_KYUTAI_MODEL)._get_model()
+    assert seen == [("config.json", backends.PINNED_REVISIONS[backends.DEFAULT_KYUTAI_MODEL])]
+
+    seen.clear()
+    with pytest.raises(Exception):
+        K.KyutaiBackend(model="x/y")._get_model()
+    assert seen == [("config.json", None)]
+
+
+def test_prefetch_spec_carries_the_pin():
+    from stt_server import backends
+
+    (spec,) = K.prefetch_specs(None)
+    assert spec.revision == backends.PINNED_REVISIONS[backends.DEFAULT_KYUTAI_MODEL]
+    assert K.prefetch_specs("x/y")[0].revision is None

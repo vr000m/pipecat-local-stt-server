@@ -251,3 +251,35 @@ def test_backend_exposes_identity():
     backend = MLXWhisperBackend(model="fake-model")
     assert backend.backend_name == "mlx"
     assert backend.model == "fake-model"
+
+
+def test_pinned_default_loads_the_pinned_snapshot_once(fake_mlx, monkeypatch):
+    from stt_server import backends
+    from stt_server.backends import mlx_whisper
+
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_snapshot_download(repo, revision=None, **_kw):
+        calls.append((repo, revision))
+        return "/cache/snapshots/pinned"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+    backend = MLXWhisperBackend(model=backends.DEFAULT_MLX_MODEL)
+    asyncio.run(_run_decode(backend))
+    asyncio.run(_run_decode(backend))
+
+    pin = backends.PINNED_REVISIONS[backends.DEFAULT_MLX_MODEL]
+    assert calls == [(backends.DEFAULT_MLX_MODEL, pin)]  # resolved once, then cached
+    assert fake_mlx.last_kwargs["path_or_hf_repo"] == "/cache/snapshots/pinned"
+    assert mlx_whisper.prefetch_specs(None)[0].revision == pin
+
+
+def test_other_models_are_not_pinned(fake_mlx):
+    assert MLXWhisperBackend(model="x/y")._model_path() == "x/y"
+    from stt_server.backends import mlx_whisper
+
+    assert mlx_whisper.prefetch_specs("x/y")[0].revision is None
