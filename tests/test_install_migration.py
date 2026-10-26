@@ -1826,10 +1826,12 @@ def test_install_reads_the_plist_under_its_own_python(tmp_path: Path):
 # Token-file path: validated == opened. Invariant: the plist records the
 # symlink-free resolved path, and every directory on it passed the walk; a
 # group-writable directory passes only when root owns it with group wheel (0) or
-# admin (80), or it is sticky. State space: parent dir {user 0700, user 0770,
-# root 0755, root 0775 gid 0, root 0775 gid 80, root 0775 gid 20, root 1775
-# sticky gid 20, root 1770 sticky gid 20 ('T'), user 1770 sticky ('T'), user
-# 1777 sticky ('t'), root 0777} x token path {plain, middle symlink}. Root
+# admin (80); an other-writable one never passes, and a sticky bit changes
+# neither answer. State space: parent dir {user 0700, user 0770, root 0755, root
+# 0775 gid 0, root 0775 gid 80, root 0775 gid 20, root 1775 sticky gid 20, root
+# 1775 sticky gid 80, root 1770 sticky gid 20 ('T'), user 1700 sticky, user 1770
+# sticky ('T'), user 1777 sticky ('t'), root 1777 sticky gid 0 (/private/tmp),
+# root 0777} x token path {plain, middle symlink}. Root
 # ownership and the gid are faked by a `stat` stub for that one directory.
 # ---------------------------------------------------------------------------
 
@@ -1841,11 +1843,19 @@ _PARENT_CASES = {
     "root-0775-gid0": (0o775, "0", True),
     "root-0775-gid80": (0o775, "80", True),
     "root-0775-gid20": (0o775, "20", False),
-    "root-1775-sticky-gid20": (0o1775, "20", True),
-    # Sticky without other-execute shows as 'T' (drwxrwx--T), not 't': still sticky.
-    "root-1770-sticky-gid20": (0o1770, "20", True),
-    "user-1770-sticky": (0o1770, None, True),
-    "user-1777-sticky": (0o1777, None, True),
+    # A sticky bit exempts nothing: it stops others deleting the token file, not
+    # creating its name once it is gone (a /tmp cleaner, a rotation), and the
+    # server re-opens the path at every start. So these follow the plain rule.
+    "root-1775-sticky-gid20": (0o1775, "20", False),
+    # Sticky without other-execute shows as 'T' (drwxrwx--T), not 't'.
+    "root-1770-sticky-gid20": (0o1770, "20", False),
+    "user-1770-sticky": (0o1770, None, False),
+    "user-1777-sticky": (0o1777, None, False),
+    # The /private/tmp shape (root:wheel 1777).
+    "root-1777-sticky-gid0": (0o1777, "0", False),
+    # Sticky does not hurt either: these pass on the plain rule.
+    "root-1775-sticky-gid80": (0o1775, "80", True),
+    "user-1700-sticky": (0o1700, None, True),
     "root-0777": (0o777, "0", False),
 }
 

@@ -87,8 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The installer's token-file check reads macOS ACLs: any ACL allow entry on the
   token file, or an allow entry with a write-class right (`write`, `add_file`,
   `delete_child`, `writesecurity`, ...) on a directory of its resolved path, fails
-  the install; deny entries pass. A sticky directory is detected from the numeric
-  mode, so mode 1770 (`drwxrwx--T`) counts as sticky, like `t`.
+  the install; deny entries pass. A sticky bit exempts no directory: a token
+  file under `/tmp` (root `1777`) or any group- or other-writable sticky
+  directory outside the `wheel`/`admin` rule is refused, since anyone who can
+  write there can create the name once it is gone (macOS empties `/tmp` at boot)
+  and the server re-opens the path at every start.
 - `install` runs the plist reader under its venv python (it needs no system
   `python3`); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
   --strict`) fails on a malformed plist by itself, so it no longer relies on the
@@ -114,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`stt_server.auth.read_token_file`) before writing the plist, and now also
   requires the token file's parent directories (symlinks resolved) to belong to
   you or root and not be writable by others (group write only on a root-owned
-  directory of group `wheel` or `admin`, or a sticky one). The plist records the
+  directory of group `wheel` or `admin`; a sticky bit is no exception). The plist records the
   resolved path, the one that was checked.
 - **The installer refuses to drop auth on reinstall.** If the installed plist
   carries a token (a pre-0.5.0 `PIPECAT_STT_AUTH_TOKEN`/`KODA_STT_AUTH_TOKEN` in

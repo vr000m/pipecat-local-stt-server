@@ -92,8 +92,11 @@ In TCP mode the installer checks the file before writing the plist: a regular
 file (not a symlink), owned by you, with no group/other permission bits and no ACL
 allow entry, in a directory chain (symlinks resolved) that only you or root own and
 that no one else can write to. A group-writable directory passes only when root
-owns it and its group is `wheel` or `admin` (whose members can act as root anyway),
-or it is sticky (`t` or `T` in `ls -ld`). ACLs count too: a directory on the path
+owns it and its group is `wheel` or `admin` (whose members can act as root anyway).
+A sticky bit (`t` or `T` in `ls -ld`) is no exception, so a token file under
+`/tmp` is refused: the sticky bit stops others deleting your file, but once the
+name is gone (macOS empties `/tmp` at boot) anyone can create it before the agent
+starts, and the server opens the path afresh at every start. ACLs count too: a directory on the path
 with an ACL allow entry carrying a write-class right (`write`, `append`, `add_file`,
 `add_subdirectory`, `delete`, `delete_child`, `writeattr`, `writeextattr`,
 `writesecurity`, `chown`) for anyone fails the install, as does any allow entry on

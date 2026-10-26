@@ -24,8 +24,8 @@
 #                       entry, in a directory chain (symlinks resolved) that only
 #                       you or root own and nobody else can write to, by mode or
 #                       by an ACL allow entry with a write right (group write only
-#                       on a root-owned directory of group wheel or admin, or on a
-#                       sticky one, 't' or 'T'). The plist records the
+#                       on a root-owned directory of group wheel or admin; a sticky
+#                       bit exempts nothing, so /tmp is refused). The plist records the
 #                       resolved path, the one that was checked. Its content must be one token of
 #                       visible ASCII (UTF-8, surrounding whitespace stripped; an
 #                       empty file, internal whitespace or non-ASCII is refused,
@@ -292,7 +292,7 @@ acl_allows() {
 # symlinked directory in the path as given could be repointed after this check;
 # the resolved path has no such component left to repoint.
 validate_token_file() {
-    local f="$1" owner group mode dir me sticky resolved base
+    local f="$1" owner group mode dir me resolved base
     me="$(id -u)"
     # The renderer requires an absolute path; say so here, before any mkdir, and
     # under this variable's own name rather than the renderer's AUTH_TOKEN_FILE.
@@ -341,25 +341,25 @@ validate_token_file() {
         exit 1
     fi
     # Walk the resolved parents: each must belong to this user or root and not be
-    # writable by anyone else, else that party could swap the file. A sticky
-    # directory (e.g. /tmp) only lets owners rename their own files. Group write
-    # is allowed only on a root-owned directory whose group is wheel (0) or admin
-    # (80): those members can already act as root. Any other writable group (say
-    # staff, 20) could swap the file. The sticky bit is read from the numeric mode
-    # (%p): the %Lp mode drops it, and the symbolic one shows 't' or, without
-    # other-execute (mode 1770), 'T'. An ACL allow entry carrying a write-class
-    # right is refused whatever the mode, sticky or not.
+    # writable by anyone else, else that party could swap the file or, once the
+    # name is gone (a /tmp cleaner, a delete-and-recreate rotation), create it:
+    # the server re-opens the path at every start. Group write is allowed only on
+    # a root-owned directory whose group is wheel (0) or admin (80): those members
+    # can already act as root. Any other writable group (say staff, 20) could swap
+    # the file. A sticky bit is no exception (it stops others deleting your file,
+    # not creating an absent name), so /tmp (1777) and any group-writable sticky
+    # directory outside that rule are refused; %Lp leaves the sticky bit out of
+    # $mode. An ACL allow entry carrying a write-class right is refused whatever
+    # the mode.
     while :; do
         owner=$(stat -f "%u" "$dir" 2>/dev/null || echo "")
         group=$(stat -f "%g" "$dir" 2>/dev/null || echo "")
         mode=$(stat -f "%Lp" "$dir" 2>/dev/null || echo "777")
-        sticky=$(stat -f "%p" "$dir" 2>/dev/null || echo "0")
-        if [[ ! "$sticky" =~ ^[0-7]+$ ]] || (((8#$sticky & 8#1000) == 0)); then sticky=0; else sticky=1; fi
         if [[ "$owner" != "$me" && "$owner" != 0 ]]; then
             echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is owned by another user" >&2
             exit 1
         fi
-        if [[ "$sticky" != 1 ]] && { (((8#$mode & 8#002) != 0)) || { (((8#$mode & 8#020) != 0)) && ! [[ "$owner" == 0 && ("$group" == 0 || "$group" == 80) ]]; }; }; then
+        if (((8#$mode & 8#002) != 0)) || { (((8#$mode & 8#020) != 0)) && ! [[ "$owner" == 0 && ("$group" == 0 || "$group" == 80) ]]; }; then
             echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is writable by others (mode $mode, gid $group)" >&2
             exit 1
         fi
