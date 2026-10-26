@@ -1713,7 +1713,8 @@ def test_installed_plist_state_space(tmp_path: Path, held_sockets, state: str, c
 # group-writable directory passes only when root owns it with group wheel (0) or
 # admin (80), or it is sticky. State space: parent dir {user 0700, user 0770,
 # root 0755, root 0775 gid 0, root 0775 gid 80, root 0775 gid 20, root 1775
-# sticky gid 20, root 0777} x token path {plain, middle symlink}. Root
+# sticky gid 20, root 1770 sticky gid 20 ('T'), user 1770 sticky ('T'), user
+# 1777 sticky ('t'), root 0777} x token path {plain, middle symlink}. Root
 # ownership and the gid are faked by a `stat` stub for that one directory.
 # ---------------------------------------------------------------------------
 
@@ -1726,6 +1727,10 @@ _PARENT_CASES = {
     "root-0775-gid80": (0o775, "80", True),
     "root-0775-gid20": (0o775, "20", False),
     "root-1775-sticky-gid20": (0o1775, "20", True),
+    # Sticky without other-execute shows as 'T' (drwxrwx--T), not 't': still sticky.
+    "root-1770-sticky-gid20": (0o1770, "20", True),
+    "user-1770-sticky": (0o1770, None, True),
+    "user-1777-sticky": (0o1777, None, True),
     "root-0777": (0o777, "0", False),
 }
 
@@ -1777,6 +1782,59 @@ def test_token_file_parent_and_resolved_path_state_space(tmp_path: Path, case: s
     else:
         assert r.returncode != 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "writable by others" in r.stderr
+        assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+        assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
+# ---------------------------------------------------------------------------
+# Token-file ACLs (macOS). Invariant: the mode bits are not the only grant; an
+# ACL allow entry on the token file (any right: read leaks it, write swaps it) or
+# an allow entry with a write-class right on a directory of its resolved path
+# fails the install; deny entries, and read-class rights on a directory, pass.
+# State space: target {file, parent} x entry {allow read, allow write, allow
+# add_file, allow delete_child, allow writesecurity, allow list+search,
+# inherited allow add_file, deny delete, deny add_file}. Real `chmod +a`.
+# ---------------------------------------------------------------------------
+
+_ACL_CASES = {
+    # case: (target, chmod ACL argument(s), accepted)
+    "file-allow-read": ("file", ["+a", "group:staff allow read"], False),
+    "file-allow-write": ("file", ["+a", "group:staff allow write"], False),
+    "file-deny-delete": ("file", ["+a", "group:everyone deny delete"], True),
+    "parent-allow-add_file": ("parent", ["+a", "group:staff allow add_file"], False),
+    "parent-allow-delete_child": ("parent", ["+a", "user:nobody allow delete_child"], False),
+    "parent-allow-writesecurity": ("parent", ["+a", "group:staff allow writesecurity"], False),
+    "parent-inherited-allow-add_file": ("parent", ["+ai", "group:staff allow add_file"], False),
+    "parent-allow-list-search": ("parent", ["+a", "group:staff allow list,search"], True),
+    "parent-deny-delete": ("parent", ["+a", "group:everyone deny delete"], True),
+    "parent-deny-add_file": ("parent", ["+a", "group:staff deny add_file"], True),
+}
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACLs (chmod +a, ls -le) only")
+@pytest.mark.parametrize("case", sorted(_ACL_CASES))
+def test_token_file_acl_state_space(tmp_path: Path, case: str):
+    target, acl, accepted = _ACL_CASES[case]
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o700)
+    tok = shared / "token.txt"
+    tok.write_text(SECRET + "\n")
+    tok.chmod(0o600)
+    victim = tok if target == "file" else shared
+    subprocess.run(["/bin/chmod", *acl, str(victim)], check=True)
+    try:
+        r = _run_install(
+            tmp_path, stub_dir, env_overrides={"PIPECAT_STT_AUTH_TOKEN_FILE": str(tok)}
+        )
+    finally:
+        subprocess.run(["/bin/chmod", "-N", str(victim)], check=False)
+    assert SECRET not in r.stdout + r.stderr
+    if accepted:
+        assert r.returncode == 0, f"{case}: stdout={r.stdout!r} stderr={r.stderr!r}"
+    else:
+        assert r.returncode != 0, f"{case}: stdout={r.stdout!r} stderr={r.stderr!r}"
+        assert "ACL" in r.stderr and "PIPECAT_STT_AUTH_TOKEN_FILE" in r.stderr
         assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
         assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
 

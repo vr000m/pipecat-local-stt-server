@@ -20,10 +20,12 @@
 #   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
 #                       file must be a regular file (not a symlink) owned by you,
-#                       with no group/other permission bits, in a directory chain
-#                       (symlinks resolved) that only you or root own and nobody
-#                       else can write to (group write only on a root-owned
-#                       directory of group wheel or admin). The plist records the
+#                       with no group/other permission bits and no ACL allow
+#                       entry, in a directory chain (symlinks resolved) that only
+#                       you or root own and nobody else can write to, by mode or
+#                       by an ACL allow entry with a write right (group write only
+#                       on a root-owned directory of group wheel or admin, or on a
+#                       sticky one, 't' or 'T'). The plist records the
 #                       resolved path, the one that was checked. Its content must be one token of
 #                       visible ASCII (UTF-8, surrounding whitespace stripped; an
 #                       empty file, internal whitespace or non-ASCII is refused,
@@ -236,6 +238,32 @@ installed_auth_state() {
     esac
 }
 
+# ACL rights that let a principal change a directory's entries or its metadata
+# (and so swap or re-permission the token file under it).
+ACL_WRITE_RIGHTS="write append add_file add_subdirectory delete delete_child writeattr writeextattr writesecurity chown"
+
+# Exit 0 when path $1 has an ACL allow entry granting any right in the
+# space-separated list $2 (or any right at all when $2 is "any"), 1 when it has
+# none, 2 when its ACL cannot be read. macOS `ls -lde` prints each ACL entry on
+# its own line after the listing, e.g. " 0: group:staff allow read" or
+# " 1: user:bob inherited allow add_file,delete_child"; a path with no ACL prints
+# no such line, so nothing changes there. Deny entries only narrow access.
+acl_allows() {
+    local path="$1" want="$2" out line r
+    local -a rights
+    out="$(ls -lde -- "$path" 2>/dev/null)" || return 2
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*[0-9]+:[[:space:]] ]] || continue
+        [[ "$line" =~ [[:space:]]allow[[:space:]]+([A-Za-z_,]+)[[:space:]]*$ ]] || continue
+        [[ "$want" == any ]] && return 0
+        IFS=, read -ra rights <<<"${BASH_REMATCH[1]}"
+        for r in "${rights[@]}"; do
+            [[ " $want " == *" $r "* ]] && return 0
+        done
+    done <<<"$out"
+    return 1
+}
+
 # Refuse a token file the server would mis-handle, and set RESOLVED_TOKEN_FILE
 # to the path the plist must carry. File-system policy lives here: a
 # group/other-readable file leaks the bearer; a file owned by another user (or a
@@ -289,23 +317,42 @@ validate_token_file() {
         echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has mode $mode; it must not be group/other accessible (chmod 600 it)" >&2
         exit 1
     fi
+    # The mode bits are not the whole story on macOS: an ACL can grant another
+    # user read (the token leaks) or write. Any allow entry on the file is refused;
+    # a deny entry only narrows access and is fine.
+    local acl_rc=0
+    acl_allows "$resolved" any || acl_rc=$?
+    if [[ "$acl_rc" -ne 1 ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f' has an ACL allow entry, or its ACL cannot be read (see 'ls -le'; 'chmod -N' removes the ACL)" >&2
+        exit 1
+    fi
     # Walk the resolved parents: each must belong to this user or root and not be
     # writable by anyone else, else that party could swap the file. A sticky
     # directory (e.g. /tmp) only lets owners rename their own files. Group write
     # is allowed only on a root-owned directory whose group is wheel (0) or admin
     # (80): those members can already act as root. Any other writable group (say
-    # staff, 20) could swap the file.
+    # staff, 20) could swap the file. The sticky bit is read from the numeric mode
+    # (%p): the %Lp mode drops it, and the symbolic one shows 't' or, without
+    # other-execute (mode 1770), 'T'. An ACL allow entry carrying a write-class
+    # right is refused whatever the mode, sticky or not.
     while :; do
         owner=$(stat -f "%u" "$dir" 2>/dev/null || echo "")
         group=$(stat -f "%g" "$dir" 2>/dev/null || echo "")
         mode=$(stat -f "%Lp" "$dir" 2>/dev/null || echo "777")
-        sticky=$(stat -f "%Sp" "$dir" 2>/dev/null | grep -c 't$' || true)
+        sticky=$(stat -f "%p" "$dir" 2>/dev/null || echo "0")
+        if [[ ! "$sticky" =~ ^[0-7]+$ ]] || (((8#$sticky & 8#1000) == 0)); then sticky=0; else sticky=1; fi
         if [[ "$owner" != "$me" && "$owner" != 0 ]]; then
             echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is owned by another user" >&2
             exit 1
         fi
         if [[ "$sticky" != 1 ]] && { (((8#$mode & 8#002) != 0)) || { (((8#$mode & 8#020) != 0)) && ! [[ "$owner" == 0 && ("$group" == 0 || "$group" == 80) ]]; }; }; then
             echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' is writable by others (mode $mode, gid $group)" >&2
+            exit 1
+        fi
+        acl_rc=0
+        acl_allows "$dir" "$ACL_WRITE_RIGHTS" || acl_rc=$?
+        if [[ "$acl_rc" -ne 1 ]]; then
+            echo "error: PIPECAT_STT_AUTH_TOKEN_FILE '$f': parent directory '$dir' has an ACL entry that lets someone else write to it, or its ACL cannot be read (see 'ls -lde'; 'chmod -N' removes the ACL)" >&2
             exit 1
         fi
         [[ "$dir" == "/" ]] && break

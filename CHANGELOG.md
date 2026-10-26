@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form of `--host`, `--port`, `--socket-path`) and no longer takes the element after
   `--supervised` as its value, so a hand-edited plist that requires a token can no
   longer read as "no token" and let a reinstall drop auth.
+- The installer's token-file check reads macOS ACLs: any ACL allow entry on the
+  token file, or an allow entry with a write-class right (`write`, `add_file`,
+  `delete_child`, `writesecurity`, ...) on a directory of its resolved path, fails
+  the install; deny entries pass. A sticky directory is detected from the numeric
+  mode, so mode 1770 (`drwxrwx--T`) counts as sticky, like `t`.
 - Socket cleanup on a transport change or `uninstall` leaves the socket and its
   `.lock` in place, with a warning, while any process holds the lock (a server
   started by hand can own the recorded path).
