@@ -440,3 +440,72 @@ def test_agents_skipped_when_say_absent(smoke, monkeypatch, tmp_path, capsys):
     assert _outcome(_row(out, "agents")) == "SKIPPED"
     assert "say" in _row(out, "agents").lower()
     assert not any(w in ln for ln in _argv(log) for w in FORBIDDEN)
+
+
+# --------------------------------------------------------------------------
+# run_command: a timed-out or interrupted child gets to run its own teardown
+# --------------------------------------------------------------------------
+
+_TRAPS_TERM = """
+import signal, sys, time
+def bye(*_):
+    open(sys.argv[1], "w").write("teardown ran")
+    sys.exit(1)
+signal.signal(signal.SIGTERM, bye)
+print("ready", flush=True)
+time.sleep(60)
+"""
+
+
+def test_run_command_timeout_lets_child_tear_down(smoke, tmp_path):
+    # subprocess.run(timeout=) SIGKILLs the child, so a harness's finally never ran.
+    marker = tmp_path / "marker"
+    with pytest.raises(subprocess.TimeoutExpired):
+        smoke.run_command([sys.executable, "-c", _TRAPS_TERM, str(marker)], 2)
+    assert marker.read_text() == "teardown ran"
+
+
+def test_run_command_kills_child_that_ignores_sigterm(smoke, monkeypatch):
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", 1.0)
+    body = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    start = __import__("time").monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        smoke.run_command([sys.executable, "-c", body], 1)
+    assert __import__("time").monotonic() - start < 20
+
+
+def test_run_command_ctrl_c_waits_for_child_instead_of_killing(smoke, monkeypatch):
+    events = []
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, *a, **k):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            events.append(("waited", timeout))
+            return "", ""
+
+        def kill(self):
+            events.append(("kill", None))
+
+        def send_signal(self, sig):
+            events.append(("signal", sig))
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", FakePopen)
+    with pytest.raises(KeyboardInterrupt):
+        smoke.run_command(["x"], 5)
+    assert events == [("waited", smoke.TEARDOWN_GRACE)]
+
+
+def test_runner_and_harness_share_spare_label_and_preconditions(smoke):
+    import _smoke_lib
+
+    assert smoke.SPARE_LABEL == _smoke_lib.SPARE_LABEL == SPARE
+    assert _smoke_lib.launchd_skip_reason({}, "linux")
+    assert _smoke_lib.launchd_skip_reason({"CI": "1"}, "darwin")
+    assert _smoke_lib.launchd_skip_reason({}, "darwin") is None

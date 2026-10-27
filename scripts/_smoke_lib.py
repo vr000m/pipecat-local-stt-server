@@ -10,12 +10,50 @@ canonical traversability check both scripts use so they cannot diverge.
 
 Pure stdlib (``os``/``stat``) so it imports under both the venv driver and any
 system-python context.
+
+It also holds what ``smoke.py`` and ``smoke_launchd.py`` must agree on: the spare
+label, the installed-agent plist glob and directory, and the launchd
+preconditions.
 """
 
 from __future__ import annotations
 
 import os
+import pwd
 import stat
+from pathlib import Path
+
+SPARE_LABEL = "pipecat.stt-server.smoke"
+AGENT_GLOB = "pipecat.stt-server*.plist"
+
+
+def env_home() -> Path:
+    """``$HOME`` (what the installer and the agents' own paths use)."""
+    return Path(os.environ.get("HOME") or str(Path.home()))
+
+
+def account_home() -> Path:
+    """The account's home from the password database; ``$HOME`` cannot move it."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def launch_agents_dir(home: Path) -> Path:
+    return home / "Library" / "LaunchAgents"
+
+
+def agent_plists(home: Path) -> list[Path]:
+    """Installed ``pipecat.stt-server*`` plists under HOME, the spare excluded."""
+    found = sorted(launch_agents_dir(home).glob(AGENT_GLOB))
+    return [p for p in found if p.name != f"{SPARE_LABEL}.plist"]
+
+
+def launchd_skip_reason(env, platform: str) -> str | None:
+    """Why the launchd checks cannot run on this machine (SKIPPED), or None."""
+    if platform != "darwin":
+        return f"launchd checks need macOS, not {platform}"
+    if env.get("CI"):
+        return "CI is set; the launchd checks never run in CI"
+    return None
 
 
 def assert_chain_traversable(sock: str) -> None:

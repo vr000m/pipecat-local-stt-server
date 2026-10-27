@@ -26,6 +26,7 @@ which would prune the backend extras).
 import argparse
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -40,8 +41,11 @@ SKIPPED = "SKIPPED"
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
-SPARE_LABEL = "pipecat.stt-server.smoke"
-AGENT_GLOB = "pipecat.stt-server*.plist"
+sys.path.insert(0, str(SCRIPTS))
+
+import _smoke_lib  # noqa: E402
+
+SPARE_LABEL = _smoke_lib.SPARE_LABEL
 CLIP_TEXT = "Hello, this is a smoke test of the speech to text server."
 CLIP_KEYWORD = "hello"
 
@@ -52,6 +56,10 @@ CLIP_TIMEOUT = 60.0
 PLIST_READ_TIMEOUT = 30.0
 DECODE_TIMEOUT = 180.0
 LAUNCHD_TIMEOUT = 900.0
+# After a step's timeout (or Ctrl-C) the child gets SIGTERM and this long to run
+# its own cleanup before SIGKILL: smoke_launchd.py's teardown runs the installer's
+# uninstall (up to 120 s) and waits on the spare .lock.
+TEARDOWN_GRACE = 180.0
 
 PEERCRED_NO_UID_MARK = "skipped: needs a second local uid"
 
@@ -82,16 +90,41 @@ def exit_code(results: list[StepResult]) -> int:
 def run_command(
     cmd: list[str], timeout: float, env: dict | None = None
 ) -> subprocess.CompletedProcess:
-    """The only place this module spawns a subprocess for a step."""
-    return subprocess.run(
+    """The only place this module spawns a subprocess for a step.
+
+    On timeout the child is sent SIGTERM and given ``TEARDOWN_GRACE`` to clean up
+    (SIGKILL only after that), then ``TimeoutExpired`` is raised. On Ctrl-C the
+    child (same process group, so it got the SIGINT too) is waited for, not
+    killed, so a harness's teardown finishes before the interrupt propagates.
+    """
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         env=env,
         cwd=str(REPO),
         stdin=subprocess.DEVNULL,
     )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGTERM)
+        _reap(proc)
+        raise
+    except KeyboardInterrupt:
+        _reap(proc)
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    """Wait up to TEARDOWN_GRACE for PROC to exit on its own, then SIGKILL it."""
+    try:
+        proc.communicate(timeout=TEARDOWN_GRACE)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
 
 
 def _tail(proc: subprocess.CompletedProcess) -> str:
@@ -157,11 +190,7 @@ def launchd_env(base: dict | None = None) -> dict:
 
 
 def launchd_skip_reason() -> str | None:
-    if sys.platform != "darwin":
-        return f"launchd checks need macOS, not {sys.platform}"
-    if os.environ.get("CI"):
-        return "CI is set; the launchd checks never run in CI"
-    return None
+    return _smoke_lib.launchd_skip_reason(os.environ, sys.platform)
 
 
 def peercred_step() -> StepResult:
@@ -176,9 +205,7 @@ def peercred_step() -> StepResult:
 
 
 def agent_plists() -> list[Path]:
-    home = Path(os.environ.get("HOME") or str(Path.home()))
-    found = sorted((home / "Library" / "LaunchAgents").glob(AGENT_GLOB))
-    return [p for p in found if p.name != f"{SPARE_LABEL}.plist"]
+    return _smoke_lib.agent_plists(_smoke_lib.env_home())
 
 
 def read_plist_cmd(field: str, plist: Path) -> list[str]:
@@ -287,7 +314,6 @@ def _free_port() -> int:
 def _token_check() -> int:
     """Start an echo server with a token file on a spare port; run the gate."""
     sys.path.insert(0, str(REPO))
-    sys.path.insert(0, str(SCRIPTS))
     from _smoke_lib import assert_token_gate
 
     port = _free_port()
