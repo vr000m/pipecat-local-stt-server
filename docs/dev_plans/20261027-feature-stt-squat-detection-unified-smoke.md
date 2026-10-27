@@ -79,7 +79,7 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 - [ ] Exit-code and stream tests: on a mismatch `stt-list` exits 0 and `stt-status` returns the probe's exit code for both 0 and 1; the warning is on stderr and stdout is byte-identical with and without a squat.
 - [ ] Add the `lsof` stub (default: no listener) to the shared fixture in `tests/test_justfile_recipes.py` in the same commit as the helper, so existing tests stay hermetic on the macos-14 runner. Add `smoke` to the public-recipe list and `_squat_check` to the private list in `test_just_list_exposes_public_recipes`.
 - [ ] `docs/operations.md`: state the trust boundary as the decision for issue #17; document the warning, the lsof limit, and what to do (`launchctl print`, `lsof -nP -iTCP:<port>`, kill the squatter or change the port).
-- [ ] CHANGELOG `[0.5.1]` entry (later phases extend it); comment the decision on issue #17 and keep it open only for proposal 1 under a narrower title, or close it.
+- [ ] CHANGELOG `[0.5.1]` entry (later phases extend it); when the PR lands, comment the decision on issue #17 (trust boundary documented, squat detection shipped, token-by-default deferred) and close it, then open a new issue "token by default for loopback TCP agents" that waits on the TTS server moving first.
 
 ### Phase 2: launchd verification harness
 
@@ -133,9 +133,11 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 ## Open Questions
 
 1. ~~Does the installer accept the `echo` backend and a `.venv` without extras?~~ RESOLVED: the renderer's allowlist is `echo|mlx|parakeet|nemotron|kyutai` (`scripts/render_stt_plist.py:52`); the installer's interpreter check is only `-x "$PYTHON"` (`install_stt_agent.sh:229`) and `_ensure-extra` runs only from `just stt-install`, which the harness bypasses. The harness asserts at start that `stt_server` imports under `python -I` (editable install).
-2. Close issue #17 after Phase 1, or keep it open for proposal 1? (Needs the TTS server's answer.)
+2. ~~Close issue #17 after Phase 1, or keep it open for proposal 1?~~ RESOLVED 2026-10-27 (grilled): close #17 with the decision comment when the PR lands and open a narrower token-by-default issue that waits on the TTS server.
 
 ## Review
+
+Grilled 2026-10-27: helper home (`squat_check.py`), three-state warn rule with 1 s re-check, any-differing-pid listener rule, allowlist harness guard with real-agent snapshot, SKIPPED/FAIL outcomes, issue #17 handling and the 0.5.1 version were each accepted as recommended.
 
 Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Critical, 19 Important, 23 Minor) folded in above:
 - the collision assertion now rests on the three-state verdict (Decision 2) and a tolerant timing bound
