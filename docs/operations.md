@@ -499,6 +499,15 @@ name the spare label; the runner sets both itself, so do the same when calling
 `scripts/smoke_launchd.py` directly. The individual scripts below still run on
 their own, but `just smoke` is the entry point.
 
+**Not yet run live against real launchd.** As of 0.5.1 these steps are covered
+only by stubbed tests (stub `launchctl`, `lsof` and `id`, a temp `HOME`): the
+launchd harness (`scripts/smoke_launchd.py`), the `token-file` child (a real echo
+server, but never run outside the test suite), the `--agents` decode against
+installed agents, and the `peercred` SKIPPED marker (`skipped: needs a second
+local uid`). Their PASS/SKIPPED results are unverified until the first live
+`just smoke --agents --launchd` run; a FAIL there may be a harness bug rather
+than an agent fault.
+
 ## Supervised smoke test
 
 `scripts/smoke_supervised.py` drives `serve --supervised` the way a menubar or

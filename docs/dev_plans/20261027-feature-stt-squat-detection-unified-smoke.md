@@ -90,7 +90,8 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 - [x] Exit-code and stream tests: on a mismatch `stt-list` exits 0 and `stt-status` returns the probe's exit code for both 0 and 1; the warning is on stderr and stdout is byte-identical with and without a squat.
 - [x] Add the `lsof` stub (default: no listener) to the shared fixture in `tests/test_justfile_recipes.py` in the same commit as the helper, so existing tests stay hermetic on the macos-14 runner. Add `_squat_check` to the private list in `test_just_list_exposes_public_recipes` (`smoke` joins the public list in Phase 3).
 - [x] `docs/operations.md`: state the trust boundary as the decision for issue #17; document the warning, the lsof limit, and what to do (`launchctl print`, `lsof -nP -iTCP:<port>`, kill the squatter or change the port).
-- [ ] CHANGELOG `[0.5.1]` entry (later phases extend it); when the PR lands, comment the decision on issue #17 (trust boundary documented, squat detection shipped, token-by-default deferred) and close it, then open a new issue "token by default for loopback TCP agents" that waits on the TTS server moving first.
+- [x] CHANGELOG `[0.5.1]` entry (later phases extend it).
+- [ ] When the PR lands, comment the decision on issue #17 (trust boundary documented, squat detection shipped, token-by-default deferred) and close it, then open a new issue "token by default for loopback TCP agents" that waits on the TTS server moving first.
 
 ### Phase 2: launchd verification harness
 
@@ -174,7 +175,7 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-27 @ fda08fe874a2b43eaf2eaad7e979ab74d2c80715 -->
+<!-- reviewed: 2026-10-27 @ ac965f6b8465c8934e823203ae87666f381fc991 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 

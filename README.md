@@ -146,6 +146,10 @@ Exit status is 1 if any step FAILED; SKIPPED never fails. `--launchd` needs both
 the runner sets itself; it never runs in CI. Details and the individual scripts:
 [docs/operations.md](docs/operations.md#smoke-tests-just-smoke).
 
+Not yet run live: the launchd harness (`--launchd`), the `token-file` child, the
+`--agents` decode and the `peercred` SKIPPED marker are tested only with stubs so
+far. Treat their results as unverified until the first live `just smoke` run.
+
 `<backend>` is one of `whisper` / `parakeet` / `nemotron` / `kyutai`, mapped to
 the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)
 (the justfile map is a checked mirror of that table — a test fails CI on drift).
