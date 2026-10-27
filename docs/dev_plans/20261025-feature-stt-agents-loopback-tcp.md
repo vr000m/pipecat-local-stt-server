@@ -1,12 +1,12 @@
 # Task: STT LaunchAgents on loopback TCP ports (TTS parity)
 
-**Status**: Implemented, in review (PR #16). Open before merge: the live checks not run on this machine (token-file auth, port-collision loop, socket rollback, login persistence). Open Question 2 (Koda/onoats installer invocation) is answered; the Koda-side follow-ups do not block this merge
+**Status**: Shipped in 0.5.0 (PR #16, merged 2026-10-27). Not run against real launchd at release: the port-collision loop, socket rollback and login persistence; these are planned in `20261027-feature-stt-squat-detection-unified-smoke.md` (0.5.1).
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: High
 **Branch**: feat/stt-recipes-tcp-endpoints
 **Created**: 2026-10-25
-**Completed**:
+**Completed**: 2026-10-27
 **Review Gates**: none
 
 ## Objective
