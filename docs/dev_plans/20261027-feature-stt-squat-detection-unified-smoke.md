@@ -77,7 +77,7 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 **Test files:** tests/test_justfile_recipes.py
 **Test command:** `.venv/bin/python -m pytest tests/test_justfile_recipes.py -q`
 
-- [ ] Replace plain `uv run` in the `smoke-peercred` recipe and the `smoke_peercred.py` docstring with `.venv/bin/python`. This phase is its own commit, and no `just smoke` runs before it lands. Add a regression test that greps the justfile, `scripts/smoke_*.py` and `README.md` for `uv run python` without `--no-sync`.
+- [x] Replace plain `uv run` in the `smoke-peercred` recipe and the `smoke_peercred.py` docstring with `.venv/bin/python`. This phase is its own commit, and no `just smoke` runs before it lands. Add a regression test that greps the justfile, `scripts/smoke_*.py` and `README.md` for `uv run python` without `--no-sync`.
 
 ### Phase 1b: Squat detection (issue #17, proposals 3 + 2)
 
@@ -85,11 +85,11 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 **Test files:** tests/test_squat_check.py, tests/test_justfile_recipes.py
 **Test command:** `.venv/bin/python -m pytest tests/test_squat_check.py tests/test_justfile_recipes.py tests/test_docs_port_caveats.py -q`
 
-- [ ] `scripts/squat_check.py` per Decisions 2-6, plus the `_squat_check` wrapper recipe, called from the `stt-list` loop (TCP plists only, reusing the pid it already read) and from `stt-status` (known backend with a plist, and the no-target path through `stt-list`), before the `exec`.
-- [ ] Tests (`tests/test_squat_check.py` for the helper, `tests/test_justfile_recipes.py` for the recipes), stubbing `lsof` and `launchctl`: match; mismatch; listener absent; job loaded with no pid and a listener; job not loaded; two listener pids where one matches (warns); a wildcard (`*:PORT`) listener with a different pid (warns) and one bound to another host (ignored); lsof unreadable (exit 2, quiet); socket agent (no call); no plist (no call).
-- [ ] Exit-code and stream tests: on a mismatch `stt-list` exits 0 and `stt-status` returns the probe's exit code for both 0 and 1; the warning is on stderr and stdout is byte-identical with and without a squat.
-- [ ] Add the `lsof` stub (default: no listener) to the shared fixture in `tests/test_justfile_recipes.py` in the same commit as the helper, so existing tests stay hermetic on the macos-14 runner. Add `_squat_check` to the private list in `test_just_list_exposes_public_recipes` (`smoke` joins the public list in Phase 3).
-- [ ] `docs/operations.md`: state the trust boundary as the decision for issue #17; document the warning, the lsof limit, and what to do (`launchctl print`, `lsof -nP -iTCP:<port>`, kill the squatter or change the port).
+- [x] `scripts/squat_check.py` per Decisions 2-6, plus the `_squat_check` wrapper recipe, called from the `stt-list` loop (TCP plists only, reusing the pid it already read) and from `stt-status` (known backend with a plist, and the no-target path through `stt-list`), before the `exec`.
+- [x] Tests (`tests/test_squat_check.py` for the helper, `tests/test_justfile_recipes.py` for the recipes), stubbing `lsof` and `launchctl`: match; mismatch; listener absent; job loaded with no pid and a listener; job not loaded; two listener pids where one matches (warns); a wildcard (`*:PORT`) listener with a different pid (warns) and one bound to another host (ignored); lsof unreadable (exit 2, quiet); socket agent (no call); no plist (no call).
+- [x] Exit-code and stream tests: on a mismatch `stt-list` exits 0 and `stt-status` returns the probe's exit code for both 0 and 1; the warning is on stderr and stdout is byte-identical with and without a squat.
+- [x] Add the `lsof` stub (default: no listener) to the shared fixture in `tests/test_justfile_recipes.py` in the same commit as the helper, so existing tests stay hermetic on the macos-14 runner. Add `_squat_check` to the private list in `test_just_list_exposes_public_recipes` (`smoke` joins the public list in Phase 3).
+- [x] `docs/operations.md`: state the trust boundary as the decision for issue #17; document the warning, the lsof limit, and what to do (`launchctl print`, `lsof -nP -iTCP:<port>`, kill the squatter or change the port).
 - [ ] CHANGELOG `[0.5.1]` entry (later phases extend it); when the PR lands, comment the decision on issue #17 (trust boundary documented, squat detection shipped, token-by-default deferred) and close it, then open a new issue "token by default for loopback TCP agents" that waits on the TTS server moving first.
 
 ### Phase 2: launchd verification harness
@@ -100,15 +100,15 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 
 This phase writes code and stubbed tests only. The first live run against real launchd happens after the user reviews `scripts/smoke_launchd.py`.
 
-- [ ] `scripts/smoke_launchd.py`: installs a spare-label agent through the real installer using `.venv/bin/python` (never `uv run`), with the `echo` backend and `PIPECAT_STT_UNLOAD_WAIT` set explicitly (the installer's "leaving socket" warning is a FAIL). Applies the Decision 7 guard. Spare port default 9998.
-- [ ] **Start state:** fail early, printing the bootout/rm commands, if the spare plist, a loaded spare job, the spare socket or the spare `.lock` already exists. Reading the log path from the installed plist's `StandardErrorPath` via `read_stt_plist.py` (it is `pipecat-stt-server-smoke.err`, not `<label>.err`).
-- [ ] **Real-agent snapshot:** record `launchctl print` pid and the lsof listener pid for every `pipecat.stt-server*` label (excluding the spare) before and after; FAIL on any change.
-- [ ] **Teardown (always, including failure and SIGINT):** the installer's `uninstall` for the spare label (bootout, wait for unload, socket removal in that order), then remove the spare `.lock` once lsof shows no holder, then remove the spare plist and logs.
+- [x] `scripts/smoke_launchd.py`: installs a spare-label agent through the real installer using `.venv/bin/python` (never `uv run`), with the `echo` backend and `PIPECAT_STT_UNLOAD_WAIT` set explicitly (the installer's "leaving socket" warning is a FAIL). Applies the Decision 7 guard. Spare port default 9998.
+- [x] **Start state:** fail early, printing the bootout/rm commands, if the spare plist, a loaded spare job, the spare socket or the spare `.lock` already exists. Reading the log path from the installed plist's `StandardErrorPath` via `read_stt_plist.py` (it is `pipecat-stt-server-smoke.err`, not `<label>.err`).
+- [x] **Real-agent snapshot:** record `launchctl print` pid and the lsof listener pid for every `pipecat.stt-server*` label (excluding the spare) before and after; FAIL on any change.
+- [x] **Teardown (always, including failure and SIGINT):** the installer's `uninstall` for the spare label (bootout, wait for unload, socket removal in that order), then remove the spare `.lock` once lsof shows no holder, then remove the spare plist and logs.
 - [ ] Check: **port collision.** Bind the spare port first, install, and poll up to 30 s for at least two address-in-use lines in the err log (launchd's `ThrottleInterval` of 10 is a minimum spacing, not a period; no fixed cadence is asserted) and at least one warning from `squat_check.py`, called directly. Free the port and assert the agent comes up.
 - [ ] Check: **socket rollback.** Install as TCP, reinstall as socket, then reinstall as TCP. After each step assert the plist records the right transport and the server answers on the new endpoint; assert the old **socket** is gone only after the old job unloaded, and that `<socket>.lock` is left in place and unheld.
 - [ ] Check: **token file through launchd.** Install with a valid 0600 token file in a 0700 directory created under `$HOME` (`/tmp` and the scratchpad fail the ancestor-directory policy in `stt_server/auth.py`); assert the policy accepts it first, then `assert_token_gate`.
-- [ ] Tests (stubbed `launchctl`/`id`, no real launchd; the installer runs for real as in `tests/test_install_migration.py`): the guard refuses `pipecat.stt-server`, `pipecat.stt-server.parakeet`, `koda.stt-server`, an unset label, a `KODA_STT_LABEL` override and each canonical port, and accepts `pipecat.stt-server.smoke` on a free port, logging no bootout or bootstrap on refusal; a forced failing check still runs teardown (argv log shows `bootout gui/<uid>/<label>`, plist and logs gone), including on SIGINT; the real-agent snapshot comparison flags a changed pid; the harness refuses when `CI` is set or the platform is not darwin.
-- [ ] Extend the CHANGELOG `[0.5.1]` entry.
+- [x] Tests (stubbed `launchctl`/`id`, no real launchd; the installer runs for real as in `tests/test_install_migration.py`): the guard refuses `pipecat.stt-server`, `pipecat.stt-server.parakeet`, `koda.stt-server`, an unset label, a `KODA_STT_LABEL` override and each canonical port, and accepts `pipecat.stt-server.smoke` on a free port, logging no bootout or bootstrap on refusal; a forced failing check still runs teardown (argv log shows `bootout gui/<uid>/<label>`, plist and logs gone), including on SIGINT; the real-agent snapshot comparison flags a changed pid; the harness refuses when `CI` is set or the platform is not darwin.
+- [x] Extend the CHANGELOG `[0.5.1]` entry.
 - [ ] Manual, documented only: persistence across logout and login.
 
 ### Phase 3: Unified smoke
@@ -117,12 +117,12 @@ This phase writes code and stubbed tests only. The first live run against real l
 **Test files:** tests/test_smoke_runner.py, tests/test_justfile_recipes.py
 **Test command:** `.venv/bin/python -m pytest tests/test_smoke_runner.py tests/test_justfile_recipes.py tests/test_docs_port_caveats.py -q`
 
-- [ ] `scripts/smoke.py` (run as `.venv/bin/python scripts/smoke.py`) and `just smoke [--agents] [--launchd]` (positional-arguments pattern as `stt-probe`): runs `smoke_supervised.py --backend echo`, `smoke_peercred.py`, the token-file refuse/accept checks (spare port, `echo` backend) and prints one table with PASS, FAIL or SKIPPED plus the reason, per Decision 8. `--agents` adds a decode through each installed agent from its plist endpoint (read-only). The repo ships no audio, so the clip is generated at run time with `say` and `afconvert` (16 kHz mono wav); the step asserts the transcript contains the spoken key word, and is SKIPPED when `say` is absent. `--launchd` adds Phase 2.
-- [ ] `scripts/_smoke_lib.py`: add `assert_token_gate()` (Decision 9).
-- [ ] Tests, with the individual smoke steps stubbed: the table renderer; the exit-code rule for every Decision 8 outcome (not requested, precondition absent, guard refused, crash, timeout, non-zero); `--agents` under stubbed `launchctl`/`id`/`uv` with rendered TCP and socket plists, asserting the argv log has only `print`/status calls, no bootout, bootstrap, kickstart or installer call, and no `uv run` without `--no-sync`.
-- [ ] Add `smoke` to the public-recipe list in `test_just_list_exposes_public_recipes`.
-- [ ] README and `docs/operations.md`: one `just smoke` section replacing the scattered smoke instructions.
-- [ ] Extend the CHANGELOG `[0.5.1]` entry.
+- [x] `scripts/smoke.py` (run as `.venv/bin/python scripts/smoke.py`) and `just smoke [--agents] [--launchd]` (positional-arguments pattern as `stt-probe`): runs `smoke_supervised.py --backend echo`, `smoke_peercred.py`, the token-file refuse/accept checks (spare port, `echo` backend) and prints one table with PASS, FAIL or SKIPPED plus the reason, per Decision 8. `--agents` adds a decode through each installed agent from its plist endpoint (read-only). The repo ships no audio, so the clip is generated at run time with `say` and `afconvert` (16 kHz mono wav); the step asserts the transcript contains the spoken key word, and is SKIPPED when `say` is absent. `--launchd` adds Phase 2.
+- [x] `scripts/_smoke_lib.py`: add `assert_token_gate()` (Decision 9).
+- [x] Tests, with the individual smoke steps stubbed: the table renderer; the exit-code rule for every Decision 8 outcome (not requested, precondition absent, guard refused, crash, timeout, non-zero); `--agents` under stubbed `launchctl`/`id`/`uv` with rendered TCP and socket plists, asserting the argv log has only `print`/status calls, no bootout, bootstrap, kickstart or installer call, and no `uv run` without `--no-sync`.
+- [x] Add `smoke` to the public-recipe list in `test_just_list_exposes_public_recipes`.
+- [x] README and `docs/operations.md`: one `just smoke` section replacing the scattered smoke instructions.
+- [x] Extend the CHANGELOG `[0.5.1]` entry.
 
 ### Phase 4: Release housekeeping
 
@@ -130,8 +130,8 @@ This phase writes code and stubbed tests only. The first live run against real l
 **Test files:** tests/test_docs_port_caveats.py
 **Test command:** `.venv/bin/python -m pytest tests/test_docs_port_caveats.py -q`
 
-- [ ] Finalise the CHANGELOG `[0.5.1]` entry.
-- [ ] Bump `pyproject.toml` to 0.5.1 and regenerate `uv.lock` with `uv lock` (never `uv sync`, which prunes the extras). Do this **before** the final `just smoke --launchd` so the same-PID check covers it.
+- [x] Finalise the CHANGELOG `[0.5.1]` entry.
+- [x] Bump `pyproject.toml` to 0.5.1 and regenerate `uv.lock` with `uv lock` (never `uv sync`, which prunes the extras). Do this **before** the final `just smoke --launchd` so the same-PID check covers it.
 - [ ] Mark this plan Shipped and flip its row in `docs/dev_plans/README.md`.
 
 ## Files to Modify
@@ -174,7 +174,7 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-27 @ c8a2b6bd23a7163d80d6c3ccd6f240cccab1b01a -->
+<!-- reviewed: 2026-10-27 @ fda08fe874a2b43eaf2eaad7e979ab74d2c80715 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 

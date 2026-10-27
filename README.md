@@ -122,6 +122,8 @@ just                       # list available recipes
 just stt-list              # every pipecat.stt-server* agent: state, pid, live backend
 just stt-status            # no argument: same as stt-list
 just stt-status nemotron   # wire health probe for one backend (installed plist's endpoint)
+                           # stt-list and stt-status <backend> also warn on stderr if a TCP agent's port is held
+                           # by another process (advisory; see docs/operations.md, "Port squat detection")
 just stt-status ~/Library/Caches/pipecat-stt/stt.sock   # a path is probed as --socket-path
 just stt-probe --host 127.0.0.1 --port 9565   # probe any endpoint (supervised or socket)
 just stt-disable whisper   # stop until next login (keeps the plist)

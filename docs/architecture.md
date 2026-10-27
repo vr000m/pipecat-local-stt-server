@@ -125,7 +125,7 @@ keeps the lock until it ends.
   finds a server already running (for example a launchd agent) should attach to
   it rather than start another.
 - After a normal stop, or after SIGKILL and a restart, the socket path is usable
-  again. `scripts/smoke_supervised.py` checks both against real models.
+  again. `scripts/smoke_supervised.py` checks both against real models (it also runs under `just smoke` with the echo backend).
 
 ## Backends
 
