@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -789,17 +790,35 @@ def test_resolve_auth_token_probe_ignores_pipecat_server_token(monkeypatch):
     assert _resolve_auth_token(None, client=True) is None
 
 
+@pytest.fixture
+def policy_safe_dir():
+    """A private directory the serve token-file policy accepts on any host.
+
+    ``tmp_path`` sits under ``/tmp`` on Linux, a world-writable directory the policy
+    refuses (a sticky bit exempts nothing), so a test about the token's content
+    would fail on the file policy first. A directory under ``$HOME`` passes it.
+    """
+    d = Path(tempfile.mkdtemp(prefix=".pipecat-stt-test-", dir=Path.home()))
+    d.chmod(0o700)
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 @pytest.mark.parametrize(
     "content",
     [b"", b"  \n\t\n", b"two\nlines\n", b"has space\n", "t\u00f6ken\n".encode(), b"\xff\xfe\n"],
 )
-def test_resolve_auth_token_serve_refuses_unusable_token_file(tmp_path: Path, content: bytes):
+def test_resolve_auth_token_serve_refuses_unusable_token_file(
+    policy_safe_dir: Path, content: bytes
+):
     """An explicit token file that would disable auth or can never match an
     Authorization header must fail startup, not run an unauthenticated listener."""
     from stt_server.__main__ import _resolve_auth_token
     from stt_server.errors import ConfigError
 
-    tok = tmp_path / "tok"
+    tok = policy_safe_dir / "tok"
     tok.write_bytes(content)
     # 0600: serve also applies the token-file policy, which would refuse a
     # group/other-readable file first; this test is about the content.
@@ -842,10 +861,10 @@ def test_resolve_auth_token_probe_stays_lenient_on_empty_token_file(tmp_path: Pa
     assert _resolve_auth_token(str(tok), client=True) is None
 
 
-def test_resolve_auth_token_serve_strips_token_file(tmp_path: Path):
+def test_resolve_auth_token_serve_strips_token_file(policy_safe_dir: Path):
     from stt_server.__main__ import _resolve_auth_token
 
-    tok = tmp_path / "tok"
+    tok = policy_safe_dir / "tok"
     tok.write_text("  s3cret-Token_1\n")
     tok.chmod(0o600)  # serve refuses a group/other-readable token file
     assert _resolve_auth_token(str(tok), client=False) == "s3cret-Token_1"
