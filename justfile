@@ -313,7 +313,7 @@ stt-enable backend:
 smoke-peercred:
     #!/usr/bin/env bash
     set -uo pipefail
-    exec uv run python "{{justfile_directory()}}/scripts/smoke_peercred.py"
+    exec .venv/bin/python "{{justfile_directory()}}/scripts/smoke_peercred.py"
 
 # The interpreter an agent installed now would run: PIPECAT_STT_PYTHON when it is
 # set and non-empty, else the backend's venv python (kyutai: kyutai_venv). The one

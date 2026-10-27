@@ -9,8 +9,8 @@ The running Whisper agent and the bot are never touched.
 
 Usage::
 
-    uv run python scripts/smoke_test_parakeet.py path/to/audio.wav
-    uv run python scripts/smoke_test_parakeet.py audio.wav --model mlx-community/parakeet-tdt-0.6b-v3
+    .venv/bin/python scripts/smoke_test_parakeet.py path/to/audio.wav
+    .venv/bin/python scripts/smoke_test_parakeet.py audio.wav --model mlx-community/parakeet-tdt-0.6b-v3
 
 The WAV must be 16 kHz mono PCM16 (the V1 wire format). The FIRST run downloads
 the ~1.5 GB Parakeet model — allow several minutes; later runs hit the cache.

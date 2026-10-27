@@ -27,8 +27,8 @@ single-uid CI run structurally cannot exercise:
 
 Usage::
 
-    uv run python scripts/smoke_peercred.py
-    uv run python scripts/smoke_peercred.py --connections 8
+    .venv/bin/python scripts/smoke_peercred.py
+    .venv/bin/python scripts/smoke_peercred.py --connections 8
 
 Run via ``just smoke-peercred``. The server runs IN-PROCESS (not as a
 subprocess) so the test-only helper replacement and ``unix_socket_mode=0o666``

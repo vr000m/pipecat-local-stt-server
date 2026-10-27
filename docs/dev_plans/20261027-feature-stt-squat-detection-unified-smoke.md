@@ -180,7 +180,7 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 
 ## Progress
 
-- [ ] Phase 1a: Replace plain `uv run` in the smoke recipes
+- [x] Phase 1a: Replace plain `uv run` in the smoke recipes
 - [ ] Phase 1b: Squat detection
 - [ ] Phase 2: launchd verification harness
 - [ ] Phase 3: Unified smoke
@@ -193,3 +193,4 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 - 2026-10-27: the user booted out all four real agents with `just stt-disable` (plists kept); re-enable with `just stt-enable <backend>` before any `--agents` or `--launchd` run.
 
 ## Review Waivers
+- 2026-10-27 Phase 1a (conduct): the regression test scans `justfile` and `scripts/smoke_*.py` only; the plan said `README.md` too. `README.md` (about 14 lines) and `docs/operations.md` (lines 334, 340, 343, 399, 402, 405, 576) still show plain `uv run python` in foreground `serve`/`prefetch`/benchmark examples. Same extras-pruning hazard, outside Phase 1a's files. Follow-up: switch them to `uv run --no-sync python` (or `.venv/bin/python`) in Phase 3's docs pass and extend the test to `README.md` then. Also fixed `scripts/smoke_test_parakeet.py` (docstring), which matches the `smoke_*.py` glob.

@@ -2279,3 +2279,20 @@ def test_nested_just_calls_forward_the_variables_their_callee_reads():
         f"expected nested just calls from stt-status, stt-enable and stt-install; "
         f"scan saw {sorted(callers_seen)}"
     )
+
+
+def test_no_plain_uv_run_python_in_smoke_surfaces():
+    """Plain `uv run python` re-syncs and strips the optional backend extras
+    (crash-looping LaunchAgents). The justfile and every scripts/smoke_*.py
+    must run `.venv/bin/python` (or `uv run --no-sync python`) instead. The
+    README and docs/operations.md foreground examples are tracked separately."""
+    files = [JUSTFILE, *sorted((REPO_ROOT / "scripts").glob("smoke_*.py"))]
+    plain = re.compile(r"\buv run python\b")
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{n}: {line.strip()}"
+        for path in files
+        if path.exists()
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if plain.search(line)
+    ]
+    assert not offenders, "plain `uv run python` (needs --no-sync):\n" + "\n".join(offenders)
