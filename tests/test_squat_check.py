@@ -45,9 +45,20 @@ class World:
     timeline for a ``launchctl print`` (None: no ``pid =`` line).
     """
 
-    def __init__(self, snapshots, *, launchd_pids=(None,), lsof_rc=0, lsof_missing=False):
+    def __init__(
+        self,
+        snapshots,
+        *,
+        launchd_pids=(None,),
+        launchd_loaded=(True,),
+        launchctl_rc=None,
+        lsof_rc=0,
+        lsof_missing=False,
+    ):
         self.snapshots = snapshots
         self.launchd_pids = launchd_pids
+        self.launchd_loaded = launchd_loaded
+        self.launchctl_rc = launchctl_rc
         self.lsof_rc = lsof_rc
         self.lsof_missing = lsof_missing
         self.step = 0
@@ -78,6 +89,11 @@ class World:
                     out.append(f"n{addr}:{PORT}")
             return subprocess.CompletedProcess(argv, 0, "\n".join(out) + ("\n" if out else ""), "")
         if tool == "launchctl":
+            if self.launchctl_rc is not None:
+                return subprocess.CompletedProcess(argv, self.launchctl_rc, "", "launchctl: boom")
+            if not self._at(self.launchd_loaded):
+                msg = f'Could not find service "{argv[2].rsplit("/", 1)[-1]}" in domain\n'
+                return subprocess.CompletedProcess(argv, 113, "", msg)
             pid = self._at(self.launchd_pids)
             body = "state = running\n" + (f"\tpid = {pid}\n" if pid is not None else "")
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -251,6 +267,104 @@ def test_recheck_without_label_reuses_given_pid_and_skips_launchctl(capsys):
     assert _check(w, pid=100) == 3
     assert not [c for c in w.calls if os.path.basename(c[0]) == "launchctl"]
     assert "100" in capsys.readouterr().err
+
+
+def test_recheck_job_unloaded_within_the_second_is_quiet(capsys):
+    # First read: loaded, no pid, a listener (case c). By the re-check launchd
+    # says the job is gone, so case (a) applies: quiet.
+    w = World([[(321, "nc", HOST)]], launchd_loaded=(True, False))
+    assert _check(w, pid=None, label="pipecat.stt-server") == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_recheck_launchctl_unreadable_keeps_callers_pid(capsys):
+    # launchctl failing in the re-check is "can't tell", not "no pid": the
+    # caller's pid 100 still matches the listener, so no false "not running".
+    w = World([[(200, "nc", HOST)], [(100, "python", HOST)]], launchctl_rc=5)
+    assert _check(w, pid=100, label="pipecat.stt-server") == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("rc", "stderr", "want"),
+    [
+        (0, "", (True, None)),
+        (113, 'Could not find service "x" in domain for user gui: 501', (False, None)),
+        (113, "", (False, None)),
+        (1, "could not find service x", (False, None)),
+        (1, "", None),
+        (5, "Operation not permitted", None),
+    ],
+)
+def test_launchd_state_not_loaded_only_on_launchctls_own_answer(rc, stderr, want):
+    def run(argv, **_kw):
+        return subprocess.CompletedProcess(argv, rc, "", stderr)
+
+    assert squat_check.launchd_state("x", run, uid=501) == want
+
+
+def test_launchd_state_launchctl_missing_is_cannot_tell():
+    def run(argv, **_kw):
+        raise FileNotFoundError("launchctl")
+
+    assert squat_check.launchd_state("x", run, uid=501) is None
+
+
+# Host matching over the whole state space: plist host x listener address x job
+# state. MATCH lists, per plist host, the listener addresses that block the
+# agent's bind (wildcard on either side, same address, localhost = 127.0.0.1 or
+# ::1). Written out by hand, not derived from the code under test.
+_ADDRS = ("127.0.0.1", "*", "[::]", "0.0.0.0", "[::1]", "10.9.9.9")
+_ALL = set(_ADDRS)
+MATCH = {
+    "127.0.0.1": {"127.0.0.1", "*", "[::]", "0.0.0.0"},
+    "0.0.0.0": _ALL,
+    "::": _ALL,
+    "[::]": _ALL,
+    "*": _ALL,
+    "localhost": {"127.0.0.1", "*", "[::]", "0.0.0.0", "[::1]"},
+    "::1": {"*", "[::]", "0.0.0.0", "[::1]"},
+    "[::1]": {"*", "[::]", "0.0.0.0", "[::1]"},
+}
+# (loaded, launchd pid, listener pid) -> warns when the address matches?
+_JOBS = {
+    "not-loaded": (0, None, 200, False),
+    "own-listener": (1, 100, 100, False),
+    "squatter": (1, 100, 200, True),
+    "loaded-no-pid": (1, None, 200, True),
+}
+
+
+@pytest.mark.parametrize("job", sorted(_JOBS))
+@pytest.mark.parametrize("addr", _ADDRS)
+@pytest.mark.parametrize("host", sorted(MATCH))
+def test_host_listener_job_state_space(capsys, host, addr, job):
+    loaded, pid, lpid, warns_on_match = _JOBS[job]
+    w = World([[(lpid, "nc", addr)]])
+    want = 3 if (warns_on_match and addr in MATCH[host]) else 0
+    assert _check(w, pid=pid, loaded=loaded, host=host) == want
+    err = capsys.readouterr().err
+    assert (PREFIX in err) == (want == 3)
+
+
+def test_listener_pids_any_host_keeps_every_listener():
+    w = World([[(1, "a", "10.9.9.9"), (2, "b", "127.0.0.1"), (3, "c", "[::1]")]])
+    assert squat_check.listener_pids(PORT, None, w.run) == ["1", "2", "3"]
+    assert squat_check.listener_pids(PORT, "127.0.0.1", w.run) == ["2"]
+
+
+def test_lsof_pids_puts_fields_before_the_file_separator():
+    calls = []
+
+    def run(argv, **_kw):
+        calls.append(argv)
+        files = argv[argv.index("--") + 1 :] if "--" in argv else []
+        if any(f.startswith("-") for f in files):  # lsof reads these as files
+            return subprocess.CompletedProcess(argv, 1, "", "lsof: status error on -Fp\n")
+        return subprocess.CompletedProcess(argv, 0, "p42\nf3\n", "")
+
+    assert squat_check.lsof_pids(["--", "/x.lock"], run) == ["42"]
+    assert calls[0].index("-Fp") < calls[0].index("--")
 
 
 def test_module_docstring_pins_the_invariant_and_the_limit():

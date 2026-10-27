@@ -29,7 +29,17 @@ Visibility limit (Decision 6): ``lsof`` run as the user lists only the user's ow
 processes' sockets. A listener owned by another uid is invisible, so this check
 can miss a squatter running as another user; it cannot prove the port is free,
 only that no visible foreign process holds it. Listeners are filtered to HOST or
-a wildcard bind (``*``, ``[::]``); ``lsof``'s ``@HOST`` filter is not used.
+a wildcard bind (``*``, ``[::]``, ``0.0.0.0``); ``lsof``'s ``@HOST`` filter is not
+used. A wildcard HOST (``0.0.0.0``, ``::``, ``*``) keeps every listener on the
+port, ``localhost`` matches ``127.0.0.1`` and ``::1``, and IPv6 brackets are
+ignored on both sides.
+
+The confirm pass re-reads the job's state with ``--label``: a job that became
+unloaded within the second is quiet again (Decision 2, case a).
+
+The ``lsof`` and ``launchctl print`` readers here are also imported by
+``scripts/smoke_launchd.py`` so the harness and the recipes share one listener
+definition.
 
 Stdlib only: it runs under the system python3 (``python3 -I``).
 """
@@ -44,25 +54,48 @@ import sys
 import time
 
 _PREFIX = "squat-check: warning:"
-_WILDCARDS = ("*", "[::]")
+# Normalised (brackets stripped) addresses that mean "every interface".
+_WILDCARDS = frozenset({"*", "::", "0.0.0.0", ""})
+_LOCALHOST = frozenset({"127.0.0.1", "::1"})
+# launchctl print's answer for a label that is not loaded (exit 113).
+_NOT_LOADED_RC = 113
+_NOT_LOADED_RE = re.compile(r"could not find service", re.IGNORECASE)
+
+
+def lsof_output(args, run=subprocess.run):
+    """``lsof -nP <args>`` stdout, or None when lsof can't tell.
+
+    ``args`` must carry its ``-F`` fields before any ``--`` (after ``--`` lsof
+    reads every word as a file name)."""
+    try:
+        res = run(["lsof", "-nP", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # lsof exits 1 with no output when nothing matches; a non-zero exit with a
+    # message (a missing file, a bad option) is a failure.
+    if res.returncode not in (0, 1) or (res.returncode == 1 and (res.stderr or "").strip()):
+        return None
+    return res.stdout or ""
 
 
 def _lsof(port, run):
-    """Return {pid: command} of listeners on PORT, or None when lsof can't tell."""
-    try:
-        res = run(
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpn"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
+    """``-Fpn`` listener output for PORT, or None when lsof can't tell."""
+    return lsof_output([f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpn"], run)
+
+
+def lsof_pids(args, run=subprocess.run):
+    """Sorted pids from ``lsof -nP -Fp <args>``; [] when none, None when lsof can't tell."""
+    out = lsof_output(["-Fp", *args], run)
+    if out is None:
         return None
-    # lsof exits 1 with no output when nothing matches; anything else with no
-    # output is a failure.
-    if res.returncode not in (0, 1) or (res.returncode == 1 and res.stderr.strip()):
-        return None
-    return res.stdout
+    return sorted({ln[1:] for ln in out.splitlines() if ln.startswith("p")})
+
+
+def listener_pids(port, host=None, run=subprocess.run):
+    """Pids listening on PORT whose address matches HOST (None: any address);
+    None when lsof can't tell."""
+    out = _lsof(port, run)
+    return None if out is None else _parse(out, host)
 
 
 def _parse(out, host):
@@ -87,10 +120,23 @@ def _parse(out, host):
     return pids
 
 
+def _norm(addr):
+    return addr.strip().strip("[]").lower()
+
+
 def _matches(addr, host):
-    # addr is "HOST:PORT", "*:PORT" or "[::]:PORT" (-n -P: numeric only).
-    base = addr.rsplit(":", 1)[0]
-    return base == host or base in _WILDCARDS
+    # addr is "HOST:PORT", "*:PORT" or "[::1]:PORT" (-n -P: numeric only). A
+    # listener blocks the agent's bind when either side is a wildcard or both
+    # name the same address; None means any address.
+    base = _norm(addr.rsplit(":", 1)[0])
+    if host is None:
+        return True
+    want = _norm(str(host))
+    if want in _WILDCARDS or base in _WILDCARDS:
+        return True
+    if want == "localhost":
+        return base in _LOCALHOST
+    return base == want
 
 
 def _commands(pids, run):
@@ -111,21 +157,33 @@ def _commands(pids, run):
     return cmds
 
 
-def _launchd_pid(label, run):
-    """Re-read the job's pid with read-only ``launchctl print``; None if none."""
+def parse_launchd_pid(text):
+    """The ``pid = N`` of a ``launchctl print`` body, or None."""
+    m = re.search(r"^\s*pid = (\d+)", text or "", re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def launchd_state(label, run=subprocess.run, uid=None):
+    """(loaded, pid) from read-only ``launchctl print``; None when it can't tell.
+
+    Not loaded is only launchctl's own "could not find service" answer; any other
+    failure is "can't tell", never "not loaded"."""
+    uid = os.getuid() if uid is None else uid
     try:
         res = run(
-            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            ["launchctl", "print", f"gui/{uid}/{label}"],
             capture_output=True,
             text=True,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if res.returncode != 0:
-        return None
-    m = re.search(r"^\s*pid = (\d+)", res.stdout, re.MULTILINE)
-    return m.group(1) if m else None
+    if res.returncode == 0:
+        return True, parse_launchd_pid(res.stdout)
+    said = (res.stderr or "") + (res.stdout or "")
+    if res.returncode == _NOT_LOADED_RC or _NOT_LOADED_RE.search(said):
+        return False, None
+    return None
 
 
 def _finding(listeners, pid):
@@ -154,7 +212,11 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
     # Confirm: a restart in flight changes the pid or the listener within a second.
     sleep(1)
     if label:
-        pid = _launchd_pid(label, run) or ""
+        state = launchd_state(label, run)
+        if state is not None:  # can't tell: keep the caller's observation
+            if not state[0]:
+                return 0  # unloaded within the second: quiet, as in the first pass
+            pid = state[1] or ""
     out = _lsof(port, run)
     if out is None:
         print("squat-check: cannot run lsof; skipping port check", file=sys.stderr)
