@@ -1,6 +1,6 @@
 # Task: Port-squat detection, one smoke entry point and launchd verification (0.5.1)
 
-**Status**: Planning (review findings folded 2026-10-27)
+**Status**: Implemented (all phases done; live launchd run and PR pending)
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: Medium
@@ -174,7 +174,7 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-27 @ bd60a819b7f972f0e54616eb253f3372bccdc796 -->
+<!-- reviewed: 2026-10-27 @ c8a2b6bd23a7163d80d6c3ccd6f240cccab1b01a -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -184,7 +184,7 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 - [x] Phase 1b: Squat detection
 - [x] Phase 2: launchd verification harness
 - [x] Phase 3: Unified smoke
-- [ ] Phase 4: Release housekeeping
+- [x] Phase 4: Release housekeeping
 
 ## Findings
 
@@ -197,3 +197,4 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 - 2026-10-27 Phase 1b (conduct): Decisions 2 and 4 contradicted each other (re-check re-reads the pid vs helper gets no label). User chose to keep an optional `--label`, used only by the confirm pass; Decision 4 reworded and the marker refreshed. One fix-loop iteration: `loaded=0` with a listener warned instead of staying quiet, and `pid in listeners` hid a second non-matching listener. Mid-phase reviewer (>3 files) skipped; the later /code-review pass covers it.
 - 2026-10-27 Phase 2 (conduct): code and stubbed tests only, 47 passed; NO live launchd run yet (awaits user review of `scripts/smoke_launchd.py`). One fix iteration: `main` filled an unset `PIPECAT_STT_LABEL` from `--label`, defeating the Decision 7 guard; removed, both label variables must be set explicitly. Choices to review: the spare socket is fixed at `~/Library/Caches/pipecat-stt-smoke-launchd/spare.sock` (`PIPECAT_STT_SOCKET` is not read); log paths come from the plist via plistlib because `read_stt_plist.py` has no `StandardErrorPath` field; `canonical_ports` asks the installer for `mlx` (its name for whisper); an extra `stt_server` import check under `python -I` runs after the start-state check; SIGINT/SIGTERM record a FAIL, run teardown and exit 1; `assert_token_gate` uses a raw websocket upgrade (401 without or with a wrong token, 101 with a good one) via `ws_handshake_status`. Unverified until the live run: two address-in-use lines within 30 s, lsof showing the harness-held port as a listener, and the strict old-job-unloaded-before-socket-removal check (may false-FAIL). Success path of `assert_token_gate` is untested (needs the real server).
 - 2026-10-27 Phase 3 (conduct, autonomous): 277 passed (+1 after the regression test was extended to `README.md` and `docs/operations.md`, closing the Phase 1a follow-up; all plain `uv run python` examples there are now `uv run --no-sync python`). `assert_token_gate` already existed from Phase 2. `smoke.py` runs `token-file` and `agents` through hidden child modes (`--_token-check`, `--_decode`) of itself via `run_command`; `agents` makes no launchctl call at all; a plist whose token is only in an env var is decoded without a token; the `peercred` SKIPPED mapping relies on the string `skipped: needs a second local uid` in `smoke_peercred.py` output (unverified against real output). Live behaviour of the token-file child, the decode and the timeouts (supervised 600 s, launchd 900 s) is unverified until `just smoke` is run. The test-writer's `say` stub touched the spoken text as a file in the repo root; fixed to touch the `-o` path.
+- 2026-10-27 Phase 4 (conduct, done directly): pyproject and uv.lock at 0.5.1. `uv lock` also raised the lockfile revision 3 to 5 with the local uv, so the committed lockfile was kept and only the package version line changed (`uv lock --check` passes). Plan status is Implemented, not Shipped: the live `smoke_launchd.py` run and the PR are still to do; flip to Shipped when the PR merges.
