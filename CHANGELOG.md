@@ -7,28 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- The default weights of every Hub-backed backend (Whisper
-  `mlx-community/whisper-large-v3-turbo`, Kyutai `kyutai/stt-1b-en_fr-mlx`,
-  Parakeet `mlx-community/parakeet-tdt-0.6b-v3`, Nemotron
-  `mlx-community/nemotron-3.5-asr-streaming-0.6b`) are pinned to a Hub commit
-  (`backends.PINNED_REVISIONS`), for serving and `prefetch`. Any other
-  `--model` still follows the repo's `main`. The pins match the snapshots
-  already cached on current installs.
-
-### Fixed
-
-- The installer and the `just` recipes capture paths losslessly. `$(...)` drops
-  trailing newlines, so a token file or socket path ending in one was validated
-  or probed as one string and recorded or acted on as another (a plist socket
-  path `<sock>\n` was cleaned up as `<sock>`). Captures now keep every byte, and
-  a token-file or socket path containing a control character (newline, tab,
-  escape) is refused with a `fix:` line before anything is created.
-- Kyutai: a cancelled stream (barge-in) now stops its decode at the next 80 ms
-  frame, so the next client no longer waits for the abandoned decode to finish.
-
-## [0.5.0] - 2026-10-26
+## [0.5.0] - 2026-10-27
 
 > **UPGRADE NOTE.** The default LaunchAgent transport changed from a Unix socket
 > to loopback TCP. Reinstalling an agent (`just stt-install <backend>`) flips it
@@ -180,6 +159,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enough to overflow bash arithmetic, fails before any `launchctl` call. `PIPECAT_STT_BACKEND` is checked against the
   renderer's backend names before any directory is created (`whisper` is the
   justfile name; the installer name is `mlx`).
+- The default weights of every Hub-backed backend (Whisper
+  `mlx-community/whisper-large-v3-turbo`, Kyutai `kyutai/stt-1b-en_fr-mlx`,
+  Parakeet `mlx-community/parakeet-tdt-0.6b-v3`, Nemotron
+  `mlx-community/nemotron-3.5-asr-streaming-0.6b`) are pinned to a Hub commit
+  (`backends.PINNED_REVISIONS`), for serving and `prefetch`. Any other
+  `--model` still follows the repo's `main`. The pins match the snapshots
+  already cached on current installs.
 
 ### Removed
 
@@ -233,6 +219,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer fails with `Bootstrap failed: 5: Input/output error` while the old job
   tears down. Still listed at the cap, it warns and reports the bootout as still
   unloading (exit 0).
+- The installer and the `just` recipes capture paths losslessly. `$(...)` drops
+  trailing newlines, so a token file or socket path ending in one was validated
+  or probed as one string and recorded or acted on as another (a plist socket
+  path `<sock>\n` was cleaned up as `<sock>`). Captures now keep every byte, and
+  a token-file or socket path containing a control character (newline, tab,
+  escape) is refused with a `fix:` line before anything is created.
+- Kyutai: a cancelled stream (barge-in) now stops its decode at the next 80 ms
+  frame, so the next client no longer waits for the abandoned decode to finish.
 
 ## [0.4.0] - 2026-10-25
 
