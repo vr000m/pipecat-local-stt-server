@@ -77,6 +77,9 @@ def _make_stub_dir(
     status_exit: int = 0,
     fail_actions: tuple[str, ...] = (),
     unload_polls: int = 0,
+    launchd_pid: int | None = 4242,
+    lsof_listeners: tuple[tuple[int, str, str], ...] = (),
+    lsof_exit: int = 0,
 ) -> tuple[Path, Path]:
     """Stub ``launchctl`` / ``id`` / ``uv`` that log argv to ``argv.log``.
 
@@ -90,6 +93,12 @@ def _make_stub_dir(
     ``bootout``, ``print`` still reports the job loaded for that many calls
     (``-1``: forever), then reports it gone; a ``bootstrap`` while it is still
     listed fails with exit 5, as launchd does in that window.
+    ``launchd_pid`` is the ``pid =`` that a loaded job's ``launchctl print``
+    reports (``None``: loaded but no ``pid =`` line, i.e. not running).
+    ``lsof_listeners`` is a tuple of ``(pid, command, address:port)`` rows the
+    stubbed ``lsof`` reports (default: no listener, so the squat check is quiet
+    and existing tests stay hermetic). Every ``lsof`` call is logged to
+    ``lsof.log`` (not ``argv.log``) so "no squat call" is assertable.
     """
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir()
@@ -116,7 +125,10 @@ if [[ -e "$TEARDOWN" ]]; then
 fi
 if [[ "$1" == "print" ]]; then
     if [[ {print_rc} -eq 0 ]]; then
-        printf 'state = running\\n\\tpid = 4242\\n'
+        printf 'state = running\\n'
+        if [[ -n "{launchd_pid if launchd_pid is not None else ""}" ]]; then
+            printf '\\tpid = {launchd_pid}\\n'
+        fi
     fi
     exit {print_rc}
 fi
@@ -139,6 +151,29 @@ if [[ "$1" == "-u" ]]; then
     exit 0
 fi
 exec /usr/bin/id "$@"
+""",
+    )
+
+    # lsof stub: logs argv to lsof.log; renders the configured listeners as
+    # `-F` field output (`p` always, `c`/`n` only when named in the -F arg).
+    rows = [list(r) for r in lsof_listeners]
+    _write_executable(
+        stub_dir / "lsof",
+        f"""#!{sys.executable}
+import sys
+with open({str(tmp_path / "lsof.log")!r}, "a") as fh:
+    fh.write("lsof " + " ".join(sys.argv[1:]) + "\\n")
+if {lsof_exit}:
+    sys.stderr.write("lsof: stub failure\\n")
+    sys.exit({lsof_exit})
+fields = "".join(a[2:] for a in sys.argv[1:] if a.startswith("-F"))
+for pid, cmd, addr in {rows!r}:
+    out = ["p%s" % pid]
+    if "c" in fields:
+        out.append("c" + cmd)
+    if "n" in fields:
+        out.append("n" + addr)
+    print("\\n".join(out))
 """,
     )
 
@@ -286,6 +321,7 @@ def test_just_list_exposes_public_recipes(tmp_path):
         assert recipe in res.stdout
     # Private (underscore) helpers are not advertised in --list.
     assert "_resolve" not in res.stdout
+    assert "_squat_check" not in res.stdout
     assert "_ensure-extra" not in res.stdout
 
 
@@ -2296,3 +2332,167 @@ def test_no_plain_uv_run_python_in_smoke_surfaces():
         if plain.search(line)
     ]
     assert not offenders, "plain `uv run python` (needs --no-sync):\n" + "\n".join(offenders)
+
+
+# --------------------------------------------------------------------------- #
+# Port-squat detection wiring (issue #17): _squat_check from stt-list/stt-status
+# --------------------------------------------------------------------------- #
+
+SQUAT_WARNING = "squat-check: warning:"
+
+
+def _lsof_log(tmp_path: Path) -> list[str]:
+    log = tmp_path / "lsof.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _squat_run(tmp_path, recipe_args, *, listeners, status_exit=0, launchd_pid=4242):
+    """One recipe run against a rendered whisper TCP plist on port 9871."""
+    stub_dir, argv_log = _make_stub_dir(
+        tmp_path,
+        print_loaded=True,
+        status_exit=status_exit,
+        launchd_pid=launchd_pid,
+        lsof_listeners=listeners,
+    )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    return _run_just(recipe_args, home=home, stub_dir=stub_dir), argv_log
+
+
+def test_lsof_stub_defaults_to_no_listener(tmp_path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    res = subprocess.run(
+        [str(stub_dir / "lsof"), "-nP", "-iTCP:9565", "-sTCP:LISTEN", "-Fpn"],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0 and res.stdout == ""
+
+
+def test_stt_list_matching_listener_is_quiet_but_checked(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-list"], listeners=((4242, "python", "127.0.0.1:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert any("9871" in ln for ln in _lsof_log(tmp_path)), "TCP agent must be checked"
+
+
+def test_stt_list_squat_warns_on_stderr_only_and_exits_zero(tmp_path):
+    (tmp_path / "clean").mkdir()
+    (tmp_path / "squat").mkdir()
+    clean, _ = _squat_run(
+        tmp_path / "clean", ["stt-list"], listeners=((4242, "python", "127.0.0.1:9871"),)
+    )
+    squat, _ = _squat_run(
+        tmp_path / "squat", ["stt-list"], listeners=((777, "nc", "127.0.0.1:9871"),)
+    )
+    assert squat.returncode == 0, squat.stderr
+    assert SQUAT_WARNING in squat.stderr
+    assert "777" in squat.stderr and "9871" in squat.stderr
+    assert SQUAT_WARNING not in squat.stdout
+    # The machine-readable surface is untouched by a squat.
+    assert squat.stdout.encode() == clean.stdout.encode()
+
+
+def test_stt_list_wildcard_squatter_warns(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-list"], listeners=((888, "nc", "*:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING in res.stderr and "888" in res.stderr
+
+
+def test_stt_list_listener_on_another_host_is_ignored(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-list"], listeners=((888, "nc", "10.9.9.9:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+
+
+def test_stt_list_loaded_without_pid_and_listener_warns(tmp_path):
+    res, _ = _squat_run(
+        tmp_path,
+        ["stt-list"],
+        listeners=((555, "nc", "127.0.0.1:9871"),),
+        launchd_pid=None,
+    )
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING in res.stderr and "555" in res.stderr
+    assert "not running" in res.stderr
+
+
+def test_stt_list_not_loaded_job_is_quiet(tmp_path):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path, print_loaded=False, lsof_listeners=((555, "nc", "127.0.0.1:9871"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+
+
+def test_stt_list_socket_agent_makes_no_squat_call(tmp_path):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path, print_loaded=True, lsof_listeners=((555, "nc", "127.0.0.1:9871"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    _render_plist(home, "pipecat.stt-server", socket_path=sock)
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert _lsof_log(tmp_path) == []
+
+
+@pytest.mark.parametrize("probe_exit", [0, 1])
+def test_stt_status_squat_keeps_probe_exit_and_stdout(tmp_path, probe_exit):
+    (tmp_path / "clean").mkdir()
+    (tmp_path / "squat").mkdir()
+    clean, _ = _squat_run(
+        tmp_path / "clean",
+        ["stt-status", "whisper"],
+        listeners=((4242, "python", "127.0.0.1:9871"),),
+        status_exit=probe_exit,
+    )
+    squat, argv_log = _squat_run(
+        tmp_path / "squat",
+        ["stt-status", "whisper"],
+        listeners=((777, "nc", "127.0.0.1:9871"),),
+        status_exit=probe_exit,
+    )
+    assert squat.returncode == probe_exit, squat.stderr
+    assert SQUAT_WARNING in squat.stderr and "777" in squat.stderr
+    assert SQUAT_WARNING not in squat.stdout
+    assert squat.stdout.encode() == clean.stdout.encode()
+    assert clean.returncode == probe_exit and SQUAT_WARNING not in clean.stderr
+    # The warning comes before the probe, and the probe still ran.
+    assert "--host 127.0.0.1 --port 9871" in _status_call(argv_log)
+
+
+def test_stt_status_no_argument_squat_via_stt_list(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-status"], listeners=((777, "nc", "127.0.0.1:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING in res.stderr
+
+
+def test_stt_status_socket_plist_makes_no_squat_call(tmp_path):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path, print_loaded=True, lsof_listeners=((555, "nc", "127.0.0.1:9565"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    _render_plist(home, "pipecat.stt-server", socket_path=sock)
+    res = _run_just(["stt-status", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert _lsof_log(tmp_path) == []
+
+
+def test_stt_status_no_plist_canonical_fallback_makes_no_squat_call(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(
+        tmp_path, print_loaded=True, lsof_listeners=((555, "nc", "127.0.0.1:9565"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["stt-status", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert _lsof_log(tmp_path) == []
+    assert "--host 127.0.0.1 --port 9565" in _status_call(argv_log)

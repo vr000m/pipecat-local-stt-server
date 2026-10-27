@@ -61,7 +61,7 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 | 1 | Squat detection **warns, never fails**: `stt-list` exits as before; `stt-status` keeps the probe's exit code. Warnings go to **stderr**, before any `exec` | A status command that starts failing would break scripts; stdout is the machine-readable probe surface |
 | 2 | **Three-state verdict** in `scripts/squat_check.py`. Inputs: host, port, launchd pid (empty if none), job-loaded flag. Listener set = the pids from `lsof -nP -iTCP:PORT -sTCP:LISTEN -Fpn`, keeping only entries whose address is HOST or a wildcard (`*`, `[::]`). A host-filtered `-iTCP@HOST:PORT` query is **not** used: probed on this machine, it returns nothing for a `0.0.0.0` listener, and a wildcard squatter is the case that blocks the agent's bind. (a) no listener, or job not loaded → quiet; (b) job running with pid P and any listener ≠ P → warn squat; (c) job loaded with no pid and a listener present → warn "port N held by pid X; label not running". Exit 0 quiet, 3 warned, 2 cannot tell (lsof failed). A would-be warning is re-checked once after 1 s (re-read the pid, then the listeners) and printed only if it persists, so a restart between the two reads cannot warn. On a warning print the listener command (`lsof -Fc`) | A KeepAlive job that fails to bind has no `pid =` for most of each 10 s window, so (c) is what makes the collision case observable. Any differing PID warns; no parent-PID exemption |
 | 3 | Squat check covers TCP agents only, and only when an installed plist exists | A socket agent keeps the peer-uid check and its `.lock`; the no-plist canonical-fallback path of `stt-status` makes no squat call |
-| 4 | The helper is `scripts/squat_check.py` (stdlib, system `python3 -I`); `_squat_check` in the justfile only wraps it. It receives the pid and loaded flag the caller already read, not a label | Matches the one-shared-reader pattern of `read_stt_plist.py`; one `launchctl print` per agent per command, no PID race |
+| 4 | The helper is `scripts/squat_check.py` (stdlib, system `python3 -I`); `_squat_check` in the justfile only wraps it. It receives the pid and loaded flag the caller already read; an optional `--label` is used only by the 1-second re-check to re-read the pid (user-approved during conduct, Phase 1b) | Matches the one-shared-reader pattern of `read_stt_plist.py`; one `launchctl print` per agent per command, no PID race |
 | 5 | The helper relies on the invariant listener PID == launchd PID (ProgramArguments[0] is the venv python serving in-process). Documented in its docstring and pinned by a test. A `PIPECAT_STT_PYTHON` wrapper that forks makes every agent warn; the printed listener command makes that recognisable | Verified: no fork/Popen in `stt_server/` |
 | 6 | `lsof` is the deliberate PID source; its limit (other users' sockets may be invisible, so exit 2 / quiet) is documented. `netstat -anv` could close it but its column layout is undocumented, so it is not used | Advisory by design |
 | 7 | launchd checks are **opt-in** (`just smoke --launchd`). The guard allows only the exact label `pipecat.stt-server.smoke` (both `PIPECAT_STT_LABEL` and the `KODA_STT_LABEL` alias set explicitly), and a port that is not one of the four canonical ports (read from `install_stt_agent.sh port <backend>`) and not already LISTENing. The port check runs before the collision step binds its occupier. Separately, the harness has two *preconditions*, `sys.platform == "darwin"` and `CI` unset (Decision 8) | An allowlist, not a prefix denylist; the label alone did not protect the real ports |
@@ -174,14 +174,14 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-27 @ 2c4ec68126d00b7e2985481643f549b8dc2a45e0 -->
+<!-- reviewed: 2026-10-27 @ bd60a819b7f972f0e54616eb253f3372bccdc796 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
 ## Progress
 
 - [x] Phase 1a: Replace plain `uv run` in the smoke recipes
-- [ ] Phase 1b: Squat detection
+- [x] Phase 1b: Squat detection
 - [ ] Phase 2: launchd verification harness
 - [ ] Phase 3: Unified smoke
 - [ ] Phase 4: Release housekeeping
@@ -194,3 +194,4 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 
 ## Review Waivers
 - 2026-10-27 Phase 1a (conduct): the regression test scans `justfile` and `scripts/smoke_*.py` only; the plan said `README.md` too. `README.md` (about 14 lines) and `docs/operations.md` (lines 334, 340, 343, 399, 402, 405, 576) still show plain `uv run python` in foreground `serve`/`prefetch`/benchmark examples. Same extras-pruning hazard, outside Phase 1a's files. Follow-up: switch them to `uv run --no-sync python` (or `.venv/bin/python`) in Phase 3's docs pass and extend the test to `README.md` then. Also fixed `scripts/smoke_test_parakeet.py` (docstring), which matches the `smoke_*.py` glob.
+- 2026-10-27 Phase 1b (conduct): Decisions 2 and 4 contradicted each other (re-check re-reads the pid vs helper gets no label). User chose to keep an optional `--label`, used only by the confirm pass; Decision 4 reworded and the marker refreshed. One fix-loop iteration: `loaded=0` with a listener warned instead of staying quiet, and `pid in listeners` hid a second non-matching listener. Mid-phase reviewer (>3 files) skipped; the later /code-review pass covers it.

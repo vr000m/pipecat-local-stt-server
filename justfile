@@ -83,6 +83,16 @@ _plist_field plist field strict='':
     [[ -n {{quote(strict)}} ]] && mode=(--strict)
     exec python3 -I "{{justfile_directory()}}/scripts/read_stt_plist.py" "${mode[@]+"${mode[@]}"}" --field {{quote(field)}} {{quote(plist)}}
 
+# Warn (stderr only) when a TCP agent's port is held by a process that is not the
+# agent: scripts/squat_check.py compares the lsof listener pid with the launchd pid
+# (`loaded` is 1/0; `pid` empty when the job has none; `label` is for its 1-second
+# re-check). Advisory: callers append `|| true`, so it never changes an exit
+# status or stdout. System python3 so a pruned venv cannot break it.
+_squat_check host port pid loaded label:
+    #!/usr/bin/env bash
+    pid={{quote(pid)}}
+    exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --loaded {{quote(loaded)}} ${pid:+--pid "$pid"} --label {{quote(label)}}
+
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
     #!/usr/bin/env bash
@@ -96,7 +106,10 @@ stt-list:
       target="gui/$uid/$label"
       # launchctl print exits non-zero when the agent is not loaded; reuse the
       # same fields the script greps (state|last exit|pid).
+      loaded=0
+      pid=
       if info=$(launchctl print "$target" 2>/dev/null); then
+        loaded=1
         pid=$(grep -m1 -E '^[[:space:]]*pid = ' <<<"$info" | grep -oE '[0-9]+' | head -1)
         state=$(grep -m1 -E '^[[:space:]]*state = ' <<<"$info" | sed -E 's/.*state = //')
         printf 'running  %-32s pid=%-7s state=%s\n' "$label" "${pid:-?}" "${state:-?}"
@@ -127,6 +140,7 @@ stt-list:
       elif [[ -n "$host" && -n "$port" ]]; then
         printf '         endpoint: %s:%s\n' "$host" "$port"
         probe=(--host "$host" --port "$port")
+        just _squat_check "$host" "$port" "$pid" "$loaded" "$label" || true
       else
         printf '         endpoint: (no serve endpoint found in plist)\n'
         probe=()
@@ -201,6 +215,16 @@ stt-status target='':
       else
         echo "stt-status: $plist has no serve endpoint (--socket-path or --host/--port)" >&2
         exit 1
+      fi
+      if [[ -z "$p_sock" ]]; then
+        # TCP plist: check the port's holder before the probe's exec. Same
+        # read-only launchctl print as stt-list, for the pid and loaded state.
+        loaded=0; pid=
+        if info=$(launchctl print "gui/$(id -u)/$label" 2>/dev/null); then
+          loaded=1
+          pid=$(grep -m1 -E '^[[:space:]]*pid = ' <<<"$info" | grep -oE '[0-9]+' | head -1)
+        fi
+        just _squat_check "$p_host" "$p_port" "$pid" "$loaded" "$label" || true
       fi
     else
       probe=(--host "$host" --port "$port")

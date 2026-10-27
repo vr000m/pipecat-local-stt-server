@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-27
+
+### Added
+
+- **Port squat detection** (issue #17). `just stt-list` and `just stt-status
+  <backend>` warn on stderr when a TCP agent's port is held by a process other
+  than the agent (listener pid vs launchd pid, confirmed after 1 second), or by
+  any process while the agent is not running. Advisory only: stdout and exit
+  codes are unchanged. `scripts/squat_check.py` does the check; `lsof` shows only
+  your own processes' sockets. See `docs/operations.md`.
+
+### Changed
+
+- `just smoke-peercred` and `scripts/smoke_test_parakeet.py` run with
+  `.venv/bin/python` instead of plain `uv run`, which pruned the backend extras.
+
 ## [0.5.0] - 2026-10-27
 
 > **UPGRADE NOTE.** The default LaunchAgent transport changed from a Unix socket

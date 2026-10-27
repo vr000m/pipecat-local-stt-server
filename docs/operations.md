@@ -87,6 +87,39 @@ agent).
   (for example `pipecat-stt-server-parakeet.err`; the default whisper agent logs
   to `pipecat-stt.err`) and free the port or reinstall on another one.
 
+### Port squat detection
+
+Decision for [issue #17](https://github.com/vr000m/pipecat-local-stt-server/issues/17):
+the trust boundary stays as described above. Loopback TCP is open to every local
+user, the token file is opt-in, and token-by-default is deferred until the TTS
+server moves. What this adds is a warning, not a gate.
+
+`just stt-list` and `just stt-status <backend>` compare the pid listening on a
+TCP agent's port (from `lsof`) with the pid launchd reports for that agent
+(`launchctl print`). They warn on stderr, after a 1-second re-check so a restart
+in flight stays quiet, when:
+
+- the agent is running but a different pid holds the port (the warning names the
+  port, the listener pid(s) and command(s), and the launchd pid), or
+- the agent is not running and something holds the port
+  (`port N held by pid X; label not running`).
+
+Stdout and exit codes do not change. Socket agents are not checked, and neither
+is the canonical-port fallback used when no plist is installed.
+
+**Limit:** `lsof` run as you lists only your own processes' sockets, so a
+squatter running as another user is invisible. No warning means no visible
+squatter, not that the port is free.
+
+If you see the warning:
+
+```bash
+launchctl print gui/$(id -u)/<label>      # the pid launchd thinks it runs
+lsof -nP -iTCP:<port> -sTCP:LISTEN        # who actually holds the port
+```
+
+Kill the squatter, or reinstall the agent on another port.
+
 ### Token file (replaces env tokens)
 
 `render_stt_plist.py` and `install_stt_agent.sh` now **refuse**
