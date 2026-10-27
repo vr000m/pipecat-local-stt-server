@@ -215,7 +215,7 @@ sequenceDiagram
 
 - [x] All existing tests pass, including the rewritten tilde-form test (no deselect)
 - [x] New tests added and passing
-- [ ] Manual verification complete (Phase 5): agents reinstalled and decoding live; `stt-list`/`stt-status` verified by the user after migration; token-file auth, port-collision loop, socket rollback and login persistence not yet checked live
+- [ ] Manual verification complete (Phase 5): agents reinstalled and decoding live; `stt-list`/`stt-status` verified by the user after migration; token-file auth checked live 2026-10-27 on a spare loopback port without launchd (loose, symlinked, relative, missing and `/tmp` files refused; a private 0600 file accepted and bearer auth enforced); port-collision loop, socket rollback and login persistence not yet checked live
 
 ### Edge Cases Tested
 
