@@ -17,6 +17,7 @@ import pytest
 
 from stt_server import __main__ as M
 from stt_server import prefetch as PF
+from stt_server.backends import PINNED_REVISIONS
 
 # The files each fake snapshot gets (enough to satisfy every backend's ``required``).
 _FILES = {
@@ -484,7 +485,8 @@ def test_human_check_output(fake_hub, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["stt_server", "prefetch", "--backend", "parakeet", "--check"])
     M.main()
     out = capsys.readouterr().out
-    assert "mlx-community/parakeet-tdt-0.6b-v3@main: missing" in out
+    pin = PINNED_REVISIONS["mlx-community/parakeet-tdt-0.6b-v3"]
+    assert f"mlx-community/parakeet-tdt-0.6b-v3@{pin}: missing" in out
     assert "parakeet: not cached" in out
 
 

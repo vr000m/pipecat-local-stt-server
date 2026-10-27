@@ -17,7 +17,10 @@ monorepo. BSD-2-Clause.
 - `turn_detection: null` required; server VAD is not implemented in V1
 - commit-oriented decode (single large `delta` + `completed`)
 - local-only trust model:
-  - Unix domain socket by default
+  - `serve` has no default endpoint: pass `--socket-path` (Unix domain socket,
+    recommended: peer-uid check, no port) or `--host`/`--port`. The
+    `just`/LaunchAgent agents default to loopback TCP (no peer-uid check), with a
+    socket opt-in
   - optional loopback TCP (`127.0.0.1`) with optional bearer token
   - browser `Origin` headers rejected
 - backend interface (`TranscriptionBackend`) so MLX can be swapped later
@@ -41,8 +44,9 @@ monorepo. BSD-2-Clause.
   through `moshi_mlx`. The extra pins an older MLX stack and is declared
   conflicting with the other MLX extras, so install it on its own. It needs
   Python 3.12 (`moshi_mlx` pins `sentencepiece==0.2.0`, which has no 3.13 wheel;
-  elsewhere it builds from source and needs `cmake`), and it is not wired into
-  the LaunchAgent tooling (`install_stt_agent.sh`, `just stt-*`): run it with
+  elsewhere it builds from source and needs `cmake`). `just stt-install kyutai`
+  handles this: it syncs the extra into a separate `.venv-kyutai` and installs a
+  LaunchAgent on `127.0.0.1:9665`. To run it by hand, use
   `serve --backend kyutai`, e.g. under `--supervised`.
 
 ## Running the server
@@ -62,14 +66,22 @@ uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock 
 
 # Loopback TCP — minimal form. Pick any free port; there is no default port,
 # so --host and --port are both required for TCP. On loopback an auth token is
-# optional (the server logs a warning and serves anyway — fine for local
+# optional (the server logs an info line and serves anyway — fine for local
 # experiments). The listener comes up on 127.0.0.1:<port>.
 uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 
 # Loopback TCP with auth (recommended for anything non-experimental — use
 # --auth-token-file or PIPECAT_STT_AUTH_TOKEN env; legacy KODA_STT_AUTH_TOKEN
-# still honoured; --auth-token on argv is visible via `ps` and marked DEPRECATED)
-uv run python -m stt_server --host 127.0.0.1 --port 8765 --auth-token-file /path/to/token
+# still honoured; there is no --auth-token flag, since argv is visible via `ps`.
+# A token file must hold one token of visible ASCII; an empty or malformed one
+# makes the server exit rather than run unauthenticated. The file itself must be
+# an absolute path to a regular file you own, mode 600 (no group/other bits, no
+# ACL), in directories only you or root can write: otherwise serve exits 1 and
+# names the file and the fix, e.g. `chmod 600 <file>` or move it out of a shared
+# directory; see docs/operations.md#token-file-replaces-env-tokens).
+# The LaunchAgent installer and renderer refuse both env tokens: use
+# PIPECAT_STT_AUTH_TOKEN_FILE there.
+uv run python -m stt_server --host 127.0.0.1 --port 9565 --auth-token-file /path/to/token
 ```
 
 > **Ports:** there is no baked-in default port — you choose it (`--port 9900`).
@@ -89,8 +101,11 @@ which implicitly routes to `serve`) and `python -m stt_server serve <flags>`
 health](docs/operations.md#checking-server-health) for the `status` subcommand.
 
 For persistent always-on operation on macOS, install the server as a
-LaunchAgent via `scripts/install_stt_agent.sh`
-(`install|start|stop|restart|status|logs`); pair it with
+LaunchAgent via `just stt-install <backend>` or `scripts/install_stt_agent.sh`
+(`install|start|stop|restart|status|logs`). Agents bind loopback TCP on a
+per-backend port by default (whisper 9565, kyutai 9665, parakeet 9765, nemotron
+9865); set `PIPECAT_STT_SOCKET` for a Unix-socket agent and point clients at a
+TCP agent with `STT_WS_HOST`/`STT_WS_PORT`. Pair it with
 `python -m stt_server status` for a wire-level health probe. A consumer
 may wrap these behind its own CLI — see [Reference consumer
 (Koda)](docs/integration.md#reference-consumer-koda) for one such integration.
@@ -105,7 +120,10 @@ idle ones. The repo-root `justfile` is a thin operator layer over `launchctl`
 ```bash
 just                       # list available recipes
 just stt-list              # every pipecat.stt-server* agent: state, pid, live backend
-just stt-status nemotron   # wire health probe for one backend
+just stt-status            # no argument: same as stt-list
+just stt-status nemotron   # wire health probe for one backend (installed plist's endpoint)
+just stt-status ~/Library/Caches/pipecat-stt/stt.sock   # a path is probed as --socket-path
+just stt-probe --host 127.0.0.1 --port 9565   # probe any endpoint (supervised or socket)
 just stt-disable whisper   # stop until next login (keeps the plist)
 just stt-enable whisper    # re-load it from the existing plist
 just stt-install parakeet  # delegates to install_stt_agent.sh (+ ensures the extra)
@@ -113,31 +131,48 @@ just stt-uninstall parakeet
 just smoke-peercred        # local UDS peer-cred smoke (cross-uid leg needs a 2nd uid)
 ```
 
-`<backend>` is one of `whisper` / `parakeet` / `nemotron`, mapped to the labels
-and sockets in the [per-ASR table](docs/operations.md#per-asr-socket-convention)
+`<backend>` is one of `whisper` / `parakeet` / `nemotron` / `kyutai`, mapped to
+the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)
 (the justfile map is a checked mirror of that table — a test fails CI on drift).
+For a TCP agent `stt-install`/`stt-uninstall` always use that canonical host and
+port (the recipes strip an ambient `PIPECAT_STT_HOST`/`PORT` and the installer applies its
+defaults); for a custom one run the installer directly with a distinct label and backend, or it
+replaces the default whisper agent (`PIPECAT_STT_LABEL=pipecat.stt-server.alt
+PIPECAT_STT_BACKEND=mlx PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh
+install`; see [Operations](docs/operations.md#per-backend-port-convention)).
+`stt-install` refuses `PIPECAT_STT_AUTH_TOKEN`; use `PIPECAT_STT_AUTH_TOKEN_FILE`
+(see [Operations](docs/operations.md#token-file-replaces-env-tokens)).
 
 `stt-install` / `stt-enable` also ensure the backend's optional Python extra is
-installed (`uv sync --extra <backend> --inexact`) so a freshly installed agent
-doesn't crash-loop on a missing import; set `PIPECAT_STT_SKIP_DEP_SYNC=1` to
-manage the extras yourself.
+installed so a freshly installed agent doesn't crash-loop on a missing import
+(`uv sync --extra <backend> --inexact`, additive; kyutai instead syncs into its
+own `.venv-kyutai` with `--frozen --python 3.12` and no `--inexact`); set `PIPECAT_STT_SKIP_DEP_SYNC=1` to
+manage the extras yourself. The check runs the interpreter the agent runs:
+`stt-install` checks `PIPECAT_STT_PYTHON` (else the venv python) and hands that
+same interpreter to the installer, and `stt-enable` checks the one the installed
+plist names (`ProgramArguments[0]`), whatever your environment says.
 
-`stt-list` prints each agent's `socket:` line in the same `~`-form a consumer's
-config uses for its endpoint (e.g. onoats' `config.toml` `[stt] ws_socket`), so
-you can match a config line to a running agent directly. Note whisper's socket is
-`stt.sock`, not `whisper.sock` — the socket line removes that guesswork.
+`stt-status <backend>` reads the installed plist's endpoint (socket or TCP, plus
+`--auth-token-file`) and only falls back to the backend's canonical host and port
+when no plist exists, so it also works on a not-yet-migrated socket agent. A path
+(or an existing socket file in the repo directory) is probed as `--socket-path`.
+`stt-list` reads each agent's live endpoint from its plist: a TCP agent shows
+an `endpoint: host:port` line, a socket agent a `socket:` line in the same `~`-form a consumer's
+config uses (e.g. onoats' `config.toml` `[stt] ws_socket`; for a TCP agent use
+`ws_host`/`ws_port`). Note whisper's socket is `stt.sock`, not `whisper.sock`.
 
 **`stt-disable` vs `stt-uninstall`.** The LaunchAgent plist sets `RunAtLoad` +
 `KeepAlive`, so `install_stt_agent.sh stop` (a plain `SIGTERM`) is respawned
 immediately. `stt-disable` instead does `launchctl bootout`, which takes the
 agent down **until the next login** — the plist stays on disk and launchd
-reloads it when you log back in. `stt-uninstall` removes the plist, so the agent
+reloads it when you log back in. It returns once launchd no longer lists the
+agent (up to 30 s), so a `just stt-enable` straight after it does not hit
+`Bootstrap failed: 5`. `stt-uninstall` removes the plist, so the agent
 stays gone. For cross-login suppression without removing the plist, use
 `launchctl disable gui/$(id -u)/<label>`.
 
 `stt-list` sweeps the `pipecat.stt-server*` label prefix, so a custom-labelled
-agent still shows up (without a live-backend line, since its socket is not
-derivable from its label). Legacy `koda.stt-server*` agents are **not** covered —
+agent still shows up, probed at the endpoint in its own plist. Legacy `koda.stt-server*` agents are **not** covered —
 check those manually during migration with `launchctl list | grep koda`.
 
 
@@ -148,13 +183,15 @@ A client (including the Pipecat service in the [integration
 guide](docs/integration.md#pipecat-integration)) only points at an *endpoint*
 and transcribes against whatever backend that server was started with. To run
 Whisper vs Parakeet you start a *different* server (or a second one on its own
-socket — see "Multi-backend operation"); no client code changes.
+endpoint — see "Multi-backend operation"); no client code changes.
 
 ```bash
 # Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo
 uv sync --extra mlx
 uv run python -m stt_server serve --backend mlx \
     --socket-path ~/Library/Caches/pipecat-stt/stt.sock
+# ...or as an always-on loopback TCP agent on 127.0.0.1:9565:
+just stt-install whisper    # parakeet 9765, nemotron 9865, kyutai 9665 likewise
 
 # Parakeet — default model mlx-community/parakeet-tdt-0.6b-v3
 uv sync --extra parakeet
@@ -177,10 +214,24 @@ default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
 `kyutai/stt-1b-en_fr-mlx` for `kyutai`). Pointing a
 backend at a mismatched repo fails fast at decode.
 
+Each of those four default models is pinned to a Hugging Face commit, so a push
+to the repo's `main` cannot change the weights under a running install. The pins
+live in one table, `PINNED_REVISIONS` in `stt_server/backends/__init__.py`, and
+both `serve` and `prefetch` use them. Any other `--model` value (another repo id
+or a local path) is not pinned and follows that repo's `main`. To move a pin,
+change its commit SHA in that table, re-run the live decode tests against it, and
+run `prefetch` so the new snapshot is cached before the agent restarts. On a
+cancelled stream (barge-in) only Kyutai stops its decode early, at the next 80 ms
+frame, and skips a decode still queued behind another; the other backends finish
+a decode once it has started.
+
 Each Unix socket gets a sibling `<socket>.lock` file (e.g. `parakeet.sock.lock`,
 mode `0600`). The server holds an `flock` on it for its lifetime, so a second
 server for the same socket fails at once with `EADDRINUSE`. The kernel releases
-it when the process exits; the file is never deleted and is safe to leave. See
+it when the process exits. Neither the server nor the installer deletes the file,
+so every server locks the same one; leaving it is safe. On a transport change or
+`uninstall` the installer removes only the old socket, once the old job has
+unloaded and no process holds the lock. See
 [Operations: single-server lock file](docs/operations.md#single-server-lock-file).
 
 Nemotron's runtime dependency is `mlx-audio>=0.4.4` — the first PyPI release

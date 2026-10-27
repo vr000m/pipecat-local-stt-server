@@ -428,3 +428,5 @@ README-table parser anchors on the header before indexing columns. See
 Issues & Solutions for the full list.
 
 <!-- reviewed: 2026-06-07 @ f144271594d3cf4660fb40d36db9ac4637b4e1e8 -->
+
+> **Superseded in part** by [20261025-feature-stt-agents-loopback-tcp.md](20261025-feature-stt-agents-loopback-tcp.md) (0.5.0): agents now default to loopback TCP ports (whisper 9565, kyutai 9665, parakeet 9765, nemotron 9865), `_resolve` emits four fields (label, host, port, backend-name), and there are four backends including kyutai. The socket map and three-field `_resolve` described above are history.

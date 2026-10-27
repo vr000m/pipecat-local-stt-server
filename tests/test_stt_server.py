@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -602,28 +603,30 @@ async def test_client_uri_overrides_socket_path():
 # ---------------------------------------------------------------------------
 # Auth contract — pins doc claims in README / AGENTS.md / architecture.md:
 #   "STT_WS_TOKEN is enforced only when the server was started with a token;
-#    TCP without a token logs a warning at startup."
+#    TCP without a token logs an info line at startup (loopback only)."
 # Prevents silent drift between the documented trust model and behavior.
 # ---------------------------------------------------------------------------
 
 
-async def test_tcp_without_token_emits_startup_warning(caplog):
-    caplog.set_level("WARNING", logger="stt_server.server")
+async def test_tcp_without_token_logs_info_not_warning(caplog):
+    caplog.set_level("INFO", logger="stt_server")
     srv = TranscriptionServer(
         EchoBackend(),
         ServerConfig(host="127.0.0.1", port=0, reject_browser_origins=False),
     )
     await srv.start()
     try:
-        assert any(
-            "TCP listener is running without --auth-token" in rec.message for rec in caplog.records
-        ), "TCP server without token must warn at startup"
+        recs = [r for r in caplog.records if "loopback TCP listener has no auth token" in r.message]
+        assert recs, "TCP server without token must say so at startup"
+        assert all(r.levelname == "INFO" for r in recs), "loopback default must not warn"
+        assert "--auth-token-file" in recs[0].message
+        assert "PIPECAT_STT_AUTH_TOKEN" not in recs[0].message
     finally:
         await srv.shutdown()
 
 
 async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
-    caplog.set_level("WARNING", logger="stt_server.server")
+    caplog.set_level("INFO", logger="stt_server")
     # Binds under a system temp dir (root-owned ancestor) which R1 rejects;
     # this test exercises the UDS-vs-TCP token warning, not ancestor-dir
     # enforcement, so neutralise the check via the Phase-4-sanctioned seam.
@@ -637,8 +640,7 @@ async def test_uds_without_token_does_not_warn(caplog, monkeypatch):
         await srv.start()
         try:
             assert not any(
-                "TCP listener is running without --auth-token" in rec.message
-                for rec in caplog.records
+                "loopback TCP listener has no auth token" in rec.message for rec in caplog.records
             ), "UDS mode is protected by file perms; must not warn about missing token"
         finally:
             await srv.shutdown()
@@ -786,6 +788,86 @@ def test_resolve_auth_token_probe_ignores_pipecat_server_token(monkeypatch):
     monkeypatch.delenv("STT_WS_TOKEN", raising=False)
     monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "pipecat-secret")
     assert _resolve_auth_token(None, client=True) is None
+
+
+@pytest.fixture
+def policy_safe_dir():
+    """A private directory the serve token-file policy accepts on any host.
+
+    ``tmp_path`` sits under ``/tmp`` on Linux, a world-writable directory the policy
+    refuses (a sticky bit exempts nothing), so a test about the token's content
+    would fail on the file policy first. A directory under ``$HOME`` passes it.
+    """
+    d = Path(tempfile.mkdtemp(prefix=".pipecat-stt-test-", dir=Path.home()))
+    d.chmod(0o700)
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"  \n\t\n", b"two\nlines\n", b"has space\n", "t\u00f6ken\n".encode(), b"\xff\xfe\n"],
+)
+def test_resolve_auth_token_serve_refuses_unusable_token_file(
+    policy_safe_dir: Path, content: bytes
+):
+    """An explicit token file that would disable auth or can never match an
+    Authorization header must fail startup, not run an unauthenticated listener."""
+    from stt_server.__main__ import _resolve_auth_token
+    from stt_server.errors import ConfigError
+
+    tok = policy_safe_dir / "tok"
+    tok.write_bytes(content)
+    # 0600: serve also applies the token-file policy, which would refuse a
+    # group/other-readable file first; this test is about the content.
+    tok.chmod(0o600)
+    with pytest.raises(ConfigError) as exc:
+        _resolve_auth_token(str(tok), client=False)
+    assert "fix:" not in str(exc.value), "refused by the file policy, not the content rule"
+
+
+@pytest.mark.parametrize("name", ["PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"])
+@pytest.mark.parametrize("value", ["tok en", "tok\nen", "t\u00f6k"])
+def test_resolve_auth_token_serve_refuses_unmatchable_env_token(monkeypatch, name, value):
+    """Same rule as the token file: a token no header can match must fail startup."""
+    from stt_server.__main__ import _resolve_auth_token
+    from stt_server.errors import ConfigError
+
+    monkeypatch.delenv("PIPECAT_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError) as exc:
+        _resolve_auth_token(None, client=False)
+    assert value not in str(exc.value)
+
+
+def test_resolve_auth_token_env_token_is_stripped_and_probe_unaffected(monkeypatch):
+    from stt_server.__main__ import _resolve_auth_token
+
+    monkeypatch.delenv("KODA_STT_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "  good-token \n")
+    assert _resolve_auth_token(None, client=False) == "good-token"
+    monkeypatch.setenv("STT_WS_TOKEN", "client tok")
+    assert _resolve_auth_token(None, client=True) == "client tok"
+
+
+def test_resolve_auth_token_probe_stays_lenient_on_empty_token_file(tmp_path: Path):
+    from stt_server.__main__ import _resolve_auth_token
+
+    tok = tmp_path / "tok"
+    tok.write_text("  \n")
+    assert _resolve_auth_token(str(tok), client=True) is None
+
+
+def test_resolve_auth_token_serve_strips_token_file(policy_safe_dir: Path):
+    from stt_server.__main__ import _resolve_auth_token
+
+    tok = policy_safe_dir / "tok"
+    tok.write_text("  s3cret-Token_1\n")
+    tok.chmod(0o600)  # serve refuses a group/other-readable token file
+    assert _resolve_auth_token(str(tok), client=False) == "s3cret-Token_1"
 
 
 def test_resolve_auth_token_file_wins_in_client_mode(monkeypatch, tmp_path: Path):

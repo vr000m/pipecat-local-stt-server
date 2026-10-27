@@ -6,22 +6,193 @@
 
 Each server process loads exactly **one** backend, pinned at launch via
 `--backend {echo,mlx,parakeet,nemotron,kyutai}`. To run more than one ASR — for example to
-A/B-benchmark Parakeet against Whisper — start a second server process on a
-**separate socket**. The V1 wire protocol is unchanged; the only difference
-between two ASRs from the bot's perspective is which socket it connects to.
+A/B-benchmark Parakeet against Whisper — start a second server process on its
+own endpoint: a **separate port** (the default for agents) or, for a socket
+agent, a separate socket. The V1 wire protocol is unchanged; the only difference
+between two ASRs from the bot's perspective is which endpoint it connects to.
 
-### Per-ASR socket convention
+### Per-backend port convention
 
-| ASR | LaunchAgent label | Socket | Bot selection |
-|---|---|---|---|
-| whisper (`mlx`) | `pipecat.stt-server` | `~/Library/Caches/pipecat-stt/stt.sock` | leave `STT_WS_SOCKET` unset |
-| parakeet | `pipecat.stt-server.parakeet` | `~/Library/Caches/pipecat-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
-| nemotron | `pipecat.stt-server.nemotron` | `~/Library/Caches/pipecat-stt/nemotron.sock` | set `STT_WS_SOCKET` to the nemotron socket |
+| ASR | LaunchAgent label | Port |
+|---|---|---|
+| whisper (`mlx`) | `pipecat.stt-server` | 9565 |
+| parakeet | `pipecat.stt-server.parakeet` | 9765 |
+| nemotron | `pipecat.stt-server.nemotron` | 9865 |
+| kyutai | `pipecat.stt-server.kyutai` | 9665 |
 
-`kyutai` has no row on purpose: it is not wired into the LaunchAgent tooling
-(`just stt-install`, the plist renderer). Its extra conflicts with the other MLX
-extras, so it runs from its own environment; start it by hand with
-`--backend kyutai --socket-path <path>` on a socket of your choosing.
+Agents bind loopback TCP (`127.0.0.1:<port>`) by default. A Unix socket is
+opt-in: set `PIPECAT_STT_SOCKET` when running `just stt-install` (see
+[Socket agents](#socket-agents-opt-in)). Point the bot at the agent with
+`STT_WS_HOST`/`STT_WS_PORT`.
+
+Why these numbers: the sibling TTS server uses 8665-9365 (its kokoro agent is
+8765, so do not copy a TTS port into an STT example), and the macOS menu bar app
+owns 9465-9665 (Apple Speech 9465 is the app's own and is not an agent).
+Whisper 9565 and kyutai 9665 are the menu bar app's existing numbers; Parakeet
+9765 and Nemotron 9865 were confirmed by the menu bar app side on 2026-10-26.
+The menu bar app does not yet adopt an occupied port, so an agent and the
+app contend for the same port if both are running.
+
+For a TCP agent, `just stt-install` / `just stt-uninstall` always use the
+canonical host and port from this table (the recipe strips an ambient
+`PIPECAT_STT_HOST`/`PIPECAT_STT_PORT`; the installer owns the socket-vs-TCP rule and
+applies its canonical defaults, and with `PIPECAT_STT_SOCKET`/`KODA_STT_SOCKET` set it
+installs a socket agent and has no TCP settings to ignore). For a custom host or port, run the installer directly, e.g.
+`PIPECAT_STT_LABEL=pipecat.stt-server.alt PIPECAT_STT_BACKEND=mlx
+PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh install`. The installer
+defaults the port to the backend's canonical one when `PIPECAT_STT_PORT` is
+unset; the `echo` backend has no canonical port and requires one. The installer
+holds the one backend-to-port map: `scripts/install_stt_agent.sh port <backend>`
+(installer backend names: `mlx`, `parakeet`, `nemotron`, `kyutai`) prints it
+without touching launchd or any file, the justfile asks it rather than keeping a
+copy, and a test checks this table against it.
+`just stt-status <backend>` probes the endpoint in the installed plist (socket
+or TCP, with its `--auth-token-file`) and falls back to the canonical port only
+when no plist exists; `just stt-list` shows each agent's live endpoint from its
+plist. Until an agent is reinstalled, both still show and probe its old socket.
+
+### Kyutai agent and its own venv
+
+`just stt-install kyutai` works like the other backends, with one difference:
+kyutai's extra conflicts with the other MLX extras, so `_ensure-extra` syncs it
+into a separate `.venv-kyutai` (`UV_PROJECT_ENVIRONMENT=.venv-kyutai uv sync
+--frozen --python 3.12 --extra kyutai`), never the shared `.venv`. It needs Python 3.12.
+The kyutai agent runs `.venv-kyutai/bin/python` (override with
+`PIPECAT_STT_PYTHON`). `just stt-install` picks the interpreter once
+(`PIPECAT_STT_PYTHON` when set, else the backend's venv python, honouring a
+`venv=`/`kyutai_venv=` override), checks the backend's extra under it and passes
+that same interpreter to the installer as `PIPECAT_STT_PYTHON`, so the plist
+records the interpreter that was checked. `just stt-enable` checks the
+interpreter the installed plist runs (its `ProgramArguments[0]`) and ignores
+`PIPECAT_STT_PYTHON` in your environment, so there is nothing to re-export. Only
+the venv python can be fixed by a sync; for any other interpreter a missing extra
+fails the recipe with the remedy (install the extra into it, or reinstall the
+agent).
+
+### Loopback TCP caveats
+
+- **Loopback TCP has no peer-uid check**: any local process (any uid) can
+  connect to the port. Unix sockets keep the peer-uid check and the owner-only
+  directory chain (see [Trust model](#trust-model-and-socket-security-same-host-uds)).
+  A TCP agent has no token by default; add one with `--auth-token-file` if that
+  matters on a shared host.
+- **A local process that binds the port first can impersonate the server.**
+  `--auth-token-file` authenticates clients to the server; it does not
+  authenticate the server to clients, so a client that connects to a squatted
+  port sends its audio to whatever answers.
+- **A taken port makes the agent restart-loop.** If the port is already in use
+  the server exits with `EADDRINUSE`, and launchd (`KeepAlive`,
+  `ThrottleInterval: 10`) restarts the agent every 10 seconds until the port is
+  free. Read `~/Library/Logs/pipecat-stt/<label with dots as dashes>.err`
+  (for example `pipecat-stt-server-parakeet.err`; the default whisper agent logs
+  to `pipecat-stt.err`) and free the port or reinstall on another one.
+
+### Token file (replaces env tokens)
+
+`render_stt_plist.py` and `install_stt_agent.sh` now **refuse**
+`PIPECAT_STT_AUTH_TOKEN` and `KODA_STT_AUTH_TOKEN` in their environment: an env
+token would be written into the plist. Put the token in a file and pass its
+absolute path instead:
+
+```bash
+install -d -m 700 ~/.config/pipecat-stt                # your own directory; sets mode 700
+install -m 600 /dev/null ~/.config/pipecat-stt/token   # then write the token into it
+PIPECAT_STT_AUTH_TOKEN_FILE=$HOME/.config/pipecat-stt/token \
+  PIPECAT_STT_BACKEND=mlx scripts/install_stt_agent.sh install
+```
+
+In TCP mode the installer checks the file before writing the plist: a regular
+file (not a symlink), owned by you, with no group/other permission bits and no ACL
+allow entry, in a directory chain (symlinks resolved) that only you or root own and
+that no one else can write to. A group-writable directory passes only when root
+owns it and its group is `wheel` or `admin` (whose members can act as root anyway).
+A sticky bit (`t` or `T` in `ls -ld`) is no exception, so a token file under
+`/tmp` is refused: the sticky bit stops others deleting your file, but once the
+name is gone (macOS empties `/tmp` at boot) anyone can create it before the agent
+starts, and the server opens the path afresh at every start. ACLs count too: a directory on the path
+with an ACL allow entry carrying a write-class right (`write`, `append`, `add_file`,
+`add_subdirectory`, `delete`, `delete_child`, `writeattr`, `writeextattr`,
+`writesecurity`, `chown`) for anyone fails the install, as does any allow entry on
+the file itself; deny entries are fine. `ls -le` shows them and `chmod -N` removes
+them. The plist records the resolved path, the one that was checked, so a
+symlinked directory in the path you gave cannot be repointed later. The content must be what the server accepts: it reads the file as
+UTF-8 and strips surrounding whitespace, and the result must be one token of
+visible ASCII characters with no internal whitespace. An empty file would disable
+auth, and a token with a space, tab or newline left inside it after stripping, or a
+non-ASCII character, can never match an `Authorization` header, so both fail the
+install. Leading and trailing whitespace, including the trailing
+newline an editor or `echo` adds, is stripped and fine. A missing file would
+crash-loop the agent, so the installer refuses that too. The probe (`status`)
+stays lenient for a client-side token file.
+
+**`serve --auth-token-file` enforces the same policy at every start.** All of the
+rules above, file and content alike, are one implementation,
+`stt_server.auth.load_token_file`, which the installer's preflight and `serve`
+both run, so an installed agent never trips over them. `serve` opens the file
+with `O_NOFOLLOW`, checks the descriptor it opened (a regular file owned by the
+user running the server, no group/other bits, no ACL allow entry) and then walks
+its resolved directory chain, and reads the token from that same descriptor. The
+path must be absolute. This applies to a server you launch by hand, or one a
+supervising app (Koda, the menu bar app) launches with `--auth-token-file`: a
+file the installer would refuse now stops startup with exit 1 and a one-line
+message naming the file, the problem and the fix, for example
+
+```text
+stt_server: auth token file '/Users/me/token' has mode 644; it must not be group/other accessible; fix: chmod 600 '/Users/me/token'
+```
+
+To fix a refused file: `chmod 600 <file>` for group/other bits; `chmod -N <file>`
+(or `<dir>`) for an ACL; for a parent directory others can write (a shared
+directory, `/tmp`, a group-writable folder) move the file into a directory only you
+can write, e.g. `install -d -m 700 ~/.config/pipecat-stt`, and pass the new
+absolute path; recreate a file someone else owns as yourself (`install -m 600
+/dev/null <file>`, then write the token); pass the real file, not a symlink to it.
+
+A reinstall never silently drops auth: if the installed plist carries a token (a
+pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
+`PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails. Set the token file, or run
+`uninstall` first to install without a token. The installer reads the installed
+plist's flags with the server's own grammar (`serve` takes full flag names only),
+so `--auth-token-file /x` and `--auth-token-file=/x` both count as a token. An
+installed plist the installer
+cannot read (malformed, truncated, or the reader's interpreter missing: `install`
+runs it under the venv python, `uninstall` under the system `python3`) also fails the install,
+since it cannot tell whether that agent required a token; `uninstall` still
+removes such an agent but leaves any socket in place, with a warning.
+
+The plist then passes `--auth-token-file <path>` to the server. `just
+stt-install` forwards the caller's environment, so exporting
+`PIPECAT_STT_AUTH_TOKEN_FILE` before the recipe has the same effect. Clients
+send the token with `STT_WS_TOKEN`.
+
+### Socket agents (opt-in)
+
+Set `PIPECAT_STT_SOCKET` (alias `KODA_STT_SOCKET`; empty counts as unset) to get
+a Unix-socket agent. The plist is byte-identical to the pre-0.5.0 agents:
+
+```bash
+PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/stt.sock" just stt-install whisper
+```
+
+Socket mode keeps the directory validation, `0700` socket directory, peer-uid
+check and lock file described below. It ignores `PIPECAT_STT_HOST`, `PORT` and
+`AUTH_TOKEN_FILE` (the installer warns on stderr). Reinstalling a previously-socket agent
+without `PIPECAT_STT_SOCKET` switches it to TCP and removes the old socket; a
+reinstall onto a different socket path removes the old one too. The old socket
+is removed only after the new agent bootstrapped and launchd no longer lists the
+old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30), and only while no
+process holds its `.lock` (a server started by hand can own the path); otherwise
+it is left in place with a warning. The `.lock` is never removed (see below). `uninstall` waits the same way,
+for a TCP agent too (its server can own the port until it exits): it prints
+`uninstalled: <label>` only once launchd no longer lists the job, and otherwise a
+warning and `uninstall incomplete (still loaded): <label>` (exit 0 either way).
+When a wait times out, no later run can find the old socket (its plist is gone or
+replaced), so the warning prints the command to remove it once the old server has
+exited (`lsof -- <socket>.lock` lists no process): `test -S <socket> && ! test -L
+<socket> && test -O <socket> && rm -f -- <socket>`, with the path shell-quoted. It
+is printed only for a path the installer would clean itself (absolute, no `..`,
+under `$HOME`, no symlinked directory); for any other recorded path the warning
+says it looks unsafe and offers no command.
 
 ### Single-server lock file
 
@@ -40,9 +211,24 @@ live server whose listen backlog is full is never mistaken for a stale socket.
 - The kernel releases the lock when the server process exits for any reason
   (including `SIGKILL` and the immediate exit on a stop during startup), so it
   cannot go stale.
-- It is never unlinked: deleting it while a server runs, or between two
+- The server never unlinks it: deleting it while a server runs, or between two
   starters, would let two servers own one socket. Leaving it behind is
-  harmless. Clients never open it.
+  harmless. Clients never open it. The installer never unlinks it either: its
+  check drops the lock when it exits, so unlinking the file afterwards would let
+  a starter that just locked it run beside a later one that creates a new file.
+  On a transport change and on `uninstall` of a socket agent it removes only the
+  stale socket, once launchd no longer lists the old job and no process holds
+  the lock. A held lock (or one it cannot check) leaves the socket in place,
+  with a warning. The check and the unlink are one step under a shared lock on
+  the `.lock`, so a server starting at that moment waits for it (a starter
+  retries a contended lock for 250 ms) and binds only after the unlink; it never
+  loses its fresh socket. With no `.lock` there, nothing is locked (the installer
+  never creates one): a `.lock` that exists when the installer re-reads the
+  entry just before the unlink is honoured (a held one keeps the socket), but
+  one created after that re-read is not seen, so a starter in that window of a
+  few syscalls can lose its fresh socket. A 0.3.x server takes no lock at all,
+  and a server still holding a `.lock` inode an older installer unlinked is not
+  seen either.
 - `serve --supervised` checks it before binding (a held lock is reported as
   `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
   a contended lock for 250 ms, so the check never makes a real start fail. It
@@ -78,69 +264,84 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   that live server's socket. Stop old servers (`just stt-disable <backend>`, or unload their
   LaunchAgents) before starting upgraded ones on the same socket path.
 
-Whisper uses the default label and socket, so a bot-side default of
-`~/Library/Caches/pipecat-stt/stt.sock` resolves to it with no `.env`
-change. Selecting Parakeet is a one-env-var flip: point
-`STT_WS_SOCKET` at `.../parakeet.sock`. The flip is **bot-wide** — in the
-dual-input bot both the Me and Them branches connect to the same resolved
-endpoint, so both arms always use the same ASR. See `.env.example` for the
-client-side configuration.
+A bare install binds TCP, and a client with no endpoint env resolves nothing
+(the library has no built-in default), so set `STT_WS_HOST=127.0.0.1` and
+`STT_WS_PORT=<port>` on the client. Selecting Parakeet is a flip of
+`STT_WS_PORT` to 9765. The flip is **bot-wide** — in the dual-input bot both the
+Me and Them branches connect to the same resolved endpoint, so both arms always
+use the same ASR. A socket agent is selected with `STT_WS_SOCKET` instead. See
+`.env.example` for the client-side configuration.
 
-### Two-agent install
+### Installing agents
 
 > **Backend dependencies.** A backend imports its ASR library lazily at startup,
 > and a bare `uv run` / `uv sync` prunes the optional extras, so an installed
 > agent can crash-loop on `ModuleNotFoundError`. `just stt-install <backend>` /
 > `just stt-enable <backend>` ensure the matching extra is present
 > (`uv sync --extra <backend> --inexact`, additive — it won't prune other
-> backends); set `PIPECAT_STT_SKIP_DEP_SYNC=1` to manage extras yourself. If an
+> backends; kyutai goes to its own `.venv-kyutai`); set
+> `PIPECAT_STT_SKIP_DEP_SYNC=1` to manage extras yourself. If an
 > agent does crash on a missing import, the server now exits with an actionable
 > `stt_server: the '<extra>' extra is not installed … run: uv sync --extra
 > <extra> --inexact` instead of a bare traceback.
 
-`scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
-`PIPECAT_STT_SOCKET` / `PIPECAT_STT_BACKEND` (the legacy `KODA_STT_*` names
-are still honoured as deprecated aliases) so two LaunchAgents can coexist
-without plist or log collisions:
-
 ```bash
-# 1. Whisper agent — default env keeps the legacy label + socket.
-scripts/install_stt_agent.sh install
-
-# 2. Parakeet agent — distinct label, socket and backend.
-#    Warm the ~1.5 GB Hugging Face model cache FIRST: a cold first launch
-#    downloads it under KeepAlive + ThrottleInterval=10 and launchd may
-#    throttle-loop the agent before the download finishes.
-uv sync --extra parakeet
-.venv/bin/python -m stt_server prefetch --backend parakeet
-PIPECAT_STT_LABEL=pipecat.stt-server.parakeet \
-  PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/parakeet.sock" \
-  PIPECAT_STT_BACKEND=parakeet \
-  scripts/install_stt_agent.sh install
+just stt-install whisper      # 127.0.0.1:9565
+just stt-install parakeet     # 127.0.0.1:9765 — warm the model cache first (below)
+just stt-install nemotron     # 127.0.0.1:9865
+just stt-install kyutai       # 127.0.0.1:9665, own .venv-kyutai
+just stt-list                 # agents, state, pid, live endpoint and backend
+just stt-status               # no argument: same as stt-list
+just stt-status parakeet      # probe the installed plist's endpoint (canonical port 9765 if no plist)
+just stt-status ~/Library/Caches/pipecat-stt/stt.sock   # a path is probed as --socket-path
+just stt-probe --host 127.0.0.1 --port 9565   # status probe of any endpoint
 ```
 
-The script manages exactly **one** agent per invocation, identified by
-`PIPECAT_STT_LABEL` (+ its socket) — there is no registry or "all" mode. To run
-any subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against
-the Parakeet agent you must re-export its `PIPECAT_STT_LABEL` and
-`PIPECAT_STT_SOCKET` (legacy `KODA_STT_*` aliases still work); a default-env
-invocation always targets the default `pipecat.stt-server` agent. See the recipe
-in the `install_stt_agent.sh` header.
+Warm the ~1.5 GB Hugging Face model cache for Parakeet FIRST: a cold first
+launch downloads it under `KeepAlive` + `ThrottleInterval=10` and launchd may
+throttle-loop the agent before the download finishes:
+
+```bash
+uv sync --extra parakeet
+.venv/bin/python -m stt_server prefetch --backend parakeet
+```
+
+`scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
+`PIPECAT_STT_BACKEND` / `PIPECAT_STT_HOST` / `PIPECAT_STT_PORT` /
+`PIPECAT_STT_SOCKET` (the legacy `KODA_STT_*` names, where they exist, are still
+honoured as deprecated aliases; `HOST`, `PORT` and `AUTH_TOKEN_FILE` have no
+`KODA_` alias) so several LaunchAgents can coexist without plist or log
+collisions. The script manages exactly **one** agent per invocation, identified
+by `PIPECAT_STT_LABEL` — there is no registry or "all" mode. To run any
+subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against a
+non-default agent you must re-export its `PIPECAT_STT_LABEL` (and
+`PIPECAT_STT_BACKEND` when it is not the default); `uninstall` removes the socket
+named in the *installed* plist, not the env (once the job has unloaded, as above). A default-env invocation always
+targets the default `pipecat.stt-server` agent. Prefer the `just` recipes, which carry
+the label for you. See the recipe in the `install_stt_agent.sh` header.
 
 ### A/B benchmark — Whisper vs Parakeet
 
-With both agents installed and socket-live, `scripts/benchmark_asr_ab.py`
+With both agents installed and live, `scripts/benchmark_asr_ab.py`
 replays a corpus of utterances through **both** servers and reports
 per-utterance Word Error Rate (WER) + decode latency, plus aggregates. It is
 a pure V1 client — no protocol surface added — and a one-off operator tool
 (no REST counterpart, not a CI gate).
 
 ```bash
-# Default endpoints: whisper on stt.sock, parakeet on parakeet.sock.
+# 0.5.0 default agents are loopback TCP, so pass the URIs. --whisper-uri /
+# --parakeet-uri override the socket flags.
+uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+    --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765
+
+# Socket agents: with no endpoint flags the script defaults to
+# ~/Library/Caches/pipecat-stt/stt.sock and .../parakeet.sock
+# (override with --whisper-socket / --parakeet-socket).
 uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus
 
 # Write a full JSON report alongside the console summary.
 uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+    --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765 \
     --json-out benchmarks/results/asr_ab.json
 ```
 
@@ -168,6 +369,12 @@ supervisor can show `downloaded_bytes / total_bytes` directly:
 - The last `progress` before `done` always has `downloaded_bytes == total_bytes`
   and `files_done == files_total`.
 
+For the four default models, `prefetch` fetches the commit pinned in
+`PINNED_REVISIONS` (`stt_server/backends/__init__.py`), so the `start`/`check`
+events carry that SHA as `revision`; any other `--model` reports `revision: null`
+and follows the repo's `main`. The server loads the same commit, so a fetched
+snapshot is the one it serves.
+
 The `kyutai` backend reads its weight filenames from the repo's `config.json`,
 so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open. Each
 name must be a plain filename (no `/`, `..` or glob characters), or prefetch and
@@ -184,8 +391,8 @@ state (queue depth, uncommitted bytes, uptime) and process health (pid,
 peak RSS), and, on connect, replies with a `server.hello` carrying
 protocol version, audio format, and capabilities. Both `server.hello` and
 `server.status` also carry a `backend` object — `{"name": ..., "model": ...}` —
-naming the ASR actually behind the socket, so a client can verify it rather
-than trust the socket path. The `status` subcommand wraps that round-trip:
+naming the ASR actually behind the endpoint, so a client can verify it rather
+than trust the socket path or port. The `status` subcommand wraps that round-trip:
 
 ```bash
 # Text output (exit 0 on success, 1 on not-reachable/timeout/error)
@@ -194,9 +401,11 @@ uv run python -m stt_server status --socket-path ~/Library/Caches/pipecat-stt/st
 # Raw JSON for scripting / monitoring
 uv run python -m stt_server status --socket-path ... --json
 
-# Loopback TCP with bearer token
-uv run python -m stt_server status --host 127.0.0.1 --port 8765 \
-    --auth-token-file /path/to/token
+# Loopback TCP agent (whisper's canonical port; add --auth-token-file if set)
+uv run python -m stt_server status --host 127.0.0.1 --port 9565
+
+# Same, through the recipe (any endpoint; an explicit endpoint is required)
+just stt-probe --host 127.0.0.1 --port 9565
 ```
 
 Representative text output:

@@ -8,9 +8,16 @@ Inputs are read from env vars (see ``scripts/install_stt_agent.sh``) and
 allowlist-validated before being placed in the plist. Unknown/invalid values
 fail loudly rather than silently producing a broken or malicious plist.
 
-May be run directly (not only via ``install_stt_agent.sh``); the label and
-auth token each accept the canonical ``PIPECAT_STT_*`` name or the deprecated
-``KODA_STT_*`` alias, resolved canonical-first by ``env_first``.
+May be run directly (not only via ``install_stt_agent.sh``). The transport is
+``SOCKET_PATH`` (a Unix socket) or ``HOST`` + ``PORT`` (loopback TCP, the
+default; ``HOST`` defaults to 127.0.0.1), never both. These are the generic
+names, so a shell that already exports ``HOST`` or ``PORT`` will trip them:
+the installer clears the ones that do not apply, a direct run must too. Only the label
+accepts the canonical ``PIPECAT_STT_LABEL`` name or the deprecated
+``KODA_STT_LABEL`` alias, resolved canonical-first by ``env_first``. The auth
+token is never read from the environment: ``PIPECAT_STT_AUTH_TOKEN`` /
+``KODA_STT_AUTH_TOKEN`` are REFUSED (a secret in the plist would be readable);
+``AUTH_TOKEN_FILE`` (a path to a token file) is the supported way.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from pathlib import Path
 # fails with the same actionable hint the shell guard gives, not an opaque
 # traceback.
 try:
+    from stt_server.auth import LOOPBACK_HOSTS
     from stt_server.env import env_first
 except ImportError:
     print(
@@ -41,8 +49,9 @@ DEFAULT_LABEL = "pipecat.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
 _MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
-_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron)$")
+_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron|kyutai)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
+_PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
 
 def _log_basename(label: str) -> str:
@@ -72,7 +81,9 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
     if not value:
         print(f"error: {name} is required", file=sys.stderr)
         sys.exit(2)
-    if not pattern.match(value):
+    # fullmatch, not match: with ``$`` anchors, ``match`` accepts a trailing
+    # newline ("/a\n"), which would then land in the plist.
+    if not pattern.fullmatch(value):
         print(
             f"error: {name}={value!r} rejected by allowlist ({hint})",
             file=sys.stderr,
@@ -81,12 +92,27 @@ def _require(name: str, value: str | None, pattern: re.Pattern[str], hint: str) 
     return value
 
 
+def check_abspath(argv: list[str]) -> None:
+    """``--check-abspath NAME VALUE``: exit 0 if VALUE passes the plist's
+    absolute-path allowlist, else 2 naming NAME. The installer's preflight calls
+    this before it creates any directory, so ``_ABSPATH_RE`` stays the one rule."""
+    if len(argv) != 4:
+        print("usage: render_stt_plist.py --check-abspath NAME VALUE", file=sys.stderr)
+        sys.exit(2)
+    _require(
+        argv[2], argv[3], _ABSPATH_RE, "absolute path; letters, digits, space and . _ / + - @ only"
+    )
+    sys.exit(0)
+
+
 def main() -> None:
+    if sys.argv[1:2] == ["--check-abspath"]:
+        check_abspath(sys.argv)
     # The label is optional; an unset value uses the default single-agent
     # label (pipecat.stt-server). Canonical PIPECAT_STT_LABEL wins;
     # KODA_STT_LABEL is a deprecated alias.
     label = env_first("PIPECAT_STT_LABEL", "KODA_STT_LABEL") or DEFAULT_LABEL
-    if not _LABEL_RE.match(label):
+    if not _LABEL_RE.fullmatch(label):
         print(
             f"error: PIPECAT_STT_LABEL={label!r} rejected by allowlist (alphanumerics / . _ -)",
             file=sys.stderr,
@@ -96,11 +122,49 @@ def main() -> None:
 
     python = _require("PYTHON", os.environ.get("PYTHON"), _ABSPATH_RE, "absolute path")
     cwd = _require("REPO_ROOT", os.environ.get("REPO_ROOT"), _ABSPATH_RE, "absolute path")
-    socket_path = _require(
-        "SOCKET_PATH", os.environ.get("SOCKET_PATH"), _ABSPATH_RE, "absolute path"
-    )
+    # Empty strings count as unset. SOCKET_PATH and HOST/PORT are mutually
+    # exclusive; TCP is the default transport when SOCKET_PATH is unset.
+    socket_path_raw = os.environ.get("SOCKET_PATH") or None
+    host_raw = os.environ.get("HOST") or None
+    port_raw = os.environ.get("PORT") or None
+    if socket_path_raw is not None and (host_raw is not None or port_raw is not None):
+        print(
+            "error: SOCKET_PATH and HOST/PORT are mutually exclusive; set one transport",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    transport_args: list[str]
+    if socket_path_raw is not None:
+        socket_path = _require("SOCKET_PATH", socket_path_raw, _ABSPATH_RE, "absolute path")
+        transport_args = ["--socket-path", socket_path]
+    else:
+        host = host_raw or "127.0.0.1"
+        # The server's own bind allowlist (stt_server.auth.LOOPBACK_HOSTS).
+        if host not in LOOPBACK_HOSTS:
+            print(
+                f"error: HOST={host!r} rejected (loopback only: {', '.join(sorted(LOOPBACK_HOSTS))})",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        port_s = _require("PORT", port_raw, _PORT_RE, "integer 1-65535")
+        port = int(port_s)
+        if not (1 <= port <= 65535):
+            print(f"error: PORT={port_s!r} out of range (1-65535)", file=sys.stderr)
+            sys.exit(2)
+        transport_args = ["--host", host, "--port", str(port)]
+    auth_token_file = os.environ.get("AUTH_TOKEN_FILE") or None
+    if auth_token_file is not None:
+        auth_token_file = _require("AUTH_TOKEN_FILE", auth_token_file, _ABSPATH_RE, "absolute path")
+    for tok_name in ("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN"):
+        if os.environ.get(tok_name):
+            print(
+                f"error: {tok_name} is set, but the renderer never writes a secret into "
+                "the plist; write the token to a file and pass AUTH_TOKEN_FILE (path) instead",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     backend = _require(
-        "BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet|nemotron"
+        "BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet|nemotron|kyutai"
     )
     model = _require(
         "MODEL",
@@ -118,8 +182,7 @@ def main() -> None:
             python,
             "-m",
             "stt_server",
-            "--socket-path",
-            socket_path,
+            *transport_args,
             "--backend",
             backend,
             "--model",
@@ -141,19 +204,13 @@ def main() -> None:
         "StandardErrorPath": str(Path(log_dir) / f"{log_basename}.err"),
     }
 
-    # Accept the canonical PIPECAT_STT_AUTH_TOKEN first, then the deprecated
-    # KODA_STT_AUTH_TOKEN alias. The server reads PIPECAT_STT_AUTH_TOKEN-first,
-    # so render the canonical name into the plist EnvironmentVariables block.
-    auth_token = env_first("PIPECAT_STT_AUTH_TOKEN", "KODA_STT_AUTH_TOKEN")
-    if auth_token:
-        # Prefer env over --auth-token so the token never lands in `ps`.
-        plist["EnvironmentVariables"]["PIPECAT_STT_AUTH_TOKEN"] = auth_token
+    if auth_token_file:
+        plist["ProgramArguments"] += ["--auth-token-file", auth_token_file]
 
     out = Path(plist_dst)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Write under a restrictive umask so the plist containing
-    # PIPECAT_STT_AUTH_TOKEN is 0o600 from the start (no race where another
-    # local user could read it between create and chmod).
+    # Write under a restrictive umask so the plist is 0o600 from the start
+    # (no race between create and chmod).
     prev_umask = os.umask(0o077)
     try:
         with out.open("wb") as f:

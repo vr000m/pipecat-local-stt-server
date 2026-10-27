@@ -25,8 +25,8 @@ from stt_server.env import env_bool_first, env_float_first
 from stt_server.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
-from ..snapshot import SnapshotSpec
-from . import DEFAULT_MLX_MODEL
+from ..snapshot import SnapshotSpec, download_phase
+from . import DEFAULT_MLX_MODEL, pinned_revision
 from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.mlx")
@@ -170,7 +170,7 @@ class _MLXStream:
                 )
                 result = mlx_whisper.transcribe(
                     audio,
-                    path_or_hf_repo=self._model,
+                    path_or_hf_repo=self._backend._model_path(),
                     # "auto"/blank -> None so Whisper auto-detects instead of
                     # raising on an unknown language token (see _normalize_language).
                     language=_normalize_language(self._language),
@@ -263,6 +263,7 @@ class MLXWhisperBackend(DecodeGuardMixin):
         self._model = model
         # Public identity for the server.hello / server.status `backend` field.
         self.model = model
+        self._resolved_path: str | None = None
         # Decode-lock pair + in-flight counter (see ``DecodeGuardMixin``).
         # The counter is incremented BEFORE the decode thread is spawned (in
         # the coroutine's event-loop context) and decremented by the stream in
@@ -270,6 +271,21 @@ class MLXWhisperBackend(DecodeGuardMixin):
         # ``Thread.start()`` and the thread reaching ``_thread_lock`` -- the
         # exact Metal-assertion window the bound exists to close.
         self._init_decode_guards()
+
+    def _model_path(self) -> str:
+        """What ``mlx_whisper`` is told to load. ``mlx_whisper`` downloads a bare
+        repo id from the repo's ``main``, so a pinned default is resolved here to
+        its snapshot directory (a local path, which it opens as-is). Any other
+        model id is passed through unchanged. Called on the decode thread."""
+        revision = pinned_revision(self._model)
+        if revision is None:
+            return self._model
+        if self._resolved_path is None:
+            from huggingface_hub import snapshot_download  # type: ignore
+
+            with download_phase():
+                self._resolved_path = snapshot_download(self._model, revision=revision)
+        return self._resolved_path
 
     async def start(self) -> None:
         # Eager import; fail fast if the extra isn't installed. Re-raise a
@@ -316,6 +332,7 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     return [
         SnapshotSpec(
             model or DEFAULT_MLX_MODEL,
+            revision=pinned_revision(model or DEFAULT_MLX_MODEL),
             required=("config.json", ("weights.safetensors", "weights.npz")),
         )
     ]

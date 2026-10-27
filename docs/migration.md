@@ -41,3 +41,89 @@ To upgrade an existing v0.1.x install:
 3. **Old dirs are left in place.** The previous socket and log directories are
    not deleted — they are simply orphaned and harmless once the new agent is
    running. Remove them by hand if you want to reclaim the space.
+
+---
+
+# Upgrading from 0.4.x to 0.5.0
+
+0.5.0 changes the default LaunchAgent transport from a Unix socket to loopback
+TCP, on the ports in the [per-backend table](operations.md#per-backend-port-convention)
+(whisper 9565, kyutai 9665, parakeet 9765, nemotron 9865; the menu bar app side
+confirmed the Parakeet and Nemotron numbers on 2026-10-26). Nothing changes
+for the wire protocol, the import name or the Python client.
+
+1. **Check downstream installer invocations first.** A reinstall without
+   `PIPECAT_STT_SOCKET` flips that agent to TCP and removes its old socket (once the old job has unloaded; see step 2), so
+   check how any consumer (Koda, onoats) invokes the installer before
+   upgrading. onoats never runs it (it only runs `launchctl kickstart` when
+   `[stt].launchd_label` is set); Koda's wrapper does (below).
+   - **Breaking for Koda:** `./koda stt install` shells into
+     `scripts/install_stt_agent.sh` (per [integration](integration.md#reference-consumer-koda)).
+     After a 0.5.0 checkout, running it creates a TCP agent and removes the old
+     socket unless the wrapper sets `PIPECAT_STT_SOCKET`/`KODA_STT_SOCKET`. Koda's
+     client falls back to its socket default, which then no longer exists. Either
+     set the socket env on the wrapper, or point Koda's client at
+     `STT_WS_HOST`/`STT_WS_PORT`. The wrapper (checked against `koda` in the
+     consumer repo, 2026-10-26; see [integration](integration.md#reference-consumer-koda))
+     exports neither `PIPECAT_STT_SOCKET` nor `KODA_STT_SOCKET`, so a bare
+     `./koda stt install` flips to TCP. It does export `STT_WS_DEFAULT_SOCKET`
+     (the old `stt.sock`), and an `STT_WS_SOCKET` line in Koda's `.env` outranks
+     `STT_WS_HOST`/`PORT`, so remove or replace that line after a TCP reinstall.
+
+2. **Reinstall the agent.** `just stt-install <backend>` writes the TCP plist,
+   removes the old socket it was replacing, and prints a note. Its
+   `<socket>.lock` is never removed (every server must lock the same file;
+   leaving it is harmless). The socket is removed only once the old job is seen
+   unloaded (up to `PIPECAT_STT_UNLOAD_WAIT` seconds) and no process holds its
+   lock; otherwise a warning is printed and the socket is left in place. For a TCP agent the recipe uses the
+   canonical host and port; for a custom one run the
+   installer directly, with the label and backend set so it does not replace the
+   default whisper agent, e.g. `PIPECAT_STT_LABEL=pipecat.stt-server.alt
+   PIPECAT_STT_BACKEND=mlx PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh
+   install` (see [operations](operations.md#per-backend-port-convention)).
+   Until an agent is reinstalled, `just stt-list` and `just stt-status <backend>`
+   still show and probe its old socket (they read the endpoint from the installed
+   plist).
+
+3. **Update client config** to the TCP endpoint: `STT_WS_HOST=127.0.0.1` and
+   `STT_WS_PORT=<port>` instead of `STT_WS_SOCKET`. `STT_WS_URI` and
+   `STT_WS_SOCKET` outrank `STT_WS_HOST`/`STT_WS_PORT`, so unset them or the
+   client keeps using the old socket.
+   - **onoats** (verified against onoats-bot `1a7b8c7`): the endpoint comes from
+     env `STT_WS_SOCKET`/`STT_WS_HOST`/`STT_WS_PORT`/`STT_WS_URI`, else
+     `config.toml` `[stt] ws_socket`/`ws_host`/`ws_port`/`ws_uri` (env wins), and
+     is resolved with this repo's `resolve_endpoint_from_env`. Set `ws_host` and
+     `ws_port` under `[stt]` and remove `ws_socket`, which would otherwise take
+     precedence.
+   - **Do not re-run `onoats init` afterwards without checking.** It rewrites
+     `[stt]` and carries over only `ws_socket` (`src/onoats/init.py:443`,
+     `:758-760`); it never writes `ws_host`/`ws_port`, so re-running it drops the
+     TCP keys. With no endpoint configured, onoats falls back to its built-in
+     `_DEFAULT_STT_WS_SOCKET` (`~/Library/Caches/pipecat-stt/stt.sock`,
+     `src/onoats/runtime.py:288`, applied at `:319-322` unless
+     `STT_WS_DEFAULT_SOCKET` is set), which a socket-to-TCP reinstall has
+     removed. Re-add `ws_host`/`ws_port` (or set the `STT_WS_*`
+     env) after any `onoats init`.
+
+4. **Env tokens are refused.** `PIPECAT_STT_AUTH_TOKEN` and
+   `KODA_STT_AUTH_TOKEN` in the installer's environment now fail the install
+   (they would be written into the plist). Write the token to a file and set
+   `PIPECAT_STT_AUTH_TOKEN_FILE=<absolute path>`. Loopback agents run without a
+   token by default, as the TTS agents do.
+
+   **Reinstalling an agent that carried a token is refused.** If the installed
+   plist has a token (an env token from before 0.5.0, or
+   `--auth-token-file`), a TCP reinstall without `PIPECAT_STT_AUTH_TOKEN_FILE`
+   exits 1 rather than replace it with an unauthenticated listener. Set
+   `PIPECAT_STT_AUTH_TOKEN_FILE`, or run `uninstall` first to install without a
+   token. A socket reinstall is not refused (it warns that the socket agent
+   carries no token).
+
+**Keeping a socket agent (the 0.4.x transport):**
+
+```bash
+PIPECAT_STT_SOCKET=<path> just stt-install <backend>
+```
+
+The socket plist is byte-identical to the 0.4.x one. Loopback TCP has no
+peer-uid check; the socket keeps it.

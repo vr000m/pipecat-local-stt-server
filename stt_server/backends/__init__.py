@@ -26,6 +26,22 @@ DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 DEFAULT_NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
 DEFAULT_KYUTAI_MODEL = "kyutai/stt-1b-en_fr-mlx"
 
+# Hub commit each pinned default loads, so a push to the repo's ``main`` cannot
+# change the weights under a released server. Keyed by the exact repo id: any
+# other ``--model`` (including a local path) is unpinned and follows ``main``.
+# Bump a SHA only after re-running the live decode tests against it.
+PINNED_REVISIONS: dict[str, str] = {
+    DEFAULT_MLX_MODEL: "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+    DEFAULT_KYUTAI_MODEL: "2b995724eef1e964b7ccb6a762b35a665c4abe0d",
+    DEFAULT_PARAKEET_MODEL: "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15",
+    DEFAULT_NEMOTRON_MODEL: "e550040c0478027ed679b2b6b0d055502c103663",
+}
+
+
+def pinned_revision(model: str | None) -> str | None:
+    """The pinned Hub commit for ``model``, or ``None`` when it is not a pinned default."""
+    return PINNED_REVISIONS.get(model) if model else None
+
 
 @dataclass(frozen=True)
 class BackendEntry:

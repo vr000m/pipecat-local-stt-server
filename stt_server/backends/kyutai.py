@@ -33,7 +33,7 @@ from pathlib import Path
 
 from ..backend import TranscriptEvent
 from ..snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
-from . import DEFAULT_KYUTAI_MODEL
+from . import DEFAULT_KYUTAI_MODEL, pinned_revision
 from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.kyutai")
@@ -80,6 +80,8 @@ class _KyutaiStream:
         self._buf = bytearray()
         self._ended = False
         self._cancelled = False
+        # Read by the decode thread once per model frame (see ``_transcribe``).
+        self._cancel_event = threading.Event()
         self._result: str | None = None
         self._decode_lock = decode_lock
         self._thread_lock = thread_lock
@@ -106,6 +108,9 @@ class _KyutaiStream:
     async def cancel(self) -> None:
         self._cancelled = True
         self._ended = True
+        # Stops an in-flight decode at the next frame so it releases
+        # ``_thread_lock`` for the next client instead of running to the end.
+        self._cancel_event.set()
 
     def _decode_sync(self) -> str:
         try:
@@ -113,7 +118,10 @@ class _KyutaiStream:
             if not pcm:
                 return ""
             with self._thread_lock:
-                return self._backend._transcribe(pcm)
+                # A stream cancelled while queued behind another decode never starts.
+                if self._cancel_event.is_set():
+                    return ""
+                return self._backend._transcribe(pcm, cancel=self._cancel_event)
         finally:
             self._backend._mark_inflight_end()
 
@@ -133,6 +141,7 @@ class KyutaiBackend(DecodeGuardMixin):
 
     def __init__(self, *, model: str = DEFAULT_KYUTAI_MODEL) -> None:
         self._model_id = model
+        self._revision = pinned_revision(model)
         self.model = model
         # Loaded on the first decode (a ~2.4 GB checkpoint), like parakeet.
         self._loaded: dict | None = None
@@ -155,7 +164,9 @@ class KyutaiBackend(DecodeGuardMixin):
             from moshi_mlx import models, utils  # type: ignore
 
             with download_phase():
-                config_path = hf_hub_download(self._model_id, "config.json")
+                config_path = hf_hub_download(
+                    self._model_id, "config.json", revision=self._revision
+                )
             # A fetched config that does not parse or name its files is an
             # unusable snapshot (``ModelInvalidError``), as in prefetch: neither
             # a download failure nor a bad endpoint (a bare ValueError).
@@ -167,9 +178,9 @@ class KyutaiBackend(DecodeGuardMixin):
                 mark_model_invalid(exc)
                 raise
             with download_phase():
-                mimi_weights = hf_hub_download(self._model_id, mimi_name)
-                lm_weights = hf_hub_download(self._model_id, moshi_name)
-                tokenizer = hf_hub_download(self._model_id, tokenizer_name)
+                mimi_weights = hf_hub_download(self._model_id, mimi_name, revision=self._revision)
+                lm_weights = hf_hub_download(self._model_id, moshi_name, revision=self._revision)
+                tokenizer = hf_hub_download(self._model_id, tokenizer_name, revision=self._revision)
 
             lm = models.Lm(models.LmConfig.from_config_dict(raw))
             lm.set_dtype(mx.bfloat16)
@@ -198,8 +209,12 @@ class KyutaiBackend(DecodeGuardMixin):
             logger.info("kyutai: loaded %s", self._model_id)
             return self._loaded
 
-    def _transcribe(self, pcm16: bytes) -> str:
-        """One utterance of pcm16 LE at 16 kHz -> text. Caller holds the thread lock."""
+    def _transcribe(self, pcm16: bytes, cancel: threading.Event | None = None) -> str:
+        """One utterance of pcm16 LE at 16 kHz -> text. Caller holds the thread lock.
+
+        ``cancel`` is checked once per 80 ms frame; when set the loop returns ``""``
+        (the stream is cancelled, so the result is discarded) and the next decode
+        resets the Mimi / LM state itself."""
         import numpy as np
 
         m = self._get_model()
@@ -228,6 +243,8 @@ class KyutaiBackend(DecodeGuardMixin):
         )
         pieces: list[str] = []
         for start in range(0, frames * _FRAME_SAMPLES, _FRAME_SAMPLES):
+            if cancel is not None and cancel.is_set():
+                return ""
             tokens = (
                 m["mimi"].encode_step(x[:, None, start : start + _FRAME_SAMPLES]).transpose(0, 2, 1)
             )
@@ -289,6 +306,7 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     return [
         SnapshotSpec(
             model or DEFAULT_KYUTAI_MODEL,
+            revision=pinned_revision(model or DEFAULT_KYUTAI_MODEL),
             allow_patterns=("config.json",),
             required=("config.json",),
             resolve=weight_files,

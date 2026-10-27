@@ -27,8 +27,8 @@ Usage:
 
     # Loopback TCP instead of a socket (per ASR).
     uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
-        --whisper-uri ws://127.0.0.1:8765/ \\
-        --parakeet-uri ws://127.0.0.1:8766/
+        --whisper-uri ws://127.0.0.1:9565/ \\
+        --parakeet-uri ws://127.0.0.1:9765/
 
     # Write the per-utterance + aggregate report as JSON.
     uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\

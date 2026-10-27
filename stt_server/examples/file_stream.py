@@ -2,7 +2,7 @@
 
 Usage::
 
-    python -m stt_server.examples.file_stream --host 127.0.0.1 --port 8765 path/to/file.wav
+    python -m stt_server.examples.file_stream --host 127.0.0.1 --port 9565 path/to/file.wav
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("path")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=9565)
     args = parser.parse_args()
     asyncio.run(run(args.path, args.host, args.port))
 

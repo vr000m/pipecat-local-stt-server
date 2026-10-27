@@ -461,3 +461,32 @@ async def test_overlapping_decodes_serialise(parakeet_mod, fake_parakeet):
     gate.set()  # release decode 1; decode 2 may now proceed
     await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5.0)
     assert model.transcribe_calls == 2
+
+
+def test_default_model_loads_the_pinned_snapshot(parakeet_mod, fake_parakeet, monkeypatch):
+    from stt_server.backends import DEFAULT_PARAKEET_MODEL, PINNED_REVISIONS
+
+    downloads: list[tuple[str, str | None, tuple[str, ...] | None]] = []
+
+    def fake_snapshot_download(repo, revision=None, allow_patterns=None, **_kw):
+        downloads.append((repo, revision, allow_patterns))
+        return "/cache/snapshots/pinned"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+    parakeet_mod.ParakeetBackend()._get_model()
+
+    pin = PINNED_REVISIONS[DEFAULT_PARAKEET_MODEL]
+    # The same two files prefetch fetches, at the pinned commit; the model loads from there.
+    assert downloads == [(DEFAULT_PARAKEET_MODEL, pin, ("config.json", "model.safetensors"))]
+    assert fake_parakeet.from_pretrained_calls == ["/cache/snapshots/pinned"]
+    assert parakeet_mod.prefetch_specs(None)[0].revision == pin
+
+
+def test_other_models_load_unpinned(parakeet_mod, fake_parakeet):
+    parakeet_mod.ParakeetBackend(model="x/y")._get_model()
+    assert fake_parakeet.from_pretrained_calls == ["x/y"]
+    assert parakeet_mod.prefetch_specs("x/y")[0].revision is None

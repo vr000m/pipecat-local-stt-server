@@ -7,6 +7,227 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-27
+
+> **UPGRADE NOTE.** The default LaunchAgent transport changed from a Unix socket
+> to loopback TCP. Reinstalling an agent (`just stt-install <backend>`) flips it
+> to TCP; set `PIPECAT_STT_SOCKET` to keep a socket agent
+> (`PIPECAT_STT_SOCKET=<path> just stt-install <backend>`). Point clients at
+> `STT_WS_HOST`/`STT_WS_PORT`. `PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN`
+> are now refused; use `PIPECAT_STT_AUTH_TOKEN_FILE`. A TCP reinstall of an
+> agent whose installed plist carried a token exits 1 unless
+> `PIPECAT_STT_AUTH_TOKEN_FILE` is set (run `uninstall` first to drop auth).
+> Check any downstream
+> installer invocations first. See `docs/migration.md`.
+
+### Added
+
+- **Kyutai LaunchAgent** (`just stt-install kyutai`, port 9665) with its own
+  `.venv-kyutai` (`uv sync --frozen --python 3.12 --extra kyutai`), since its extra
+  conflicts with the other MLX extras.
+- **`just stt-probe`**: a wire status probe for any endpoint (`--host/--port`,
+  `--socket-path`, `--uri`), including servers a supervising app started.
+- `PIPECAT_STT_HOST`, `PIPECAT_STT_PORT` and `PIPECAT_STT_AUTH_TOKEN_FILE` for
+  the installer; it passes them to `render_stt_plist.py` as `HOST`, `PORT` and
+  `AUTH_TOKEN_FILE`.
+- `PIPECAT_STT_PYTHON`: installer interpreter override (default
+  `.venv/bin/python`, or `.venv-kyutai/bin/python` for kyutai). `just
+  stt-install` checks the backend extra under it when it is set (and fails rather
+  than sync the venv), so a custom interpreter without the extra no longer passes
+  the check and then crash-loops; it passes the interpreter it checked to the
+  installer as `PIPECAT_STT_PYTHON`, so the plist records the checked interpreter
+  by construction, under a `venv=` override too. `just stt-enable` checks the
+  interpreter the installed plist runs (`ProgramArguments[0]`, read through the
+  plist reader) and ignores the caller's `PIPECAT_STT_PYTHON`.
+- Canonical per-backend loopback ports: whisper 9565, kyutai 9665, parakeet 9765,
+  nemotron 9865 (parakeet and nemotron confirmed with the menu bar app side on
+  2026-10-26). The installer holds the only copy of this map;
+  `scripts/install_stt_agent.sh port <backend>` prints a backend's port without
+  calling `launchctl` or touching any file, and the justfile's `_resolve` asks it
+  instead of keeping its own.
+
+### Changed
+
+- **Agents default to loopback TCP** instead of a Unix socket. `PIPECAT_STT_SOCKET`
+  (or `KODA_STT_SOCKET`), when non-empty, is an explicit opt-in to a socket agent
+  whose plist is byte-identical to before. Loopback TCP has no peer-uid check.
+- `just stt-status` with no argument runs `just stt-list`. `just stt-status
+  <backend>` probes the endpoint (socket or TCP, plus `--auth-token-file`) in the
+  installed plist, falling back to the backend's canonical host and port only
+  when no plist exists; a path is probed as `--socket-path`. `just stt-list`
+  reads each agent's live endpoint from its plist.
+- `stt-install`/`stt-uninstall` always use the canonical host and port for a TCP
+  agent; use the installer script directly for a custom one. The recipes strip an
+  ambient `PIPECAT_STT_HOST`/`PIPECAT_STT_PORT` and leave the transport to the
+  installer, so the socket rollback (`PIPECAT_STT_SOCKET` set) no longer warns
+  about ignored TCP settings and the socket-vs-TCP rule lives in one place.
+- **`PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN` get the same check as the token
+  file.** A value with internal whitespace or non-ASCII characters now fails
+  startup instead of running with a token no client can send.
+- `just stt-list`, `stt-status` and `stt-probe` run `uv run --no-sync`, so a probe can
+  no longer prune an agent's backend extras.
+- The installer and the justfile read an installed plist through one helper,
+  `scripts/read_stt_plist.py` (stdlib `plistlib`), instead of two `plutil` loops.
+  A plist it cannot read (truncated, garbage, wrong shape) or a failed reader
+  (its interpreter missing) now fails an install instead of counting as "no auth", and
+  makes `uninstall` leave any socket in place; `stt-list` shows blank fields and a
+  one-line warning for it instead of a traceback. The reader answers one field by
+  name (`--field host|port|socket-path|auth-token-file|interpreter`, the last being
+  `ProgramArguments[0]`), so no caller splits its output by line position; the
+  earlier four positional lines are gone (a call without `--field` is a usage
+  error, exit 2), and a newline inside a plist value can no longer shift one field
+  into another.
+- **`serve` takes each flag by its full name only** (argparse `allow_abbrev=False`):
+  `--auth-token /x` or `--sock /x` now fails at startup instead of being read as
+  `--auth-token-file` / `--socket-path`. `--flag=value` still works. The plist
+  reader follows the same grammar: it reads `--auth-token-file=/x` (and the `=`
+  form of `--host`, `--port`, `--socket-path`) and no longer takes the element after
+  `--supervised` as its value, so a hand-edited plist that requires a token can no
+  longer read as "no token" and let a reinstall drop auth.
+- The installer's token-file check reads macOS ACLs: any ACL allow entry on the
+  token file, or an allow entry with a write-class right (`write`, `add_file`,
+  `delete_child`, `writesecurity`, ...) on a directory of its resolved path, fails
+  the install; deny entries pass. A sticky bit exempts no directory: a token
+  file under `/tmp` (root `1777`) or any group- or other-writable sticky
+  directory outside the `wheel`/`admin` rule is refused, since anyone who can
+  write there can create the name once it is gone (macOS empties `/tmp` at boot)
+  and the server re-opens the path at every start.
+- `install` runs the plist reader and the socket cleanup's lock step under its venv
+  python (it needs no system `python3`, also when it retires an old socket); `uninstall` keeps `python3`. The endpoint read (`read_stt_plist.py
+  --strict --field socket-path`) fails on a malformed plist by itself, so it no longer relies on the
+  `--has-auth` read having run first.
+- `uninstall` waits for launchd to drop the job for a TCP agent too, and prints
+  `uninstalled: <label>` only once it is gone; a job still loaded after
+  `PIPECAT_STT_UNLOAD_WAIT` gets a warning and `uninstall incomplete (still
+  loaded)` instead (exit status unchanged, 0). When that wait times out on a
+  socket agent (on `uninstall`, or on an install that changes the socket path),
+  the warning prints the command that removes the stale socket by hand, instead
+  of advising a re-run that could no longer find it.
+- Socket cleanup on a transport change or `uninstall` leaves the socket in
+  place, with a warning, while any process holds its `.lock` (a server started
+  by hand can own the recorded path). The installer never removes the `.lock`
+  itself, as the server never does: unlinking it after the check could let a
+  starter that just locked the old file run beside a later one that creates a
+  new file at the same path.
+- The installer's token-file check refuses a path outside the plist allowlist
+  before it creates any directory.
+- The installer's raw-token refusal tests only the token's length, so running it
+  under `bash -x` no longer prints a `PIPECAT_STT_AUTH_TOKEN` /
+  `KODA_STT_AUTH_TOKEN` value to stderr.
+- **Loopback TCP without a token logs INFO, not a warning.** That is the default
+  agent setup, and non-loopback binds are refused, so there was nothing to warn
+  about. The message names `--auth-token-file`, not the env token.
+- **Breaking for hand or supervised launches: `serve --auth-token-file` enforces
+  the token-file policy at every start**, the one the installer already applied:
+  the path must be absolute; the file is opened with `O_NOFOLLOW` (a symlink is
+  refused) and the opened descriptor must be a regular file owned by the user
+  running the server with no group/other permission bits and no ACL allow
+  entry; every directory of its resolved path must be owned by that user or root
+  and writable by nobody else (by mode, or by a write-class ACL allow entry;
+  group write only on a root-owned `wheel`/`admin` directory; a sticky bit
+  exempts nothing, so `/tmp` is refused). A refused file stops startup (exit 1)
+  with a message naming the file, the problem and the fix (`chmod 600 <file>`,
+  `chmod -N` for an ACL, or move it out of a shared directory into one only you
+  can write, e.g. `~/.config/pipecat-stt`). The policy is one Python
+  implementation, `stt_server.auth.load_token_file`; the installer's preflight
+  now calls it instead of its own bash checks, so installer and server cannot
+  disagree. An installed agent is unaffected (its file passed the same check);
+  a `0644` token file, a relative path or one under `/tmp` passed to `serve` by
+  hand or by a supervising app now fails. The probe (`status`) is unchanged.
+- **`serve --auth-token-file` is strict.** An empty or whitespace-only file, a
+  token with internal whitespace (a space, tab or newline inside it; a trailing
+  newline is stripped and fine) or a non-ASCII character, or a
+  non-UTF-8 file now stops the server at startup instead of silently running
+  without auth (an empty token disabled it) or never matching any client. The
+  probe (`status`) stays lenient. The installer runs the same check
+  (`stt_server.auth.load_token_file`) before writing the plist, and now also
+  requires the token file's parent directories (symlinks resolved) to belong to
+  you or root and not be writable by others (group write only on a root-owned
+  directory of group `wheel` or `admin`; a sticky bit is no exception). The plist records the
+  resolved path, the one that was checked.
+- **The installer refuses to drop auth on reinstall.** If the installed plist
+  carries a token (a pre-0.5.0 `PIPECAT_STT_AUTH_TOKEN`/`KODA_STT_AUTH_TOKEN` in
+  `EnvironmentVariables`, or `--auth-token-file`) and a TCP install sets no
+  `PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails instead of leaving an
+  unauthenticated listener. Set the token file, or `uninstall` first to install
+  without one.
+- **`PIPECAT_STT_AUTH_TOKEN_FILE` is validated** in TCP mode: a regular file, not a
+  symlink, owned by you, no group/other permission bits, and non-empty (an empty
+  file would silently disable auth).
+- `PIPECAT_STT_UNLOAD_WAIT` must be an integer from 0 to 86400 (leading zeros are
+  read as decimal, so `08` is 8 seconds); anything else, including values large
+  enough to overflow bash arithmetic, fails before any `launchctl` call. `PIPECAT_STT_BACKEND` is checked against the
+  renderer's backend names before any directory is created (`whisper` is the
+  justfile name; the installer name is `mlx`).
+- The default weights of every Hub-backed backend (Whisper
+  `mlx-community/whisper-large-v3-turbo`, Kyutai `kyutai/stt-1b-en_fr-mlx`,
+  Parakeet `mlx-community/parakeet-tdt-0.6b-v3`, Nemotron
+  `mlx-community/nemotron-3.5-asr-streaming-0.6b`) are pinned to a Hub commit
+  (`backends.PINNED_REVISIONS`), for serving and `prefetch`. Any other
+  `--model` still follows the repo's `main`. The pins match the snapshots
+  already cached on current installs.
+
+### Removed
+
+- **Breaking:** `PIPECAT_STT_AUTH_TOKEN` and `KODA_STT_AUTH_TOKEN` are refused by
+  the installer and renderer (an env token would land in the plist). Use
+  `PIPECAT_STT_AUTH_TOKEN_FILE`.
+
+### Fixed
+
+- **Old socket cleanup waits for the old server.** The installer removes the old
+  socket only after the new agent bootstrapped and launchd no longer lists the
+  old job; `uninstall` waits for the job to unload first, since the old server
+  owns its socket until it exits. A failed bootstrap now leaves the old socket in
+  place. The `.lock` beside it is left in place in every case. A reinstall from one socket path to
+  another also retires the old socket (it was orphaned before).
+- `just stt-status` (no argument) forwards a `la_dir=` override to `stt-list`, and
+  `stt-install`/`stt-enable` forward `venv=`/`kyutai_venv=` to `_ensure-extra`.
+- **Reinstalling over a socket agent no longer risks deleting the wrong file.** The installer removes the old socket only when the installed plist names an absolute path under `$HOME` without `..` or a symlinked directory component and the socket is a real socket (not a symlink), owner-checked; anything else is left in place with a warning. It never removes the `.lock`. The renderer's validators use `fullmatch`, so a trailing newline is rejected.
+- **Reinstalling a running agent could leave it unloaded** (`Bootstrap failed: 5:
+  Input/output error`). `launchctl bootout` returns before launchd has finished
+  tearing the old job down (a loaded ASR model takes seconds to exit), and the
+  installer bootstrapped straight into that window. The installer now waits
+  (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30) until the label is gone
+  and retries the bootstrap once. Existed before 0.5.0 (same bootout/bootstrap
+  sequence); reproduced on a nemotron reinstall.
+- **Socket cleanup no longer races a starting server.** The installer checked
+  the old socket's `.lock` and released it before unlinking the socket, so a
+  server that took the lock and bound in between lost its fresh socket. The lock
+  check, the socket checks (a real socket, not a symlink, owned by you) and the
+  unlink now run in one step while the installer holds a shared lock on the
+  `.lock`; a starter waits for it (its 250 ms lock retry) and binds after.
+- The manual socket-removal command printed after a timed-out wait applies the
+  installer's own path guards: it is offered only for an absolute, `..`-free
+  path under `$HOME` with no symlinked directory (otherwise the warning says the
+  recorded path looks unsafe), and it removes the path only if it is still a
+  socket, not a symlink, and owned by you (`test -S P && ! test -L P && test -O P
+  && rm -f -- P`).
+- `_ensure-extra` (run by `stt-install`/`stt-enable`) probes the interpreter
+  the agent will run: for `stt-install`, `PIPECAT_STT_PYTHON` when it is set and
+  non-empty (the installer's override), else the venv, and that interpreter is
+  the one installed; for `stt-enable`, the
+  installed plist's `ProgramArguments[0]` (a plist with no interpreter, or one the
+  reader cannot parse, fails before any bootstrap). A failed probe of an
+  interpreter outside the venv fails the recipe with the remedy instead of
+  syncing the venv, which could not fix it.
+- `_ensure-extra` re-runs the import probe after a successful `uv sync` and fails
+  if it still fails, instead of reporting the extra ready and letting the agent
+  crash-loop.
+- `just stt-disable` waits (up to 30 s) until launchd no longer lists the agent
+  before it reports `booted out`, so a `just stt-enable` straight after it no
+  longer fails with `Bootstrap failed: 5: Input/output error` while the old job
+  tears down. Still listed at the cap, it warns and reports the bootout as still
+  unloading (exit 0).
+- The installer and the `just` recipes capture paths losslessly. `$(...)` drops
+  trailing newlines, so a token file or socket path ending in one was validated
+  or probed as one string and recorded or acted on as another (a plist socket
+  path `<sock>\n` was cleaned up as `<sock>`). Captures now keep every byte, and
+  a token-file or socket path containing a control character (newline, tab,
+  escape) is refused with a `fix:` line before anything is created.
+- Kyutai: a cancelled stream (barge-in) now stops its decode at the next 80 ms
+  frame, so the next client no longer waits for the abandoned decode to finish.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added
@@ -538,6 +759,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.5.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.0
 [0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0
 [0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
 [0.3.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.2
