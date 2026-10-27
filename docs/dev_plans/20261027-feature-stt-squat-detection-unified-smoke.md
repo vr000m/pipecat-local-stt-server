@@ -69,19 +69,36 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 | 9 | One `assert_token_gate(host, port, token_file)` in `scripts/_smoke_lib.py` (401 without a token, success with it), used by `smoke.py` and `smoke_launchd.py` | Avoids two copies of the same assertion |
 | 10 | Token by default stays out; revisit with the TTS server | Breaks every consumer's no-config default |
 
-## Phases
+## Implementation Checklist
 
-### Phase 1: Squat detection (issue #17, proposals 3 + 2)
+### Phase 1a: Replace plain `uv run` in the smoke recipes
 
-- [ ] **First commit, alone:** replace plain `uv run` in the `smoke-peercred` recipe and the `smoke_peercred.py` docstring with `.venv/bin/python`. No `just smoke` runs before it lands. Add a regression test that greps the justfile, `scripts/smoke_*.py` and `README.md` for `uv run python` without `--no-sync`.
+**Impl files:** justfile, scripts/smoke_peercred.py
+**Test files:** tests/test_justfile_recipes.py
+**Test command:** `.venv/bin/python -m pytest tests/test_justfile_recipes.py -q`
+
+- [ ] Replace plain `uv run` in the `smoke-peercred` recipe and the `smoke_peercred.py` docstring with `.venv/bin/python`. This phase is its own commit, and no `just smoke` runs before it lands. Add a regression test that greps the justfile, `scripts/smoke_*.py` and `README.md` for `uv run python` without `--no-sync`.
+
+### Phase 1b: Squat detection (issue #17, proposals 3 + 2)
+
+**Impl files:** scripts/squat_check.py, justfile, docs/operations.md, CHANGELOG.md
+**Test files:** tests/test_squat_check.py, tests/test_justfile_recipes.py
+**Test command:** `.venv/bin/python -m pytest tests/test_squat_check.py tests/test_justfile_recipes.py tests/test_docs_port_caveats.py -q`
+
 - [ ] `scripts/squat_check.py` per Decisions 2-6, plus the `_squat_check` wrapper recipe, called from the `stt-list` loop (TCP plists only, reusing the pid it already read) and from `stt-status` (known backend with a plist, and the no-target path through `stt-list`), before the `exec`.
 - [ ] Tests (`tests/test_squat_check.py` for the helper, `tests/test_justfile_recipes.py` for the recipes), stubbing `lsof` and `launchctl`: match; mismatch; listener absent; job loaded with no pid and a listener; job not loaded; two listener pids where one matches (warns); a wildcard (`*:PORT`) listener with a different pid (warns) and one bound to another host (ignored); lsof unreadable (exit 2, quiet); socket agent (no call); no plist (no call).
 - [ ] Exit-code and stream tests: on a mismatch `stt-list` exits 0 and `stt-status` returns the probe's exit code for both 0 and 1; the warning is on stderr and stdout is byte-identical with and without a squat.
-- [ ] Add the `lsof` stub (default: no listener) to the shared fixture in `tests/test_justfile_recipes.py` in the same commit as the helper, so existing tests stay hermetic on the macos-14 runner. Add `smoke` to the public-recipe list and `_squat_check` to the private list in `test_just_list_exposes_public_recipes`.
+- [ ] Add the `lsof` stub (default: no listener) to the shared fixture in `tests/test_justfile_recipes.py` in the same commit as the helper, so existing tests stay hermetic on the macos-14 runner. Add `_squat_check` to the private list in `test_just_list_exposes_public_recipes` (`smoke` joins the public list in Phase 3).
 - [ ] `docs/operations.md`: state the trust boundary as the decision for issue #17; document the warning, the lsof limit, and what to do (`launchctl print`, `lsof -nP -iTCP:<port>`, kill the squatter or change the port).
 - [ ] CHANGELOG `[0.5.1]` entry (later phases extend it); when the PR lands, comment the decision on issue #17 (trust boundary documented, squat detection shipped, token-by-default deferred) and close it, then open a new issue "token by default for loopback TCP agents" that waits on the TTS server moving first.
 
 ### Phase 2: launchd verification harness
+
+**Impl files:** scripts/smoke_launchd.py, scripts/_smoke_lib.py, CHANGELOG.md
+**Test files:** tests/test_smoke_launchd.py
+**Test command:** `.venv/bin/python -m pytest tests/test_smoke_launchd.py tests/test_docs_port_caveats.py -q`
+
+This phase writes code and stubbed tests only. The first live run against real launchd happens after the user reviews `scripts/smoke_launchd.py`.
 
 - [ ] `scripts/smoke_launchd.py`: installs a spare-label agent through the real installer using `.venv/bin/python` (never `uv run`), with the `echo` backend and `PIPECAT_STT_UNLOAD_WAIT` set explicitly (the installer's "leaving socket" warning is a FAIL). Applies the Decision 7 guard. Spare port default 9998.
 - [ ] **Start state:** fail early, printing the bootout/rm commands, if the spare plist, a loaded spare job, the spare socket or the spare `.lock` already exists. Reading the log path from the installed plist's `StandardErrorPath` via `read_stt_plist.py` (it is `pipecat-stt-server-smoke.err`, not `<label>.err`).
@@ -96,13 +113,22 @@ Rules: Python orchestrators call scripts, never `just`. `squat_check.py` is the 
 
 ### Phase 3: Unified smoke
 
+**Impl files:** scripts/smoke.py, justfile, README.md, docs/operations.md, CHANGELOG.md
+**Test files:** tests/test_smoke_runner.py, tests/test_justfile_recipes.py
+**Test command:** `.venv/bin/python -m pytest tests/test_smoke_runner.py tests/test_justfile_recipes.py tests/test_docs_port_caveats.py -q`
+
 - [ ] `scripts/smoke.py` (run as `.venv/bin/python scripts/smoke.py`) and `just smoke [--agents] [--launchd]` (positional-arguments pattern as `stt-probe`): runs `smoke_supervised.py --backend echo`, `smoke_peercred.py`, the token-file refuse/accept checks (spare port, `echo` backend) and prints one table with PASS, FAIL or SKIPPED plus the reason, per Decision 8. `--agents` adds a decode through each installed agent from its plist endpoint (read-only). The repo ships no audio, so the clip is generated at run time with `say` and `afconvert` (16 kHz mono wav); the step asserts the transcript contains the spoken key word, and is SKIPPED when `say` is absent. `--launchd` adds Phase 2.
 - [ ] `scripts/_smoke_lib.py`: add `assert_token_gate()` (Decision 9).
 - [ ] Tests, with the individual smoke steps stubbed: the table renderer; the exit-code rule for every Decision 8 outcome (not requested, precondition absent, guard refused, crash, timeout, non-zero); `--agents` under stubbed `launchctl`/`id`/`uv` with rendered TCP and socket plists, asserting the argv log has only `print`/status calls, no bootout, bootstrap, kickstart or installer call, and no `uv run` without `--no-sync`.
+- [ ] Add `smoke` to the public-recipe list in `test_just_list_exposes_public_recipes`.
 - [ ] README and `docs/operations.md`: one `just smoke` section replacing the scattered smoke instructions.
 - [ ] Extend the CHANGELOG `[0.5.1]` entry.
 
 ### Phase 4: Release housekeeping
+
+**Impl files:** pyproject.toml, uv.lock, CHANGELOG.md, docs/dev_plans/README.md
+**Test files:** tests/test_docs_port_caveats.py
+**Test command:** `.venv/bin/python -m pytest tests/test_docs_port_caveats.py -q`
 
 - [ ] Finalise the CHANGELOG `[0.5.1]` entry.
 - [ ] Bump `pyproject.toml` to 0.5.1 and regenerate `uv.lock` with `uv lock` (never `uv sync`, which prunes the extras). Do this **before** the final `just smoke --launchd` so the same-PID check covers it.
@@ -144,15 +170,18 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 - the `.lock` assertion matches the installer's contract
 - the guard is an allowlist covering label, port, platform and start state, and has tests
 - teardown, real-agent snapshot, exit-code rule, helper design and call flow are specified
-- the `uv run` fix moves to the first commit of Phase 1
+- the `uv run` fix moves to its own Phase 1a, ahead of everything else
 
-<!-- reviewed: 2026-10-27 @ 8fa3572cc8bd3a24dd22f7a402d34755b84b0164 -->
+Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
+
+<!-- reviewed: 2026-10-27 @ 2c4ec68126d00b7e2985481643f549b8dc2a45e0 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
 ## Progress
 
-- [ ] Phase 1: Squat detection (issue #17, proposals 3 + 2)
+- [ ] Phase 1a: Replace plain `uv run` in the smoke recipes
+- [ ] Phase 1b: Squat detection
 - [ ] Phase 2: launchd verification harness
 - [ ] Phase 3: Unified smoke
 - [ ] Phase 4: Release housekeeping
