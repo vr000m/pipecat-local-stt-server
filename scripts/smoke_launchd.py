@@ -19,7 +19,8 @@ is handed the running interpreter through ``PIPECAT_STT_PYTHON``.
 
 Order: preconditions (darwin, ``CI`` unset; otherwise ``SKIPPED``, exit 0) ->
 guard (exact spare label in both ``PIPECAT_STT_LABEL`` and ``KODA_STT_LABEL``, a
-port that is neither canonical nor already listening) -> start state (no spare
+port that is not canonical, not recorded in an installed real agent's plist and
+not already listening) -> start state (no spare
 plist, loaded job, socket or ``.lock``) -> snapshot of the real agents -> the
 three checks inside a try/finally -> teardown -> re-snapshot and compare. A guard
 or start-state refusal is a FAIL and happens before any ``launchctl`` bootstrap or
@@ -27,6 +28,12 @@ bootout and before any installer call. Teardown always runs after that point
 (failure, exception, SIGINT, SIGTERM): the installer's ``uninstall`` for the spare
 label, then the spare ``.lock`` once nothing holds it, then the spare plist and
 logs. It never touches another label.
+
+The real agents are found under the account's home from the password database,
+not ``$HOME``, so an overridden ``HOME`` cannot empty the before/after snapshot.
+``launchctl print`` and ``lsof`` are read through ``squat_check.py``'s helpers
+(one listener definition); a ``launchctl`` or ``lsof`` answer the harness cannot
+read refuses or FAILs, never reads as "not loaded" or "free".
 
 Exit 0 unless a requested step FAILed. The external tools (``launchctl``,
 ``lsof``, ``id``, ``bash``, ``python3``) are called by bare name through PATH.
@@ -42,6 +49,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,8 +68,9 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 import _smoke_lib  # noqa: E402
+import squat_check  # noqa: E402
 
-SPARE_LABEL = "pipecat.stt-server.smoke"
+SPARE_LABEL = _smoke_lib.SPARE_LABEL
 DEFAULT_PORT = 9998
 HOST = "127.0.0.1"
 # Installer backends with a canonical port (the justfile's "whisper" is "mlx").
@@ -76,7 +85,9 @@ CMD_TIMEOUT = 15
 # inherited steers an install; the harness sets what it needs per call.
 _SCRUB_PREFIXES = ("PIPECAT_STT_", "KODA_STT_")
 _KEEP = ("PIPECAT_STT_LOG_DIR", "KODA_STT_LOG_DIR")
-_WARN_RE = re.compile(r"leaving|still loaded|uninstall incomplete", re.IGNORECASE)
+_WARN_RE = re.compile(
+    r"leaving|still loaded|uninstall incomplete|may still hold|could not remove", re.IGNORECASE
+)
 _IN_USE_RE = re.compile(r"address already in use|errno 48", re.IGNORECASE)
 
 PASS, FAIL, SKIPPED = "PASS", "FAIL", "SKIPPED"
@@ -94,7 +105,8 @@ class CheckFailed(Exception):
 
 
 def _home() -> Path:
-    return Path(os.environ.get("HOME") or str(Path.home()))
+    """``$HOME``: where the installer puts the spare's plist, logs and socket."""
+    return _smoke_lib.env_home()
 
 
 def _plist_path(label: str) -> Path:
@@ -107,20 +119,25 @@ def _log_dir() -> Path:
 
 
 def _log_paths(label: str) -> list[Path]:
-    """The spare's log files: from the plist when installed, else by the
-    installer's naming rule (basename is the label with '.' replaced by '-')."""
+    """[err log, out log] for the spare: StandardErrorPath / StandardOutPath from
+    the installed plist; the installer's naming rule (the label with '.' replaced
+    by '-') only for a key the plist lacks, or when there is no plist yet."""
     base = label.replace(".", "-")
-    paths = [_log_dir() / f"{base}.err", _log_dir() / f"{base}.log"]
+    paths = {
+        "StandardErrorPath": _log_dir() / f"{base}.err",
+        "StandardOutPath": _log_dir() / f"{base}.log",
+    }
     try:
         with open(_plist_path(label), "rb") as fh:
             data = plistlib.load(fh)
-        for key in ("StandardErrorPath", "StandardOutPath"):
+        for key in paths:
             val = data.get(key)
-            if isinstance(val, str) and val and Path(val) not in paths:
-                paths.append(Path(val))
+            if isinstance(val, str) and val:
+                paths[key] = Path(val)
     except (OSError, ValueError, plistlib.InvalidFileException):
         pass
-    return paths
+    err, out = paths["StandardErrorPath"], paths["StandardOutPath"]
+    return [err] if out == err else [err, out]
 
 
 def _err_log(label: str) -> Path:
@@ -134,6 +151,50 @@ def spare_socket_path() -> Path:
 
 def _lock_path(sock: Path | str) -> Path:
     return Path(f"{sock}.lock")
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_from(path: Path, offset: int) -> str:
+    """PATH's text past OFFSET (from 0 if it was truncated); '' when unreadable."""
+    try:
+        with open(path, "rb") as fh:
+            if _size(path) >= offset:
+                fh.seek(offset)
+            return fh.read().decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def _in_use_lines(text: str) -> int:
+    """Address-in-use LINES (one traceback line can name both forms)."""
+    return sum(1 for ln in text.splitlines() if _IN_USE_RE.search(ln))
+
+
+def prepare_private_dir(path: Path) -> bool:
+    """Create PATH 0700, or make an existing directory of ours 0700.
+
+    ``lstat`` first: a symlink or a non-directory is refused, so a planted link's
+    target is never chmod'ed or used. Returns True when it created PATH."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        path.mkdir(parents=True, mode=0o700)
+        os.chmod(path, 0o700)
+        return True
+    if stat.S_ISLNK(st.st_mode):
+        raise CheckFailed(f"{path} is a symlink; refusing to use it for the spare socket")
+    if not stat.S_ISDIR(st.st_mode):
+        raise CheckFailed(f"{path} exists and is not a directory")
+    if st.st_uid != os.getuid():
+        raise CheckFailed(f"{path} is not owned by the current user")
+    os.chmod(path, 0o700)
+    return False
 
 
 # --- process helpers (all by bare name through PATH) ----------------------
@@ -152,34 +213,39 @@ def current_uid(run=subprocess.run) -> str:
 
 
 def launchd_state(label: str, uid: str, run=subprocess.run) -> tuple[bool, str | None]:
-    """(loaded, pid) from ``launchctl print``. Read-only."""
-    res = _run(["launchctl", "print", f"gui/{uid}/{label}"], run)
-    if res.returncode != 0:
-        return False, None
-    m = re.search(r"^\s*pid = (\d+)", res.stdout or "", re.MULTILINE)
-    return True, (m.group(1) if m else None)
+    """(loaded, pid) from read-only ``launchctl print`` (squat_check's reader).
+
+    Raises RuntimeError when launchctl's answer is not "loaded" or launchctl's
+    own "could not find service": an unreadable state never reads as unloaded."""
+    state = squat_check.launchd_state(label, run, uid=uid)
+    if state is None:
+        raise RuntimeError(f"cannot read the launchd state of {label} (launchctl print failed)")
+    return state
 
 
-def _lsof_pids(args: list[str], run=subprocess.run) -> list[str]:
-    """Pids from ``lsof -Fp`` for the given selection; [] when none or lsof fails."""
-    try:
-        res = _run(["lsof", "-nP", *args, "-Fp"], run)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return sorted({ln[1:] for ln in (res.stdout or "").splitlines() if ln.startswith("p")})
+def tcp_listener_pids(port: int | str, run=subprocess.run) -> list[str] | None:
+    """Pids listening on PORT on any address; None when lsof can't tell."""
+    return squat_check.listener_pids(port, None, run)
 
 
-def tcp_listener_pids(port: int | str, run=subprocess.run) -> list[str]:
-    return _lsof_pids([f"-iTCP:{port}", "-sTCP:LISTEN"], run)
+def lock_holders(lock: Path, run=subprocess.run) -> list[str] | None:
+    """Pids holding LOCK open; None when lsof can't tell."""
+    return squat_check.lsof_pids(["--", str(lock)], run)
 
 
-def lock_holders(lock: Path, run=subprocess.run) -> list[str]:
-    return _lsof_pids(["--", str(lock)], run)
+def lock_unheld(lock: Path, run=subprocess.run) -> bool:
+    """True only when lsof answered and listed no holder (fail closed)."""
+    return lock_holders(lock, run) == []
 
 
 def is_listening(port: int, run=subprocess.run) -> bool:
-    """True when something listens on PORT (lsof, then a loopback connect)."""
-    if tcp_listener_pids(port, run):
+    """True when something listens on PORT (lsof, then a loopback connect).
+
+    Raises GuardRefused when lsof can't tell."""
+    pids = tcp_listener_pids(port, run)
+    if pids is None:
+        raise GuardRefused(f"cannot tell whether port {port} is free (lsof failed)")
+    if pids:
         return True
     import socket
 
@@ -191,12 +257,15 @@ def is_listening(port: int, run=subprocess.run) -> bool:
 
 
 def read_plist_field(label: str, field: str, run=subprocess.run) -> str:
-    res = _run(
-        [sys.executable, "-I", str(READ_PLIST), "--field", field, str(_plist_path(label))],
-        run,
-    )
+    return read_plist_field_path(_plist_path(label), field, run)
+
+
+def read_plist_field_path(plist: Path, field: str, run=subprocess.run, *, strict=False) -> str:
+    """One field from PLIST; ``strict`` makes a malformed plist an error, not ''."""
+    mode = ["--strict"] if strict else []
+    res = _run([sys.executable, "-I", str(READ_PLIST), *mode, "--field", field, str(plist)], run)
     if res.returncode != 0:
-        raise CheckFailed(f"cannot read plist field {field}: {(res.stderr or '').strip()}")
+        raise CheckFailed(f"cannot read {field} from {plist}: {(res.stderr or '').strip()}")
     return res.stdout or ""
 
 
@@ -205,11 +274,7 @@ def read_plist_field(label: str, field: str, run=subprocess.run) -> str:
 
 def preconditions(env=os.environ, platform=sys.platform) -> str | None:
     """A reason to skip (not fail) on this machine, or None."""
-    if platform != "darwin":
-        return f"launchd is macOS only (platform is {platform})"
-    if env.get("CI"):
-        return "CI is set; the launchd checks are opt-in and never run in CI"
-    return None
+    return _smoke_lib.launchd_skip_reason(env, platform)
 
 
 def canonical_ports(run=subprocess.run) -> set[int]:
@@ -227,7 +292,27 @@ def canonical_ports(run=subprocess.run) -> set[int]:
     return ports
 
 
-def check_guard(label, port, *, env=os.environ, canonical_ports, is_listening) -> None:
+def real_agent_plists(home: Path | None = None) -> list[Path]:
+    """Installed real-agent plists under the account home (never ``$HOME``)."""
+    return _smoke_lib.agent_plists(home if home is not None else _smoke_lib.account_home())
+
+
+def agent_ports(home: Path | None = None, run=subprocess.run) -> dict[int, str]:
+    """port -> label for each installed real agent's recorded TCP port."""
+    ports: dict[int, str] = {}
+    for plist in real_agent_plists(home):
+        try:
+            port = read_plist_field_path(plist, "port", run, strict=True).strip()
+        except (CheckFailed, OSError, subprocess.SubprocessError) as exc:
+            raise GuardRefused(f"cannot read the port recorded in {plist}: {exc}") from exc
+        if port.isdigit():
+            ports[int(port)] = plist.name[: -len(".plist")]
+    return ports
+
+
+def check_guard(
+    label, port, *, env=os.environ, canonical_ports, is_listening, agent_ports=None
+) -> None:
     """Raise GuardRefused unless this is the spare label on a spare, free port."""
     if label != SPARE_LABEL:
         raise GuardRefused(f"label {label!r} is not the spare label {SPARE_LABEL!r}")
@@ -238,6 +323,8 @@ def check_guard(label, port, *, env=os.environ, canonical_ports, is_listening) -
             raise GuardRefused(f"{name} must be set to {SPARE_LABEL!r} (it is {shown})")
     if port in canonical_ports:
         raise GuardRefused(f"port {port} is a canonical agent port")
+    if agent_ports and port in agent_ports:
+        raise GuardRefused(f"port {port} is recorded in the installed {agent_ports[port]} plist")
     if is_listening(port):
         raise GuardRefused(f"port {port} already has a listener")
 
@@ -245,16 +332,16 @@ def check_guard(label, port, *, env=os.environ, canonical_ports, is_listening) -
 # --- real-agent snapshot ----------------------------------------------------
 
 
-def snapshot_real_agents(run=subprocess.run) -> dict[str, tuple[str | None, str | None]]:
+def snapshot_real_agents(
+    run=subprocess.run, home: Path | None = None
+) -> dict[str, tuple[str | None, str | None]]:
     """label -> (launchd pid, listener pid) for each installed pipecat.stt-server*
-    plist except the spare. Read-only calls only."""
+    plist under the account home, except the spare. Read-only calls only; a
+    listener lsof cannot read is recorded as "unknown"."""
     uid = current_uid(run)
     snap: dict[str, tuple[str | None, str | None]] = {}
-    agents = _home() / "Library" / "LaunchAgents"
-    for plist in sorted(agents.glob("pipecat.stt-server*.plist")):
+    for plist in real_agent_plists(home):
         label = plist.name[: -len(".plist")]
-        if label == SPARE_LABEL:
-            continue
         _loaded, pid = launchd_state(label, uid, run)
         listener = None
         try:
@@ -263,21 +350,14 @@ def snapshot_real_agents(run=subprocess.run) -> dict[str, tuple[str | None, str 
             if port:
                 pids = tcp_listener_pids(port, run)
             elif sock:
-                pids = _lsof_pids(["--", sock], run)
+                pids = lock_holders(Path(sock), run)
             else:
                 pids = []
-            listener = ",".join(pids) or None
+            listener = "unknown" if pids is None else (",".join(pids) or None)
         except (CheckFailed, OSError, subprocess.SubprocessError):
             listener = None
         snap[label] = (pid, listener)
     return snap
-
-
-def read_plist_field_path(plist: Path, field: str, run=subprocess.run) -> str:
-    res = _run([sys.executable, "-I", str(READ_PLIST), "--field", field, str(plist)], run)
-    if res.returncode != 0:
-        raise CheckFailed(f"cannot read {field} from {plist}")
-    return res.stdout or ""
 
 
 def compare_snapshots(before, after) -> list[str]:
@@ -340,7 +420,11 @@ def install_env(label: str, port: int, *, socket_path=None, token_file=None, bas
     return env
 
 
-def run_installer(sub: str, env: dict, run=subprocess.run) -> subprocess.CompletedProcess:
+def run_installer(
+    sub: str, env: dict, run=subprocess.run, *, new_session: bool = False
+) -> subprocess.CompletedProcess:
+    """``new_session`` puts the installer in its own session, so a terminal
+    Ctrl-C (sent to the whole foreground group) cannot kill it mid-teardown."""
     res = run(
         ["bash", str(INSTALLER), sub],
         capture_output=True,
@@ -348,6 +432,7 @@ def run_installer(sub: str, env: dict, run=subprocess.run) -> subprocess.Complet
         timeout=INSTALL_TIMEOUT,
         env=env,
         cwd=REPO_ROOT,
+        start_new_session=new_session,
     )
     return res
 
@@ -387,6 +472,8 @@ class Harness:
         self.injected = True
         if self.inject == "fail":
             raise CheckFailed("injected failure (--inject fail)")
+        if self.inject == "crash":
+            raise LookupError("injected crash (--inject crash)")
         if self.inject == "hang":
             print("inject: hanging until interrupted", flush=True)
             while True:
@@ -435,18 +522,19 @@ class Harness:
         self.holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.holder.bind((HOST, self.port))
         self.holder.listen(1)
+        # Only lines written after this install count: an earlier run's
+        # address-in-use lines must not satisfy the assertion.
+        offsets = {p: _size(p) for p in _log_paths(self.label)}  # no plist yet: naming rule
         install(install_env(self.label, self.port), "collision")
         self.maybe_inject()
-        errlog = _err_log(self.label)
+        errlog = _err_log(self.label)  # now from the plist's StandardErrorPath
+        offset = offsets.get(errlog, _size(errlog))
         deadline = time.monotonic() + COLLISION_TIMEOUT
         in_use = 0
         warned = False
         while time.monotonic() < deadline:
-            try:
-                text = errlog.read_text(errors="replace")
-            except OSError:
-                text = ""
-            in_use = len(_IN_USE_RE.findall(text))
+            text = _read_from(errlog, offset)
+            in_use = _in_use_lines(text)
             if in_use >= 2:
                 loaded, pid = launchd_state(self.label, self.uid)
                 warned = self.squat_warns(loaded, pid)
@@ -496,10 +584,7 @@ class Harness:
     def check_rollback(self) -> str:
         sock = self.sock
         lock = _lock_path(sock)
-        if not sock.parent.exists():
-            sock.parent.mkdir(parents=True, mode=0o700)
-            self.sock_dir_made = True
-        os.chmod(sock.parent, 0o700)
+        self.sock_dir_made = prepare_private_dir(sock.parent)
 
         install(install_env(self.label, self.port), "rollback: TCP")
         self.expect_transport("tcp")
@@ -511,20 +596,25 @@ class Harness:
         if not lock.exists():
             raise CheckFailed(f"{lock} was not created by the socket server")
 
-        _loaded, old_pid = launchd_state(self.label, self.uid)
+        # The harness cannot watch the unload and the unlink race from outside
+        # (the old server may unlink its own socket while it exits). What it
+        # proves: install() refused any "still loaded" / "may still hold" /
+        # "leaving" warning, so the installer took its unload-confirmed removal
+        # path (wait_unloaded returned 0), reported it, and the socket is gone.
         out = install(install_env(self.label, self.port), "rollback: back to TCP")
         self.expect_transport("tcp")
         self.wait_for("the TCP agent to answer again", self.tcp_up)
-        if sock.exists() or sock.is_symlink():
-            raise CheckFailed(f"old socket {sock} still exists after the move back to TCP")
-        if old_pid and _pid_alive(old_pid):
-            raise CheckFailed(f"old socket removed while the old job (pid {old_pid}) still ran")
         if "removing the old socket" not in out:
             raise CheckFailed("installer did not report removing the old socket")
+        if sock.exists() or sock.is_symlink():
+            raise CheckFailed(f"old socket {sock} still exists after the move back to TCP")
         if not lock.exists():
             raise CheckFailed(f"{lock} was removed; the installer must leave it")
-        self.wait_for(f"{lock} to be unheld", lambda: not lock_holders(lock), timeout=10)
-        return "tcp -> socket -> tcp; old socket gone after unload, .lock left and unheld"
+        self.wait_for(f"{lock} to be unheld", lambda: lock_unheld(lock), timeout=10)
+        return (
+            "tcp -> socket -> tcp; old socket removed on the installer's "
+            "unload-confirmed path, .lock left and unheld"
+        )
 
     # -- check: token file
 
@@ -559,10 +649,7 @@ class Harness:
         """Remove everything the harness created. Touches only the spare label."""
         problems: list[str] = []
         label = self.label
-        if self.holder is not None:
-            with contextlib.suppress(OSError):
-                self.holder.close()
-            self.holder = None
+        self.release_holder()
         logs = _log_paths(label)  # read StandardErrorPath before the plist goes
         try:
             socket_in_plist = read_plist_field(label, "socket-path")
@@ -572,7 +659,7 @@ class Harness:
 
         env = install_env(label, self.port)
         try:
-            res = run_installer("uninstall", env)
+            res = run_installer("uninstall", env, new_session=True)
             if res.returncode != 0 or _WARN_RE.search(res.stderr or ""):
                 problems.append(
                     f"uninstall: exit {res.returncode}: {(res.stderr or '').strip()[-200:]}"
@@ -585,7 +672,7 @@ class Harness:
             if lock.exists() or lock.is_symlink():
                 try:
                     self.wait_for(
-                        f"{lock} to be unheld", lambda lock=lock: not lock_holders(lock), timeout=10
+                        f"{lock} to be unheld", lambda lock=lock: lock_unheld(lock), timeout=10
                     )
                 except CheckFailed as exc:
                     problems.append(str(exc))
@@ -605,25 +692,19 @@ class Harness:
         for path in [plist, *logs]:
             with contextlib.suppress(OSError):
                 path.unlink()
-        loaded, _pid = launchd_state(label, self.uid)
-        if loaded:
-            problems.append(
-                f"{label} is still loaded; run: launchctl bootout gui/{self.uid}/{label}"
-            )
+        try:
+            loaded, _pid = launchd_state(label, self.uid)
+        except RuntimeError as exc:
+            problems.append(f"{exc}; check by hand: launchctl print gui/{self.uid}/{label}")
+        else:
+            if loaded:
+                problems.append(
+                    f"{label} is still loaded; run: launchctl bootout gui/{self.uid}/{label}"
+                )
         left = [p for p in [plist, *logs, self.sock, _lock_path(self.sock)] if p.exists()]
         if left:
             problems.append("left behind: " + ", ".join(str(p) for p in left))
         return problems
-
-
-def _pid_alive(pid: str) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, ValueError):
-        return True
-    return True
 
 
 # --- main -------------------------------------------------------------------
@@ -648,8 +729,9 @@ def main(argv=None) -> int:
     ap.add_argument("--label", default=SPARE_LABEL, help=f"must be {SPARE_LABEL} (guarded)")
     ap.add_argument(
         "--inject",
-        choices=("fail", "hang"),
+        choices=("fail", "crash", "hang"),
         help="TEST HOOK: 'fail' raises in the first check right after its install; "
+        "'crash' raises an unexpected exception type there; "
         "'hang' sleeps there so a test can send SIGINT. Teardown must still run.",
     )
     args = ap.parse_args(argv)
@@ -672,6 +754,14 @@ def main(argv=None) -> int:
             print(f"  cleanup: {cmd}")
         return 1
 
+    home, account = _home(), _smoke_lib.account_home()
+    if home.resolve() != account.resolve():
+        print(
+            f"warning: HOME={home} is not the account home {account}; the spare goes "
+            f"under $HOME, the real-agent snapshot and port guard read {account}",
+            file=sys.stderr,
+        )
+
     try:
         check_guard(
             args.label,
@@ -679,6 +769,7 @@ def main(argv=None) -> int:
             env=env,
             canonical_ports=canonical_ports(),
             is_listening=is_listening,
+            agent_ports=agent_ports(),
         )
     except GuardRefused as exc:
         return refuse("guard", str(exc))
@@ -723,14 +814,11 @@ def main(argv=None) -> int:
         ):
             try:
                 results.append((name, PASS, fn()))
-            except (
-                CheckFailed,
-                AssertionError,
-                OSError,
-                RuntimeError,
-                subprocess.SubprocessError,
-            ) as exc:
-                results.append((name, FAIL, str(exc) or type(exc).__name__))
+            except Exception as exc:  # noqa: BLE001 - any crash is this check's FAIL row
+                detail = str(exc) or type(exc).__name__
+                if not isinstance(exc, (CheckFailed, AssertionError)):
+                    detail = f"{type(exc).__name__}: {detail}"
+                results.append((name, FAIL, detail))
             finally:
                 harness.release_holder()
     except (KeyboardInterrupt, SystemExit) as exc:
@@ -753,7 +841,8 @@ def main(argv=None) -> int:
             (
                 "real agents unchanged",
                 FAIL if diffs else PASS,
-                "; ".join(diffs) or f"{len(before)} agents, same pids",
+                "; ".join(diffs)
+                or f"{len(before)} agents under {_smoke_lib.account_home()}, same pids",
             )
         )
         for s, h in old.items():

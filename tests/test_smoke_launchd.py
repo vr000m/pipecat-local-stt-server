@@ -80,13 +80,17 @@ class Env:
         self.agents = self.home / "Library" / "LaunchAgents"
         self.logs = self.home / "Library" / "Logs" / "pipecat-stt"
         self.loaded_marker = tmp_path / "loaded"
+        self.print_fails = tmp_path / "print-fails"
+        # Not loaded is launchctl's own answer: exit 113, "Could not find service".
         _exe(
             self.stub / "launchctl",
             f"""#!/usr/bin/env bash
 printf 'launchctl %s\\n' "$*" >> {self.log!s}
 if [[ "$1" == "print" ]]; then
+    if [[ -e {self.print_fails!s} ]]; then echo "launchctl: boom" >&2; exit 5; fi
     if [[ -e {self.loaded_marker!s} && "$2" == *"{SPARE}" ]]; then exit 0; fi
-    exit 1
+    echo "Could not find service \\"${{2##*/}}\\" in domain for user gui: {FAKE_UID}" >&2
+    exit 113
 fi
 exit 0
 """,
@@ -342,9 +346,210 @@ def test_snapshot_excludes_spare(smoke, env, monkeypatch):
     (env.agents / f"{SPARE}.plist").write_text("<plist><dict/></plist>")
     monkeypatch.setenv("HOME", str(env.home))
     monkeypatch.setenv("PATH", env.path)
-    snap = smoke.snapshot_real_agents()
+    snap = smoke.snapshot_real_agents(home=env.home)
     assert SPARE not in snap
     assert "pipecat.stt-server" in snap
+
+
+def test_snapshot_reads_account_home_not_env_home(smoke, env, monkeypatch, tmp_path):
+    # An overridden HOME must not empty the snapshot (vacuous PASS).
+    (env.agents / "pipecat.stt-server.plist").write_text("<plist><dict/></plist>")
+    other = tmp_path / "other-home"
+    (other / "Library" / "LaunchAgents").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(other))
+    monkeypatch.setenv("PATH", env.path)
+    monkeypatch.setattr(smoke._smoke_lib, "account_home", lambda: env.home)
+    assert "pipecat.stt-server" in smoke.snapshot_real_agents()
+    assert [p.name for p in smoke.real_agent_plists()] == ["pipecat.stt-server.plist"]
+
+
+def _agent_plist(path: Path, port: str) -> None:
+    import plistlib
+
+    args = [sys.executable, "-m", "stt_server", "serve", "--host", "127.0.0.1", "--port", port]
+    path.write_bytes(plistlib.dumps({"Label": path.stem, "ProgramArguments": args}))
+
+
+def test_guard_refuses_port_recorded_in_installed_agent_plist(smoke, env):
+    _agent_plist(env.agents / "pipecat.stt-server.custom.plist", "9123")
+    _agent_plist(env.agents / f"{SPARE}.plist", "9124")  # the spare's own port is not real
+    ports = smoke.agent_ports(home=env.home)
+    assert ports == {9123: "pipecat.stt-server.custom"}
+    with pytest.raises(smoke.GuardRefused, match="pipecat.stt-server.custom"):
+        smoke.check_guard(
+            SPARE,
+            9123,
+            env=_good_env(),
+            canonical_ports=set(CANONICAL),
+            is_listening=lambda p: False,
+            agent_ports=ports,
+        )
+
+
+def test_agent_ports_unreadable_plist_refuses(smoke, env):
+    (env.agents / "pipecat.stt-server.broken.plist").write_text("not a plist")
+    with pytest.raises(smoke.GuardRefused):
+        smoke.agent_ports(home=env.home)
+
+
+# --------------------------------------------------------------------------
+# launchctl / lsof answers the harness cannot read fail closed
+# --------------------------------------------------------------------------
+
+
+def _cp(argv, rc=0, out="", err=""):
+    return subprocess.CompletedProcess(argv, rc, out, err)
+
+
+@pytest.mark.parametrize(
+    ("rc", "err", "want"),
+    [
+        (0, "", (True, None)),
+        (113, 'Could not find service "x" in domain', (False, None)),
+        (1, "", "raise"),
+        (5, "Operation not permitted", "raise"),
+    ],
+)
+def test_launchd_state_unreadable_is_not_unloaded(smoke, rc, err, want):
+    def run(argv, **_kw):
+        return _cp(argv, rc, "", err)
+
+    if want == "raise":
+        with pytest.raises(RuntimeError):
+            smoke.launchd_state(SPARE, FAKE_UID, run)
+    else:
+        assert smoke.launchd_state(SPARE, FAKE_UID, run) == want
+
+
+def test_cli_unreadable_launchctl_refuses_start_state(env):
+    env.print_fails.write_text("1")
+    r = env.run(["--port", str(_free_port())], env.spare_env())
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "start state" in r.stdout and "launchd state" in r.stdout
+    assert _mutating(env.argv()) == []
+    assert not [ln for ln in env.argv() if "install" in ln]
+
+
+def _lsof_like(holders):
+    """A fake lsof that honours ``--``: every word after it is a file name."""
+
+    def run(argv, **_kw):
+        if "--" in argv:
+            files = argv[argv.index("--") + 1 :]
+            if any(f.startswith("-") for f in files):
+                return _cp(argv, 1, "", f"lsof: status error on {files[-1]}\n")
+        if holders is None:
+            return _cp(argv, 1, "", "lsof: boom\n")
+        if not holders:
+            return _cp(argv, 1)
+        return _cp(argv, 0, "".join(f"p{p}\nf3\nn*:1\n" for p in holders))
+
+    return run
+
+
+# (lsof answer) -> (lock_holders, lock_unheld): the whole holder/lock state space.
+@pytest.mark.parametrize(
+    ("holders", "want", "unheld"),
+    [(["4242"], ["4242"], False), ([], [], True), (None, None, False)],
+)
+def test_lock_holders_state_space(smoke, holders, want, unheld):
+    run = _lsof_like(holders)
+    assert smoke.lock_holders(Path("/x/spare.sock.lock"), run) == want
+    assert smoke.lock_unheld(Path("/x/spare.sock.lock"), run) is unheld
+
+
+@pytest.mark.parametrize(("holders", "want"), [(["7"], True), ([], False)])
+def test_is_listening_reads_lsof(smoke, holders, want):
+    port = _free_port()
+    assert smoke.is_listening(port, _lsof_like(holders)) is want
+
+
+def test_is_listening_lsof_failure_refuses(smoke):
+    with pytest.raises(smoke.GuardRefused):
+        smoke.is_listening(_free_port(), _lsof_like(None))
+
+
+# --------------------------------------------------------------------------
+# logs: plist paths first, only this install's lines count
+# --------------------------------------------------------------------------
+
+
+def test_log_paths_prefer_the_plists_paths(smoke, env, monkeypatch, tmp_path):
+    import plistlib
+
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.delenv("PIPECAT_STT_LOG_DIR", raising=False)
+    monkeypatch.delenv("KODA_STT_LOG_DIR", raising=False)
+    rule = env.logs / "pipecat-stt-server-smoke.err"
+    assert smoke._err_log(SPARE) == rule  # no plist: the installer's naming rule
+    err, out = tmp_path / "elsewhere.err", tmp_path / "elsewhere.log"
+    (env.agents / f"{SPARE}.plist").write_bytes(
+        plistlib.dumps({"StandardErrorPath": str(err), "StandardOutPath": str(out)})
+    )
+    assert smoke._log_paths(SPARE) == [err, out]
+
+
+def test_stale_address_in_use_lines_do_not_count(smoke, tmp_path):
+    log = tmp_path / "x.err"
+    line = "OSError: [Errno 48] error while attempting to bind: address already in use\n"
+    log.write_text(line * 3)
+    offset = smoke._size(log)
+    assert smoke._in_use_lines(smoke._read_from(log, offset)) == 0
+    with open(log, "a") as fh:
+        fh.write(line)
+    # One line naming both "Errno 48" and "address already in use" is ONE line.
+    assert smoke._in_use_lines(smoke._read_from(log, offset)) == 1
+    log.write_text("errno 48\n")  # truncated (rotated): read from the start
+    assert smoke._in_use_lines(smoke._read_from(log, offset)) == 1
+
+
+# --------------------------------------------------------------------------
+# rollback: the spare socket directory, the installer's leave-behind warnings
+# --------------------------------------------------------------------------
+
+
+def test_prepare_private_dir_refuses_a_symlink_and_leaves_its_target(smoke, tmp_path):
+    target = tmp_path / "target"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    link = tmp_path / "sockdir"
+    link.symlink_to(target)
+    with pytest.raises(smoke.CheckFailed, match="symlink"):
+        smoke.prepare_private_dir(link)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def test_prepare_private_dir_creates_or_tightens(smoke, tmp_path):
+    new = tmp_path / "a" / "b"
+    assert smoke.prepare_private_dir(new) is True
+    assert stat.S_IMODE(new.stat().st_mode) == 0o700
+    new.chmod(0o755)
+    assert smoke.prepare_private_dir(new) is False
+    assert stat.S_IMODE(new.stat().st_mode) == 0o700
+    f = tmp_path / "file"
+    f.write_text("")
+    with pytest.raises(smoke.CheckFailed):
+        smoke.prepare_private_dir(f)
+
+
+# Every installer warning that means the old socket (or job) was left behind;
+# install() must FAIL on each, which is what makes the rollback's "removed on
+# the unload-confirmed path" claim hold.
+@pytest.mark.parametrize(
+    "line",
+    [
+        "warning: pipecat.stt-server.smoke still loaded 30s after bootout",
+        "warning: old job may still hold /h/spare.sock.lock; leaving /h/spare.sock",
+        "warning: /h/spare.sock.lock is held by a running server; leaving /h/spare.sock",
+        "warning: /h/spare.sock is not a socket; leaving it",
+        "warning: /h/spare.sock not owned by current user, leaving it",
+        "warning: could not remove /h/spare.sock",
+        "warning: could not tell whether /h/spare.sock.lock is held; leaving /h/spare.sock",
+        "warning: installed socket path '/h/spare.sock' is not absolute; leaving it",
+    ],
+)
+def test_install_fails_on_every_leave_behind_warning(smoke, line):
+    assert smoke._WARN_RE.search(line)
 
 
 # --------------------------------------------------------------------------
@@ -437,7 +642,38 @@ def test_signal_during_hang_still_tears_down(env, sig):
         if p.poll() is None:
             p.kill()
             p.wait()
+    assert p.returncode == 1, p.stdout.read() if p.stdout else ""
     _assert_torn_down(env)
+
+
+def test_unexpected_exception_is_a_fail_row_and_checks_continue(env):
+    r = env.run(["--inject", "crash", "--port", str(_free_port())], env.spare_env())
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stderr
+    rows = {
+        ln.split()[1]: ln.split()[0] for ln in r.stdout.splitlines() if ln[:4] in ("PASS", "FAIL")
+    }
+    assert "LookupError" in r.stdout
+    assert rows.get("port") == "FAIL"
+    # The later checks still ran (their rows exist) and the table was printed.
+    assert "socket rollback" in r.stdout and "token file" in r.stdout
+    assert "real agents unchanged" in r.stdout
+    _assert_torn_down(env)
+
+
+def test_teardown_runs_the_uninstall_in_its_own_session(smoke, env, monkeypatch):
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    seen = []
+
+    def fake_installer(sub, e, run=None, *, new_session=False):
+        seen.append((sub, new_session))
+        return _cp(["bash"], 0)
+
+    monkeypatch.setattr(smoke, "run_installer", fake_installer)
+    h = smoke.Harness(SPARE, _free_port(), None)
+    assert h.teardown() == []
+    assert seen == [("uninstall", True)]
 
 
 # --------------------------------------------------------------------------
