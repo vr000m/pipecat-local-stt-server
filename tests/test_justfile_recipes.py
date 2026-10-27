@@ -317,12 +317,48 @@ def test_just_list_exposes_public_recipes(tmp_path):
         "stt-install",
         "stt-uninstall",
         "stt-probe",
+        "smoke",
     ):
-        assert recipe in res.stdout
+        assert re.search(rf"^\s*{re.escape(recipe)}\b", res.stdout, re.M), recipe
     # Private (underscore) helpers are not advertised in --list.
     assert "_resolve" not in res.stdout
     assert "_squat_check" not in res.stdout
     assert "_ensure-extra" not in res.stdout
+
+
+def test_smoke_recipe_passes_args_to_smoke_py(tmp_path):
+    """`just smoke ARGS` runs `.venv/bin/python scripts/smoke.py ARGS` from the
+    justfile dir. Hermetic: the justfile is copied beside a stub interpreter and
+    an empty `scripts/smoke.py`; no real smoke step runs."""
+    work = tmp_path / "work"
+    (work / ".venv" / "bin").mkdir(parents=True)
+    (work / "scripts").mkdir()
+    (work / "scripts" / "smoke.py").write_text("")
+    shutil.copy(JUSTFILE, work / "justfile")
+    argv_out = tmp_path / "py-argv.log"
+    _write_executable(
+        work / ".venv" / "bin" / "python",
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {argv_out}\npwd >> {argv_out}\n",
+    )
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    env = {
+        "HOME": str(home),
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+    }
+    env.pop("CI", None)
+    res = subprocess.run(
+        ["just", "smoke", "--agents", "--launchd"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=str(work),
+    )
+    assert res.returncode == 0, res.stderr
+    lines = argv_out.read_text().splitlines()
+    assert lines[:3] == ["scripts/smoke.py", "--agents", "--launchd"]
+    assert Path(lines[3]).resolve() == work.resolve()
 
 
 def _resolve(backend: str, tmp_path: Path) -> subprocess.CompletedProcess:
@@ -2320,9 +2356,14 @@ def test_nested_just_calls_forward_the_variables_their_callee_reads():
 def test_no_plain_uv_run_python_in_smoke_surfaces():
     """Plain `uv run python` re-syncs and strips the optional backend extras
     (crash-looping LaunchAgents). The justfile and every scripts/smoke_*.py
-    must run `.venv/bin/python` (or `uv run --no-sync python`) instead. The
-    README and docs/operations.md foreground examples are tracked separately."""
-    files = [JUSTFILE, *sorted((REPO_ROOT / "scripts").glob("smoke_*.py"))]
+    must run `.venv/bin/python` (or `uv run --no-sync python`) instead; the
+    README and docs/operations.md examples follow the same rule."""
+    files = [
+        JUSTFILE,
+        *sorted((REPO_ROOT / "scripts").glob("smoke_*.py")),
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "docs" / "operations.md",
+    ]
     plain = re.compile(r"\buv run python\b")
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{n}: {line.strip()}"

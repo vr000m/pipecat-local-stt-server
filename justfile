@@ -339,6 +339,18 @@ smoke-peercred:
     set -uo pipefail
     exec .venv/bin/python "{{justfile_directory()}}/scripts/smoke_peercred.py"
 
+# One-command smoke: supervised (echo), peer-cred, token-file refuse/accept, and
+# one PASS/FAIL/SKIPPED table (exit 1 on any FAIL). `--agents` also decodes a
+# generated clip through each installed agent (read-only); `--launchd` also runs
+# the launchd harness on the spare label (macOS only, opt-in, never in CI).
+# Uses .venv/bin/python, never `uv run` (which prunes the backend extras).
+[positional-arguments]
+smoke *args:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{justfile_directory()}}"
+    exec .venv/bin/python scripts/smoke.py "$@"
+
 # The interpreter an agent installed now would run: PIPECAT_STT_PYTHON when it is
 # set and non-empty, else the backend's venv python (kyutai: kyutai_venv). The one
 # place the justfile picks an interpreter: stt-install probes this value and

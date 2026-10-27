@@ -364,16 +364,16 @@ a pure V1 client — no protocol surface added — and a one-off operator tool
 ```bash
 # 0.5.0 default agents are loopback TCP, so pass the URIs. --whisper-uri /
 # --parakeet-uri override the socket flags.
-uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
     --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765
 
 # Socket agents: with no endpoint flags the script defaults to
 # ~/Library/Caches/pipecat-stt/stt.sock and .../parakeet.sock
 # (override with --whisper-socket / --parakeet-socket).
-uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus
+uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus
 
 # Write a full JSON report alongside the console summary.
-uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
     --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765 \
     --json-out benchmarks/results/asr_ab.json
 ```
@@ -429,13 +429,13 @@ than trust the socket path or port. The `status` subcommand wraps that round-tri
 
 ```bash
 # Text output (exit 0 on success, 1 on not-reachable/timeout/error)
-uv run python -m stt_server status --socket-path ~/Library/Caches/pipecat-stt/stt.sock
+uv run --no-sync python -m stt_server status --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 
 # Raw JSON for scripting / monitoring
-uv run python -m stt_server status --socket-path ... --json
+uv run --no-sync python -m stt_server status --socket-path ... --json
 
 # Loopback TCP agent (whisper's canonical port; add --auth-token-file if set)
-uv run python -m stt_server status --host 127.0.0.1 --port 9565
+uv run --no-sync python -m stt_server status --host 127.0.0.1 --port 9565
 
 # Same, through the recipe (any endpoint; an explicit endpoint is required)
 just stt-probe --host 127.0.0.1 --port 9565
@@ -477,6 +477,27 @@ Use this as a preflight before starting a client, in CI smoke tests, or
 from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 `--port`/`--auth-token-file` endpoint flags work for both `serve` and
 `status` subcommands.
+
+## Smoke tests (`just smoke`)
+
+`just smoke [--agents] [--launchd]` runs the local checks in one command and
+prints one table of PASS, FAIL or SKIPPED with a reason per step; the exit status
+is 1 if any step FAILED (SKIPPED never fails). It runs `.venv/bin/python
+scripts/smoke.py`, never `uv run` (which prunes the backend extras).
+
+| Step | What it runs |
+| --- | --- |
+| `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
+| `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
+| `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101` |
+| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist. Read-only: no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
+| `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
+
+`--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
+The harness refuses to run unless both `PIPECAT_STT_LABEL` and `KODA_STT_LABEL`
+name the spare label; the runner sets both itself, so do the same when calling
+`scripts/smoke_launchd.py` directly. The individual scripts below still run on
+their own, but `just smoke` is the entry point.
 
 ## Supervised smoke test
 
@@ -598,7 +619,7 @@ catches a width/signature regression — keep it.
 
 Two local checks exercise what single-uid CI cannot:
 
-- `just smoke-peercred` (`scripts/smoke_peercred.py`) — opens N concurrent
+- `just smoke-peercred` (also part of `just smoke`; `scripts/smoke_peercred.py`) — opens N concurrent
   same-uid sessions (regression guard) and, when a second local uid is reachable
   via passwordless `sudo`, drives a foreign-uid connection that must be rejected
   `403`. The cross-uid leg skips cleanly when no second uid is available.
@@ -606,7 +627,7 @@ Two local checks exercise what single-uid CI cannot:
   `websockets`) that drives a probe as **both** the owning uid (expect `101`) and
   `nobody` (expect `403`) against one permissive socket. Same socket + perms,
   only the uid differs, so a `101`-vs-`403` split proves peer-cred — not the
-  filesystem — is the discriminator. Run with `sudo -v && uv run python
+  filesystem — is the discriminator. Run with `sudo -v && uv run --no-sync python
   scripts/verify_peercred_crossuid.py`. It binds under `/tmp` (world-traversable)
   and asserts every ancestor is traversable, so a filesystem-boundary failure is
   reported as inconclusive rather than masquerading as a peer-cred result.

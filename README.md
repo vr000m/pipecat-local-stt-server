@@ -58,17 +58,17 @@ monorepo. BSD-2-Clause.
 
 ```bash
 # UDS (recommended for local use — no port, no bearer token)
-uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend echo
+uv run --no-sync python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend echo
 
 # MLX Whisper over UDS
 uv sync --extra mlx
-uv run python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend mlx
+uv run --no-sync python -m stt_server --socket-path ~/Library/Caches/pipecat-stt/stt.sock --backend mlx
 
 # Loopback TCP — minimal form. Pick any free port; there is no default port,
 # so --host and --port are both required for TCP. On loopback an auth token is
 # optional (the server logs an info line and serves anyway — fine for local
 # experiments). The listener comes up on 127.0.0.1:<port>.
-uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
+uv run --no-sync python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 
 # Loopback TCP with auth (recommended for anything non-experimental — use
 # --auth-token-file or PIPECAT_STT_AUTH_TOKEN env; legacy KODA_STT_AUTH_TOKEN
@@ -81,7 +81,7 @@ uv run python -m stt_server --host 127.0.0.1 --port 9900 --backend echo
 # directory; see docs/operations.md#token-file-replaces-env-tokens).
 # The LaunchAgent installer and renderer refuse both env tokens: use
 # PIPECAT_STT_AUTH_TOKEN_FILE there.
-uv run python -m stt_server --host 127.0.0.1 --port 9565 --auth-token-file /path/to/token
+uv run --no-sync python -m stt_server --host 127.0.0.1 --port 9565 --auth-token-file /path/to/token
 ```
 
 > **Ports:** there is no baked-in default port — you choose it (`--port 9900`).
@@ -130,6 +130,19 @@ just stt-install parakeet  # delegates to install_stt_agent.sh (+ ensures the ex
 just stt-uninstall parakeet
 just smoke-peercred        # local UDS peer-cred smoke (cross-uid leg needs a 2nd uid)
 ```
+
+### Smoke tests
+
+```bash
+just smoke             # supervised (echo), peer-cred, token-file: one PASS/FAIL/SKIPPED table
+just smoke --agents    # also decode a generated clip through each installed agent (read-only)
+just smoke --launchd   # also run the launchd harness on the spare label (macOS only, opt-in)
+```
+
+Exit status is 1 if any step FAILED; SKIPPED never fails. `--launchd` needs both
+`PIPECAT_STT_LABEL` and `KODA_STT_LABEL` set to `pipecat.stt-server.smoke`, which
+the runner sets itself; it never runs in CI. Details and the individual scripts:
+[docs/operations.md](docs/operations.md#smoke-tests-just-smoke).
 
 `<backend>` is one of `whisper` / `parakeet` / `nemotron` / `kyutai`, mapped to
 the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)
@@ -188,23 +201,23 @@ endpoint — see "Multi-backend operation"); no client code changes.
 ```bash
 # Whisper (MLX) — default model mlx-community/whisper-large-v3-turbo
 uv sync --extra mlx
-uv run python -m stt_server serve --backend mlx \
+uv run --no-sync python -m stt_server serve --backend mlx \
     --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 # ...or as an always-on loopback TCP agent on 127.0.0.1:9565:
 just stt-install whisper    # parakeet 9765, nemotron 9865, kyutai 9665 likewise
 
 # Parakeet — default model mlx-community/parakeet-tdt-0.6b-v3
 uv sync --extra parakeet
-uv run python -m stt_server serve --backend parakeet \
+uv run --no-sync python -m stt_server serve --backend parakeet \
     --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
 
 # Nemotron 3.5 — default model mlx-community/nemotron-3.5-asr-streaming-0.6b
 uv sync --extra nemotron
-uv run python -m stt_server serve --backend nemotron \
+uv run --no-sync python -m stt_server serve --backend nemotron \
     --socket-path ~/Library/Caches/pipecat-stt/nemotron.sock
 
 # Pick a specific model with --model (any compatible mlx-community HF repo id)
-uv run python -m stt_server serve --backend mlx \
+uv run --no-sync python -m stt_server serve --backend mlx \
     --model mlx-community/whisper-small --socket-path .../stt.sock
 ```
 
@@ -271,9 +284,9 @@ so a cold server answers its first request only after a multi-GB download.
 without touching the network:
 
 ```bash
-uv run python -m stt_server prefetch --backend parakeet          # download
-uv run python -m stt_server prefetch --backend parakeet --check  # offline probe
-uv run python -m stt_server prefetch --backend mlx --model mlx-community/whisper-small --json
+uv run --no-sync python -m stt_server prefetch --backend parakeet          # download
+uv run --no-sync python -m stt_server prefetch --backend parakeet --check  # offline probe
+uv run --no-sync python -m stt_server prefetch --backend mlx --model mlx-community/whisper-small --json
 ```
 
 It fetches exactly what the backend loads, into the standard Hugging Face cache
@@ -287,7 +300,7 @@ repo id only: `prefetch` rejects a local path for it (`ConfigError`), while
 and fails at model load.
 
 ```bash
-uv run python -m stt_server prefetch --backend parakeet --model ~/models/parakeet --check
+uv run --no-sync python -m stt_server prefetch --backend parakeet --model ~/models/parakeet --check
 ```
 
 `--check` exits 0 whenever the probe ran; the answer is the `cached` field. With
@@ -338,7 +351,7 @@ menu bar app. Logging on stderr is unchanged. In addition:
   `TranscriptionServer` class docstring.)
 
 ```bash
-( sleep 5 ) | uv run python -m stt_server serve --backend echo \
+( sleep 5 ) | uv run --no-sync python -m stt_server serve --backend echo \
     --host 127.0.0.1 --port 0 --supervised
 ```
 

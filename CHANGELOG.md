@@ -28,8 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `assert_token_gate` in `scripts/_smoke_lib.py` checks that a request without
   the token gets 401 and with it is accepted.
 
+- **Unified `just smoke [--agents] [--launchd]`**. `scripts/smoke.py` runs the
+  supervised (echo), peer-cred and token-file checks and prints one table of
+  PASS, FAIL or SKIPPED with a reason; the exit status is 1 on any FAIL.
+  `--agents` decodes a clip (generated with `say`/`afconvert`) through each
+  installed agent from its plist endpoint, read-only; `--launchd` adds the launchd
+  harness (macOS only, opt-in, never in CI).
+
 ### Changed
 
+- README and `docs/operations.md`: one `just smoke` section replaces the scattered
+  smoke instructions, and the remaining `uv run python` examples use `uv run
+  --no-sync python` so they cannot prune the backend extras.
 - `just smoke-peercred` and `scripts/smoke_test_parakeet.py` run with
   `.venv/bin/python` instead of plain `uv run`, which pruned the backend extras.
 
