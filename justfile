@@ -109,8 +109,11 @@ stt-list:
       # plist reads as empty with a warning; only the first read shows it.
       host=$(just _plist_field "$plist" host)
       port=$(just _plist_field "$plist" port 2>/dev/null)
-      sock=$(just _plist_field "$plist" socket-path 2>/dev/null)
-      authfile=$(just _plist_field "$plist" auth-token-file 2>/dev/null)
+      # Paths are captured losslessly: `$(...)` drops trailing newlines, which
+      # would probe a path other than the one the plist records. Append a
+      # sentinel inside the substitution and strip it after.
+      sock=$(just _plist_field "$plist" socket-path 2>/dev/null && printf x); sock=${sock%x}
+      authfile=$(just _plist_field "$plist" auth-token-file 2>/dev/null && printf x); authfile=${authfile%x}
       # Empty-safe array expansion for bash 3.2 under `set -u`.
       auth=()
       [[ -n "$authfile" ]] && auth=(--auth-token-file "$authfile")
@@ -186,8 +189,10 @@ stt-status target='':
       # One keyed field per read; a malformed plist warns once and reads empty.
       p_host=$(just _plist_field "$plist" host)
       p_port=$(just _plist_field "$plist" port 2>/dev/null)
-      p_sock=$(just _plist_field "$plist" socket-path 2>/dev/null)
-      p_auth=$(just _plist_field "$plist" auth-token-file 2>/dev/null)
+      # Lossless path captures (sentinel `x` appended inside, stripped after):
+      # `$(...)` alone drops trailing newlines from a recorded path.
+      p_sock=$(just _plist_field "$plist" socket-path 2>/dev/null && printf x); p_sock=${p_sock%x}
+      p_auth=$(just _plist_field "$plist" auth-token-file 2>/dev/null && printf x); p_auth=${p_auth%x}
       [[ -n "$p_auth" ]] && auth=(--auth-token-file "$p_auth")
       if [[ -n "$p_sock" ]]; then
         probe=(--socket-path "$p_sock")
@@ -383,10 +388,12 @@ _ensure-extra backend python='' plist='':
     plist={{quote(plist)}}
     python={{quote(python)}}
     if [[ -n "$plist" ]]; then
-      if ! py=$(just _plist_field "$plist" interpreter 1); then
+      # Lossless (sentinel `x`): the interpreter probed is the one recorded.
+      if ! py=$(just _plist_field "$plist" interpreter 1 && printf x); then
         echo "_ensure-extra: cannot read the interpreter from $plist; fix or reinstall it ('just stt-install $backend')" >&2
         exit 1
       fi
+      py=${py%x}
       if [[ -z "$py" ]]; then
         echo "_ensure-extra: $plist names no interpreter (no ProgramArguments); reinstall it ('just stt-install $backend')" >&2
         exit 1
@@ -395,8 +402,12 @@ _ensure-extra backend python='' plist='':
     else
       if [[ -n "$python" ]]; then
         py="$python"
-      elif ! py=$(just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _agent-python "$backend"); then
+      elif ! py=$(just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _agent-python "$backend" && printf x); then
         exit 1
+      else
+        # _agent-python ends its output with one newline; strip the sentinel and
+        # exactly that one, nothing the path itself carries.
+        py=${py%x}; py=${py%$'\n'}
       fi
       remedy="PIPECAT_STT_PYTHON=$py cannot run '$probe'; install the '$extra' extra into that interpreter, or unset PIPECAT_STT_PYTHON to use $default_py"
     fi
@@ -435,7 +446,8 @@ stt-install backend:
     # One field per line; four reads keep this bash-3.2-compatible — macOS
     # system bash has no `mapfile`.
     { read -r label; read -r _host; read -r _port; read -r bk; } <<<"$resolved"
-    py=$(just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _agent-python "$backend") || exit 1
+    py=$(just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _agent-python "$backend" && printf x) || exit 1
+    py=${py%x}; py=${py%$'\n'}
     just venv={{quote(venv)}} kyutai_venv={{quote(kyutai_venv)}} _ensure-extra "$backend" "$py" || exit 1
     # Strip an ambient HOST/PORT so the installer's canonical defaults apply; the
     # installer alone decides socket vs TCP (see the NOTE near the top).

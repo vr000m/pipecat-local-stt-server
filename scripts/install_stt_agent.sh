@@ -96,7 +96,24 @@ set -euo pipefail
 # Canonical PIPECAT_STT_* names take precedence; the legacy KODA_STT_* names
 # are still honoured as deprecated aliases.
 LABEL="${PIPECAT_STT_LABEL:-${KODA_STT_LABEL:-pipecat.stt-server}}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Lossless capture of a path. `$(...)` drops every trailing newline, so a path
+# whose last bytes are newlines would be checked as one string and acted on as
+# another. Every capture of a path or a reader's output below appends a sentinel
+# `x` inside the substitution and strips it after (`${v%x}`), so what is held is
+# byte-for-byte what the command wrote. `path_dirname VAR PATH` sets VAR to
+# dirname(PATH) that way (dirname itself ends its output with one newline, which
+# is removed exactly once).
+path_dirname() {
+    local _pd_out
+    _pd_out="$(dirname "$2" && printf x)" || return
+    _pd_out="${_pd_out%x}"
+    printf -v "$1" '%s' "${_pd_out%$'\n'}"
+}
+_script_dir=""
+path_dirname _script_dir "${BASH_SOURCE[0]}"
+_repo_dir="$(cd "$_script_dir/.." && printf '%sx' "$PWD")"
+REPO_ROOT="${_repo_dir%x}"
+unset _script_dir _repo_dir
 RENDER_PY="$REPO_ROOT/scripts/render_stt_plist.py"
 READ_PLIST_PY="$REPO_ROOT/scripts/read_stt_plist.py"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -228,21 +245,27 @@ else
     READER_PYTHON="python3"
 fi
 
-# Print the value of field NAME (e.g. socket-path; the reader's --field names) in
-# the installed plist (empty if the plist is absent or does not carry it). Used
-# to decide socket cleanup from the transport actually installed, not from the
-# caller's env. One keyed read per field: nothing here depends on the order of
-# the reader's output. Returns 2 (printing nothing; the reader's error is on
-# stderr) when a plist is there but cannot be read, or the reader failed: the
-# reader's --strict form, so a malformed plist never reads as "no socket",
-# whatever the caller checked before. Call it as
-# `if ! v="$(installed_field NAME)"; then ...`.
+# Set variable VAR to the value of field NAME (e.g. socket-path; the reader's
+# --field names) in the installed plist (empty if the plist is absent or does
+# not carry it). Used to decide socket cleanup from the transport actually
+# installed, not from the caller's env. One keyed read per field: nothing here
+# depends on the order of the reader's output. Returns 2 (setting nothing; the
+# reader's error is on stderr) when a plist is there but cannot be read, or the
+# reader failed: the reader's --strict form, so a malformed plist never reads as
+# "no socket", whatever the caller checked before.
+#
+# The value is exactly what read_stt_plist.py wrote, trailing newlines included:
+# the capture appends a sentinel inside the substitution and strips it after, and
+# the result is stored with printf -v, not handed back through a second `$(...)`
+# (which would strip the newlines again). Call it as
+# `if ! installed_field NAME VAR; then ...`.
 installed_field() {
-    local name="$1" out rc=0
+    local _if_name="$1" _if_var="$2" _if_out _if_rc=0
+    printf -v "$_if_var" '%s' ""
     [[ -e "$PLIST_DST" || -L "$PLIST_DST" ]] || return 0
-    out="$("$READER_PYTHON" -I "$READ_PLIST_PY" --strict --field "$name" "$PLIST_DST")" || rc=$?
-    [[ "$rc" -eq 0 ]] || return 2
-    printf '%s' "$out"
+    _if_out="$("$READER_PYTHON" -I "$READ_PLIST_PY" --strict --field "$_if_name" "$PLIST_DST" && printf x)" || _if_rc=$?
+    [[ "$_if_rc" -eq 0 ]] || return 2
+    printf -v "$_if_var" '%s' "${_if_out%x}"
 }
 
 # Classify the INSTALLED plist by its return status. The token value is never
@@ -284,6 +307,8 @@ installed_auth_state() {
 validate_token_file() {
     local f="$1" me resolved
     me="$(id -u)"
+    # Lossless capture (see path_dirname): the path validated below is the path
+    # the plist records, trailing newline or not.
     if ! resolved="$("$PYTHON" -I -c '
 import sys
 try:
@@ -301,7 +326,17 @@ except ValueError as exc:
     print(f"error: PIPECAT_STT_AUTH_TOKEN_FILE: {exc}", file=sys.stderr)
     sys.exit(1)
 sys.stdout.write(resolved)
-' "$f" "$me")"; then
+' "$f" "$me" && printf x)"; then
+        exit 1
+    fi
+    resolved="${resolved%x}"
+    # A control character (newline, tab, ESC) cannot be carried safely by the
+    # plist or by launchd's argument handling, and shell and tooling downstream
+    # treat it as a separator or a terminal escape. Refuse it rather than record
+    # a path nobody typed.
+    if [[ "$resolved" == *[[:cntrl:]]* ]]; then
+        echo "error: PIPECAT_STT_AUTH_TOKEN_FILE resolves to a path containing a control character (newline, tab or escape), which the plist and launchd cannot carry safely" >&2
+        echo "fix: rename the token file and its directories so the path has only letters, digits, space and . _ / + - @, then re-run" >&2
         exit 1
     fi
     # The renderer enforces its plist allowlist after the directories exist; ask
@@ -422,7 +457,7 @@ except Exception:
 # only for a path the installer itself would clean.
 socket_path_unsafe() {
     local sock="$1" dir home="${HOME%/}" component parent
-    dir="$(dirname "$sock")"
+    path_dirname dir "$sock"
     case "$sock" in
     /*) : ;;
     *)
@@ -447,7 +482,7 @@ socket_path_unsafe() {
             return 1
         fi
         [[ "$component" == "$home" ]] && break
-        parent="$(dirname "$component")"
+        path_dirname parent "$component"
         [[ "$parent" == "$component" ]] && break
         component="$parent"
     done
@@ -525,7 +560,14 @@ manual_socket_cleanup() {
 validate_socket_path() {
     local sock="$1"
     local dir
-    dir="$(dirname "$sock")"
+    # The renderer's allowlist would refuse a control character, but only after
+    # the directories below are made; refuse it before any mutation.
+    if [[ "$sock" == *[[:cntrl:]]* ]]; then
+        echo "error: socket path contains a control character (newline, tab or escape); the plist and launchd cannot carry it safely" >&2
+        echo "fix: use a path with only letters, digits, space and . _ / + - @" >&2
+        exit 1
+    fi
+    path_dirname dir "$sock"
     local home="${HOME%/}"
 
     # Absolute path required (lexical containment below assumes it).
@@ -564,7 +606,7 @@ validate_socket_path() {
         fi
         [[ "$component" == "$home" ]] && break
         local parent
-        parent="$(dirname "$component")"
+        path_dirname parent "$component"
         [[ "$parent" == "$component" ]] && break
         component="$parent"
     done
@@ -614,8 +656,12 @@ render_plist() {
             AUTH_TOKEN_FILE="$RESOLVED_TOKEN_FILE"
         fi
     fi
-    mkdir -p "$LOG_DIR" "$(dirname "$PLIST_DST")"
+    local plist_dir=""
+    path_dirname plist_dir "$PLIST_DST"
+    mkdir -p "$LOG_DIR" "$plist_dir"
     if [[ -n "$SOCKET_PATH" ]]; then
+        local sock_dir=""
+        path_dirname sock_dir "$SOCKET_PATH"
         # Create the socket's parent directory owner-only (0700) from birth so
         # there is no window under a permissive umask (commonly 0755) in which
         # another local user could pre-create a socket at the same path. The server
@@ -624,8 +670,8 @@ render_plist() {
         # group/other-writable, so 0700 here is load-bearing, not just hygiene.
         # The trailing `chmod 700` repairs a pre-existing 0755 dir in place.
         # shellcheck disable=SC2174
-        mkdir -m 700 -p "$(dirname "$SOCKET_PATH")"
-        chmod 700 "$(dirname "$SOCKET_PATH")"
+        mkdir -m 700 -p "$sock_dir"
+        chmod 700 "$sock_dir"
     fi
     # Delegate to plistlib (via render_stt_plist.py) so XML escaping and
     # allowlist validation handle hostile values instead of sed string
@@ -663,7 +709,7 @@ install)
     # Each read fails on its own for a plist it cannot read, so neither depends
     # on the other having run first.
     old_socket=""
-    if [[ "$auth_state" -eq 2 ]] || ! old_socket="$(installed_field socket-path)"; then
+    if [[ "$auth_state" -eq 2 ]] || ! installed_field socket-path old_socket; then
         echo "error: cannot read the installed plist $PLIST_DST (malformed or unreadable, or the plist reader failed under $READER_PYTHON), so this install cannot tell whether $LABEL requires an auth token or owns a socket. Fix or remove that plist, or run 'uninstall' first" >&2
         exit 1
     fi
@@ -750,7 +796,7 @@ uninstall)
     # unreadable plist names no socket we can trust, so uninstall still removes
     # the agent but leaves any socket in place.
     old_socket=""
-    if ! old_socket="$(installed_field socket-path)"; then
+    if ! installed_field socket-path old_socket; then
         echo "warning: cannot read the installed plist $PLIST_DST; uninstalling $LABEL without socket cleanup (remove its socket by hand if it had one, once no server runs)" >&2
         old_socket=""
     fi

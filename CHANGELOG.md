@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The installer and the `just` recipes capture paths losslessly. `$(...)` drops
+  trailing newlines, so a token file or socket path ending in one was validated
+  or probed as one string and recorded or acted on as another (a plist socket
+  path `<sock>\n` was cleaned up as `<sock>`). Captures now keep every byte, and
+  a token-file or socket path containing a control character (newline, tab,
+  escape) is refused with a `fix:` line before anything is created.
 - Kyutai: a cancelled stream (barge-in) now stops its decode at the next 80 ms
   frame, so the next client no longer waits for the abandoned decode to finish.
 

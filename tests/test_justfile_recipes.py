@@ -977,6 +977,40 @@ def test_plist_field_helper_is_keyed(tmp_path, kwargs, expected):
     assert got == want
 
 
+def test_stt_list_keeps_a_recorded_token_path_ending_in_a_newline(tmp_path):
+    """``$(...)`` drops trailing newlines: the probe was handed ``/h/tok`` for a plist
+    recording ``/h/tok\\n``. The capture appends and strips a sentinel, so the path
+    the status probe gets is the recorded one, newline included."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path, print_loaded=True, status_exit=0)
+    home = _home_with_agents(tmp_path, [])
+    token = home / "tok\n"
+    plist = home / "Library" / "LaunchAgents" / "pipecat.stt-server.nl.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "pipecat.stt-server.nl",
+                "ProgramArguments": [
+                    "py",
+                    "-m",
+                    "stt_server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "9871",
+                    "--auth-token-file",
+                    str(token),
+                ],
+            }
+        )
+    )
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    # The stub logs "$*" then a newline; ``token`` already ends in one, so the
+    # recorded path leaves a blank line (a stripped path would not).
+    log = argv_log.read_text()
+    assert f"--auth-token-file {token}\n" in log, log
+
+
 @pytest.mark.skipif(shutil.which("plutil") is None, reason="plutil (macOS) not available")
 def test_plist_endpoint_and_stt_list_keep_paths_with_spaces(tmp_path):
     """Regression: bare ``read -r`` trims leading/trailing IFS whitespace, so a

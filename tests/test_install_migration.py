@@ -1655,6 +1655,115 @@ def test_relative_token_file_is_refused_by_the_preflight(tmp_path: Path):
     assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
 
 
+def test_token_file_whose_name_ends_in_a_newline_is_refused_and_never_recorded(tmp_path: Path):
+    """``$(...)`` strips trailing newlines: the path validated was ``/x/tok\\n`` while the
+    plist would have recorded ``/x/tok``, a path nobody checked. The capture is
+    lossless, so the control character is seen and refused (with a ``fix:`` line)
+    before any directory or plist exists."""
+    stub_dir, argv_log = _make_stub_dir(tmp_path)
+    good = _good_token_file(tmp_path)
+    tok = tmp_path / "tok\n"
+    good.rename(tok)
+    # What the stripped path would have named: a valid, readable token file.
+    stripped = tmp_path / "tok"
+    stripped.write_text(SECRET + "\n")
+    stripped.chmod(0o600)
+    log_dir = tmp_path / "logs"
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={
+            "PIPECAT_STT_AUTH_TOKEN_FILE": str(tok),
+            "PIPECAT_STT_LOG_DIR": str(log_dir),
+        },
+    )
+    assert r.returncode == 1, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "control character" in r.stderr and "fix:" in r.stderr, r.stderr
+    assert SECRET not in r.stdout and SECRET not in r.stderr
+    assert not log_dir.exists(), "a directory was created before the path was refused"
+    assert not (_agents(tmp_path / "home") / f"{NEW_LABEL}.plist").exists()
+    assert not any(ln.startswith("launchctl ") for ln in _argv_lines(argv_log))
+
+
+def _installer_function(name: str) -> str:
+    """The text of shell function ``name`` from the installer (it has no source guard)."""
+    text = SCRIPT.read_text()
+    m = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
+    assert m, f"{name} not found in the installer"
+    return m.group(0)
+
+
+def test_installed_field_returns_the_plist_value_exactly(tmp_path: Path):
+    """``read_stt_plist.py`` writes the value with no added newline; a plist value that
+    ends in newlines must come back byte-for-byte (``$(...)`` alone would drop them)."""
+    value = "/Users/x/Library/Caches/stt.sock\n\n"
+    plist = tmp_path / "a.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": NEW_LABEL,
+                "ProgramArguments": [str(VENV_PYTHON), "-m", "stt_server", "--socket-path", value],
+            }
+        )
+    )
+    snippet = (
+        _installer_function("installed_field")
+        + 'installed_field socket-path got; printf "%s" "$got" > "$OUT"\n'
+        + 'installed_field host host_got; printf "%s" "[$host_got]" > "$OUT.host"\n'
+    )
+    out = tmp_path / "out"
+    r = subprocess.run(
+        ["bash", "-c", snippet],
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PLIST_DST": str(plist),
+            "READER_PYTHON": str(VENV_PYTHON),
+            "READ_PLIST_PY": str(REPO_ROOT / "scripts" / "read_stt_plist.py"),
+            "OUT": str(out),
+        },
+    )
+    assert r.returncode == 0, r.stderr
+    assert out.read_bytes() == value.encode()
+    assert Path(str(out) + ".host").read_text() == "[]"
+
+
+def test_path_dirname_keeps_a_directory_name_ending_in_a_newline(tmp_path: Path):
+    snippet = (
+        _installer_function("path_dirname") + 'path_dirname d "$1"; printf "%s" "$d" > "$OUT"\n'
+    )
+    out = tmp_path / "out"
+    for path, want in (
+        ("/a/b\n/sock", "/a/b\n"),
+        ("/a/b/sock", "/a/b"),
+        ("/sock", "/"),
+    ):
+        r = subprocess.run(
+            ["bash", "-c", snippet, "bash", path],
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OUT": str(out)},
+        )
+        assert r.returncode == 0, r.stderr
+        assert out.read_bytes() == want.encode(), (path, out.read_bytes())
+
+
+def test_uninstall_acts_on_the_recorded_socket_path_not_a_newline_stripped_one(
+    tmp_path: Path, held_sockets
+):
+    """A plist recording ``<sock>\\n`` names a path that does not exist. The stripped
+    path ``<sock>`` is a real, owned socket that must be left alone."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    sock, _lock = _seed_socket_files(home, held_sockets)
+    _seed_plist(home, ["--socket-path", str(sock) + "\n"])
+
+    r = _run_install(tmp_path, stub_dir, cmd="uninstall")
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert sock.exists(), "uninstall removed a socket the plist does not name"
+
+
 def test_token_path_the_renderer_would_refuse_is_refused_by_the_preflight(tmp_path: Path):
     """A path outside the renderer's allowlist (here, parentheses) must fail in the
     preflight, before any directory is created, not later in the renderer."""
