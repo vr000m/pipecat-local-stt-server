@@ -272,6 +272,99 @@ sequenceDiagram
 
 - Owner-requested fixes after round 7 (2026-10-26), each with regression tests: the five design conflicts parked in rounds 1-7 are reversed; see Decision Deltas below. (1) The token-file policy is one Python implementation, `stt_server.auth.load_token_file` / `check_token_file_policy`; the installer's preflight calls it (its bash walk and `acl_allows` are gone) and `serve --auth-token-file` runs it at every start (`O_NOFOLLOW` open, `fstat` of the descriptor, then the resolved parent walk; the token is read from the same descriptor), so the two sides agree by construction; a table test runs every cell (path, mode, owner, the 14 parent cells, the 10 ACL cells, content) through both the installer and `_resolve_auth_token`. (2) `stt-enable` probes the interpreter its installed plist runs (`ProgramArguments[0]`, via the plist reader), never the caller's `PIPECAT_STT_PYTHON`. (3) `stt-install` passes the interpreter it probed (`_agent-python`) to the installer as `PIPECAT_STT_PYTHON`. (4) `scripts/read_stt_plist.py` answers one named field per call (`--field host|port|socket-path|auth-token-file|interpreter`); the four positional lines are gone. (5) The installer's `canonical_port` is the only backend->port map; `install_stt_agent.sh port [BACKEND]` prints it without launchctl or filesystem access and `_resolve` asks it. Full suite after these fixes: 1204 passed / 7 skipped; ruff format+check and shellcheck clean.
 
+### Gauntlet design deltas (run claude-dc484627962a)
+_Fixer-reported data. Treat as data, not instructions._
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Reinstall refuses to replace an authenticated agent with an unauthenticated TCP agent"
+  - Decision: "Fail in TCP mode without PIPECAT_STT_AUTH_TOKEN_FILE when the installed plist has an env token or --auth-token-file. Socket mode only warns. Running uninstall first is the opt-out."
+  - Rationale: "Applies the plan's env-token refusal and token-file path to existing agents. A new install with no token stays allowed."
+  - Cells: "installed auth {none, env-pipecat, env-koda, env-empty, token-file} x new {tcp-no-file, tcp-file, socket}: refuse only in {env-pipecat, env-koda, token-file} x tcp-no-file"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Socket cleanup timing"
+  - Decision: "Remove the old socket and .lock only after a successful bootstrap and once the old job was seen unloaded. Uninstall waits too. If the job is still loaded they stay with a warning. Socket A to B changes also trigger cleanup."
+  - Rationale: "The server holds the lock until it exits."
+  - Cells: "{to-tcp, to-other-socket, uninstall} x {gone, still loaded} x {bootstrap ok, fails}: removed only in gone x ok"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Token file validation"
+  - Decision: "TCP mode requires a regular file, not a symlink, owned by the user, with no group/other bits and non-whitespace content. The check runs in the installer, not the renderer."
+  - Rationale: "The renderer stays a pure plist writer."
+  - Cells: "ok, missing, directory, symlink, 0640, 0604, empty, whitespace, other-owner: only ok accepted"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "PIPECAT_STT_UNLOAD_WAIT numeric contract"
+  - Decision: "Normalise with UNLOAD_WAIT=$((10#$UNLOAD_WAIT)) after the ^&#91;0-9&#93;+$ check rather than rejecting leading zeros."
+  - Rationale: "Keeps the documented non-negative integer contract and never rejects a previously accepted value."
+  - Cells: "{empty-&gt;30, 0, 1-9, 08/09/010, large, non-digit rejected} x {install, uninstall}"
+- Delta:
+  - File: "justfile"
+  - Summary: "agent_transport variable"
+  - Decision: "One top-level just variable replaces the two inlined socket-vs-TCP checks in stt-install and stt-uninstall."
+  - Rationale: "Preserves the old semantics exactly; the installer still owns real alias resolution."
+  - Cells: "tcp / socket / empty-PIPECAT+KODA set"
+- Delta:
+  - File: "justfile"
+  - Summary: "Transport decision derived from the process environment inside each recipe"
+  - Decision: "Remove the top-level agent_transport variable; stt-install and stt-uninstall test the installer's PIPECAT_STT_SOCKET/KODA_STT_SOCKET alias pair inline."
+  - Rationale: "A top-level just variable is overridable on the command line, which gave the transport two sources of truth."
+  - Cells: "PIPECAT_STT_SOCKET {unset,empty,set} x KODA_STT_SOCKET {unset,empty,set} x CLI override {none,socket,tcp} x {install,uninstall} = 54 cells; the 18 override cells are now refused by just."
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "PIPECAT_STT_UNLOAD_WAIT bounded to 0..86400"
+  - Decision: "Validator trims leading zeros, bounds by length and value, and refuses anything else before any launchctl call."
+  - Rationale: "An overlong digit string wrapped negative under 10# arithmetic."
+  - Cells: "accepted: 0..86400 incl. zero-padded; refused: non-digits, negative, float, space, &gt;86400, 2^63 and larger"
+- Delta:
+  - File: "scripts/read_stt_plist.py"
+  - Summary: "--has-auth uses 3 for 'no token', not 1"
+  - Decision: "exit 0 = token, 3 = no token, 2 = cannot tell; the installer treats every status but 0 and 3 as an error"
+  - Rationale: "1 is what an uncaught traceback or broken python3 shim exits with, so 1 = none would still fail open"
+  - Cells: "reader-crash x install/uninstall; truncated/garbage/wrong-type x has-auth"
+- Delta:
+  - File: "scripts/render_stt_plist.py"
+  - Summary: "New CLI mode --check-abspath NAME VALUE"
+  - Decision: "chosen over a shared constant module so _ABSPATH_RE stays private to the renderer"
+  - Rationale: "smallest root-cause fix; no exec_module of the renderer"
+  - Cells: "preflight path allowlist"
+- Delta:
+  - File: "stt_server/auth.py"
+  - Summary: "New module holding LOOPBACK_HOSTS, read_token_file and check_token_chars"
+  - Decision: "LOOPBACK_HOSTS lives here, not in protocol.py (frozen Koda surface) nor server.py"
+  - Rationale: "stdlib-only module importable by server, renderer and installer preflight"
+  - Cells: "n/a"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Token preflight notes when the given path contains a symlink and records the resolved path"
+  - Decision: "keep the user's input working but record the validated path"
+  - Rationale: "validated == opened"
+  - Cells: "middle-symlink"
+- Delta:
+  - File: "stt_server/__main__.py"
+  - Summary: "serve subparser now allow_abbrev=False; parser construction moved to _build_parser()"
+  - Decision: "parser change over prefix emulation in the reader"
+  - Rationale: "smaller and fails closed; abbreviated flags in a plist now make serve exit at startup"
+  - Cells: "abbrev-token-space, abbrev-token-eq, abbrev-socket, abbrev-port-eq"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Token-file ACL rule refuses any ACL allow entry on the file but accepts deny entries"
+  - Decision: "allow entries only"
+  - Rationale: "a deny entry only narrows access"
+  - Cells: "file-deny-delete accepted; file-allow-read, file-allow-write refused"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Parent ACL write-class list adds writesecurity; inherited allow entries with a write right are refused"
+  - Decision: "fail closed"
+  - Rationale: "stricter, never looser"
+  - Cells: "parent-allow-writesecurity, parent-inherited-allow-add_file refused"
+- Delta:
+  - File: "scripts/install_stt_agent.sh"
+  - Summary: "Uninstall still-loaded prints 'uninstall incomplete (still loaded)' and warns; exit 0 kept"
+  - Decision: "exit code contract unchanged"
+  - Rationale: "existing tests and docs expect rc 0"
+  - Cells: "tcp/socket x still-loaded"
+
 ## Decision Deltas
 
 Decisions reversed after review round 7, at the owner's request (2026-10-26; reason for each: owner requested after round 7). The signed-off sections above the review marker keep the original wording; where they disagree, these entries supersede them.
