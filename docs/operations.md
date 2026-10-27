@@ -223,8 +223,12 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   the `.lock`, so a server starting at that moment waits for it (a starter
   retries a contended lock for 250 ms) and binds only after the unlink; it never
   loses its fresh socket. With no `.lock` there, nothing is locked (the installer
-  never creates one), and a `.lock` that appears before the unlink leaves the
-  socket in place.
+  never creates one): a `.lock` that exists when the installer re-reads the
+  entry just before the unlink is honoured (a held one keeps the socket), but
+  one created after that re-read is not seen, so a starter in that window of a
+  few syscalls can lose its fresh socket. A 0.3.x server takes no lock at all,
+  and a server still holding a `.lock` inode an older installer unlinked is not
+  seen either.
 - `serve --supervised` checks it before binding (a held lock is reported as
   `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
   a contended lock for 250 ms, so the check never makes a real start fail. It

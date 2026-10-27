@@ -347,12 +347,17 @@ wait_unloaded() {
 #     for 250 ms, so it never makes a real starter fail (as for
 #     stt_server.server.socket_lock_held). The lock drops when this exits, after
 #     the unlink.
-#   * No regular file at "$1.lock": no server can hold it (it opens the lock
-#     O_NOFOLLOW and refuses anything but a regular file it owns; an absent one
-#     must first be created). The installer never creates the .lock (nor unlinks
-#     it), so there is nothing to lock; the .lock entry is re-read right before
-#     the unlink and any change since the first look is 2, so a starter that
-#     created it meanwhile wins.
+#   * No regular file at "$1.lock": no lock is taken, so nothing excludes a
+#     starter. A server that creates the .lock (acquire_socket_lock) after the
+#     re-read below, flocks it, unlinks the stale socket and binds, can have its
+#     fresh socket removed by the unlink here (a window of a few syscalls; this
+#     is accepted). What is guaranteed: a regular .lock that exists at the
+#     re-read is honoured (held means the socket stays); one created after the
+#     re-read is not seen. The installer never creates the .lock (nor unlinks
+#     it); the .lock entry is re-read right before the unlink and any change
+#     since the first look is 2, so a .lock created before the re-read is seen
+#     and wins. A 0.3.x server takes no lock at all, and a server that still
+#     holds a .lock inode an older installer unlinked is invisible here too.
 #   * Stricter than socket_lock_held, which answers "not held" for a lock another
 #     user owns or one it cannot open: this flocks any regular file there, and
 #     every error is 2.
