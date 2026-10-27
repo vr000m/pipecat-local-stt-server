@@ -795,6 +795,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.5.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.1
 [0.5.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.0
 [0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0
 [0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
