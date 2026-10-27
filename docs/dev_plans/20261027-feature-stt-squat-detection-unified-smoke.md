@@ -146,7 +146,8 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 - teardown, real-agent snapshot, exit-code rule, helper design and call flow are specified
 - the `uv run` fix moves to the first commit of Phase 1
 
-<!-- reviewed: YYYY-MM-DD @ <hash> -->
+<!-- reviewed: 2026-10-27 @ 8fa3572cc8bd3a24dd22f7a402d34755b84b0164 -->
+
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
 ## Progress
