@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   codes are unchanged. `scripts/squat_check.py` does the check; `lsof` shows only
   your own processes' sockets. See `docs/operations.md`.
 
+- **launchd verification harness** (opt-in). `scripts/smoke_launchd.py` runs
+  the checks 0.5.0 covered only with stubs against real launchd, on a spare
+  label (`pipecat.stt-server.smoke`) and port (9998) that no real agent shares:
+  the port-collision restart loop (with a squat warning), the TCP-to-socket-and-
+  back rollback, and a token file through launchd. It refuses any other label or
+  a canonical or busy port, tears the spare agent down on every exit, and
+  compares the real agents' pids and listeners before and after. The shared
+  `assert_token_gate` in `scripts/_smoke_lib.py` checks that a request without
+  the token gets 401 and with it is accepted.
+
 ### Changed
 
 - `just smoke-peercred` and `scripts/smoke_test_parakeet.py` run with

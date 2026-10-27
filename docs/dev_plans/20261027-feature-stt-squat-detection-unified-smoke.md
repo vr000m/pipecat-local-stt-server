@@ -182,7 +182,7 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 
 - [x] Phase 1a: Replace plain `uv run` in the smoke recipes
 - [x] Phase 1b: Squat detection
-- [ ] Phase 2: launchd verification harness
+- [x] Phase 2: launchd verification harness
 - [ ] Phase 3: Unified smoke
 - [ ] Phase 4: Release housekeeping
 
@@ -195,3 +195,4 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 ## Review Waivers
 - 2026-10-27 Phase 1a (conduct): the regression test scans `justfile` and `scripts/smoke_*.py` only; the plan said `README.md` too. `README.md` (about 14 lines) and `docs/operations.md` (lines 334, 340, 343, 399, 402, 405, 576) still show plain `uv run python` in foreground `serve`/`prefetch`/benchmark examples. Same extras-pruning hazard, outside Phase 1a's files. Follow-up: switch them to `uv run --no-sync python` (or `.venv/bin/python`) in Phase 3's docs pass and extend the test to `README.md` then. Also fixed `scripts/smoke_test_parakeet.py` (docstring), which matches the `smoke_*.py` glob.
 - 2026-10-27 Phase 1b (conduct): Decisions 2 and 4 contradicted each other (re-check re-reads the pid vs helper gets no label). User chose to keep an optional `--label`, used only by the confirm pass; Decision 4 reworded and the marker refreshed. One fix-loop iteration: `loaded=0` with a listener warned instead of staying quiet, and `pid in listeners` hid a second non-matching listener. Mid-phase reviewer (>3 files) skipped; the later /code-review pass covers it.
+- 2026-10-27 Phase 2 (conduct): code and stubbed tests only, 47 passed; NO live launchd run yet (awaits user review of `scripts/smoke_launchd.py`). One fix iteration: `main` filled an unset `PIPECAT_STT_LABEL` from `--label`, defeating the Decision 7 guard; removed, both label variables must be set explicitly. Choices to review: the spare socket is fixed at `~/Library/Caches/pipecat-stt-smoke-launchd/spare.sock` (`PIPECAT_STT_SOCKET` is not read); log paths come from the plist via plistlib because `read_stt_plist.py` has no `StandardErrorPath` field; `canonical_ports` asks the installer for `mlx` (its name for whisper); an extra `stt_server` import check under `python -I` runs after the start-state check; SIGINT/SIGTERM record a FAIL, run teardown and exit 1; `assert_token_gate` uses a raw websocket upgrade (401 without or with a wrong token, 101 with a good one) via `ws_handshake_status`. Unverified until the live run: two address-in-use lines within 30 s, lsof showing the harness-held port as a listener, and the strict old-job-unloaded-before-socket-removal check (may false-FAIL). Success path of `assert_token_gate` is untested (needs the real server).
