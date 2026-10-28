@@ -32,8 +32,11 @@ re-snapshot compared with the baseline -> teardown -> re-snapshot and compare. A
 or start-state refusal is a FAIL and happens before any ``launchctl`` bootstrap or
 bootout and before any installer call. Teardown always runs after that point
 (failure, exception, SIGINT, SIGTERM): the installer's ``uninstall`` for the spare
-label, then the spare ``.lock`` once nothing holds it, then the spare plist and
-logs. It never touches another label.
+label, then the spare socket and ``.lock`` only while the harness itself holds
+that ``.lock``'s ``flock`` (so no live server owns them), then the spare plist
+and logs. It never touches another label, leaves (and reports) anything it
+cannot prove is its own and unheld, and any removal that fails, or any artifact
+still present afterwards, makes the teardown row FAIL.
 
 The real agents are every installed ``pipecat.stt-server*`` plist under
 ``_smoke_lib.agents_home()`` (the account's home from the password database, not
@@ -995,8 +998,82 @@ class Harness:
 
     # -- teardown
 
+    def _unlink(self, path: Path, problems: list[str]) -> None:
+        """Unlink PATH; a failure other than "already gone" is a problem."""
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            problems.append(f"cannot remove {path}: {exc}")
+
+    def remove_spare_socket(self, problems: list[str], wait: float = 10.0) -> None:
+        """Remove the spare socket and its ``.lock``, only while proving no live
+        server owns them.
+
+        The start state proved neither existed when the run began, and the path
+        is the harness's own. A server holds an exclusive ``flock`` on
+        ``<socket>.lock`` for its whole life and takes it before it binds, so the
+        harness takes that same lock itself (non-blocking, retried for WAIT
+        seconds): while it holds the lock no server can be serving the socket or
+        start to. Holding it, the harness unlinks the socket (only an AF_UNIX
+        socket owned by this user), then the ``.lock`` (only while the path still
+        names the inode it holds), then lets go. A lock it cannot take (held by a
+        live process), a path of the wrong type or owner, or a socket with no
+        ``.lock`` (nothing can prove it unserved) is left in place and reported."""
+        import fcntl
+
+        sock, lock = self.sock, _lock_path(self.sock)
+        if not (os.path.lexists(sock) or os.path.lexists(lock)):
+            return
+        if not os.path.lexists(lock):
+            problems.append(f"{sock} has no {lock.name} to prove it unserved; left in place")
+            return
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as exc:
+            problems.append(f"cannot open {lock} ({exc}); {sock} and {lock} left in place")
+            return
+        try:
+            held = os.fstat(fd)
+            if not stat.S_ISREG(held.st_mode) or held.st_uid != os.getuid():
+                problems.append(f"{lock} is not a regular file owned by this user; left in place")
+                return
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        problems.append(
+                            f"{lock} is still held by a live process after {wait:.0f}s; "
+                            f"{sock} and {lock} left in place"
+                        )
+                        return
+                    time.sleep(0.2)
+            if os.path.lexists(sock):
+                st = os.lstat(sock)
+                if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
+                    self._unlink(sock, problems)
+                else:
+                    problems.append(f"{sock} is not a socket owned by this user; left in place")
+            try:
+                now = os.lstat(lock)
+            except FileNotFoundError:
+                now = None
+            if now is not None and (now.st_dev, now.st_ino) == (held.st_dev, held.st_ino):
+                self._unlink(lock, problems)
+            elif now is not None:
+                problems.append(f"{lock} was replaced during teardown; left in place")
+        finally:
+            os.close(fd)
+
     def teardown(self) -> list[str]:
-        """Remove everything the harness created. Touches only the spare label."""
+        """Remove everything the harness created; touches only the spare label.
+        Every removal that fails, and every artifact still present at the end
+        (``lexists``: a dangling symlink counts), is a problem, so a teardown
+        that did not clean up can never PASS."""
         problems: list[str] = []
         label = self.label
         self.release_holder()
@@ -1005,7 +1082,6 @@ class Harness:
             socket_in_plist = read_plist_field(label, "socket-path")
         except (CheckFailed, OSError, subprocess.SubprocessError):
             socket_in_plist = ""
-        socks = {str(self.sock)} | ({socket_in_plist} if socket_in_plist else set())
 
         env = install_env(label, self.port)
         try:
@@ -1017,31 +1093,28 @@ class Harness:
         except (OSError, subprocess.SubprocessError) as exc:
             problems.append(f"uninstall failed: {exc}")
 
-        for sock in sorted(socks):
-            lock = _lock_path(sock)
-            if lock.exists() or lock.is_symlink():
-                try:
-                    self.wait_for(
-                        f"{lock} to be unheld", lambda lock=lock: lock_unheld(lock), timeout=10
-                    )
-                except CheckFailed as exc:
-                    problems.append(str(exc))
-                    continue
-                with contextlib.suppress(OSError):
-                    lock.unlink()
-            # The installer removes a recorded socket; sweep a leftover spare one.
-            if sock == str(self.sock) and (Path(sock).exists() or Path(sock).is_symlink()):
-                with contextlib.suppress(OSError):
-                    Path(sock).unlink()
-        if self.sock_dir_made:
-            with contextlib.suppress(OSError):
+        self.remove_spare_socket(problems)
+        # Only the harness's own socket path is ever removed: a different one in
+        # the plist is not provably the harness's, so it is reported, not touched.
+        if socket_in_plist and socket_in_plist != str(self.sock):
+            for path in (Path(socket_in_plist), _lock_path(socket_in_plist)):
+                if os.path.lexists(path):
+                    problems.append(f"{path} (recorded in the spare plist) left in place")
+        if self.sock_dir_made and os.path.lexists(self.sock.parent):
+            try:
                 self.sock.parent.rmdir()
+            except OSError as exc:
+                problems.append(f"cannot remove {self.sock.parent}: {exc}")
         if self.token_dir is not None:
-            shutil.rmtree(self.token_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(self.token_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                problems.append(f"cannot remove {self.token_dir}: {exc}")
         plist = _plist_path(label)
         for path in [plist, *logs]:
-            with contextlib.suppress(OSError):
-                path.unlink()
+            self._unlink(path, problems)
         try:
             loaded, _pid = require_launchd_state(label, self.uid)
         except RuntimeError as exc:
@@ -1051,7 +1124,12 @@ class Harness:
             if loaded:
                 hint = shell_command("launchctl", "bootout", f"gui/{self.uid}/{label}")
                 problems.append(f"{label} is still loaded; run: {hint}")
-        left = [p for p in [plist, *logs, self.sock, _lock_path(self.sock)] if p.exists()]
+        residue = [plist, *logs, self.sock, _lock_path(self.sock)]
+        if self.sock_dir_made:
+            residue.append(self.sock.parent)
+        if self.token_dir is not None:
+            residue.append(self.token_dir)
+        left = [p for p in residue if os.path.lexists(p)]
         if left:
             problems.append("left behind: " + ", ".join(str(p) for p in left))
         return problems

@@ -1756,3 +1756,96 @@ exit 0
     )
     flags = lambda text: re.findall(r"(?<!\S)--[a-z][a-z-]*", text)  # noqa: E731
     assert flags(argv[0]) == flags(recipe) == ["--host", "--port", "--label", "--launchctl-rc"]
+
+
+# Teardown removes the spare socket and .lock only while it holds the .lock's
+# flock itself: .lock state x socket state -> what is removed, what is reported.
+@pytest.mark.parametrize("sock_state", ["absent", "socket", "file"])
+@pytest.mark.parametrize("lock_state", ["absent", "free", "held", "symlink"])
+def test_remove_spare_socket_state_space(smoke, lock_state, sock_state):
+    import fcntl
+    import os
+    import tempfile
+
+    d = Path(tempfile.mkdtemp(prefix="sk", dir="/tmp"))  # short: AF_UNIX path limit
+    sock, lock = d / "s.sock", d / "s.sock.lock"
+    holder = None
+    try:
+        if sock_state == "socket":
+            with socket.socket(socket.AF_UNIX) as s:
+                s.bind(str(sock))
+        elif sock_state == "file":
+            sock.write_text("")
+        if lock_state in ("free", "held"):
+            lock.write_text("")
+        if lock_state == "held":  # another open file description holds the flock
+            holder = os.open(lock, os.O_RDWR)
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if lock_state == "symlink":
+            (d / "target").write_text("")
+            lock.symlink_to(d / "target")
+        h = object.__new__(smoke.Harness)
+        h.sock = sock
+        problems: list[str] = []
+        h.remove_spare_socket(problems, wait=0.3)
+
+        provable = lock_state == "free"
+        sock_ours = sock_state == "socket"
+        if sock_state == "absent" and lock_state == "absent":
+            assert problems == []
+        # The socket goes only when the harness held the lock and it is a socket.
+        assert os.path.lexists(sock) == (sock_state != "absent" and not (provable and sock_ours))
+        # The lock goes only when the harness held it (a free regular file).
+        assert os.path.lexists(lock) == (lock_state != "absent" and not provable)
+        if lock_state == "held":
+            assert any("still held" in p for p in problems), problems
+        if lock_state == "symlink":
+            assert problems and (d / "target").exists()
+        if lock_state == "absent" and sock_state != "absent":
+            assert any("to prove it unserved" in p for p in problems), problems
+        if provable and sock_state == "file":
+            assert any("not a socket" in p for p in problems), problems
+        if provable and sock_state != "file":
+            assert problems == []
+    finally:
+        if holder is not None:
+            os.close(holder)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# A cleanup that fails can never PASS: each failure below is a teardown problem,
+# and the residue check uses lexists, so a dangling symlink is still residue.
+@pytest.mark.parametrize("failure", ["none", "token-dir", "sock-dir", "dangling-socket"])
+def test_teardown_reports_every_failed_cleanup(smoke, env, monkeypatch, failure):
+    import os
+
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
+    monkeypatch.setattr(smoke, "UNLOAD_WAIT", 2)
+    h = smoke.Harness(SPARE, _free_port(), None)
+    h.sock_dir_made = smoke.prepare_private_dir(h.sock.parent, env.home)
+    locked = None
+    if failure == "token-dir":
+        h.token_dir = env.home / "tok"
+        h.token_dir.mkdir()
+        (h.token_dir / "token").write_text("x")
+        h.token_dir.chmod(0o500)  # its entry cannot be unlinked
+        locked = h.token_dir
+    elif failure == "sock-dir":
+        (h.sock.parent / "someone-elses").write_text("")
+    elif failure == "dangling-socket":
+        h.sock.symlink_to(env.home / "nowhere")
+    try:
+        problems = h.teardown()
+    finally:
+        if locked is not None:
+            locked.chmod(0o700)
+    if failure == "none":
+        assert problems == []
+        assert not os.path.lexists(h.sock.parent)
+    else:
+        assert problems, failure
+        assert any("left behind" in p for p in problems), problems
+    if failure == "dangling-socket":
+        assert os.path.lexists(h.sock) and str(h.sock) in " ".join(problems)
