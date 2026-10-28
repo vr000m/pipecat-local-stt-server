@@ -1557,3 +1557,70 @@ def test_reap_never_leaves_a_reader_on_a_pipe_an_escaped_daemon_holds(smoke, tmp
         if daemon is not None:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(daemon, signal.SIGKILL)
+
+
+# The token-file step's server stderr is never an undrained pipe: a server
+# that logs more than a pipe buffer (64 KB) during the gate must not block on
+# write, and an early exit still reports the server's own stderr tail.
+# server behaviour -> _token_check's exit and what it reports.
+_FAKE_SERVER = r"""
+import socket, sys, time
+port, done, mode = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+if mode == "exit-early":
+    sys.stderr.write("x" * 1000 + "boom: cannot start\n"); sys.exit(4)
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(8)
+sys.stderr.write("log line " * 30000)  # ~270 KB, far past a 64 KB pipe buffer
+sys.stderr.flush()
+open(done, "w").write("flushed")
+time.sleep(60)
+"""
+
+
+@pytest.mark.parametrize("mode", ["floods-stderr", "exit-early"])
+def test_token_check_server_stderr_never_blocks_the_server(
+    smoke, monkeypatch, tmp_path, capsys, mode
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    done = tmp_path / "done"
+    real_popen = subprocess.Popen
+    started = []
+
+    def popen(argv, *a, **k):
+        argv = [str(x) for x in argv]
+        if "stt_server" in argv:
+            port = argv[argv.index("--port") + 1]
+            proc = real_popen([sys.executable, "-c", _FAKE_SERVER, port, str(done), mode], *a, **k)
+            started.append(proc)
+            return proc
+        return real_popen(argv, *a, **k)
+
+    def gate(host, port, token_file, *, connect):
+        # The gate runs while the server logs: it needs the server to get
+        # past its whole stderr write, which an undrained pipe would block.
+        deadline = time.monotonic() + 15
+        while not done.exists():
+            if time.monotonic() > deadline:
+                raise AssertionError("the server blocked writing its stderr")
+            time.sleep(0.05)
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", popen)
+    monkeypatch.setattr(smoke._smoke_lib, "assert_token_gate", gate)
+    try:
+        rc = smoke._token_check()
+    finally:
+        for proc in started:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    err = capsys.readouterr().err
+    if mode == "floods-stderr":
+        assert rc == 0, err
+        assert done.read_text() == "flushed"
+    else:
+        assert rc == 1
+        assert "server exited early (4)" in err and "boom: cannot start" in err
+    assert started and started[0].returncode is not None, "server left running"
+    assert not list(home.glob("stt-smoke-token.*")), "token directory left behind"

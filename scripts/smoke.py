@@ -509,6 +509,10 @@ def _token_check() -> int:
     old_term = signal.signal(signal.SIGTERM, on_term)
     tmp = None
     server = None
+    # The server's stderr goes to an anonymous temp file, never a pipe nobody
+    # drains after start-up (more than a pipe buffer of log lines during the
+    # gate would block the server on write); read back only for an early exit.
+    errlog = tempfile.TemporaryFile()
     try:
         # The token file must pass stt_server.auth's policy (_smoke_lib's one
         # fixture, which the launchd harness also checks against load_token_file).
@@ -523,13 +527,13 @@ def _token_check() -> int:
             cwd=str(REPO),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
+            stderr=errlog,
         )  # fmt: skip
         deadline = time.time() + 30
         while time.time() < deadline:
             if server.poll() is not None:
-                err = (server.stderr.read() if server.stderr else "")[-300:]
+                errlog.seek(0)
+                err = errlog.read().decode(errors="replace")[-300:]
                 print(f"server exited early ({server.returncode}): {err}", file=sys.stderr)
                 return 1
             try:
@@ -565,6 +569,7 @@ def _token_check() -> int:
                     server.wait()
             if tmp is not None:
                 shutil.rmtree(tmp, ignore_errors=True)
+            errlog.close()
         signal.signal(signal.SIGTERM, old_term)
 
 
