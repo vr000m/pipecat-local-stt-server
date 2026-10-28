@@ -54,6 +54,29 @@ SKIPPED = "SKIPPED"
 # The first stdout line smoke_launchd.py prints (exit 0) when a precondition is
 # absent; smoke.py maps it to SKIPPED, never PASS.
 LAUNCHD_SKIP_MARK = "SKIPPED: launchd checks not run: "
+# The failure channel: after its table smoke_launchd.py prints one stdout line
+# per FAIL row, this mark + "<check>: <detail>"; smoke.py's launchd row takes its
+# detail from these lines (never from whatever line happens to come last).
+LAUNCHD_FAIL_MARK = "FAIL: launchd check failed: "
+
+
+def launchd_fail_lines(rows) -> list[str]:
+    """The failure-channel lines for ROWS ((name, outcome, detail) triples)."""
+    return [
+        f"{LAUNCHD_FAIL_MARK}{name}: {' '.join(detail.split())}"
+        for name, outcome, detail in rows
+        if outcome == FAIL
+    ]
+
+
+def launchd_failures(stdout: str) -> list[str]:
+    """ "<check>: <detail>" for each failure-channel line in STDOUT."""
+    return [
+        ln[len(LAUNCHD_FAIL_MARK) :]
+        for ln in (stdout or "").splitlines()
+        if ln.startswith(LAUNCHD_FAIL_MARK)
+    ]
+
 
 SPARE_LABEL = "pipecat.stt-server.smoke"
 AGENT_GLOB = "pipecat.stt-server*.plist"

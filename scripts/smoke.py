@@ -239,7 +239,9 @@ def token_file_step() -> StepResult:
 def launchd_step(requested: bool) -> StepResult:
     """The harness exits 0 with ``LAUNCHD_SKIP_MARK`` + reason as its first
     stdout line when a precondition is absent: that is SKIPPED, never PASS. The
-    runner also checks the same preconditions itself and skips without spawning."""
+    runner also checks the same preconditions itself and skips without spawning.
+    On a FAIL the detail is the harness's ``LAUNCHD_FAIL_MARK`` lines (the
+    checks that failed); without any (a crash) it is the output's last line."""
     if not requested:
         return StepResult("launchd", SKIPPED, "not requested")
     reason = launchd_skip_reason()
@@ -249,6 +251,11 @@ def launchd_step(requested: bool) -> StepResult:
     first = ((proc.stdout or "") if proc is not None else "").lstrip().split("\n", 1)[0]
     if outcome == PASS and first.startswith(_smoke_lib.LAUNCHD_SKIP_MARK):
         return StepResult("launchd", SKIPPED, first[len(_smoke_lib.LAUNCHD_SKIP_MARK) :].strip())
+    failures = _smoke_lib.launchd_failures(proc.stdout if proc is not None else "")
+    if outcome == FAIL and failures:
+        # The harness's failure channel names the checks that failed; the last
+        # output line is only the last table row.
+        detail = f"exit {proc.returncode}: " + "; ".join(failures)
     return StepResult("launchd", outcome, detail)
 
 

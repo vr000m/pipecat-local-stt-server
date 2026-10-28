@@ -1892,3 +1892,40 @@ def test_log_paths_match_what_the_renderer_writes(smoke, monkeypatch, tmp_path, 
         Path(rendered["StandardErrorPath"]),
         Path(rendered["StandardOutPath"]),
     ]
+
+
+# The runner's launchd row takes its FAIL detail from the harness's failure
+# channel (LAUNCHD_FAIL_MARK lines), fed here the REAL harness output: the row
+# names the check that failed, never just the table's last row.
+@pytest.mark.parametrize(
+    ("case", "want"),
+    [
+        ("inject-fail", "port collision: injected failure"),
+        ("guard", "guard: KODA_STT_LABEL must be set"),
+        ("crash", "Traceback-last-line"),
+        ("channel-not-last", "token file: nope"),
+    ],
+)
+def test_runner_reads_the_harness_failure_channel(smoke, env, monkeypatch, case, want):
+    runner = _load(REPO_ROOT / "scripts" / "smoke.py", "smoke_runner_for_channel")
+    if case == "channel-not-last":  # the channel line wins over the last line
+        out = smoke._smoke_lib.LAUNCHD_FAIL_MARK + "token file: nope\nFAIL     trailer  x\n"
+        r = subprocess.CompletedProcess([], 1, out, "")
+    elif case == "crash":  # no channel line: the runner falls back to the last line
+        r = subprocess.CompletedProcess(
+            [], 1, "", "Traceback (most recent call last):\nTraceback-last-line\n"
+        )
+    else:
+        e = env.spare_env() if case == "inject-fail" else env.env(PIPECAT_STT_LABEL=SPARE)
+        r = env.run(["--inject", "fail", "--port", str(_free_port())], e)
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        lines = [
+            ln for ln in r.stdout.splitlines() if ln.startswith(smoke._smoke_lib.LAUNCHD_FAIL_MARK)
+        ]
+        assert lines and any(want in ln for ln in lines), r.stdout
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.setattr(runner, "run_command", lambda *a, **k: r)
+    row = runner.launchd_step(True)
+    assert row.outcome == "FAIL" and want in row.detail, row
+    if case == "inject-fail":
+        assert "real agents unchanged" not in row.detail

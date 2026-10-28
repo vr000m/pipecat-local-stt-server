@@ -71,7 +71,9 @@ spare during the checks stops the remaining checks, like a lost port.
 
 When a precondition is absent the harness prints
 ``_smoke_lib.LAUNCHD_SKIP_MARK`` + the reason and exits 0; ``smoke.py`` maps
-that line to SKIPPED. Exit 0 unless a requested step FAILed. The external tools
+that line to SKIPPED. After its table it prints one
+``_smoke_lib.LAUNCHD_FAIL_MARK`` + "<check>: <detail>" line per FAIL row, which
+``smoke.py`` uses as its launchd row's detail. Exit 0 unless a requested step FAILed. The external tools
 (``launchctl``, ``lsof``, ``id``, ``bash``, ``python3``) are called by bare name
 through PATH.
 """
@@ -1143,10 +1145,14 @@ class Harness:
 
 
 def _print_table(results) -> None:
+    """The table, then one failure-channel line per FAIL row
+    (``_smoke_lib.LAUNCHD_FAIL_MARK``), which ``smoke.py`` reads."""
     width = max((len(n) for n, _s, _d in results), default=4)
     print()
     for name, status, detail in results:
         print(f"{status:<8} {name:<{width}}  {detail}".rstrip())
+    for line in _smoke_lib.launchd_fail_lines(results):
+        print(line)
 
 
 def run_checks(harness, checks, rows: list) -> list:
