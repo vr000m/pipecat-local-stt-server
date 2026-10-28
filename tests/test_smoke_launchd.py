@@ -540,24 +540,108 @@ def test_prepare_private_dir_creates_or_tightens(smoke, tmp_path):
         smoke.prepare_private_dir(f)
 
 
-# Every installer warning that means the old socket (or job) was left behind;
-# install() must FAIL on each, which is what makes the rollback's "removed on
-# the unload-confirmed path" claim hold.
+# The installer's "warning:" lines, read from its source, each classified here by
+# a fragment of its text: True = something was left behind (the harness must
+# FAIL the install or the uninstall on it), False = benign. Every warning in the
+# installer must match exactly one entry, so a new or reworded warning fails
+# this test until it is classified, and the harness's rule must agree with each.
+INSTALLER = REPO_ROOT / "scripts" / "install_stt_agent.sh"
+_INSTALLER_WARNINGS = {
+    "still loaded ${cap}s after bootout": True,
+    "installed socket path '$sock' $reason; leaving it": True,
+    "$sock.lock is held by a running server; leaving $sock": True,
+    "$sock is not a socket; leaving it": True,
+    "$sock not owned by current user, leaving it": True,
+    "could not remove $sock": True,
+    "could not tell whether $sock.lock is held; leaving $sock": True,
+    "it looks unsafe, so no removal command is offered": True,
+    "no later run will remove it": True,
+    "socket mode (PIPECAT_STT_SOCKET set): ignoring": False,
+    "a socket agent carries none": False,
+    "launchctl bootstrap failed for $LABEL; retrying once": False,
+    "old job may still hold $old_socket.lock; leaving $old_socket": True,
+    "uninstalling $LABEL without socket cleanup": True,
+    "$LABEL may still hold $old_socket.lock; leaving $old_socket": True,
+    "the uninstall is incomplete": True,
+}
+
+
+def _installer_warnings() -> list[str]:
+    import re
+
+    return re.findall(r'echo "(warning: [^"]*)"', INSTALLER.read_text())
+
+
+def _rendered(line: str) -> str:
+    """A warning as the installer prints it: every expansion replaced by a value."""
+    import re
+
+    return re.sub(r"\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*", "/h/x", line)
+
+
+def test_every_installer_warning_is_classified_and_the_harness_agrees(smoke):
+    found = _installer_warnings()
+    assert len(found) >= len(_INSTALLER_WARNINGS)
+    used = set()
+    for line in found:
+        keys = [k for k in _INSTALLER_WARNINGS if k in line]
+        assert len(keys) == 1, f"classify this installer warning: {line!r} (matched {keys})"
+        used.add(keys[0])
+        printed = _rendered(line)
+        assert (smoke.leave_behind_warnings(printed) != []) == _INSTALLER_WARNINGS[keys[0]], printed
+    assert used == set(_INSTALLER_WARNINGS), "stale entries: " + repr(
+        set(_INSTALLER_WARNINGS) - used
+    )
+
+
+def test_old_socket_note_and_log_naming_match_the_installer(smoke, monkeypatch, tmp_path):
+    import re
+
+    src = INSTALLER.read_text()
+    notes = re.findall(r'echo "(note: endpoint changed [^"]*)"', src)
+    assert len(notes) == 2 and all(n.endswith(smoke.OLD_SOCKET_NOTE) for n in notes)
+    # The log dir and basename rule the harness falls back on before a plist exists.
+    assert (
+        'LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/pipecat-stt}}"'
+        in src
+    )
+    assert 'LOG_BASENAME="${LABEL//./-}"' in src
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PIPECAT_STT_LOG_DIR", raising=False)
+    monkeypatch.delenv("KODA_STT_LOG_DIR", raising=False)
+    logs = tmp_path / "Library" / "Logs" / "pipecat-stt"
+    assert smoke._log_paths(SPARE) == [
+        logs / "pipecat-stt-server-smoke.err",
+        logs / "pipecat-stt-server-smoke.log",
+    ]
+    monkeypatch.setenv("KODA_STT_LOG_DIR", str(tmp_path / "k"))
+    assert smoke._log_dir() == tmp_path / "k"
+    monkeypatch.setenv("PIPECAT_STT_LOG_DIR", str(tmp_path / "p"))
+    assert smoke._log_dir() == tmp_path / "p"
+    # The canonical backends are the installer's port table.
+    table = re.findall(r"^\s*([a-z]+)\) echo (\d+) ;;", src, re.MULTILINE)
+    assert tuple(b for b, _p in table) == smoke.CANONICAL_BACKENDS
+
+
+# Leave-behind lines the harness must refuse even when worded unlike any above.
 @pytest.mark.parametrize(
-    "line",
+    ("stderr", "left"),
     [
-        "warning: pipecat.stt-server.smoke still loaded 30s after bootout",
-        "warning: old job may still hold /h/spare.sock.lock; leaving /h/spare.sock",
-        "warning: /h/spare.sock.lock is held by a running server; leaving /h/spare.sock",
-        "warning: /h/spare.sock is not a socket; leaving it",
-        "warning: /h/spare.sock not owned by current user, leaving it",
-        "warning: could not remove /h/spare.sock",
-        "warning: could not tell whether /h/spare.sock.lock is held; leaving /h/spare.sock",
-        "warning: installed socket path '/h/spare.sock' is not absolute; leaving it",
+        ("", False),
+        (
+            "note: endpoint changed from socket /a to TCP 127.0.0.1:9; removing the old socket",
+            False,
+        ),
+        ("warning: socket mode (PIPECAT_STT_SOCKET set): ignoring PIPECAT_STT_PORT (x)", False),
+        ("warning: something new the harness has never seen", True),
+        (
+            "warning: launchctl bootstrap failed for x; retrying once\nwarning: could not remove /a",
+            True,
+        ),
     ],
 )
-def test_install_fails_on_every_leave_behind_warning(smoke, line):
-    assert smoke._WARN_RE.search(line)
+def test_leave_behind_warnings_state_space(smoke, stderr, left):
+    assert (smoke.leave_behind_warnings(stderr) != []) == left
 
 
 # --------------------------------------------------------------------------
@@ -840,8 +924,8 @@ def test_teardown_runs_the_uninstall_in_its_own_session(smoke, env, monkeypatch)
     monkeypatch.setenv("PATH", env.path)
     seen = []
 
-    def fake_installer(sub, e, run=None, *, new_session=False):
-        seen.append((sub, new_session))
+    def fake_installer(sub, e, *, teardown=False):
+        seen.append((sub, teardown))
         return _cp(["bash"], 0)
 
     monkeypatch.setattr(smoke, "run_installer", fake_installer)
@@ -1176,3 +1260,144 @@ def test_prepare_private_dir_allows_a_symlink_that_stays_inside_home(smoke, tmp_
     target = home / "Library" / "Caches" / "pipecat-stt-smoke-launchd"
     assert smoke.prepare_private_dir(target, home) is True
     assert (home / "Library" / "RealCaches" / "pipecat-stt-smoke-launchd").is_dir()
+
+
+# --------------------------------------------------------------------------
+# start state over both homes; quoted cleanup commands (D, J)
+# --------------------------------------------------------------------------
+
+
+# where a stale (unloaded) spare plist sits x whether $HOME is the agents home
+# -> the start state names exactly the plists that exist, in either home.
+@pytest.mark.parametrize("where", ["none", "home", "account", "both"])
+@pytest.mark.parametrize("same_home", [True, False])
+def test_start_state_sees_a_spare_plist_in_either_home(smoke, env, monkeypatch, where, same_home):
+    account = env.home if same_home else env.tmp / "account"
+    (account / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(account))
+    in_home = env.agents / f"{SPARE}.plist"
+    in_account = account / "Library" / "LaunchAgents" / f"{SPARE}.plist"
+    if where in ("home", "both"):
+        in_home.write_text("<plist><dict/></plist>")
+    if where in ("account", "both"):
+        in_account.write_text("<plist><dict/></plist>")
+    sock = env.home / "Library" / "Caches" / "pipecat-stt-smoke-launchd" / "spare.sock"
+    cmds = smoke.start_state_problems(SPARE, FAKE_UID, sock)
+    want = set()
+    if where != "none":
+        want = {f"rm -f {in_home}"} if (same_home or where in ("home", "both")) else set()
+        if where in ("account", "both"):
+            want.add(f"rm -f {in_account}")
+    assert set(cmds) == want
+
+
+# A cleanup command a user pastes must name exactly the path the harness saw,
+# whatever the path holds: shlex.split(printed) == the argv it stands for.
+@pytest.mark.parametrize(
+    "name", ["plain", "with space", "quote'in", 'dq"x', "semi;rm -rf x", "$(touch y)", "tab\tx"]
+)
+def test_cleanup_commands_round_trip_through_the_shell(smoke, env, monkeypatch, name):
+    import shlex
+
+    home = env.tmp / name / "home"
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", env.path)
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
+    plist = home / "Library" / "LaunchAgents" / f"{SPARE}.plist"
+    plist.write_text("<plist><dict/></plist>")
+    sock = home / "Library" / "Caches" / "pipecat-stt-smoke-launchd" / "spare.sock"
+    sock.parent.mkdir(parents=True)
+    sock.write_text("")
+    cmds = smoke.start_state_problems(SPARE, FAKE_UID, sock)
+    assert sorted(shlex.split(c) for c in cmds) == sorted(
+        [["rm", "-f", str(plist)], ["rm", "-f", str(sock)]]
+    )
+
+
+# --------------------------------------------------------------------------
+# the installer runs in its own process group (E)
+# --------------------------------------------------------------------------
+
+_FAKE_INSTALLER = """#!/usr/bin/env bash
+marker="$PIPECAT_SMOKE_TEST_MARKER"
+sleep 60 &
+echo $! > "$marker.desc"
+: > "$marker.ready"
+if [[ "$PIPECAT_SMOKE_TEST_MODE" == quick ]]; then sleep 1; echo done; exit 0; fi
+sleep 60
+"""
+
+
+def _gone(pid: int) -> bool:
+    """Not running: no such process, or a zombie awaiting its new parent's reap."""
+    res = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return res.stdout.strip() == "" or res.stdout.strip().startswith("Z")
+
+
+# the trigger x install or teardown uninstall -> outcome; in every cell the
+# installer's background descendant is no longer running when run_installer
+# returns or raises, so teardown cannot race it.
+@pytest.mark.parametrize(
+    ("trigger", "teardown", "mode", "want"),
+    [
+        ("none", False, "quick", "result"),
+        ("timeout", False, "slow", "timeout"),
+        ("signal", False, "slow", "interrupt"),
+        ("signal", True, "quick", "result"),  # teardown: a signal does not stop it
+        ("none", True, "quick", "result"),
+    ],
+)
+def test_installer_group_never_outlives_run_installer(
+    smoke, monkeypatch, tmp_path, trigger, teardown, mode, want
+):
+    import os
+
+    fake = tmp_path / "fake_installer.sh"
+    _exe(fake, _FAKE_INSTALLER)
+    marker = tmp_path / "m"
+    monkeypatch.setattr(smoke, "INSTALLER", fake)
+    monkeypatch.setattr(smoke, "INSTALL_TIMEOUT", 2 if trigger == "timeout" else 30)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "PIPECAT_SMOKE_TEST_MARKER": str(marker),
+        "PIPECAT_SMOKE_TEST_MODE": mode,
+    }
+    state = {"tearing_down": teardown}
+    old = {
+        s: signal.signal(s, smoke.signal_handler(state)) for s in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    def fire():
+        deadline = time.monotonic() + 30
+        while not Path(f"{marker}.ready").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    t = threading.Thread(target=fire) if trigger == "signal" else None
+    got = None
+    try:
+        if t:
+            t.start()
+        try:
+            res = smoke.run_installer("install", env, teardown=teardown)
+            got = "result"
+        except subprocess.TimeoutExpired:
+            got = "timeout"
+        except KeyboardInterrupt:
+            got = "interrupt"
+        desc = int(Path(f"{marker}.desc").read_text())
+        gone_at_return = _gone(desc)
+    finally:
+        if t:
+            t.join()
+        for s, h in old.items():
+            signal.signal(s, h)
+    assert got == want
+    assert gone_at_return, f"installer descendant {desc} still running after run_installer"
+    if want == "result":
+        assert res.returncode == 0 and "done" in res.stdout
+    if want == "interrupt":
+        assert state["tearing_down"] is True  # the harness's own handler saw the signal

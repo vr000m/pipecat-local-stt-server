@@ -232,14 +232,19 @@ def token_file_step() -> StepResult:
 
 
 def launchd_step(requested: bool) -> StepResult:
-    return run_step(
-        "launchd",
-        launchd_cmd(),
-        LAUNCHD_TIMEOUT,
-        requested=requested,
-        skip_reason=launchd_skip_reason() if requested else None,
-        env=launchd_env() if requested else None,
-    )
+    """The harness exits 0 with ``LAUNCHD_SKIP_MARK`` + reason as its first
+    stdout line when a precondition is absent: that is SKIPPED, never PASS. The
+    runner also checks the same preconditions itself and skips without spawning."""
+    if not requested:
+        return StepResult("launchd", SKIPPED, "not requested")
+    reason = launchd_skip_reason()
+    if reason:
+        return StepResult("launchd", SKIPPED, reason)
+    outcome, detail, proc = _execute(launchd_cmd(), LAUNCHD_TIMEOUT, launchd_env())
+    first = ((proc.stdout or "") if proc is not None else "").lstrip().split("\n", 1)[0]
+    if outcome == PASS and first.startswith(_smoke_lib.LAUNCHD_SKIP_MARK):
+        return StepResult("launchd", SKIPPED, first[len(_smoke_lib.LAUNCHD_SKIP_MARK) :].strip())
+    return StepResult("launchd", outcome, detail)
 
 
 def peercred_step() -> StepResult:
@@ -399,14 +404,10 @@ def _token_check() -> int:
     tmp = None
     server = None
     try:
-        # The token file must pass stt_server.auth's policy: 0600, owner-only,
-        # under an owner-only directory below $HOME (/tmp fails the ancestor check).
-        tmp = tempfile.mkdtemp(prefix="stt-smoke-token.", dir=str(Path.home()))
-        os.chmod(tmp, 0o700)
-        token_file = os.path.join(tmp, "token")
-        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write("smoke-token-" + os.urandom(8).hex() + "\n")
+        # The token file must pass stt_server.auth's policy (_smoke_lib's one
+        # fixture, which the launchd harness also checks against load_token_file).
+        tmp, token_path = _smoke_lib.write_policy_token_file(Path.home(), "stt-smoke-token.")
+        token_file = str(token_path)
         server = subprocess.Popen(
             [
                 sys.executable, "-m", "stt_server", "serve", "--backend", "echo",

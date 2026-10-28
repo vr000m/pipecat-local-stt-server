@@ -17,7 +17,7 @@ spare label; an unset or different value is refused (never filled in).
 Never run it with plain ``uv run`` (that prunes the backend extras); the installer
 is handed the running interpreter through ``PIPECAT_STT_PYTHON``.
 
-Order: preconditions (darwin, ``CI`` unset; otherwise ``SKIPPED``, exit 0) ->
+Order: preconditions (darwin, ``CI`` unset; otherwise skipped, exit 0) ->
 run lock (an exclusive non-blocking ``flock`` on
 ``<agents home>/Library/Caches/pipecat-stt-smoke-launchd.lock``; a second run
 refuses and touches nothing; the lock is held until the process exits) ->
@@ -55,8 +55,22 @@ Two reads live here: the job list (``launchctl list``) and a plistless job's
 ``squat_check.parse_launchd_pid``). A ``launchctl`` or ``lsof`` answer the
 harness cannot read refuses or FAILs, never reads as "not loaded" or "free".
 
-Exit 0 unless a requested step FAILed. The external tools (``launchctl``,
-``lsof``, ``id``, ``bash``, ``python3``) are called by bare name through PATH.
+Every installer call runs in its own process group through
+``_smoke_lib.run_owned`` (``run_installer``): a SIGINT/SIGTERM during an install
+SIGKILLs the installer's whole group before the interrupt reaches the harness,
+so teardown never runs beside an installer descendant. Any installer
+``warning:`` line not in the short benign list (``_BENIGN_WARNINGS``) FAILs the
+install or the teardown. Plists are read in-process through
+``read_stt_plist`` (``load``, ``read_field``), the one shared plist reader. The
+start state refuses a spare plist under ``$HOME`` or under the agents home, and
+prints every cleanup command shell-quoted. An unreadable launchd state of the
+spare during the checks stops the remaining checks, like a lost port.
+
+When a precondition is absent the harness prints
+``_smoke_lib.LAUNCHD_SKIP_MARK`` + the reason and exits 0; ``smoke.py`` maps
+that line to SKIPPED. Exit 0 unless a requested step FAILed. The external tools
+(``launchctl``, ``lsof``, ``id``, ``bash``, ``python3``) are called by bare name
+through PATH.
 """
 
 from __future__ import annotations
@@ -65,22 +79,19 @@ import argparse
 import contextlib
 import fnmatch
 import os
-import plistlib
 import re
-import secrets
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 INSTALLER = SCRIPTS / "install_stt_agent.sh"
-READ_PLIST = SCRIPTS / "read_stt_plist.py"
 SQUAT_CHECK = SCRIPTS / "squat_check.py"
 
 # Importing the shared helpers (and, lazily, stt_server.auth) needs these on the
@@ -110,12 +121,21 @@ CMD_TIMEOUT = 15
 # inherited steers an install; the harness sets what it needs per call.
 _SCRUB_PREFIXES = ("PIPECAT_STT_", "KODA_STT_")
 _KEEP = ("PIPECAT_STT_LOG_DIR", "KODA_STT_LOG_DIR")
-_WARN_RE = re.compile(
-    r"leaving|still loaded|uninstall incomplete|may still hold|could not remove", re.IGNORECASE
+# The installer's stderr "warning:" lines that do NOT mean something was left
+# behind. Every other warning line fails the install (fail closed: a new or
+# reworded installer warning is a FAIL until it is classified here), which is
+# what makes the rollback's "removed on the unload-confirmed path" claim hold.
+# tests/test_smoke_launchd.py classifies every warning in the installer source.
+_BENIGN_WARNINGS = (
+    "warning: socket mode (PIPECAT_STT_SOCKET set): ignoring ",
+    "warning: launchctl bootstrap failed for ",  # "...; retrying once" (a failed retry exits non-zero)
+    "a socket agent carries none",  # the installed agent required a token
 )
+# The installer's stdout note when an install retires the old socket.
+OLD_SOCKET_NOTE = "removing the old socket"
 _IN_USE_RE = re.compile(r"address already in use|errno 48", re.IGNORECASE)
 
-PASS, FAIL, SKIPPED = "PASS", "FAIL", "SKIPPED"
+PASS, FAIL, SKIPPED = _smoke_lib.PASS, _smoke_lib.FAIL, _smoke_lib.SKIPPED
 
 
 class GuardRefused(Exception):
@@ -167,14 +187,13 @@ def _log_paths(label: str) -> list[Path]:
         "StandardOutPath": _log_dir() / f"{base}.log",
     }
     try:
-        with open(_plist_path(label), "rb") as fh:
-            data = plistlib.load(fh)
-        for key in paths:
-            val = data.get(key)
-            if isinstance(val, str) and val:
-                paths[key] = Path(val)
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        pass
+        data = read_stt_plist.load(str(_plist_path(label)))
+    except read_stt_plist.MalformedPlist:
+        data = {}
+    for key in paths:
+        val = data.get(key)
+        if isinstance(val, str) and val:
+            paths[key] = Path(val)
     err, out = paths["StandardErrorPath"], paths["StandardOutPath"]
     return [err] if out == err else [err, out]
 
@@ -349,17 +368,21 @@ def is_listening(port: int, run=subprocess.run) -> bool:
     return True
 
 
-def read_plist_field(label: str, field: str, run=subprocess.run) -> str:
-    return read_plist_field_path(_plist_path(label), field, run)
+def read_plist_field(label: str, field: str) -> str:
+    return read_plist_field_path(_plist_path(label), field)
 
 
-def read_plist_field_path(plist: Path, field: str, run=subprocess.run, *, strict=False) -> str:
-    """One field from PLIST; ``strict`` makes a malformed plist an error, not ''."""
-    mode = ["--strict"] if strict else []
-    res = _run([sys.executable, "-I", str(READ_PLIST), *mode, "--field", field, str(plist)], run)
-    if res.returncode != 0:
-        raise CheckFailed(f"cannot read {field} from {plist}: {(res.stderr or '').strip()}")
-    return res.stdout or ""
+def read_plist_field_path(plist: Path, field: str, *, strict=False) -> str:
+    """One field from PLIST, exactly as recorded, through ``read_stt_plist`` (the
+    one plist reader; in-process). '' when the plist is absent or lacks it;
+    a malformed plist is '' too, or with ``strict`` a CheckFailed."""
+    try:
+        data = read_stt_plist.load(str(plist))
+    except read_stt_plist.MalformedPlist as exc:
+        if strict:
+            raise CheckFailed(f"cannot read {field} from {plist}: {exc}") from exc
+        data = {}
+    return read_stt_plist.read_field(data, field)
 
 
 # --- guard ------------------------------------------------------------------
@@ -455,7 +478,7 @@ def agent_ports(
             ports[int(port)] = label
     for plist in real_agent_plists(home):
         try:
-            port = read_plist_field_path(plist, "port", run, strict=True).strip()
+            port = read_plist_field_path(plist, "port", strict=True).strip()
         except (CheckFailed, OSError, subprocess.SubprocessError) as exc:
             raise GuardRefused(f"cannot read the port recorded in {plist}: {exc}") from exc
         if port.isdigit():
@@ -511,9 +534,9 @@ def snapshot_real_agents(
         label = plist.name[: -len(".plist")]
         _loaded, pid = require_launchd_state(label, uid, run)
         try:
-            port = read_plist_field_path(plist, "port", run).strip()
+            port = read_plist_field_path(plist, "port").strip()
             # The path exactly as recorded (read_stt_plist adds no newline).
-            sock = read_plist_field_path(plist, "socket-path", run)
+            sock = read_plist_field_path(plist, "socket-path")
             listener = _listener(port, sock, run)
         except (CheckFailed, OSError, subprocess.SubprocessError):
             listener = UNKNOWN
@@ -553,21 +576,36 @@ def compare_snapshots(before, after) -> list[str]:
 # --- start state ------------------------------------------------------------
 
 
+def spare_plist_paths(label: str) -> list[Path]:
+    """Every place a spare plist can define the spare's launchd identity: under
+    ``$HOME`` (where the installer writes it) and under the agents home (the
+    account home, whose LaunchAgents launchd loads at login). The label lives
+    in the per-uid launchd domain, so a plist in either one is the same job."""
+    paths = [_plist_path(label)]
+    other = _smoke_lib.launch_agents_dir(_smoke_lib.agents_home()) / f"{label}.plist"
+    if os.path.abspath(other) != os.path.abspath(paths[0]):
+        paths.append(other)
+    return paths
+
+
+def shell_command(*argv: str | Path) -> str:
+    """ARGV as one line a user can paste into a shell: every word quoted."""
+    return " ".join(shlex.quote(str(a)) for a in argv)
+
+
 def start_state_problems(label: str, uid: str, sock: Path, run=subprocess.run) -> list[str]:
-    """Cleanup commands for each piece of spare state that already exists."""
+    """Cleanup commands (each word shell-quoted) for each piece of spare state
+    that already exists."""
     cmds = []
     loaded, _pid = require_launchd_state(label, uid, run)
     if loaded:
-        cmds.append(f"launchctl bootout gui/{uid}/{label}")
-    plist = _plist_path(label)
-    if plist.exists() or plist.is_symlink():
-        cmds.append(f"rm -f {plist}")
+        cmds.append(shell_command("launchctl", "bootout", f"gui/{uid}/{label}"))
     # Teardown unlinks the spare's logs, so they must be the harness's own: logs
     # already at those paths (an earlier run, or a label sharing the basename)
     # refuse the run instead.
-    for path in (sock, _lock_path(sock), *_log_paths(label)):
+    for path in (*spare_plist_paths(label), sock, _lock_path(sock), *_log_paths(label)):
         if path.exists() or path.is_symlink():
-            cmds.append(f"rm -f {path}")
+            cmds.append(shell_command("rm", "-f", path))
     return cmds
 
 
@@ -596,21 +634,40 @@ def install_env(label: str, port: int, *, socket_path=None, token_file=None, bas
     return env
 
 
-def run_installer(
-    sub: str, env: dict, run=subprocess.run, *, new_session: bool = False
-) -> subprocess.CompletedProcess:
-    """``new_session`` puts the installer in its own session, so a terminal
-    Ctrl-C (sent to the whole foreground group) cannot kill it mid-teardown."""
-    res = run(
-        ["bash", str(INSTALLER), sub],
-        capture_output=True,
-        text=True,
-        timeout=INSTALL_TIMEOUT,
+def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.CompletedProcess:
+    """``install_stt_agent.sh SUB`` in its own process group, through
+    ``_smoke_lib.run_owned`` (the runner's step lifecycle): when this returns or
+    raises, no installer process, nor anything it started, is still running, so
+    teardown can never race a late ``launchctl bootstrap``.
+
+    A terminal Ctrl-C reaches only the harness. A SIGINT/SIGTERM to the harness
+    during an install is held, the installer's whole group is SIGKILLed while
+    its leader is unreaped, and only then does the signal reach the harness's
+    handler (KeyboardInterrupt, teardown follows). With ``teardown`` (the
+    uninstall) a signal does not stop the installer. INSTALL_TIMEOUT kills the
+    group and raises subprocess.TimeoutExpired."""
+    cmd = ["bash", str(INSTALLER), sub]
+    res, timed_out = _smoke_lib.run_owned(
+        cmd,
+        INSTALL_TIMEOUT,
         env=env,
-        cwd=REPO_ROOT,
-        start_new_session=new_session,
+        cwd=str(REPO_ROOT),
+        stop_on_signal=not teardown,
+        interrupt_signal=None,
+        timeout_signal=None,
     )
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, INSTALL_TIMEOUT, output=res.stdout, stderr=res.stderr)
     return res
+
+
+def leave_behind_warnings(stderr: str) -> list[str]:
+    """The installer's ``warning:`` lines on STDERR that are not known benign."""
+    return [
+        ln.strip()
+        for ln in (stderr or "").splitlines()
+        if ln.strip().startswith("warning:") and not any(b in ln for b in _BENIGN_WARNINGS)
+    ]
 
 
 def install(env: dict, what: str) -> str:
@@ -619,8 +676,9 @@ def install(env: dict, what: str) -> str:
     err = res.stderr or ""
     if res.returncode != 0:
         raise CheckFailed(f"install ({what}) exited {res.returncode}: {err.strip()[-300:]}")
-    if _WARN_RE.search(err):
-        raise CheckFailed(f"install ({what}) warned about a leftover: {err.strip()[-300:]}")
+    left = leave_behind_warnings(err)
+    if left:
+        raise CheckFailed(f"install ({what}) warned about a leftover: {left[-1][-300:]}")
     return res.stdout or ""
 
 
@@ -798,7 +856,7 @@ class Harness:
         out = install(install_env(self.label, self.port), "rollback: back to TCP")
         self.expect_transport("tcp")
         self.wait_for("the TCP agent to answer again", self.tcp_up)
-        if "removing the old socket" not in out:
+        if OLD_SOCKET_NOTE not in out:
             raise CheckFailed("installer did not report removing the old socket")
         if sock.exists() or sock.is_symlink():
             raise CheckFailed(f"old socket {sock} still exists after the move back to TCP")
@@ -815,12 +873,9 @@ class Harness:
     def check_token(self) -> str:
         from stt_server.auth import load_token_file
 
-        self.token_dir = Path(tempfile.mkdtemp(prefix="pipecat-smoke-token-", dir=_home()))
-        os.chmod(self.token_dir, 0o700)
-        token_file = self.token_dir / "token"
-        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(secrets.token_urlsafe(24) + "\n")
+        self.token_dir, token_file = _smoke_lib.write_policy_token_file(
+            _home(), "pipecat-smoke-token-"
+        )
         # The server's own policy must accept it before launchd is asked to.
         try:
             resolved, token = load_token_file(str(token_file), uid=int(self.uid))
@@ -853,8 +908,8 @@ class Harness:
 
         env = install_env(label, self.port)
         try:
-            res = run_installer("uninstall", env, new_session=True)
-            if res.returncode != 0 or _WARN_RE.search(res.stderr or ""):
+            res = run_installer("uninstall", env, teardown=True)
+            if res.returncode != 0 or leave_behind_warnings(res.stderr):
                 problems.append(
                     f"uninstall: exit {res.returncode}: {(res.stderr or '').strip()[-200:]}"
                 )
@@ -889,12 +944,12 @@ class Harness:
         try:
             loaded, _pid = require_launchd_state(label, self.uid)
         except RuntimeError as exc:
-            problems.append(f"{exc}; check by hand: launchctl print gui/{self.uid}/{label}")
+            hint = shell_command("launchctl", "print", f"gui/{self.uid}/{label}")
+            problems.append(f"{exc}; check by hand: {hint}")
         else:
             if loaded:
-                problems.append(
-                    f"{label} is still loaded; run: launchctl bootout gui/{self.uid}/{label}"
-                )
+                hint = shell_command("launchctl", "bootout", f"gui/{self.uid}/{label}")
+                problems.append(f"{label} is still loaded; run: {hint}")
         left = [p for p in [plist, *logs, self.sock, _lock_path(self.sock)] if p.exists()]
         if left:
             problems.append("left behind: " + ", ".join(str(p) for p in left))
@@ -977,7 +1032,7 @@ def main(argv=None) -> int:
 
     reason = preconditions()
     if reason:
-        print(f"SKIPPED: {reason}")
+        print(_smoke_lib.LAUNCHD_SKIP_MARK + reason)
         return 0
 
     # Both label variables must already name the spare; the environment goes to
@@ -1004,7 +1059,8 @@ def main(argv=None) -> int:
     elif home.resolve() != agents_at.resolve():
         print(
             f"warning: HOME={home} is not the account home {agents_at}; the spare goes "
-            f"under $HOME, the real-agent snapshot and port guard read {agents_at}",
+            f"under $HOME, the real-agent snapshot and port guard read {agents_at}, and "
+            "the start-state check refuses a spare plist under either",
             file=sys.stderr,
         )
 

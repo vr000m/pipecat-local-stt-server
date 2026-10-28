@@ -11,10 +11,13 @@ canonical traversability check both scripts use so they cannot diverge.
 Pure stdlib (``os``/``stat``) so it imports under both the venv driver and any
 system-python context.
 
-It also holds what ``smoke.py`` and ``smoke_launchd.py`` must agree on: the spare
+It also holds what ``smoke.py`` and ``smoke_launchd.py`` must agree on: the
+outcome names and the harness's skip line (``LAUNCHD_SKIP_MARK``), the spare
 label, the installed-agent plist glob and directory, the home the installed real
-agents are read from, the launchd preconditions, and the websocket token-gate
-assertion (``assert_token_gate``).
+agents are read from, the launchd preconditions, the token-file fixture
+(``write_policy_token_file``), the websocket token-gate assertion
+(``assert_token_gate``), and the owned-process-group lifecycle (``run_owned``)
+both use for children whose whole group they may kill.
 
 Two homes. ``env_home()`` is ``$HOME``: where the installer puts the spare's
 plist, logs and socket. ``agents_home()`` is where both scripts look for the
@@ -261,11 +264,15 @@ def write_policy_token_file(home: Path, prefix: str) -> tuple[Path, Path]:
     import secrets
 
     directory = Path(tempfile.mkdtemp(prefix=prefix, dir=str(home)))
-    os.chmod(directory, 0o700)
-    token_file = directory / "token"
-    fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(secrets.token_urlsafe(24) + "\n")
+    try:
+        os.chmod(directory, 0o700)
+        token_file = directory / "token"
+        fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(secrets.token_urlsafe(24) + "\n")
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
     return directory, token_file
 
 

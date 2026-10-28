@@ -44,8 +44,9 @@ takes no value (``--supervised``, ``--help``) never consumes the next element. A
 VALUE is consumed in the step after its flag, so a value that looks like a flag
 (``--log-level --socket-path``) is never read as one. tests/test_justfile_recipes.py
 checks this against the real parser. The justfile (stt-list, stt-status,
-stt-enable) and scripts/install_stt_agent.sh all call this, so they cannot
-disagree about what an installed plist says. Stdlib only: it must run under the
+stt-enable), scripts/install_stt_agent.sh and scripts/smoke.py all call this, and
+scripts/smoke_launchd.py imports it (``load``, ``read_field``, ``read_flags``),
+so they cannot disagree about what an installed plist says. Stdlib only: it must run under the
 system python3 when the project venv is absent.
 """
 
@@ -94,6 +95,13 @@ def _load(path: str) -> dict:
     if bad:
         raise MalformedPlist(f"ProgramArguments holds a {bad[0]}, not only strings")
     return data
+
+
+def load(path: str) -> dict:
+    """The plist at PATH as a dict: ``{}`` when absent, ``MalformedPlist`` when
+    malformed (the three states above). ``scripts/smoke_launchd.py`` reads every
+    plist through this and ``read_field`` in-process."""
+    return _load(path)
 
 
 def read_flags(plist: dict) -> dict[str, str]:

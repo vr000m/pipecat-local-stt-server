@@ -1097,3 +1097,70 @@ def test_peercred_skip_marks_are_shared_constants(smoke):
     assert smoke.PEERCRED_PLATFORM_MARK is _smoke_lib.PEERCRED_PLATFORM_MARK
     text = (REPO_ROOT / "scripts" / "smoke_peercred.py").read_text()
     assert "PEERCRED_NO_UID_MARK" in text and "PEERCRED_PLATFORM_MARK" in text
+
+
+# The harness's answer (exit, first stdout line) -> the launchd row. Its skip
+# line is _smoke_lib.LAUNCHD_SKIP_MARK, printed with exit 0: SKIPPED, never PASS,
+# even when the runner's own precondition check did not skip first.
+@pytest.mark.parametrize(
+    ("rc", "out", "want"),
+    [
+        (0, "SKIPPED: launchd checks not run: CI is set\n", "SKIPPED"),
+        (0, "\nPASS     port collision  ok\n", "PASS"),
+        (0, "", "PASS"),
+        (1, "SKIPPED: launchd checks not run: CI is set\n", "FAIL"),
+        (1, "FAIL     guard  refused\n", "FAIL"),
+    ],
+)
+def test_launchd_outcome_state_space(smoke, monkeypatch, rc, out, want):
+    monkeypatch.setattr(smoke, "launchd_skip_reason", lambda: None)
+    monkeypatch.setattr(smoke, "run_command", lambda *a, **k: _cp(rc, out=out))
+    row = smoke.launchd_step(True)
+    assert row.outcome == want
+    if want == "SKIPPED":
+        assert row.detail == "CI is set"
+
+
+def test_launchd_skip_line_round_trips_from_the_real_harness(smoke, monkeypatch, tmp_path):
+    # The harness itself, with CI set: whatever it prints for a skip must map
+    # to SKIPPED through the runner's own launchd_step.
+    harness = REPO_ROOT / "scripts" / "smoke_launchd.py"
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "CI": "1"}
+    res = subprocess.run(
+        [sys.executable, str(harness)], capture_output=True, text=True, timeout=60, env=env
+    )
+    assert res.returncode == 0, res.stderr
+    monkeypatch.setattr(smoke, "launchd_skip_reason", lambda: None)
+    monkeypatch.setattr(smoke, "run_command", lambda *a, **k: res)
+    row = smoke.launchd_step(True)
+    assert row.outcome == "SKIPPED" and "CI" in row.detail
+
+
+def test_runner_and_harness_share_outcome_names(smoke):
+    import _smoke_lib
+
+    harness = importlib.util.spec_from_file_location(
+        "smoke_launchd_names", REPO_ROOT / "scripts" / "smoke_launchd.py"
+    )
+    mod = importlib.util.module_from_spec(harness)
+    harness.loader.exec_module(mod)
+    for name in ("PASS", "FAIL", "SKIPPED"):
+        assert getattr(smoke, name) == getattr(mod, name) == getattr(_smoke_lib, name)
+
+
+def test_token_fixture_passes_the_server_policy(smoke, monkeypatch, tmp_path):
+    # One fixture for smoke.py's token-file child and the launchd harness: the
+    # file it writes must pass stt_server.auth's own policy.
+    sys.path.insert(0, str(REPO_ROOT))
+    from stt_server.auth import load_token_file
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    directory, token_file = smoke._smoke_lib.write_policy_token_file(home, "t-")
+    try:
+        resolved, token = load_token_file(str(token_file), uid=os.getuid())
+        assert token and Path(resolved).resolve() == token_file.resolve()
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
