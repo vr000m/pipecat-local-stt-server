@@ -158,11 +158,13 @@ exec /usr/bin/id "$@"
     def argv(self) -> list[str]:
         return self.log.read_text().splitlines() if self.log.exists() else []
 
-    def run(self, args: list[str], env: dict[str, str], timeout: int = 180, audit=None):
+    def run(
+        self, args: list[str], env: dict[str, str], timeout: int = 180, audit=None, inject=None
+    ):
         assert env["PATH"].split(":")[0] == str(self.stub)
         assert "CI" not in env
         return subprocess.run(
-            self.cmd(*args, audit=audit),
+            self.cmd(*args, audit=audit, inject=inject),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -170,12 +172,16 @@ exec /usr/bin/id "$@"
             cwd=str(REPO_ROOT),
         )
 
-    def cmd(self, *args: str, audit=None) -> list[str]:
+    def cmd(self, *args: str, audit=None, inject=None) -> list[str]:
         """The harness command line, run through tests/_with_agents_home.py so
         the real-agent scan reads the temp home, never the account's
-        ~/Library/LaunchAgents (optionally under the audit wrapper first)."""
+        ~/Library/LaunchAgents (optionally under the audit wrapper first).
+        INJECT is the wrapper's test-only failure injection (fail, crash or
+        hang right after the first install); the harness has no such flag."""
         pre = [str(AUDIT_WRAPPER), str(audit)] if audit is not None else []
         wrap = [str(AGENTS_HOME_WRAPPER), str(self.home)]
+        if inject is not None:
+            wrap += ["--inject", inject]
         return [str(VENV_PYTHON), *pre, *wrap, str(HARNESS), *args]
 
     def spare_residue(self) -> list[Path]:
@@ -796,7 +802,7 @@ def _assert_torn_down(env: Env):
 
 
 def test_inject_fail_still_tears_down(env):
-    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+    r = env.run(["--port", str(_free_port())], env.spare_env(), inject="fail")
     assert r.returncode == 1, (r.stdout, r.stderr)
     _assert_torn_down(env)
 
@@ -805,7 +811,7 @@ def test_unreadable_baseline_snapshot_refuses_before_any_install(env):
     # A real agent whose plist cannot be read is UNKNOWN in the baseline, so
     # "real agents unchanged" could never PASS: refuse before the first install.
     (env.agents / "pipecat.stt-server.custom.plist").mkdir()
-    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+    r = env.run(["--port", str(_free_port())], env.spare_env(), inject="fail")
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert "snapshot" in r.stdout and "pipecat.stt-server.custom" in r.stdout
     assert _mutating(env.argv()) == []
@@ -846,7 +852,7 @@ def test_concurrent_run_is_refused_and_mutates_nothing(env):
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+        r = env.run(["--port", str(_free_port())], env.spare_env(), inject="fail")
     finally:
         os.close(fd)
     assert r.returncode == 1, (r.stdout, r.stderr)
@@ -860,7 +866,7 @@ def test_run_lock_is_released_after_a_run(env):
     import fcntl
     import os
 
-    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+    r = env.run(["--port", str(_free_port())], env.spare_env(), inject="fail")
     assert r.returncode == 1, (r.stdout, r.stderr)
     fd = os.open(_run_lock(env), os.O_RDWR)
     try:
@@ -908,7 +914,7 @@ def test_stubbed_run_reads_no_real_library_path(env, tmp_path):
     # an audit hook: no open, scandir, mkdir or unlink of a path under the real
     # account's ~/Library, and no subprocess handed one.
     audit = tmp_path / "audit.log"
-    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env(), audit=audit)
+    r = env.run(["--port", str(_free_port())], env.spare_env(), audit=audit, inject="fail")
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert audit.exists(), "the audit hook never ran"
     lines = audit.read_text().splitlines()
@@ -920,7 +926,7 @@ def test_stubbed_run_reads_no_real_library_path(env, tmp_path):
 def test_signal_during_hang_still_tears_down(env, sig):
     e = env.spare_env()
     p = subprocess.Popen(
-        env.cmd("--inject", "hang", "--port", str(_free_port())),
+        env.cmd("--port", str(_free_port()), inject="hang"),
         env=e,
         cwd=str(REPO_ROOT),
         stdout=subprocess.PIPE,
@@ -945,7 +951,7 @@ def test_signal_during_hang_still_tears_down(env, sig):
 
 
 def test_unexpected_exception_is_a_fail_row_and_checks_continue(env):
-    r = env.run(["--inject", "crash", "--port", str(_free_port())], env.spare_env())
+    r = env.run(["--port", str(_free_port())], env.spare_env(), inject="crash")
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert "Traceback" not in r.stderr
     rows = {
@@ -969,7 +975,7 @@ def test_teardown_runs_the_uninstall_in_its_own_session(smoke, env, monkeypatch)
         return _cp(["bash"], 0)
 
     monkeypatch.setattr(smoke, "run_installer", fake_installer)
-    h = smoke.Harness(SPARE, _free_port(), None)
+    h = smoke.Harness(SPARE, _free_port())
     assert h.teardown() == []
     assert seen == [("uninstall", True)]
 
@@ -1405,7 +1411,7 @@ def test_collision_check_fails_when_the_port_was_taken_after_the_guard(smoke, en
         squatter.bind(("127.0.0.1", 0))
         squatter.listen(1)
         port = squatter.getsockname()[1]
-        h = smoke.Harness(SPARE, port, None)
+        h = smoke.Harness(SPARE, port)
         with pytest.raises(smoke.PortLost):
             h.check_collision()
     assert installs == [] and h.holder is None
@@ -1427,7 +1433,7 @@ def test_collision_check_fails_when_the_port_was_taken_after_the_guard(smoke, en
 def test_ensure_port_ours_state_space(smoke, env, monkeypatch, listeners, pid, lost):
     monkeypatch.setenv("HOME", str(env.home))
     monkeypatch.setenv("PATH", env.path)
-    h = smoke.Harness(SPARE, _free_port(), None)
+    h = smoke.Harness(SPARE, _free_port())
     monkeypatch.setattr(smoke, "tcp_listener_pids", lambda port, run=None: listeners)
     monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (True, pid))
     if lost:
@@ -1651,7 +1657,7 @@ def test_teardown_verdict_follows_the_launchd_state(smoke, env, monkeypatch, loa
     env.bootout_mode.write_text(bootout)
     if loaded:
         env.loaded_marker.write_text("")
-    h = smoke.Harness(SPARE, _free_port(), None)
+    h = smoke.Harness(SPARE, _free_port())
     problems = h.teardown()
     stays_loaded = loaded and bootout != "ok"
     assert env.loaded_marker.exists() == stays_loaded
@@ -1826,7 +1832,7 @@ def test_teardown_reports_every_failed_cleanup(smoke, env, monkeypatch, failure)
     monkeypatch.setenv("PATH", env.path)
     monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
     monkeypatch.setattr(smoke, "UNLOAD_WAIT", 2)
-    h = smoke.Harness(SPARE, _free_port(), None)
+    h = smoke.Harness(SPARE, _free_port())
     h.sock_dir_made = smoke.prepare_private_dir(h.sock.parent, env.home)
     locked = None
     if failure == "token-dir":
@@ -1920,7 +1926,7 @@ def test_runner_reads_the_harness_failure_channel(smoke, env, monkeypatch, case,
         )
     else:
         e = env.spare_env() if case == "inject-fail" else env.env(PIPECAT_STT_LABEL=SPARE)
-        r = env.run(["--inject", "fail", "--port", str(_free_port())], e)
+        r = env.run(["--port", str(_free_port())], e, inject="fail")
         assert r.returncode == 1, (r.stdout, r.stderr)
         lines = [
             ln for ln in r.stdout.splitlines() if ln.startswith(smoke._smoke_lib.LAUNCHD_FAIL_MARK)
@@ -1948,3 +1954,16 @@ def test_current_uid_state_space(smoke, monkeypatch, uid, id_answer):
     )
     assert smoke.current_uid() == str(uid)
     assert calls == []
+
+
+# The failure injection lives in tests/_with_agents_home.py only: the production
+# harness has no test hook, so `--inject <mode>` is an argparse usage error
+# (exit 2) and nothing is installed or booted out.
+@pytest.mark.parametrize("mode", ["fail", "crash", "hang"])
+def test_production_harness_has_no_inject_hook(smoke, env, mode):
+    assert not hasattr(smoke.Harness, "maybe_inject")
+    r = env.run(["--inject", mode, "--port", str(_free_port())], env.spare_env(), timeout=60)
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "unrecognized arguments: --inject" in r.stderr
+    assert _mutating(env.argv()) == []
+    assert not env.spare_residue()

@@ -778,33 +778,17 @@ def install(env: dict, what: str) -> str:
 
 
 class Harness:
-    def __init__(self, label: str, port: int, inject: str | None, baseline=None):
+    def __init__(self, label: str, port: int, baseline=None):
         self.label = label
         self.baseline = baseline if baseline is not None else {}
         self.port = port
-        self.inject = inject
         self.uid = current_uid()
         self.sock = spare_socket_path()
         self.sock_dir_made = False
         self.token_dir: Path | None = None
         self.holder = None  # the collision check's port occupier
-        self.injected = False
 
-    # -- hooks, waits
-
-    def maybe_inject(self) -> None:
-        """Test hooks, fired once, right after the first install step."""
-        if self.injected or not self.inject:
-            return
-        self.injected = True
-        if self.inject == "fail":
-            raise CheckFailed("injected failure (--inject fail)")
-        if self.inject == "crash":
-            raise LookupError("injected crash (--inject crash)")
-        if self.inject == "hang":
-            print("inject: hanging until interrupted", flush=True)
-            while True:
-                time.sleep(1)
+    # -- waits
 
     def wait_for(self, what: str, pred, timeout: float = UP_TIMEOUT, every: float = 1.0):
         deadline = time.monotonic() + timeout
@@ -857,7 +841,6 @@ class Harness:
         # address-in-use lines must not satisfy the assertion.
         offsets = {p: _size(p) for p in _log_paths(self.label)}  # no plist yet: naming rule
         install(install_env(self.label, self.port), "collision")
-        self.maybe_inject()
         errlog = _err_log(self.label)  # now from the plist's StandardErrorPath
         offset = offsets.get(errlog, _size(errlog))
         deadline = time.monotonic() + COLLISION_TIMEOUT
@@ -1204,17 +1187,9 @@ def main(argv=None) -> int:
         "PIPECAT_STT_LABEL and KODA_STT_LABEL must both be set explicitly to "
         f"{SPARE_LABEL}, e.g. PIPECAT_STT_LABEL={SPARE_LABEL} "
         f"KODA_STT_LABEL={SPARE_LABEL} .venv/bin/python scripts/smoke_launchd.py",
-        epilog="--inject is a test hook for this harness's own tests, not for normal use.",
     )
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="spare TCP port (default 9998)")
     ap.add_argument("--label", default=SPARE_LABEL, help=f"must be {SPARE_LABEL} (guarded)")
-    ap.add_argument(
-        "--inject",
-        choices=("fail", "crash", "hang"),
-        help="TEST HOOK: 'fail' raises in the first check right after its install; "
-        "'crash' raises an unexpected exception type there; "
-        "'hang' sleeps there so a test can send SIGINT. Teardown must still run.",
-    )
     args = ap.parse_args(argv)
 
     reason = preconditions()
@@ -1312,7 +1287,7 @@ def _locked_main(args, env, results, refuse, agents_at) -> int:
 
     state = {"tearing_down": False}
     old = {s: signal.signal(s, signal_handler(state)) for s in (signal.SIGINT, signal.SIGTERM)}
-    harness = Harness(args.label, args.port, args.inject, baseline=before)
+    harness = Harness(args.label, args.port, baseline=before)
     interrupted = False
     try:
         run_checks(
