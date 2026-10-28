@@ -289,6 +289,14 @@ def test_verified_client_handshakes_over_the_verified_socket(lib, transport):
 
         async def go():
             async with smoke._verified_client(sock, uri, None) as c:
+                # Only the transport step is the smoke client's own: connect
+                # (the headers and the server.hello / session.created tail)
+                # is the production TranscriptionClient's.
+                from stt_server.client import TranscriptionClient
+
+                cls = type(c)
+                assert cls.connect is TranscriptionClient.connect
+                assert [n for n in vars(cls) if not n.startswith("__")] == ["_open_ws"]
                 return c._ws is not None
 
         assert asyncio.run(asyncio.wait_for(go(), 30))

@@ -575,27 +575,20 @@ def _token_check() -> int:
 
 def _verified_client(sock, uri: str, token: str | None):
     """A ``TranscriptionClient`` that speaks over SOCK, a connection
-    ``connect_verified`` already checked, instead of opening its own (the
-    production client is unchanged): the same handshake, ``server.hello``
-    then ``session.created``."""
+    ``connect_verified`` already checked, instead of opening its own. It
+    overrides ONLY the transport step (``_open_ws``): the headers (the bearer
+    token) and the handshake (``server.hello`` then ``session.created``) are
+    the production ``connect``'s own."""
     from websockets.asyncio.client import connect as ws_connect
 
     from stt_server import protocol as P
     from stt_server.client import TranscriptionClient
 
     class VerifiedSocketClient(TranscriptionClient):
-        async def connect(self) -> dict:
-            headers = {"Authorization": f"Bearer {self._auth_token}"} if self._auth_token else None
-            self._ws = await ws_connect(
-                self._uri, sock=sock, additional_headers=headers, max_size=P.MAX_APPEND_BYTES
+        async def _open_ws(self, headers):
+            return await ws_connect(
+                uri, sock=sock, additional_headers=headers, max_size=P.MAX_APPEND_BYTES
             )
-            hello = await self._recv_json()
-            if hello.get("type") != P.EVT_SERVER_HELLO:
-                raise RuntimeError(f"expected server.hello, got {hello.get('type')}")
-            created = await self._recv_json()
-            if created.get("type") != P.EVT_SESSION_CREATED:
-                raise RuntimeError(f"expected session.created, got {created.get('type')}")
-            return hello
 
     return VerifiedSocketClient(uri=uri, auth_token=token)
 
