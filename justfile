@@ -84,14 +84,17 @@ _plist_field plist field strict='':
     exec python3 -I "{{justfile_directory()}}/scripts/read_stt_plist.py" "${mode[@]+"${mode[@]}"}" --field {{quote(field)}} {{quote(plist)}}
 
 # Warn (stderr only) when a TCP agent's port is held by a process that is not the
-# agent: scripts/squat_check.py compares the lsof listener pid with the launchd pid
-# (`loaded` is 1/0; `pid` empty when the job has none; `label` is for its 1-second
-# re-check). Advisory: callers append `|| true`, so it never changes an exit
-# status or stdout. System python3 so a pruned venv cannot break it.
-_squat_check host port pid loaded label:
+# agent: scripts/squat_check.py compares the lsof listener pid with the launchd pid.
+# `print_rc`/`print_out` are the exit status and output (stdout and stderr) of
+# the caller's one `launchctl print gui/<uid>/<label>`; squat_check.py reads the
+# loaded state and pid from them with the same rule as its own re-check (only
+# launchctl's "could not find service" is not loaded; any other failure is
+# "cannot tell", exit 2, never quiet). `label` is for the 1-second re-check.
+# Advisory: callers append `|| true`, so it never changes an exit status or
+# stdout. System python3 so a pruned venv cannot break it.
+_squat_check host port label print_rc print_out:
     #!/usr/bin/env bash
-    pid={{quote(pid)}}
-    exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --loaded {{quote(loaded)}} ${pid:+--pid "$pid"} --label {{quote(label)}}
+    exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --label {{quote(label)}} --launchctl-rc {{quote(print_rc)}} --launchctl-output={{quote(print_out)}}
 
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
@@ -104,12 +107,14 @@ stt-list:
       found=1
       label=$(basename "$plist" .plist)
       target="gui/$uid/$label"
-      # launchctl print exits non-zero when the agent is not loaded; reuse the
-      # same fields the script greps (state|last exit|pid).
-      loaded=0
+      # One read-only launchctl print per agent (stdout and stderr): its pid and
+      # state are shown here, and its answer goes to _squat_check as-is, which
+      # classifies it (an unreadable answer is "cannot tell" there, not "not
+      # loaded"). The display below shows any non-zero answer as stopped.
       pid=
-      if info=$(launchctl print "$target" 2>/dev/null); then
-        loaded=1
+      info=$(launchctl print "$target" 2>&1)
+      print_rc=$?
+      if [[ "$print_rc" -eq 0 ]]; then
         pid=$(grep -m1 -E '^[[:space:]]*pid = ' <<<"$info" | grep -oE '[0-9]+' | head -1)
         state=$(grep -m1 -E '^[[:space:]]*state = ' <<<"$info" | sed -E 's/.*state = //')
         printf 'running  %-32s pid=%-7s state=%s\n' "$label" "${pid:-?}" "${state:-?}"
@@ -140,7 +145,7 @@ stt-list:
       elif [[ -n "$host" && -n "$port" ]]; then
         printf '         endpoint: %s:%s\n' "$host" "$port"
         probe=(--host "$host" --port "$port")
-        just _squat_check "$host" "$port" "$pid" "$loaded" "$label" || true
+        just _squat_check "$host" "$port" "$label" "$print_rc" "$info" || true
       else
         printf '         endpoint: (no serve endpoint found in plist)\n'
         probe=()
@@ -218,13 +223,10 @@ stt-status target='':
       fi
       if [[ -z "$p_sock" ]]; then
         # TCP plist: check the port's holder before the probe's exec. Same
-        # read-only launchctl print as stt-list, for the pid and loaded state.
-        loaded=0; pid=
-        if info=$(launchctl print "gui/$(id -u)/$label" 2>/dev/null); then
-          loaded=1
-          pid=$(grep -m1 -E '^[[:space:]]*pid = ' <<<"$info" | grep -oE '[0-9]+' | head -1)
-        fi
-        just _squat_check "$p_host" "$p_port" "$pid" "$loaded" "$label" || true
+        # one read-only launchctl print as stt-list; _squat_check classifies it.
+        info=$(launchctl print "gui/$(id -u)/$label" 2>&1)
+        print_rc=$?
+        just _squat_check "$p_host" "$p_port" "$label" "$print_rc" "$info" || true
       fi
     else
       probe=(--host "$host" --port "$port")

@@ -592,3 +592,40 @@ def test_cli_lsof_absent_is_exit_2_without_warning(tmp_path):
     res = _cli(empty, "--host", HOST, "--port", str(PORT), "--loaded", "1", "--pid", "100")
     assert res.returncode == 2 and res.stdout == ""
     assert PREFIX not in res.stderr
+
+
+# The recipes' form: the caller's launchctl print answer (exit, output) x a
+# foreign listener -> exit. classify_print is the one rule (launchd_state's too).
+@pytest.mark.parametrize(
+    ("rc", "output", "want"),
+    [
+        (0, "state = running\n\tpid = 100\n", 3),  # running, a foreign pid listens
+        (0, "state = waiting\n", 3),  # loaded, no pid, a listener: case (c)
+        (113, 'Could not find service "x" in domain for user gui: 501', 0),
+        (1, 'Could not find service "x" in domain', 0),
+        (5, "Input/output error", 2),
+        (1, "Operation not permitted", 2),
+        (1, "", 2),
+    ],
+)
+def test_cli_launchctl_answer_state_space(tmp_path, rc, output, want):
+    d = _stub_lsof(tmp_path, [(200, "nc", f"{HOST}:{PORT}")])
+    res = _cli(
+        d, "--host", HOST, "--port", str(PORT), "--launchctl-rc", str(rc),
+        f"--launchctl-output={output}",
+    )  # fmt: skip
+    assert res.returncode == want, res.stderr
+    assert res.stdout == ""
+    assert (PREFIX in res.stderr) == (want == 3)
+    assert ("cannot read the launchd state" in res.stderr) == (want == 2)
+    assert squat_check.classify_print(rc, output) == (
+        None
+        if want == 2
+        else ((False, None) if want == 0 else (True, squat_check.parse_launchd_pid(output)))
+    )
+
+
+def test_cli_pid_with_launchctl_answer_is_a_usage_error(tmp_path):
+    d = _stub_lsof(tmp_path, [])
+    res = _cli(d, "--host", HOST, "--port", str(PORT), "--launchctl-rc", "0", "--pid", "1")
+    assert res.returncode == 2 and PREFIX not in res.stderr

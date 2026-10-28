@@ -74,6 +74,7 @@ def _make_stub_dir(
     tmp_path: Path,
     *,
     print_loaded: bool = False,
+    print_error: tuple[int, str] | None = None,
     status_exit: int = 0,
     fail_actions: tuple[str, ...] = (),
     unload_polls: int = 0,
@@ -83,8 +84,10 @@ def _make_stub_dir(
 ) -> tuple[Path, Path]:
     """Stub ``launchctl`` / ``id`` / ``uv`` that log argv to ``argv.log``.
 
-    ``print_loaded`` controls ``launchctl print``'s exit code (0 == agent
-    loaded). ``status_exit`` controls the exit code of the stubbed
+    ``print_loaded`` controls ``launchctl print``'s answer: loaded (exit 0) or
+    launchd's own not-loaded answer (exit 113, "Could not find service" on
+    stderr). ``print_error`` ``(rc, stderr)`` makes ``print`` fail any other
+    way (an answer that is neither: "cannot tell"). ``status_exit`` controls the exit code of the stubbed
     ``uv run --no-sync python -m stt_server status`` probe (non-zero == stopped socket).
     ``fail_actions`` names ``launchctl`` subcommands (e.g. ``bootout``,
     ``bootstrap``, ``kickstart``) that should exit non-zero, so recipe
@@ -104,7 +107,9 @@ def _make_stub_dir(
     stub_dir.mkdir()
     argv_log = tmp_path / "argv.log"
 
-    print_rc = 0 if print_loaded else 1
+    print_rc, print_err = (0, "") if print_loaded else (113, "Could not find service")
+    if print_error is not None:
+        print_rc, print_err = print_error
     fail_set = " ".join(fail_actions)
     _write_executable(
         stub_dir / "launchctl",
@@ -129,6 +134,8 @@ if [[ "$1" == "print" ]]; then
         if [[ -n "{launchd_pid if launchd_pid is not None else ""}" ]]; then
             printf '\\tpid = {launchd_pid}\\n'
         fi
+    elif [[ -n "{print_err}" ]]; then
+        printf '%s\\n' "{print_err}" >&2
     fi
     exit {print_rc}
 fi
@@ -2537,3 +2544,48 @@ def test_stt_status_no_plist_canonical_fallback_makes_no_squat_call(tmp_path):
     assert SQUAT_WARNING not in res.stderr
     assert _lsof_log(tmp_path) == []
     assert "--host 127.0.0.1 --port 9565" in _status_call(argv_log)
+
+
+# The recipe's one `launchctl print` answer x its listener -> the squat verdict.
+# Not loaded is only launchd's own "could not find service" (quiet, no lsof); an
+# answer that is neither loaded nor that is "cannot tell" (a note, no warning,
+# never quiet-as-not-loaded); the recipe's exit status and stdout never change.
+_PRINT_ANSWERS = {
+    "loaded": {"print_loaded": True},
+    "not-loaded": {"print_loaded": False},
+    "denied": {"print_error": (1, "Operation not permitted")},
+    "io-error": {"print_error": (5, "Input/output error")},
+    "silent-fail": {"print_error": (1, "")},
+}
+
+
+@pytest.mark.parametrize("recipe", [["stt-list"], ["stt-status", "whisper"]])
+@pytest.mark.parametrize(
+    ("answer", "listener", "verdict"),
+    [
+        ("loaded", 4242, "quiet-checked"),
+        ("loaded", 777, "warn"),
+        ("not-loaded", 777, "quiet-unchecked"),
+        ("denied", 777, "cannot-tell"),
+        ("io-error", 777, "cannot-tell"),
+        ("silent-fail", 777, "cannot-tell"),
+    ],
+)
+def test_squat_verdict_follows_the_recipes_launchctl_answer(
+    tmp_path, recipe, answer, listener, verdict
+):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path,
+        status_exit=0,
+        lsof_listeners=((listener, "nc", "127.0.0.1:9871"),),
+        **_PRINT_ANSWERS[answer],
+    )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    res = _run_just(recipe, home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stdout
+    assert (SQUAT_WARNING in res.stderr) == (verdict == "warn")
+    assert ("cannot read the launchd state" in res.stderr) == (verdict == "cannot-tell")
+    checked = any("9871" in ln for ln in _lsof_log(tmp_path))
+    assert checked == (verdict in ("quiet-checked", "warn"))
