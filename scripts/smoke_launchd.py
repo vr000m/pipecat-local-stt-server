@@ -147,6 +147,11 @@ LOCK_UNHELD_WAIT = 10  # the rollback's wait for the .lock to be released
 WAIT_EVERY = 1.0  # Harness.wait_for's poll interval
 # Python start-up, imports, file work and the table: what no named bound covers.
 BUDGET_MARGIN = 30.0
+# The squat CLI in the collision check sees one listener on the spare port:
+# the harness's own holder socket (the spare job cannot bind it). More
+# listeners can outlast squat_cli_timeout(); that is "cannot tell", a FAIL.
+SQUAT_LISTENERS = 1
+SQUAT_START = 5.0  # the squat CLI's `python3 -I` start-up, outside cli_bound
 
 
 # --- the harness's time budget ------------------------------------------------
@@ -191,6 +196,17 @@ def _verified_status_bound() -> float:
     return CMD_TIMEOUT + _connect_verified_bound() + _handshake_bound()
 
 
+def squat_cli_timeout() -> float:
+    """The squat CLI's timeout in squat_warns: squat_check's own worst case
+    (``cli_bound``) for SQUAT_LISTENERS listeners, plus its start-up."""
+    return squat_check.cli_bound(SQUAT_LISTENERS) + SQUAT_START
+
+
+def _squat_warns_bound() -> float:
+    """Harness.squat_warns: the spare's launchctl print, then the CLI."""
+    return CMD_TIMEOUT + squat_cli_timeout()
+
+
 def _wait_bound(timeout: float, pred: float) -> float:
     """Harness.wait_for: a predicate may start just before the deadline."""
     return timeout + WAIT_EVERY + pred
@@ -222,8 +238,7 @@ def run_budget(n_agents: int) -> float:
     )  # fmt: skip
     boundaries = 3 * snap + 2 * (squat_check.LSOF_TIMEOUT + squat_check.LAUNCHCTL_TIMEOUT)
     up = _wait_bound(UP_TIMEOUT, _verified_status_bound())
-    squat = CMD_TIMEOUT + 2 * CMD_TIMEOUT  # squat_warns: print, then the CLI
-    collision = install_bound() + COLLISION_TIMEOUT + squat + WAIT_EVERY + up
+    collision = install_bound() + COLLISION_TIMEOUT + _squat_warns_bound() + WAIT_EVERY + up
     rollback = 3 * (install_bound() + up) + _wait_bound(LOCK_UNHELD_WAIT, squat_check.LSOF_TIMEOUT)
     token = (
         install_bound()
@@ -1127,7 +1142,9 @@ class Harness:
         ``launchctl print`` of the spare, its exit status on argv
         (``--launchctl-rc``) and its output on stdin, classified there by
         ``classify_print``. Raises LaunchdUnreadable when that same rule cannot
-        tell the spare's state (the harness's own stop rule)."""
+        tell the spare's state (the harness's own stop rule). A CLI that gives
+        no answer within ``squat_cli_timeout()`` (its own worst case), or
+        cannot be run, is "cannot tell": CheckFailed, the check's FAIL row."""
         target = f"gui/{self.uid}/{self.label}"
         try:
             res = _run(["launchctl", "print", target])
@@ -1141,11 +1158,19 @@ class Harness:
                 f"cannot read the launchd state of {self.label} "
                 f"(launchctl print exit {res.returncode})"
             )
-        sq = _run(
-            squat_cli(HOST, self.port, self.label, res.returncode),
-            input=answer,
-            timeout=CMD_TIMEOUT * 2,
-        )
+        timeout = squat_cli_timeout()
+        try:
+            sq = _run(
+                squat_cli(HOST, self.port, self.label, res.returncode),
+                input=answer,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CheckFailed(
+                f"squat_check.py cannot tell: no verdict within {timeout:.0f}s"
+            ) from exc
+        except OSError as exc:
+            raise CheckFailed(f"squat_check.py cannot tell: cannot run it: {exc}") from exc
         return sq.returncode == 3 and "squat-check: warning:" in (sq.stderr or "")
 
     # -- check: socket rollback

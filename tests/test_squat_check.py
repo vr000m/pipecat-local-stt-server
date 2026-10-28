@@ -678,3 +678,28 @@ def test_endpoint_holders_state_space(tmp_path, socket, lock, lsof_rc, want, lso
         assert len(calls) == 1 and any(lsof_target in a for a in calls[0]), calls
         if socket:
             assert calls[0][-1] == f"{sock}.lock" and str(sock) not in calls[0][:-1]
+
+
+# cli_bound IS the CLI's worst case: the slowest path through check() (a
+# squatter that persists, --label given, so both pid re-reads run, then one
+# command lookup per listener) x listener count -> the sum of every timeout it
+# hands lsof / launchctl plus every sleep == cli_bound(n). A new wait in
+# check() that cli_bound does not count fails here, and so would a caller's
+# timeout derived from it.
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_cli_bound_is_the_slowest_path(capsys, n):
+    spent = []
+
+    def run(cmd, **kw):
+        spent.append(kw["timeout"])
+        if cmd[0] == "launchctl":
+            return subprocess.CompletedProcess(cmd, 0, "\tpid = 100\n", "")
+        if "-Fc" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, f"p{cmd[cmd.index('-p') + 1]}\ncx\n", "")
+        rows = "".join(f"p{200 + i}\nn127.0.0.1:{PORT}\n" for i in range(n))
+        return subprocess.CompletedProcess(cmd, 0, rows, "")
+
+    rc = squat_check.check(HOST, PORT, "100", True, label="x", run=run, sleep=spent.append)
+    assert rc == 3  # the warning path: every wait ran
+    assert sum(spent) == squat_check.cli_bound(n)
+    assert len(spent) == 2 + 1 + 2 + n  # two lsof, the sleep, two prints, n lookups

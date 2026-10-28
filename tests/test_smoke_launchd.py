@@ -2587,3 +2587,71 @@ def test_unimportable_renderer_is_a_start_state_fail_row(
         assert len(fails) == 1 and fails[0].startswith("start state: cannot read the start state: ")
         assert "render_stt_plist.py does not import" in fails[0]
         assert "cannot import stt_server" in fails[0]  # the renderer's own message
+
+
+# squat_warns: the CLI's answer -> verdict. Its timeout is squat_check's own
+# worst case (cli_bound) plus start-up, never a hand-copied number; a CLI that
+# outlasts it, or cannot run, is "cannot tell": CheckFailed, so the collision
+# check's row is a FAIL verdict, never a crash row.
+_SQUAT_ANSWERS = {
+    "warned": (3, "squat-check: warning: port 1 is held by pid 9\n", True),
+    "quiet": (0, "", False),
+    "cannot-tell": (2, "squat-check: cannot run lsof; skipping port check\n", False),
+    "timeout": (subprocess.TimeoutExpired, "", "cannot tell: no verdict within"),
+    "no-python": (FileNotFoundError, "", "cannot tell: cannot run it"),
+}
+
+
+@pytest.mark.parametrize("answer", list(_SQUAT_ANSWERS))
+def test_squat_warns_answer_state_space(smoke, monkeypatch, answer):
+    rc, err, want = _SQUAT_ANSWERS[answer]
+    timeouts = []
+
+    def run(cmd, run=None, timeout=smoke.CMD_TIMEOUT, **kw):
+        if cmd[0] == "launchctl":
+            return _cp(cmd, 0, "\tpid = 4242\n")
+        timeouts.append(timeout)
+        if rc is subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        if rc is FileNotFoundError:
+            raise FileNotFoundError("python3")
+        return _cp(cmd, rc, "", err)
+
+    monkeypatch.setattr(smoke, "_run", run)
+    h = object.__new__(smoke.Harness)
+    h.label, h.port, h.uid = SPARE, 9998, FAKE_UID
+    if isinstance(want, str):
+        with pytest.raises(smoke.CheckFailed, match=want):
+            h.squat_warns()
+        rows = smoke.run_checks(
+            type("H", (), {"ensure_real_agents_unchanged": lambda s: None,
+                           "ensure_port_ours": lambda s: None,
+                           "release_holder": lambda s: None})(),
+            (("port collision", h.squat_warns),),
+            [],
+        )  # fmt: skip
+        assert rows[0][1] == smoke.FAIL and rows[0][2].startswith("squat_check.py cannot tell")
+    else:
+        assert h.squat_warns() is want
+    assert timeouts and set(timeouts) == {smoke.squat_cli_timeout()}
+
+
+# The squat timeout and the budget both derive from squat_check.cli_bound:
+# the timeout covers the CLI's worst case for the listeners the collision
+# check can see, and every second of it is in run_budget (so smoke.py's
+# SIGTERM can never land inside a squat check the budget did not count).
+def test_squat_timeout_and_budget_follow_cli_bound(smoke, monkeypatch):
+    assert smoke.SQUAT_LISTENERS >= 1  # the harness's own holder socket
+    assert smoke.squat_cli_timeout() == (
+        smoke.squat_check.cli_bound(smoke.SQUAT_LISTENERS) + smoke.SQUAT_START
+    )
+    assert smoke._squat_warns_bound() == smoke.CMD_TIMEOUT + smoke.squat_cli_timeout()
+    before = {n: smoke.run_budget(n) for n in (0, 3)}
+    # A slower CLI (one more listener's lookup) moves the timeout and the
+    # budget by exactly that much, and the teardown budget not at all.
+    tear = smoke.teardown_budget(0)
+    monkeypatch.setattr(smoke, "SQUAT_LISTENERS", smoke.SQUAT_LISTENERS + 1)
+    step = smoke.squat_check.LSOF_TIMEOUT
+    for n, b in before.items():
+        assert smoke.run_budget(n) - b == pytest.approx(step)
+    assert smoke.teardown_budget(0) == tear

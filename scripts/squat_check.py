@@ -65,8 +65,9 @@ Import surface (besides the CLI), exactly what each importer uses:
 
 * ``scripts/smoke_launchd.py``: ``classify_print``, ``endpoint_holders``,
   ``launchd_state`` (with the ``uid`` keyword), ``listener_pids``,
-  ``lsof_pids``, and the bounds ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its
-  time budget sums them).
+  ``lsof_pids``, the bounds ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its
+  time budget sums them) and ``cli_bound`` (the CLI's own worst case, which
+  its squat-check timeout and budget derive from).
 * ``scripts/_smoke_lib.py`` (imported lazily, inside ``launchd_identity`` and
   ``tcp_server_end_pids``, which ``smoke.py`` and ``connect_verified`` use):
   ``classify_print`` and ``lsof_output``.
@@ -98,6 +99,17 @@ _LSOF_WARNING = "lsof: WARNING"
 # Each lsof / launchctl call's own bound (the launchd harness's budget adds them).
 LSOF_TIMEOUT = 10
 LAUNCHCTL_TIMEOUT = 10
+CONFIRM_SLEEP = 1  # the confirm pass's wait before it re-reads
+
+
+def cli_bound(listeners):
+    """The CLI's worst-case wall time (``main`` -> ``check``, interpreter
+    start-up excluded) with LISTENERS pids listening on the port: the first
+    lsof, the confirm sleep, the ``--label`` pid re-read, the second lsof, the
+    bracketing pid read, then one ``lsof -Fc`` per listener for its command.
+    Every wait ``check`` makes is one of these bounds (tests pin the sum to a
+    run of the slowest path)."""
+    return 2 * LSOF_TIMEOUT + CONFIRM_SLEEP + 2 * LAUNCHCTL_TIMEOUT + listeners * LSOF_TIMEOUT
 
 
 def _only_warnings(stderr):
@@ -272,7 +284,7 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
         return 0
 
     # Confirm: a restart in flight changes the pid or the listener within a second.
-    sleep(1)
+    sleep(CONFIRM_SLEEP)
     pid_current = True
     if label:
         state = launchd_state(label, run)
