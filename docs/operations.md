@@ -598,15 +598,19 @@ ignoring TCP settings, a dropped token for a socket agent, a retried bootstrap).
 **What has been verified live.** The checks themselves were run by hand at 0.5.0
 (token-file refusal and acceptance on a spare port without launchd, a decode
 through each real agent, `smoke_supervised.py --backend echo`, same-uid
-peer-cred). New in 0.5.1, and so far covered only by stubbed tests (stub
-`launchctl`, `lsof` and `id`, a temp home): the launchd harness
-(`scripts/smoke_launchd.py`), and the `smoke.py` code that now automates the
-0.5.0 checks — the `token-file` child, the `--agents` decode and the `peercred`
-SKIPPED mapping. The server-end check (`LOCAL_PEERPID`, `lsof` on an accepted
-connection) is tested against listeners the tests start themselves and a real
-echo server, not yet against launchd agents. Treat these results as unverified
-until the first live `just smoke --agents --launchd` run; a FAIL there may be a
-harness bug rather than an agent fault.
+peer-cred). New in 0.5.1: the launchd harness (`scripts/smoke_launchd.py`) ran
+live once, on 2026-10-28, against the spare label and port 9998. The port
+collision (with the squat warning), the socket rollback, the token file and the
+teardown all passed, each answer's server end was verified against the spare
+job, and the real agents were unchanged afterwards. That run confirms that
+`launchctl print` prints a `runs =` line and that `LOCAL_PEERPID` and `lsof`
+identify a launchd job's server end. Still covered only by stubbed tests (stub
+`launchctl`, `lsof` and `id`, a temp home): the `smoke.py` code that now
+automates the 0.5.0 checks — the `token-file` child, the `--agents` decode and
+the `peercred` SKIPPED mapping — and the `just smoke --launchd` wiring around
+the harness. Treat those results as unverified until a live
+`just smoke --agents --launchd` run; a FAIL there may be a harness bug rather
+than an agent fault.
 
 ## Supervised smoke test
 
