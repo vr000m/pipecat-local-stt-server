@@ -194,9 +194,13 @@ def _log_dir() -> Path:
 
 def _log_paths(label: str) -> list[Path]:
     """[err log, out log] for the spare: StandardErrorPath / StandardOutPath from
-    the installed plist; the installer's naming rule (the label with '.' replaced
-    by '-') only for a key the plist lacks, or when there is no plist yet."""
-    base = label.replace(".", "-")
+    the installed plist; for a key the plist lacks, or before there is a plist,
+    the name ``render_stt_plist._log_basename`` (the code that writes those
+    keys) gives the label. Imported here, not at module load: the renderer
+    exits when ``stt_server`` does not import, which the start state reports."""
+    from render_stt_plist import _log_basename
+
+    base = _log_basename(label)
     paths = {
         "StandardErrorPath": _log_dir() / f"{base}.err",
         "StandardOutPath": _log_dir() / f"{base}.log",

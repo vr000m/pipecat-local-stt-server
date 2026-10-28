@@ -670,12 +670,12 @@ def test_old_socket_note_and_log_naming_match_the_installer(smoke, monkeypatch, 
     src = INSTALLER.read_text()
     notes = re.findall(r'echo "(note: endpoint changed [^"]*)"', src)
     assert len(notes) == 2 and all(n.endswith(smoke.OLD_SOCKET_NOTE) for n in notes)
-    # The log dir and basename rule the harness falls back on before a plist exists.
+    # The log dir the harness falls back on before a plist exists is the
+    # installer's (the basename rule is pinned to the renderer below).
     assert (
         'LOG_DIR="${PIPECAT_STT_LOG_DIR:-${KODA_STT_LOG_DIR:-$HOME/Library/Logs/pipecat-stt}}"'
         in src
     )
-    assert 'LOG_BASENAME="${LABEL//./-}"' in src
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("PIPECAT_STT_LOG_DIR", raising=False)
     monkeypatch.delenv("KODA_STT_LOG_DIR", raising=False)
@@ -1849,3 +1849,46 @@ def test_teardown_reports_every_failed_cleanup(smoke, env, monkeypatch, failure)
         assert any("left behind" in p for p in problems), problems
     if failure == "dangling-socket":
         assert os.path.lexists(h.sock) and str(h.sock) in " ".join(problems)
+
+
+# The harness's fallback log names come from the code that writes the plist's
+# StandardErrorPath / StandardOutPath: for each label, the harness's names equal
+# the paths render_stt_plist.py really renders (the installer's shell copy is
+# pinned to the renderer in tests/test_render_stt_plist.py).
+@pytest.mark.parametrize(
+    "label", [SPARE, "pipecat.stt-server", "koda.stt-server", "pipecat.stt-server.parakeet"]
+)
+def test_log_paths_match_what_the_renderer_writes(smoke, monkeypatch, tmp_path, label):
+    import plistlib
+
+    logs = tmp_path / "logs"
+    dst = tmp_path / "out.plist"
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "PYTHONPATH": str(REPO_ROOT),
+        "PIPECAT_STT_LABEL": label,
+        "PYTHON": sys.executable,
+        "REPO_ROOT": str(REPO_ROOT),
+        "BACKEND": "echo",
+        "MODEL": "test/model",
+        "HOME": str(tmp_path),
+        "LOG_DIR": str(logs),
+        "PLIST_DST": str(dst),
+        "HOST": "127.0.0.1",
+        "PORT": "9998",
+    }
+    res = subprocess.run(
+        [str(VENV_PYTHON), str(REPO_ROOT / "scripts" / "render_stt_plist.py")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    assert res.returncode == 0, res.stderr
+    rendered = plistlib.loads(dst.read_bytes())
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))  # no plist at the label's path
+    monkeypatch.setenv("PIPECAT_STT_LOG_DIR", str(logs))
+    assert smoke._log_paths(label) == [
+        Path(rendered["StandardErrorPath"]),
+        Path(rendered["StandardOutPath"]),
+    ]
