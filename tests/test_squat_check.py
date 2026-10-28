@@ -54,7 +54,11 @@ class World:
         launchctl_rc=None,
         lsof_rc=0,
         lsof_missing=False,
+        launchd_reads=None,
     ):
+        # launchd_reads: one (loaded, pid) answer per launchctl call, in call
+        # order (None: launchctl fails), overriding the sleep timeline.
+        self.launchd_reads = list(launchd_reads) if launchd_reads is not None else None
         self.snapshots = snapshots
         self.launchd_pids = launchd_pids
         self.launchd_loaded = launchd_loaded
@@ -89,6 +93,15 @@ class World:
                     out.append(f"n{addr}:{PORT}")
             return subprocess.CompletedProcess(argv, 0, "\n".join(out) + ("\n" if out else ""), "")
         if tool == "launchctl":
+            if self.launchd_reads is not None:
+                answer = self.launchd_reads.pop(0) if self.launchd_reads else (True, None)
+                if answer is None:
+                    return subprocess.CompletedProcess(argv, 5, "", "launchctl: boom")
+                loaded, pid = answer
+                if not loaded:
+                    return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
+                body = "state = running\n" + (f"\tpid = {pid}\n" if pid is not None else "")
+                return subprocess.CompletedProcess(argv, 0, body, "")
             if self.launchctl_rc is not None:
                 return subprocess.CompletedProcess(argv, self.launchctl_rc, "", "launchctl: boom")
             if not self._at(self.launchd_loaded):
@@ -312,6 +325,48 @@ def test_recheck_pid_state_space(capsys, launchctl_rc, pids, second, want):
     w = World([[(200, "nc", HOST)], snap2], launchd_pids=pids, launchctl_rc=launchctl_rc)
     assert _check(w, pid=100, label="pipecat.stt-server") == want
     assert (PREFIX in capsys.readouterr().err) == (want == 3)
+
+
+# The re-check brackets its second listener read with two launchd reads: the
+# pid read before it and the pid read after it, x the second listener -> exit.
+# A warning needs the same pid on both sides; a job that restarted during the
+# listener read (its new pid holding the port) is "cannot tell", never a warning.
+# Caller pid 100, first listener 200 (a would-be squat).
+@pytest.mark.parametrize(
+    ("before", "after", "second", "want"),
+    [
+        ((True, 100), (True, 100), 200, 3),  # stable pid, persistent squatter
+        ((True, 100), (True, 200), 200, 2),  # restarted mid-read: new pid is the listener
+        ((True, 100), (True, 300), 200, 2),  # restarted mid-read, pid changed
+        ((True, None), (True, 300), 300, 2),  # came up mid-read: no pid, then the listener
+        ((True, None), (True, None), 300, 3),  # stable no pid, listener: not running
+        ((True, 100), (False, None), 200, 0),  # unloaded mid-read: quiet
+        ((True, 100), None, 200, 2),  # the bracketing read failed
+        ((True, 100), (True, 100), 100, 0),  # the listener now matches: quiet
+        ((True, 200), (True, 200), 200, 0),  # restarted before the re-check: quiet
+        ((True, 100), (True, 100), None, 0),  # listener gone: quiet
+    ],
+)
+def test_recheck_brackets_the_listener_read_with_two_pid_reads(capsys, before, after, second, want):
+    snap2 = [] if second is None else [(second, "nc", HOST)]
+    w = World([[(200, "nc", HOST)], snap2], launchd_reads=[before, after])
+    assert _check(w, pid=100, label="pipecat.stt-server") == want
+    err = capsys.readouterr().err
+    assert (PREFIX in err) == (want == 3)
+    if want == 2:
+        assert len(err.strip().splitlines()) == 1
+
+
+def test_restart_between_the_pid_read_and_the_listener_read_does_not_warn(capsys):
+    # The reported race: the re-check reads launchd pid 100, the job restarts,
+    # and lsof then sees the new job (pid 200) on the port. Comparing 200 with
+    # the stale 100 would warn; the bracketing read sees 200 and says cannot tell.
+    w = World(
+        [[(200, "python", HOST)], [(200, "python", HOST)]],
+        launchd_reads=[(True, 100), (True, 200)],
+    )
+    assert _check(w, pid=100, label="pipecat.stt-server") == 2
+    assert PREFIX not in capsys.readouterr().err
 
 
 # lsof's answer (exit, stdout, stderr) -> lsof_output: the whole state space.

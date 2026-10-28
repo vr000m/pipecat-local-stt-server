@@ -97,7 +97,8 @@ server moves. What this adds is a warning, not a gate.
 `just stt-list` and `just stt-status <backend>` compare the pid listening on a
 TCP agent's port (from `lsof`) with the pid launchd reports for that agent
 (`launchctl print`). They warn on stderr, after a 1-second re-check so a restart
-in flight stays quiet, when:
+in flight stays quiet (the re-check reads the launchd pid before and after its
+`lsof` read; a pid that changed in between gives no warning), when:
 
 - the agent is running but a different pid holds the port (the warning names the
   port, the listener pid(s) and command(s), and the launchd pid), or

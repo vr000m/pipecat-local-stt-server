@@ -9,8 +9,8 @@ never starts, stops or signals anything. Stdout is always empty. Each warning is
 one block on stderr, every line starting ``squat-check: warning:``.
 
 Exit status: 0 quiet, 3 warned, 2 cannot tell (``lsof`` missing or failed, or
-the confirm pass could not re-read the launchd pid; a one-line note on stderr, no
-warning).
+the confirm pass could not re-read the launchd pid or saw it change; a one-line
+note on stderr, no warning).
 
 The invariant (Decision 5): the PID listening on the agent's port must equal the
 PID launchd reports for the agent. Two warnings break it:
@@ -26,7 +26,10 @@ launchd pid or the listener changing between the two reads) never warns. The
 re-check re-reads the listeners and, when ``--label`` is given, the pid with
 ``launchctl print gui/<uid>/<label>``; without ``--label`` it reuses ``--pid``.
 When that re-read fails, a finding that persists is "cannot tell" (exit 2), never a
-warning resting on the first pass's pid.
+warning resting on the first pass's pid. With ``--label`` the pid is read once more
+after the second listener read; a pid that changed across that listener read (the
+job restarted while lsof ran) or a read that failed is also "cannot tell", so a
+warning always compares the listeners with a pid that held for the whole read.
 
 Visibility limit (Decision 6): ``lsof`` run as the user lists only the user's own
 processes' sockets. A listener owned by another uid is invisible, so this check
@@ -250,6 +253,18 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
     if not pid_current:
         print("squat-check: cannot re-read the launchd pid; skipping port check", file=sys.stderr)
         return 2
+    if label:
+        # Bracket the listener read: a job that restarted between the pid read
+        # above and lsof would have its new pid compared with the old one.
+        after = launchd_state(label, run)
+        if after is not None and not after[0]:
+            return 0  # unloaded during the read: quiet, as above
+        if after is None or (after[1] or "") != pid:
+            print(
+                "squat-check: the launchd pid changed during the re-check; skipping port check",
+                file=sys.stderr,
+            )
+            return 2
 
     cmds = _commands(listeners, run)
     if kind == "b":
