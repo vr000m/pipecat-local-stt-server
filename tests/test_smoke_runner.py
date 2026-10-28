@@ -8,7 +8,9 @@ on a PATH led by a stub dir, with a temp ``HOME``; the fixture asserts the stub
 
 Assumptions (contract is silent): the table prints one line per step holding
 the step name and its outcome word; ``--agents`` discovers plists under
-``$HOME/Library/LaunchAgents`` (``Path.home()``/``expanduser`` honour ``HOME``);
+``_smoke_lib.agents_home()``, which the fixtures point at the temp home through
+the test-only ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` (``HOME`` alone does not
+move it, so no test reads the developer's real ``~/Library/LaunchAgents``);
 commands whose argv[0] is not a stubbed tool (launchctl/id/uv/say/afconvert/
 lsof) are faked as success in the ``--agents`` test, so only the stubbed tools
 ever run for real.
@@ -20,9 +22,12 @@ import importlib.util
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SMOKE = REPO_ROOT / "scripts" / "smoke.py"
 RENDERER = REPO_ROOT / "scripts" / "render_stt_plist.py"
 SPARE = "pipecat.stt-server.smoke"
+AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
 
 
 def _load():
@@ -79,6 +85,7 @@ def seam(smoke, monkeypatch, tmp_path):
     home = tmp_path / "home"
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
     monkeypatch.delenv("CI", raising=False)
     calls: list[tuple[list[str], dict | None]] = []
     behaviour = {"default": _cp(0), "by_script": {}}
@@ -373,6 +380,7 @@ def agents_env(smoke, monkeypatch, tmp_path):
     home = tmp_path / "home"
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
     monkeypatch.delenv("CI", raising=False)
     log = _stub_env(tmp_path, monkeypatch)
     ran: list[list[str]] = []
@@ -430,6 +438,7 @@ def test_agents_skipped_when_say_absent(smoke, monkeypatch, tmp_path, capsys):
     home = tmp_path / "home"
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
     monkeypatch.delenv("CI", raising=False)
     _render_plist(home, "pipecat.stt-server", port=9565)
     log = _stub_env(tmp_path, monkeypatch, with_say=False)
@@ -474,14 +483,16 @@ def test_run_command_kills_child_that_ignores_sigterm(smoke, monkeypatch):
     assert __import__("time").monotonic() - start < 20
 
 
-def test_run_command_ctrl_c_waits_for_child_instead_of_killing(smoke, monkeypatch):
+def test_run_command_ctrl_c_forwards_sigint_and_waits(smoke, monkeypatch):
     events = []
 
     class FakePopen:
         returncode = 0
+        pid = 4242
 
         def __init__(self, *a, **k):
             self.calls = 0
+            events.append(("new session", k.get("start_new_session")))
 
         def communicate(self, timeout=None):
             self.calls += 1
@@ -497,9 +508,185 @@ def test_run_command_ctrl_c_waits_for_child_instead_of_killing(smoke, monkeypatc
             events.append(("signal", sig))
 
     monkeypatch.setattr(smoke.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(smoke.os, "killpg", lambda pg, sig: events.append(("killpg", pg, sig)))
     with pytest.raises(KeyboardInterrupt):
         smoke.run_command(["x"], 5)
-    assert events == [("waited", smoke.TEARDOWN_GRACE)]
+    assert events == [
+        ("new session", True),
+        ("signal", signal.SIGINT),
+        ("waited", smoke.TEARDOWN_GRACE),
+        ("killpg", 4242, signal.SIGKILL),
+    ]
+
+
+_TRAPS_INT = """
+import signal, sys, time
+signal.signal(signal.SIGINT, signal.default_int_handler)
+open(sys.argv[1] + ".ready", "w").write("")
+try:
+    time.sleep(60)
+except KeyboardInterrupt:
+    open(sys.argv[1], "w").write("teardown ran")
+    sys.exit(1)
+"""
+
+
+def _wait_for(path: Path, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        time.sleep(0.05)
+
+
+def test_direct_sigterm_to_runner_reaches_the_active_step(smoke, monkeypatch, tmp_path):
+    # A SIGTERM sent to the runner itself (not via the terminal's group) must
+    # reach the step, which then runs its own teardown, before the runner exits.
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", 15.0)
+    marker = tmp_path / "marker"
+
+    def fire():
+        _wait_for(Path(f"{marker}.ready"))
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    t = threading.Thread(target=fire)
+    with smoke._term_as_interrupt():
+        t.start()
+        with pytest.raises(KeyboardInterrupt):
+            smoke.run_command([sys.executable, "-c", _TRAPS_INT, str(marker)], 60)
+    t.join()
+    assert marker.read_text() == "teardown ran"
+
+
+def test_direct_sigint_to_runner_reaches_the_active_step(smoke, monkeypatch, tmp_path):
+    # The step runs in its own session, so only a forwarded signal can reach it.
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", 15.0)
+    marker = tmp_path / "marker"
+
+    def fire():
+        _wait_for(Path(f"{marker}.ready"))
+        os.kill(os.getpid(), signal.SIGINT)
+
+    t = threading.Thread(target=fire)
+    t.start()
+    with pytest.raises(KeyboardInterrupt):
+        smoke.run_command([sys.executable, "-c", _TRAPS_INT, str(marker)], 60)
+    t.join()
+    assert marker.read_text() == "teardown ran"
+
+
+_LEAVES_A_GRANDCHILD = """
+import signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen(["sleep", "60"])
+open(sys.argv[1], "w").write(str(child.pid))
+time.sleep(60)
+"""
+
+
+def test_stopped_step_leaves_no_process_behind(smoke, monkeypatch, tmp_path):
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", 1.0)
+    pidfile = tmp_path / "grandchild"
+    with pytest.raises(subprocess.TimeoutExpired):
+        smoke.run_command([sys.executable, "-c", _LEAVES_A_GRANDCHILD, str(pidfile)], 3)
+    gpid = int(pidfile.read_text())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"grandchild {gpid} outlived the stopped step")
+
+
+def test_token_check_sigterm_removes_server_and_token_dir(smoke, monkeypatch, tmp_path):
+    # The runner's timeout SIGTERMs the token-file child; the child must stop its
+    # server and remove its token directory, not die with both left behind.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    real_popen = subprocess.Popen
+    started = []
+
+    def popen(argv, *a, **k):
+        if "stt_server" in [str(x) for x in argv]:
+            # A "server" that never listens, so the child sits in its wait loop.
+            proc = real_popen(["sleep", "60"], stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            started.append(proc)
+            return proc
+        return real_popen(argv, *a, **k)
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", popen)
+    hit_default = []
+    old = signal.signal(signal.SIGTERM, lambda *_: hit_default.append(1))
+
+    def fire():
+        deadline = time.monotonic() + 30
+        while not started and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    t = threading.Thread(target=fire)
+    t.start()
+    try:
+        with pytest.raises(SystemExit):
+            smoke._token_check()
+    finally:
+        t.join()
+        signal.signal(signal.SIGTERM, old)
+        for proc in started:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert not hit_default, "_token_check installed no SIGTERM handler"
+    assert started and started[0].returncode is not None, "server left running"
+    assert not list(home.glob("stt-smoke-token.*")), "token directory left behind"
+
+
+# smoke_peercred.py's answer (exit, stdout) -> the peercred row: every cell.
+@pytest.mark.parametrize(
+    ("rc", "out", "want"),
+    [
+        (0, "=== summary ===\n  same-uid multi-connection: PASS\n", "PASS"),
+        (0, "  skipped: needs a second local uid reachable via passwordless sudo\n", "SKIPPED"),
+        (0, "skipped: peer-cred smoke needs macOS/Linux, not win32\n", "SKIPPED"),
+        (1, "skipped: peer-cred smoke needs macOS/Linux, not win32\n", "FAIL"),
+        (1, "  skipped: needs a second local uid reachable via passwordless sudo\n", "FAIL"),
+        (1, "", "FAIL"),
+    ],
+)
+def test_peercred_outcome_state_space(smoke, monkeypatch, rc, out, want):
+    monkeypatch.setattr(smoke, "run_command", lambda *a, **k: _cp(rc, out=out))
+    assert smoke.peercred_step().outcome == want
+
+
+def test_peercred_marks_match_smoke_peercred_output():
+    text = (REPO_ROOT / "scripts" / "smoke_peercred.py").read_text()
+    assert 'print("  skipped: needs a second local uid' in text
+    assert 'print(f"skipped: peer-cred smoke needs macOS/Linux' in text
+
+
+# CI value x platform -> launchd skip: CI present with ANY value (empty too) skips.
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+@pytest.mark.parametrize("ci", [None, "", "0", "false", "1", "true"])
+def test_launchd_skip_state_space(smoke, platform, ci):
+    import _smoke_lib
+
+    env = {} if ci is None else {"CI": ci}
+    skips = _smoke_lib.launchd_skip_reason(env, platform) is not None
+    assert skips == (platform != "darwin" or ci is not None)
+
+
+def test_agents_home_ignores_home_and_honours_only_the_test_override(smoke, monkeypatch, tmp_path):
+    import _smoke_lib
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(AGENTS_HOME_ENV, raising=False)
+    assert _smoke_lib.agents_home() == _smoke_lib.account_home() != tmp_path
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(tmp_path))
+    assert _smoke_lib.agents_home() == tmp_path
+    monkeypatch.setenv(AGENTS_HOME_ENV, "")
+    assert _smoke_lib.agents_home() == _smoke_lib.account_home()
 
 
 def test_runner_and_harness_share_spare_label_and_preconditions(smoke):
@@ -509,3 +696,20 @@ def test_runner_and_harness_share_spare_label_and_preconditions(smoke):
     assert _smoke_lib.launchd_skip_reason({}, "linux")
     assert _smoke_lib.launchd_skip_reason({"CI": "1"}, "darwin")
     assert _smoke_lib.launchd_skip_reason({}, "darwin") is None
+
+
+def test_main_turns_sigterm_into_an_interrupt_while_steps_run(smoke, seam, monkeypatch, capsys):
+    seen = []
+
+    def fake_build(agents, launchd):
+        seen.append(signal.getsignal(signal.SIGTERM))
+        return [smoke.StepResult("supervised", smoke.PASS)]
+
+    monkeypatch.setattr(smoke, "build_and_run", fake_build)
+    before = signal.getsignal(signal.SIGTERM)
+    assert smoke.main([]) == 0
+    capsys.readouterr()
+    assert seen and seen[0] not in (signal.SIG_DFL, signal.SIG_IGN, None, before)
+    with pytest.raises(KeyboardInterrupt):
+        seen[0](signal.SIGTERM, None)
+    assert signal.getsignal(signal.SIGTERM) == before

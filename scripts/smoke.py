@@ -7,12 +7,15 @@ Run it as ``just smoke [--agents] [--launchd]``. Steps, in order:
 
 * ``supervised``: ``smoke_supervised.py --backend echo``.
 * ``peercred``: ``smoke_peercred.py`` (SKIPPED when there is no second uid, the
-  usual dev case; the same-uid leg still ran).
+  usual dev case, where the same-uid leg still ran; or when the platform is not
+  macOS or Linux, where nothing ran).
 * ``token-file``: a spare-port echo server with a token file; a request with no
   token or a wrong one must get 401 and the right one 101 (``assert_token_gate``).
 * ``agents`` (``--agents``): decode a short generated clip through every installed
-  ``pipecat.stt-server*`` agent from its plist endpoint. Strictly read-only: it
-  never calls bootout, bootstrap, kickstart or the installer.
+  ``pipecat.stt-server*`` agent from its plist endpoint. The plists are read from
+  ``_smoke_lib.agents_home()`` (the account home, the same one the launchd
+  harness snapshots; ``$HOME`` does not move it). Strictly read-only: it never
+  calls bootout, bootstrap, kickstart or the installer.
 * ``launchd`` (``--launchd``): ``smoke_launchd.py`` on the spare label and port.
   macOS only, never in CI, and it needs both ``PIPECAT_STT_LABEL`` and
   ``KODA_STT_LABEL`` set to the spare label, which this runner does explicitly.
@@ -21,9 +24,15 @@ Each step is PASS, FAIL or SKIPPED with a reason. The exit status is 1 if any
 step FAILED, else 0 (SKIPPED never fails). Stdlib only; every step runs in a
 subprocess through ``run_command`` with ``sys.executable`` (never ``uv run``,
 which would prune the backend extras).
+
+Each step runs in its own session. On a step timeout the step gets SIGTERM, on
+Ctrl-C (or a SIGINT or SIGTERM sent to this runner) SIGINT; either way it has
+``TEARDOWN_GRACE`` to clean up before its whole process group is SIGKILLed, and
+further signals to the runner are ignored until then.
 """
 
 import argparse
+import contextlib
 import os
 import shutil
 import signal
@@ -31,6 +40,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,12 +66,15 @@ CLIP_TIMEOUT = 60.0
 PLIST_READ_TIMEOUT = 30.0
 DECODE_TIMEOUT = 180.0
 LAUNCHD_TIMEOUT = 900.0
-# After a step's timeout (or Ctrl-C) the child gets SIGTERM and this long to run
-# its own cleanup before SIGKILL: smoke_launchd.py's teardown runs the installer's
-# uninstall (up to 120 s) and waits on the spare .lock.
+# After a step's timeout (SIGTERM) or Ctrl-C (SIGINT) the child gets this long to
+# run its own cleanup before its process group is SIGKILLed: smoke_launchd.py's
+# teardown runs the installer's uninstall (up to 120 s) and waits on the spare
+# .lock.
 TEARDOWN_GRACE = 180.0
 
+# smoke_peercred.py's own skip lines (it exits 0 on both).
 PEERCRED_NO_UID_MARK = "skipped: needs a second local uid"
+PEERCRED_PLATFORM_MARK = "skipped: peer-cred smoke needs"
 
 
 @dataclass
@@ -92,10 +105,11 @@ def run_command(
 ) -> subprocess.CompletedProcess:
     """The only place this module spawns a subprocess for a step.
 
-    On timeout the child is sent SIGTERM and given ``TEARDOWN_GRACE`` to clean up
-    (SIGKILL only after that), then ``TimeoutExpired`` is raised. On Ctrl-C the
-    child (same process group, so it got the SIGINT too) is waited for, not
-    killed, so a harness's teardown finishes before the interrupt propagates.
+    The child runs in its own session (process group), so a terminal Ctrl-C
+    reaches only this runner, which forwards it. On timeout the child is sent
+    SIGTERM, on Ctrl-C (``KeyboardInterrupt``, which a SIGTERM to this runner
+    also raises under ``main``) SIGINT; then ``_stop`` gives it ``TEARDOWN_GRACE``
+    to clean up and SIGKILLs its group, and the exception propagates.
     """
     proc = subprocess.Popen(
         cmd,
@@ -105,26 +119,69 @@ def run_command(
         env=env,
         cwd=str(REPO),
         stdin=subprocess.DEVNULL,
+        start_new_session=True,
     )
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.send_signal(signal.SIGTERM)
-        _reap(proc)
+        _stop(proc, signal.SIGTERM)
         raise
     except KeyboardInterrupt:
-        _reap(proc)
+        _stop(proc, signal.SIGINT)
         raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-def _reap(proc: subprocess.Popen) -> None:
-    """Wait up to TEARDOWN_GRACE for PROC to exit on its own, then SIGKILL it."""
+@contextlib.contextmanager
+def _signals_held():
+    """Ignore SIGINT and SIGTERM to this process for the block (main thread only),
+    so a second Ctrl-C cannot cut a child's teardown short."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
-        proc.communicate(timeout=TEARDOWN_GRACE)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
+        yield
+    finally:
+        for s, h in old.items():
+            if h is not None:
+                signal.signal(s, h)
+
+
+def _stop(proc: subprocess.Popen, sig: int) -> None:
+    """Send SIG to PROC, wait up to TEARDOWN_GRACE for it to exit, then SIGKILL
+    its process group so nothing it started (a server, a sleep) outlives it."""
+    with _signals_held():
+        with contextlib.suppress(ProcessLookupError):
+            proc.send_signal(sig)
+        try:
+            proc.communicate(timeout=TEARDOWN_GRACE)
+        except subprocess.TimeoutExpired:
+            # The group first: a grandchild holding the pipes would block the read.
+            _kill_group(proc)
+            proc.kill()
+            proc.communicate()
+        _kill_group(proc)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+@contextlib.contextmanager
+def _term_as_interrupt():
+    """Make a SIGTERM to this runner raise KeyboardInterrupt, like Ctrl-C, so the
+    active step is stopped through ``_stop`` instead of being orphaned."""
+
+    def handler(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    old = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, old)
 
 
 def _tail(proc: subprocess.CompletedProcess) -> str:
@@ -195,7 +252,12 @@ def launchd_skip_reason() -> str | None:
 
 def peercred_step() -> StepResult:
     outcome, detail, proc = _execute(peercred_cmd(), PEERCRED_TIMEOUT)
-    if outcome == PASS and proc is not None and PEERCRED_NO_UID_MARK in (proc.stdout or ""):
+    out = (proc.stdout or "") if proc is not None else ""
+    if outcome == PASS and PEERCRED_PLATFORM_MARK in out:
+        return StepResult(
+            "peercred", SKIPPED, f"peer-cred smoke needs macOS or Linux, not {sys.platform}"
+        )
+    if outcome == PASS and PEERCRED_NO_UID_MARK in out:
         return StepResult(
             "peercred",
             SKIPPED,
@@ -205,7 +267,15 @@ def peercred_step() -> StepResult:
 
 
 def agent_plists() -> list[Path]:
-    return _smoke_lib.agent_plists(_smoke_lib.env_home())
+    """Installed real-agent plists, from the home the launchd harness snapshots."""
+    override = _smoke_lib.agents_home_override()
+    if override is not None:
+        print(
+            f"warning: reading installed agents from {override} "
+            f"({_smoke_lib.TEST_AGENTS_HOME_ENV} is a test-only override)",
+            file=sys.stderr,
+        )
+    return _smoke_lib.agent_plists(_smoke_lib.agents_home())
 
 
 def read_plist_cmd(field: str, plist: Path) -> list[str]:
@@ -317,11 +387,19 @@ def _token_check() -> int:
     from _smoke_lib import assert_token_gate
 
     port = _free_port()
-    # The token file must pass stt_server.auth's policy: 0600, owner-only, under
-    # an owner-only directory below $HOME (/tmp fails the ancestor check).
-    tmp = tempfile.mkdtemp(prefix="stt-smoke-token.", dir=str(Path.home()))
+
+    # The runner's timeout sends SIGTERM; its default action would skip the
+    # finally below and leave the server and the token directory behind.
+    def on_term(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    old_term = signal.signal(signal.SIGTERM, on_term)
+    tmp = None
     server = None
     try:
+        # The token file must pass stt_server.auth's policy: 0600, owner-only,
+        # under an owner-only directory below $HOME (/tmp fails the ancestor check).
+        tmp = tempfile.mkdtemp(prefix="stt-smoke-token.", dir=str(Path.home()))
         os.chmod(tmp, 0o700)
         token_file = os.path.join(tmp, "token")
         fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -361,13 +439,17 @@ def _token_check() -> int:
         print(f"token gate OK on 127.0.0.1:{port}")
         return 0
     finally:
-        if server is not None and server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(10)
-            except subprocess.TimeoutExpired:
-                server.kill()
-        shutil.rmtree(tmp, ignore_errors=True)
+        with _signals_held():
+            if server is not None and server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+        signal.signal(signal.SIGTERM, old_term)
 
 
 def _decode(args: argparse.Namespace) -> int:
@@ -439,7 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         "--launchd", action="store_true", help="run the launchd harness on the spare label (macOS)"
     )
     args = ap.parse_args(argv)
-    results = build_and_run(args.agents, args.launchd)
+    with _term_as_interrupt():
+        results = build_and_run(args.agents, args.launchd)
     print(render_table(results))
     return exit_code(results)
 

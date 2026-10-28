@@ -12,8 +12,24 @@ Pure stdlib (``os``/``stat``) so it imports under both the venv driver and any
 system-python context.
 
 It also holds what ``smoke.py`` and ``smoke_launchd.py`` must agree on: the spare
-label, the installed-agent plist glob and directory, and the launchd
-preconditions.
+label, the installed-agent plist glob and directory, the home the installed real
+agents are read from, the launchd preconditions, and the websocket token-gate
+assertion (``assert_token_gate``).
+
+Two homes. ``env_home()`` is ``$HOME``: where the installer puts the spare's
+plist, logs and socket. ``agents_home()`` is where both scripts look for the
+installed real agents (``smoke.py --agents`` and the harness's port guard and
+before/after snapshot): the account's home from the password database, so an
+overridden ``HOME`` can neither empty the snapshot nor hide an agent from the
+port guard. The only way to move ``agents_home()`` is the test-only variable
+``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` (``TEST_AGENTS_HOME_ENV``), which the
+stubbed test suites set to a temp directory so they never read the developer's
+real ``~/Library/LaunchAgents``. Nothing else reads it, the installer's
+environment is scrubbed of it, and whoever honours it says so on stderr.
+
+The launchd checks are SKIPPED when ``CI`` is present in the environment with
+any value, the empty string included (Decision 8: they run only when ``CI`` is
+unset).
 """
 
 from __future__ import annotations
@@ -25,6 +41,7 @@ from pathlib import Path
 
 SPARE_LABEL = "pipecat.stt-server.smoke"
 AGENT_GLOB = "pipecat.stt-server*.plist"
+TEST_AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
 
 
 def env_home() -> Path:
@@ -35,6 +52,18 @@ def env_home() -> Path:
 def account_home() -> Path:
     """The account's home from the password database; ``$HOME`` cannot move it."""
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def agents_home_override(env=None) -> Path | None:
+    """The test-only agents home override, or None when it is not set."""
+    val = (os.environ if env is None else env).get(TEST_AGENTS_HOME_ENV)
+    return Path(val) if val else None
+
+
+def agents_home(env=None) -> Path:
+    """Where the installed real agents are read from: the account home, or the
+    test-only override. ``$HOME`` never moves it."""
+    return agents_home_override(env) or account_home()
 
 
 def launch_agents_dir(home: Path) -> Path:
@@ -51,7 +80,7 @@ def launchd_skip_reason(env, platform: str) -> str | None:
     """Why the launchd checks cannot run on this machine (SKIPPED), or None."""
     if platform != "darwin":
         return f"launchd checks need macOS, not {platform}"
-    if env.get("CI"):
+    if "CI" in env:  # set at all, even empty: Decision 8 runs them only when unset
         return "CI is set; the launchd checks never run in CI"
     return None
 
