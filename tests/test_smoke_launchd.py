@@ -19,6 +19,7 @@ at ``$HOME/Library/LaunchAgents/<label>.plist`` and logs under
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import importlib.util
 import os
@@ -2823,3 +2824,355 @@ def test_no_second_launchctl_print_parser(smoke):
     for p in ("_smoke_lib.py", "smoke_launchd.py", "smoke.py"):
         src = (scripts / p).read_text()
         assert '["launchctl", "print"' not in src, p  # an argv: a call of its own
+
+
+# --------------------------------------------------------------------------
+# the live checks' happy paths end to end under stubs (Cause C)
+# --------------------------------------------------------------------------
+#
+# check_collision and check_rollback run in-process with the REAL read_job
+# (squat_check's reader over a stub `launchctl` on PATH), the REAL
+# connect_verified (a stub `lsof` names the server end of each TCP connection;
+# LOCAL_PEERPID is the real one for a socket), the REAL ws_handshake_status
+# against a fake agent served by this process over a real socket, and, in the
+# collision check, the REAL squat_check.py CLI. Only the installer is replaced
+# (by a function that does what the installer's install leaves behind). The
+# agent records every byte it receives, so each refusal cell can prove nothing
+# was sent on the refused connection.
+
+
+class _FakeAgent:
+    """A websocket upgrade endpoint served by this process: answers 101 to any
+    request (or, with TOKEN, 401 unless it carries ``Bearer TOKEN``) and
+    records every request's bytes. TCP binds are retried until the port is
+    free (the collision check's holder releases it)."""
+
+    def __init__(self, kind: str, where, token: str | None = None, on_bind=None):
+        self.requests: list[bytes] = []
+        self.accepted = 0
+        self.token = token
+        self.on_bind = on_bind
+        self.stop = threading.Event()
+        self.srv = None
+        self.kind, self.where = kind, where
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _bind(self):
+        while not self.stop.is_set():
+            s = socket.socket(socket.AF_INET if self.kind == "tcp" else socket.AF_UNIX)
+            if self.kind == "tcp":
+                # Earlier agents' closed connections may linger in TIME_WAIT;
+                # a live listener (the collision check's holder) still
+                # refuses the bind.
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", self.where) if self.kind == "tcp" else str(self.where))
+                s.listen(8)
+                s.settimeout(0.05)
+                return s
+            except OSError:
+                s.close()
+                time.sleep(0.05)
+        return None
+
+    def _run(self):
+        self.srv = self._bind()
+        if self.srv is None:
+            return
+        if self.on_bind:
+            self.on_bind()
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                continue
+            self.accepted += 1
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        with conn:
+            conn.settimeout(5)
+            buf = b""
+            try:
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except OSError:
+                pass
+            if not buf:
+                return
+            self.requests.append(buf)
+            ok = self.token is None or f"Bearer {self.token}".encode() in buf
+            with contextlib.suppress(OSError):
+                conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n\r\n" if ok else
+                             b"HTTP/1.1 401 Unauthorized\r\n\r\n")  # fmt: skip
+
+    def close(self):
+        self.stop.set()
+        self.t.join(3)
+        if self.srv is not None:
+            self.srv.close()
+        if self.kind == "unix":
+            with contextlib.suppress(OSError):
+                os.unlink(self.where)
+
+
+class _LiveStubs:
+    """A stub ``launchctl`` and ``lsof`` on PATH, driven by files in STATE:
+
+    * ``job``: "PID RUNS" of the loaded spare job (absent: not loaded);
+      ``flap`` present: RUNS moves on every print (a restart loop);
+      ``print-fails`` present: every print exits 5 (unreadable).
+    * ``owner``: the pid lsof names as holding the server end of any TCP
+      connection to ``port``; ``holder``: the pid lsof names as LISTENing on
+      ``port`` (the collision check's own holder socket)."""
+
+    def __init__(self, tmp: Path, port: int):
+        self.state = tmp / "state"
+        self.state.mkdir()
+        self.stub = tmp / "livebin"
+        self.stub.mkdir()
+        self.log = tmp / "live.log"
+        self.write("port", str(port))
+        st = self.state
+        _exe(
+            self.stub / "launchctl",
+            f"""#!/bin/bash
+printf 'launchctl %s\\n' "$*" >> {self.log}
+if [[ "$1" == print ]]; then
+    [[ -e {st}/print-fails ]] && {{ echo "launchctl: boom" >&2; exit 5; }}
+    [[ -s {st}/job ]] || {{ echo 'Could not find service "x" in domain' >&2; exit 113; }}
+    read -r pid runs < {st}/job
+    if [[ -e {st}/flap ]]; then
+        n=$(( $(cat {st}/flap 2>/dev/null || echo 0) + 1 )); echo $n > {st}/flap; runs=$((runs + n))
+    fi
+    printf 'gui/x = {{\\n\\tstate = running\\n\\tpid = %s\\n\\truns = %s\\n}}\\n' "$pid" "$runs"
+    exit 0
+fi
+exit 0
+""",
+        )
+        _exe(
+            self.stub / "lsof",
+            f"""#!/bin/bash
+printf 'lsof %s\\n' "$*" >> {self.log}
+port=$(cat {st}/port)
+for a in "$@"; do
+    case "$a" in
+    -sTCP:LISTEN)
+        [[ -s {st}/holder ]] || exit 1
+        printf 'p%s\\nn127.0.0.1:%s\\n' "$(cat {st}/holder)" "$port"; exit 0;;
+    -Fc) printf 'p1\\ncpython\\n'; exit 0;;
+    -iTCP@*)
+        printf 'p%s\\nn127.0.0.1:%s->%s\\n' "$(cat {st}/owner)" "$port" "${{a#-iTCP@}}"; exit 0;;
+    esac
+done
+exit 1
+""",
+        )
+
+    def write(self, name: str, value: str) -> None:
+        (self.state / name).write_text(value)
+
+    def remove(self, name: str) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            (self.state / name).unlink()
+
+    @property
+    def path(self) -> str:
+        return f"{self.stub}:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+@pytest.fixture
+def short_home(monkeypatch):
+    """A HOME short enough for an AF_UNIX path under it (104 bytes on macOS)."""
+    import tempfile
+
+    home = Path(tempfile.mkdtemp(prefix="sl.", dir="/tmp")).resolve()
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PIPECAT_STT_LOG_DIR", raising=False)
+    monkeypatch.delenv("KODA_STT_LOG_DIR", raising=False)
+    try:
+        yield home
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def _fast_waits(smoke, monkeypatch, timeout=3.0):
+    real = smoke.Harness.wait_for
+
+    def wait_for(self, what, pred, timeout_=None, every=None, **k):
+        return real(self, what, pred, timeout=timeout, every=0.1)
+
+    monkeypatch.setattr(smoke.Harness, "wait_for", wait_for)
+
+
+def _write_spare_plist(home: Path, port: int | None = None, sock: Path | None = None):
+    import plistlib
+
+    serve = ["--host", "127.0.0.1", "--port", str(port)] if sock is None else [
+        "--socket-path", str(sock)]  # fmt: skip
+    (home / "Library" / "LaunchAgents" / f"{SPARE}.plist").write_bytes(
+        plistlib.dumps(
+            {
+                "Label": SPARE,
+                "ProgramArguments": [
+                    sys.executable,
+                    "-m",
+                    "stt_server",
+                    "serve",
+                    "--backend",
+                    "echo",
+                    *serve,
+                ],
+            }  # fmt: skip
+        )
+    )
+
+
+_SECRET_MARK = b"Authorization"
+
+# the collision check, end to end: what the spare job looks like once the port
+# is freed (its server end x its launchd identity) -> PASS, or the refusal and
+# nothing sent on the refused connection.
+_COLLISION = {
+    "ok": None,
+    "foreign-listener": "not the spare job",
+    "pid-runs-change": "not the spare job",
+    "identity-unreadable": "unreadable",
+}
+
+
+@pytest.mark.parametrize("cell", list(_COLLISION))
+def test_collision_check_end_to_end(smoke, monkeypatch, tmp_path, short_home, cell):
+    port = _free_port()
+    stubs = _LiveStubs(tmp_path, port)
+    monkeypatch.setenv("PATH", stubs.path)
+    _fast_waits(smoke, monkeypatch)
+    stubs.write("holder", str(os.getpid()))  # the harness's own holder socket
+    stubs.write("owner", "777" if cell == "foreign-listener" else "4242")
+    agents = []
+
+    def on_bind():
+        stubs.remove("holder")  # the holder is gone: the agent listens now
+        if cell == "identity-unreadable":
+            stubs.write("print-fails", "1")
+        if cell == "pid-runs-change":
+            stubs.write("flap", "0")
+
+    def install(env, what):
+        assert what == "collision" and env["PIPECAT_STT_PORT"] == str(port)
+        assert "PIPECAT_STT_AUTH_TOKEN_FILE" not in env
+        log = smoke._err_log(SPARE)  # no plist: the installer's naming rule
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a") as fh:
+            fh.write("OSError: [Errno 48] address already in use\n" * 2)
+        stubs.write("job", "4242 3")
+        agents.append(_FakeAgent("tcp", port, on_bind=on_bind))
+        return ""
+
+    monkeypatch.setattr(smoke, "install", install)
+    h = smoke.Harness(SPARE, port)
+    try:
+        want = _COLLISION[cell]
+        if want is None:
+            detail = h.check_collision()
+            assert "squat warning" in detail and "server end verified" in detail
+            assert len(agents[0].requests) >= 1
+        elif want == "unreadable":
+            with pytest.raises(smoke.LaunchdUnreadable):
+                h.check_collision()
+        else:
+            with pytest.raises(smoke.CheckFailed, match=want):
+                h.check_collision()
+            assert agents[0].requests == []  # refused: nothing written
+        assert h.holder is None
+        # The squat CLI warned: it saw the holder (not pid 4242) on the port.
+        log = stubs.log.read_text()
+        assert "-sTCP:LISTEN" in log
+        for req in agents[0].requests:
+            assert _SECRET_MARK not in req
+    finally:
+        h.release_holder()
+        for a in agents:
+            a.close()
+
+
+# the rollback body, end to end: TCP -> socket -> TCP, each transport's answer
+# over a verified connection. A fault (the server end not the job's, a
+# restart loop, an unreadable launchd state) injected at install k -> the check
+# stops there with a refusal, no later install runs, nothing is sent on the
+# refused connection; no fault -> PASS, old socket gone, .lock left.
+_ROLLBACK_FAULTS = ["foreign-listener", "pid-runs-change", "identity-unreadable"]
+_ROLLBACK_CELLS = [("none", None)] + [(f, k) for f in _ROLLBACK_FAULTS for k in (0, 1, 2)]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="LOCAL_PEERPID is macOS")
+@pytest.mark.parametrize(("fault", "at"), _ROLLBACK_CELLS)
+def test_rollback_check_end_to_end(smoke, monkeypatch, tmp_path, short_home, fault, at):
+    port = _free_port()
+    stubs = _LiveStubs(tmp_path, port)
+    monkeypatch.setenv("PATH", stubs.path)
+    _fast_waits(smoke, monkeypatch)
+    me = str(os.getpid())  # a socket's LOCAL_PEERPID is this process: the "job"
+    stubs.write("owner", me)
+    h = smoke.Harness(SPARE, port)
+    sock = h.sock
+    agents: list[_FakeAgent] = []
+    installs: list[str] = []
+
+    def install(env, what):
+        k = len(installs)
+        installs.append(what)
+        had_socket = os.path.lexists(sock)  # the old socket agent's, before it stops
+        for a in agents:
+            a.close()
+        stubs.write("job", f"{me} {k + 1}")
+        if fault != "none" and k == at:
+            if fault == "foreign-listener":
+                stubs.write("job", f"4242 {k + 1}")
+            elif fault == "pid-runs-change":
+                stubs.write("flap", "0")
+            else:
+                stubs.write("print-fails", "1")
+        out = ""
+        if env.get("PIPECAT_STT_SOCKET"):
+            assert env["PIPECAT_STT_SOCKET"] == str(sock)
+            _write_spare_plist(short_home, sock=sock)
+            Path(f"{sock}.lock").write_text("")
+            agents.append(_FakeAgent("unix", sock))
+        else:
+            if had_socket:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(sock)
+                out = f"note: endpoint changed from socket {sock} to TCP; {smoke.OLD_SOCKET_NOTE}"
+            _write_spare_plist(short_home, port=port)
+            agents.append(_FakeAgent("tcp", port))
+        return out
+
+    monkeypatch.setattr(smoke, "install", install)
+    seen = []
+    try:
+        if fault == "none":
+            detail = h.check_rollback()
+            assert "tcp -> socket -> tcp" in detail
+            assert installs == ["rollback: TCP", "rollback: socket", "rollback: back to TCP"]
+            assert not os.path.lexists(sock) and os.path.exists(f"{sock}.lock")
+            assert all(len(a.requests) >= 1 for a in agents)
+        else:
+            exc = smoke.LaunchdUnreadable if fault == "identity-unreadable" else smoke.CheckFailed
+            with pytest.raises(exc):
+                h.check_rollback()
+            assert len(installs) == at + 1  # stopped at the faulty transport
+            assert agents[-1].requests == []  # refused: nothing written
+        seen = [r for a in agents for r in a.requests]
+        assert all(_SECRET_MARK not in r for r in seen)
+    finally:
+        for a in agents:
+            a.close()
+        with contextlib.suppress(OSError):
+            os.unlink(f"{sock}.lock")

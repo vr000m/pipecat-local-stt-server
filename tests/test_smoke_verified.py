@@ -384,3 +384,189 @@ def test_no_caller_fakes_a_launchd_runs_value():
     text = (SCRIPTS / "smoke.py").read_text()
     assert '"self"' not in text
     assert "connect_verified_child(" in text
+
+
+# --------------------------------------------------------------------------
+# the --agents decode contract, end to end (Cause C)
+# --------------------------------------------------------------------------
+#
+# smoke.py's decode child runs as a real subprocess (``decode_cmd``'s argv, the
+# token on stdin) against a fake agent this process serves with the
+# websockets library over a real TCP or AF_UNIX socket. Its launchd identity
+# comes from a stub ``launchctl`` on PATH through squat_check's one reader, the
+# TCP server end from a stub ``lsof``, a socket's from the real LOCAL_PEERPID
+# (this process). Nothing is stubbed inside the child: connect_verified, the
+# stdin token and the production TranscriptionClient connect tail all run.
+
+_DECODE_LAUNCHCTL = """#!/bin/bash
+if [[ "$1" == print ]]; then
+    [[ -e {st}/print-fails ]] && {{ echo "launchctl: boom" >&2; exit 5; }}
+    read -r pid runs < {st}/job
+    printf 'gui/x = {{\\n\\tstate = running\\n\\tpid = %s\\n\\truns = %s\\n}}\\n' "$pid" "$runs"
+    exit 0
+fi
+exit 1
+"""
+_DECODE_LSOF = """#!/bin/bash
+for a in "$@"; do
+    case "$a" in
+    -iTCP@*) printf 'p%s\\nn127.0.0.1:%s->%s\\n' "$(cat {st}/owner)" "$(cat {st}/port)" "${{a#-iTCP@}}"; exit 0;;
+    esac
+done
+exit 1
+"""
+
+
+class _FakeSttAgent:
+    """The server half of the wire protocol, served from a thread's own event
+    loop: checks the bearer token in the upgrade request (401 otherwise),
+    sends server.hello and session.created, answers a commit with a
+    transcript. Records every upgrade request's headers."""
+
+    def __init__(self, transport: str, where, token: str | None):
+        import asyncio
+
+        self.requests: list[dict] = []
+        self.token = token
+        self.loop = asyncio.new_event_loop()
+        self.ready = threading.Event()
+        self.where = where
+        self.transport = transport
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+        assert self.ready.wait(10)
+
+    def _run(self):
+        import asyncio
+
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._start())
+        self.ready.set()
+        self.loop.run_forever()
+
+    async def _start(self):
+        import json
+
+        from websockets.asyncio.server import serve, unix_serve
+
+        from stt_server import protocol as P
+
+        def process_request(connection, request):
+            self.requests.append({"Authorization": request.headers.get("Authorization")})
+            want = f"Bearer {self.token}" if self.token else None
+            if request.headers.get("Authorization") != want:
+                return connection.respond(401, "unauthorized\n")
+            return None
+
+        async def handler(ws):
+            await ws.send(json.dumps({"type": P.EVT_SERVER_HELLO}))
+            await ws.send(json.dumps({"type": P.EVT_SESSION_CREATED}))
+            async for msg in ws:
+                if isinstance(msg, str) and json.loads(msg).get("type") == P.EVT_AUDIO_COMMIT:
+                    await ws.send(
+                        json.dumps(
+                            {"type": P.EVT_TRANSCRIPT_COMPLETED, "transcript": "Hello smoke"}
+                        )
+                    )
+
+        if self.transport == "tcp":
+            self.server = await serve(handler, "127.0.0.1", 0, process_request=process_request)
+            self.port = self.server.sockets[0].getsockname()[1]
+        else:
+            self.server = await unix_serve(handler, self.where, process_request=process_request)
+
+    def close(self):
+        import asyncio
+
+        async def stop():
+            self.server.close()
+            await self.server.wait_closed()
+
+        asyncio.run_coroutine_threadsafe(stop(), self.loop).result(10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.t.join(5)
+
+
+# the decode child's identity gate x transport -> exit status, and what the
+# agent received: only the "ok" cell decodes; a refused gate (server end not
+# the job's, the job restarted between the two reads, launchd unreadable)
+# exits DECODE_REFUSED with no request at all (no token); a token the agent
+# refuses is a decode failure (exit 1) after the gate passed.
+_DECODE_CELLS = {
+    "ok": "pass",
+    "foreign-listener": "refused",
+    "pid-runs-change": "refused",
+    "identity-unreadable": "refused",
+    "token-refused": "fail",
+}
+
+
+@darwin
+@pytest.mark.skipif(not VENV_PYTHON.exists(), reason="needs the project venv")
+@pytest.mark.parametrize("cell", list(_DECODE_CELLS))
+@pytest.mark.parametrize("transport", ["tcp", "unix"])
+def test_agents_decode_contract_end_to_end(transport, cell, tmp_path):
+    import wave
+
+    sys.path.insert(0, str(REPO_ROOT))
+    spec = importlib.util.spec_from_file_location("smoke_runner_decode", SCRIPTS / "smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    sys.modules["smoke_runner_decode"] = smoke
+    spec.loader.exec_module(smoke)
+
+    st = tmp_path / "state"
+    st.mkdir()
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    for name, body in (("launchctl", _DECODE_LAUNCHCTL), ("lsof", _DECODE_LSOF)):
+        (stub / name).write_text(body.format(st=st))
+        (stub / name).chmod(0o755)
+    wav = tmp_path / "clip.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\0\0" * 3200)
+
+    token = "s3cret-token"
+    d = tempfile.mkdtemp(dir="/tmp")
+    agent = _FakeSttAgent(
+        transport, os.path.join(d, "a.sock"), token + "-other" if cell == "token-refused" else token
+    )
+    me = str(os.getpid())  # this process holds the server end
+    job_pid = "4242" if cell == "foreign-listener" else me
+    (st / "owner").write_text(me)
+    (st / "port").write_text(str(getattr(agent, "port", 0)))
+    # The child's argv says (job_pid, 7); the re-read must still give it.
+    (st / "job").write_text(f"{job_pid} {8 if cell == 'pid-runs-change' else 7}")
+    if cell == "identity-unreadable":
+        (st / "print-fails").write_text("1")
+    if transport == "tcp":
+        endpoint = {"host": "127.0.0.1", "port": str(agent.port)}
+    else:
+        endpoint = {"socket-path": agent.where}
+    try:
+        res = subprocess.run(
+            smoke.decode_cmd("pipecat.stt-server", endpoint, str(wav), job_pid, "7"),
+            input=token,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env={**os.environ, "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin"},
+            cwd=str(REPO_ROOT),
+        )
+    finally:
+        agent.close()
+    want = _DECODE_CELLS[cell]
+    assert token not in " ".join(smoke.decode_cmd("x", endpoint, str(wav), job_pid, "7"))
+    if want == "pass":
+        assert res.returncode == 0, res.stderr
+        assert "Hello smoke" in res.stdout
+        assert [r.get("Authorization") for r in agent.requests] == [f"Bearer {token}"]
+    elif want == "refused":
+        assert res.returncode == smoke.DECODE_REFUSED, (res.returncode, res.stderr)
+        assert "refused:" in res.stderr
+        assert agent.requests == []  # nothing, the token least of all, was sent
+    else:
+        assert res.returncode == 1, res.stderr
+        assert len(agent.requests) == 1  # the gate passed; the agent refused the token
