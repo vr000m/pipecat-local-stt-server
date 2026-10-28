@@ -1470,3 +1470,49 @@ def test_teardown_verdict_follows_the_launchd_state(smoke, env, monkeypatch, loa
     assert any("still loaded" in p for p in problems) == stays_loaded, problems
     if not stays_loaded:
         assert problems == []
+
+
+# Every way a regression could touch the real ~/Library -> the audit wrapper
+# logs it (stat-family reads raise no audit event; the wrapper covers them).
+_PROBES = {
+    "exists": "Path(P).exists()",
+    "is_symlink": "Path(P).is_symlink()",
+    "stat": "os.stat(P)",
+    "lstat": "os.path.lexists(P)",
+    "os.path.exists": "os.path.exists(P)",
+    "open": "open(P)",
+    "chmod": "os.chmod(P, 0o700)",
+    "rename": "os.rename(P, P + '.x')",
+    "rmtree": "shutil.rmtree(P, ignore_errors=True)",
+    "unlink": "os.unlink(P)",
+    "listdir": "os.listdir(P)",
+}
+
+
+@pytest.mark.parametrize("probe", list(_PROBES))
+def test_audit_wrapper_sees_every_real_library_touch(tmp_path, probe):
+    import os
+    import pwd
+
+    # A path that does not exist: every probe fails with ENOENT after the hook.
+    real = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library" / f"pipecat-audit-{os.getpid()}-x"
+    assert not os.path.lexists(real)
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "import contextlib, os, shutil\n"
+        "from pathlib import Path\n"
+        f"P = {str(real)!r}\n"
+        f"with contextlib.suppress(OSError):\n    {_PROBES[probe]}\n"
+    )
+    log = tmp_path / "audit.log"
+    res = subprocess.run(
+        [sys.executable, str(AUDIT_WRAPPER), str(log), str(script)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    lines = log.read_text().splitlines()
+    assert lines[0] == "audit: on"
+    assert any(str(real) in ln for ln in lines[1:]), lines
+    assert not os.path.lexists(real)
