@@ -24,8 +24,13 @@ overridden ``HOME`` can neither empty the snapshot nor hide an agent from the
 port guard. The only way to move ``agents_home()`` is the test-only variable
 ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` (``TEST_AGENTS_HOME_ENV``), which the
 stubbed test suites set to a temp directory so they never read the developer's
-real ``~/Library/LaunchAgents``. Nothing else reads it, the installer's
-environment is scrubbed of it, and whoever honours it says so on stderr.
+real ``~/Library/LaunchAgents``. It is honoured only while the ``launchctl`` on
+PATH is not the system ``/bin/launchctl`` (the suites' stub), so a stale export
+can never hide a real agent from a run that reaches real launchd: there it is
+ignored, ``smoke.py --agents`` says so on stderr and ``smoke_launchd.py``
+refuses to run. ``smoke.py`` drops it from the harness's environment, the
+installer's environment is scrubbed of it, and both scripts print the same
+``agents_home_notice()`` line whenever it is set.
 
 The launchd checks are SKIPPED when ``CI`` is present in the environment with
 any value, the empty string included (Decision 8: they run only when ``CI`` is
@@ -36,12 +41,18 @@ from __future__ import annotations
 
 import os
 import pwd
+import shutil
 import stat
 from pathlib import Path
 
 SPARE_LABEL = "pipecat.stt-server.smoke"
 AGENT_GLOB = "pipecat.stt-server*.plist"
 TEST_AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
+SYSTEM_LAUNCHCTL = "/bin/launchctl"
+# smoke_peercred.py's skip lines start with these (it exits 0 on both), and
+# smoke.py maps them to SKIPPED; one definition so the two cannot drift.
+PEERCRED_NO_UID_MARK = "skipped: needs a second local uid"
+PEERCRED_PLATFORM_MARK = "skipped: peer-cred smoke needs"
 
 
 def env_home() -> Path:
@@ -54,15 +65,51 @@ def account_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
+def launchctl_stubbed(env=None) -> bool:
+    """True when the ``launchctl`` on PATH is not the system ``/bin/launchctl``
+    (a test's stub). No ``launchctl`` at all is not a stub."""
+    env = os.environ if env is None else env
+    found = shutil.which("launchctl", path=env.get("PATH") or os.defpath)
+    return found is not None and os.path.realpath(found) != os.path.realpath(SYSTEM_LAUNCHCTL)
+
+
 def agents_home_override(env=None) -> Path | None:
-    """The test-only agents home override, or None when it is not set."""
-    val = (os.environ if env is None else env).get(TEST_AGENTS_HOME_ENV)
-    return Path(val) if val else None
+    """The test-only agents home, or None. Honoured only while ``launchctl`` is
+    stubbed, when no real launchd state can be reached; otherwise it is ignored
+    (``ignored_agents_home_override``)."""
+    env = os.environ if env is None else env
+    val = env.get(TEST_AGENTS_HOME_ENV)
+    return Path(val) if val and launchctl_stubbed(env) else None
+
+
+def ignored_agents_home_override(env=None) -> str | None:
+    """The override's value when it is set but not honoured (a stale export
+    with the real ``launchctl``), else None."""
+    env = os.environ if env is None else env
+    val = env.get(TEST_AGENTS_HOME_ENV)
+    return val if val and not launchctl_stubbed(env) else None
+
+
+def agents_home_notice(env=None) -> str | None:
+    """The stderr line both scripts print about the override, or None."""
+    override = agents_home_override(env)
+    if override is not None:
+        return (
+            f"warning: {TEST_AGENTS_HOME_ENV}={override} is a test-only override "
+            "(launchctl is stubbed); installed agent plists are read from there"
+        )
+    ignored = ignored_agents_home_override(env)
+    if ignored is not None:
+        return (
+            f"warning: {TEST_AGENTS_HOME_ENV}={ignored} is set but ignored: it is "
+            "test-only and launchctl is not stubbed; unset it"
+        )
+    return None
 
 
 def agents_home(env=None) -> Path:
     """Where the installed real agents are read from: the account home, or the
-    test-only override. ``$HOME`` never moves it."""
+    test-only override while launchctl is stubbed. ``$HOME`` never moves it."""
     return agents_home_override(env) or account_home()
 
 

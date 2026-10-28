@@ -641,6 +641,143 @@ def test_inject_fail_still_tears_down(env):
     _assert_torn_down(env)
 
 
+def test_stale_agents_home_override_is_refused_before_anything_runs(env, tmp_path):
+    # Exported outside a stubbed run (launchctl is not a stub; here there is no
+    # launchctl at all, so nothing real can be reached), the test-only override
+    # would hide installed agents from the guard: the harness refuses up front.
+    empty = tmp_path / "nopath"
+    empty.mkdir()
+    e = {
+        "HOME": str(env.home),
+        "PATH": str(empty),
+        AGENTS_HOME_ENV: str(env.home),
+        "PIPECAT_STT_LABEL": SPARE,
+        "KODA_STT_LABEL": SPARE,
+    }
+    r = subprocess.run(
+        [str(VENV_PYTHON), str(HARNESS), "--port", str(_free_port())],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=e,
+        cwd=str(REPO_ROOT),
+    )
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "FAIL" in r.stdout and "guard" in r.stdout
+    assert AGENTS_HOME_ENV in r.stdout and "ignored" in r.stdout
+    assert env.argv() == []  # not even id or lsof ran
+
+
+def _endpointless_plist(path: Path) -> None:
+    import plistlib
+
+    with open(path, "wb") as fh:
+        plistlib.dump(
+            {
+                "Label": path.stem,
+                "ProgramArguments": [sys.executable, "-m", "stt_server", "serve"],
+            },
+            fh,
+        )
+
+
+def test_unreadable_baseline_snapshot_refuses_before_any_install(env):
+    # A real agent whose listener cannot be read is UNKNOWN in the baseline, so
+    # "real agents unchanged" could never PASS: refuse before the first install.
+    _endpointless_plist(env.agents / "pipecat.stt-server.custom.plist")
+    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "snapshot" in r.stdout and "pipecat.stt-server.custom" in r.stdout
+    assert _mutating(env.argv()) == []
+    assert "port collision" not in r.stdout
+    assert not env.spare_residue()
+
+
+@pytest.mark.parametrize(
+    ("snap", "unknown"),
+    [
+        ({}, []),
+        ({"a": ("1", "1")}, []),
+        ({"a": (None, None)}, []),
+        ({"a": ("1", "unknown")}, ["a"]),
+        ({"a": (None, "unknown"), "b": ("2", "2")}, ["a"]),
+        ({"b": ("2", "unknown"), "a": ("1", "unknown")}, ["a", "b"]),
+    ],
+)
+def test_snapshot_unknowns_state_space(smoke, snap, unknown):
+    assert smoke.snapshot_unknowns(snap) == unknown
+
+
+def _run_lock(env: Env) -> Path:
+    return env.home / "Library" / "Caches" / "pipecat-stt-smoke-launchd.lock"
+
+
+def test_concurrent_run_is_refused_and_mutates_nothing(env):
+    import fcntl
+    import os
+
+    lock = _run_lock(env)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+    finally:
+        os.close(fd)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "another smoke_launchd.py run" in r.stdout
+    assert _mutating(env.argv()) == []
+    assert not env.spare_residue()
+    assert "port collision" not in r.stdout
+
+
+def test_run_lock_is_released_after_a_run(env):
+    import fcntl
+    import os
+
+    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    fd = os.open(_run_lock(env), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if still held
+    finally:
+        os.close(fd)
+
+
+# The lock file's state -> acquired or refused.
+@pytest.mark.parametrize("state", ["absent", "free", "held", "symlink", "directory"])
+def test_run_lock_state_space(smoke, tmp_path, state):
+    import fcntl
+    import os
+
+    lock = tmp_path / "Library" / "Caches" / "x.lock"
+    other = None
+    if state != "absent":
+        lock.parent.mkdir(parents=True)
+    if state in ("free", "held"):
+        lock.write_text("")
+    if state == "held":
+        other = os.open(lock, os.O_RDWR)
+        fcntl.flock(other, fcntl.LOCK_EX)
+    if state == "symlink":
+        (tmp_path / "target").write_text("")
+        lock.symlink_to(tmp_path / "target")
+    if state == "directory":
+        lock.mkdir()
+    try:
+        if state in ("absent", "free"):
+            fd = smoke.acquire_run_lock(lock)
+            os.close(fd)
+        else:
+            with pytest.raises(smoke.GuardRefused):
+                smoke.acquire_run_lock(lock)
+    finally:
+        if other is not None:
+            os.close(other)
+    if state == "symlink":
+        assert (tmp_path / "target").read_text() == ""
+
+
 def test_stubbed_run_reads_no_real_library_path(env, tmp_path):
     # A whole stubbed run (guard, snapshot, checks, teardown, re-snapshot) under
     # an audit hook: no open, scandir, mkdir or unlink of a path under the real

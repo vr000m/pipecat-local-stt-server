@@ -18,6 +18,9 @@ Never run it with plain ``uv run`` (that prunes the backend extras); the install
 is handed the running interpreter through ``PIPECAT_STT_PYTHON``.
 
 Order: preconditions (darwin, ``CI`` unset; otherwise ``SKIPPED``, exit 0) ->
+run lock (an exclusive non-blocking ``flock`` on
+``<agents home>/Library/Caches/pipecat-stt-smoke-launchd.lock``; a second run
+refuses and touches nothing; the lock is held until the process exits) ->
 guard (exact spare label in both ``PIPECAT_STT_LABEL`` and ``KODA_STT_LABEL``, a
 port that is not canonical, not recorded in an installed real agent's plist and
 not already listening) -> start state (no spare
@@ -33,18 +36,24 @@ The real agents are every installed ``pipecat.stt-server*`` plist under
 ``_smoke_lib.agents_home()`` (the account's home from the password database, not
 ``$HOME``, so an overridden ``HOME`` cannot empty the before/after snapshot) plus
 every loaded ``pipecat.stt-server*`` job ``launchctl list`` reports, plist or not;
-the spare is excluded. A loaded job without a plist has its endpoint read from
-``launchctl print``'s ``arguments`` block. The test-only
-``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` moves the plist home (and is announced on
-stderr); it cannot hide a loaded job, which ``launchctl list`` still reports. A
-listener the harness cannot read never compares as unchanged.
+the spare is excluded. A loaded job without a plist has its pid and endpoint
+read from one ``launchctl print`` (its ``pid =`` line and ``arguments`` block).
+The test-only ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` moves the plist home only
+while ``launchctl`` is a stub (announced on stderr); set with the real
+``launchctl`` it is refused (see ``_smoke_lib``). It cannot hide a loaded job,
+which ``launchctl list`` still reports. A listener the harness cannot read never
+compares as unchanged, so one in the baseline snapshot refuses the run before
+the first install.
 
 The spare port is held for the whole run: if the collision check cannot bind it,
 or a later check finds a listener on it that is not the spare job, the run FAILs
 there (the remaining checks are not run) and teardown still runs.
-``launchctl print`` and ``lsof`` are read through ``squat_check.py``'s helpers
-(one listener definition); a ``launchctl`` or ``lsof`` answer the harness cannot
-read refuses or FAILs, never reads as "not loaded" or "free".
+Listeners (``lsof``) and a labelled job's (loaded, pid) state (``launchctl
+print``) are read through ``squat_check.py``'s helpers (one definition each).
+Two reads live here: the job list (``launchctl list``) and a plistless job's
+``launchctl print`` (its arguments block, pid parsed with
+``squat_check.parse_launchd_pid``). A ``launchctl`` or ``lsof`` answer the
+harness cannot read refuses or FAILs, never reads as "not loaded" or "free".
 
 Exit 0 unless a requested step FAILed. The external tools (``launchctl``,
 ``lsof``, ``id``, ``bash``, ``python3``) are called by bare name through PATH.
@@ -282,18 +291,21 @@ def loaded_agent_labels(run=subprocess.run) -> set[str]:
     return labels
 
 
-def print_endpoint(label: str, uid: str, run=subprocess.run) -> dict[str, str]:
-    """The serve flags (``--port``, ``--socket-path``, ...) in a loaded job's
-    ``launchctl print`` ``arguments`` block. Raises RuntimeError when unreadable."""
+def print_job(label: str, uid: str, run=subprocess.run) -> tuple[str | None, dict[str, str]]:
+    """(launchd pid, serve flags) from ONE read-only ``launchctl print`` of a
+    loaded job: its ``pid =`` line (``squat_check.parse_launchd_pid``) and the
+    flags (``--port``, ``--socket-path``, ...) in its ``arguments`` block.
+    Raises RuntimeError when unreadable."""
     try:
         res = _run(["launchctl", "print", f"gui/{uid}/{label}"], run)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"cannot read {label} with launchctl print: {exc}") from exc
     if res.returncode != 0:
         raise RuntimeError(f"cannot read {label} with launchctl print (exit {res.returncode})")
-    m = re.search(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", res.stdout or "", re.M | re.S)
+    m = re.search(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", res.stdout or "", re.MULTILINE | re.DOTALL)
     args = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()] if m else []
-    return read_stt_plist.read_flags({"ProgramArguments": args})
+    pid = squat_check.parse_launchd_pid(res.stdout)
+    return pid, read_stt_plist.read_flags({"ProgramArguments": args})
 
 
 def lock_holders(lock: Path, run=subprocess.run) -> list[str] | None:
@@ -345,6 +357,43 @@ def preconditions(env=os.environ, platform=sys.platform) -> str | None:
     return _smoke_lib.launchd_skip_reason(env, platform)
 
 
+def run_lock_path() -> Path:
+    """The run lock. Under the agents home (the account home; the test override
+    in stubbed runs), not ``$HOME``: the spare label lives in the per-uid launchd
+    domain, so two runs with different ``$HOME`` values still share it."""
+    return _smoke_lib.agents_home() / "Library" / "Caches" / "pipecat-stt-smoke-launchd.lock"
+
+
+def acquire_run_lock(path: Path) -> int:
+    """Take an exclusive, non-blocking ``flock`` on PATH and return its fd; the
+    lock lasts until the fd is closed or the process exits, however it exits.
+
+    Raises GuardRefused when another run holds it, or PATH is a symlink, not a
+    regular file or not ours. The file is never unlinked: unlinking a lock file
+    lets two runs lock different inodes of the same path."""
+    import fcntl
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise GuardRefused(f"cannot open the run lock {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise GuardRefused(f"the run lock {path} is not a regular file owned by this user")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise GuardRefused(
+                f"another smoke_launchd.py run holds {path}; wait for it to finish"
+            ) from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def canonical_ports(run=subprocess.run) -> set[int]:
     """The four canonical ports, read from ``install_stt_agent.sh port <backend>``."""
     ports: set[int] = set()
@@ -365,14 +414,20 @@ def real_agent_plists(home: Path | None = None) -> list[Path]:
     return _smoke_lib.agent_plists(home if home is not None else _smoke_lib.agents_home())
 
 
+def plistless_jobs(
+    uid: str, run=subprocess.run, home: Path | None = None
+) -> dict[str, tuple[str | None, dict[str, str]]]:
+    """label -> (pid, serve flags) for each loaded real job with no installed
+    plist, one ``launchctl print`` each."""
+    have = {p.name[: -len(".plist")] for p in real_agent_plists(home)}
+    return {label: print_job(label, uid, run) for label in sorted(loaded_agent_labels(run) - have)}
+
+
 def plistless_agents(
     uid: str, run=subprocess.run, home: Path | None = None
 ) -> dict[str, dict[str, str]]:
     """label -> serve flags for each loaded real job with no installed plist."""
-    have = {p.name[: -len(".plist")] for p in real_agent_plists(home)}
-    return {
-        label: print_endpoint(label, uid, run) for label in sorted(loaded_agent_labels(run) - have)
-    }
+    return {label: flags for label, (_pid, flags) in plistless_jobs(uid, run, home).items()}
 
 
 def agent_ports(
@@ -444,16 +499,21 @@ def snapshot_real_agents(
         _loaded, pid = require_launchd_state(label, uid, run)
         try:
             port = read_plist_field_path(plist, "port", run).strip()
-            sock = read_plist_field_path(plist, "socket-path", run).strip()
+            # The path exactly as recorded (read_stt_plist adds no newline).
+            sock = read_plist_field_path(plist, "socket-path", run)
             listener = _listener(port, sock, run)
         except (CheckFailed, OSError, subprocess.SubprocessError):
             listener = UNKNOWN
         snap[label] = (pid, listener)
-    for label, flags in plistless_agents(uid, run, home).items():
-        _loaded, pid = require_launchd_state(label, uid, run)
+    for label, (pid, flags) in plistless_jobs(uid, run, home).items():
         listener = _listener(flags.get("--port", ""), flags.get("--socket-path", ""), run)
         snap[label] = (pid, listener)
     return snap
+
+
+def snapshot_unknowns(snap) -> list[str]:
+    """Labels whose listener the snapshot could not read (sorted)."""
+    return sorted(label for label, (_pid, listener) in snap.items() if listener == UNKNOWN)
 
 
 def compare_snapshots(before, after) -> list[str]:
@@ -913,14 +973,14 @@ def main(argv=None) -> int:
             print(f"  cleanup: {cmd}")
         return 1
 
+    # A stale export of the test-only override (launchctl is the real one) would
+    # hide installed agents from the guard and snapshot: refuse before any call.
+    notice = _smoke_lib.agents_home_notice()
+    if _smoke_lib.ignored_agents_home_override() is not None:
+        return refuse("guard", notice)
     home, agents_at = _home(), _smoke_lib.agents_home()
-    override = _smoke_lib.agents_home_override()
-    if override is not None:
-        print(
-            f"warning: {_smoke_lib.TEST_AGENTS_HOME_ENV}={override} is a test-only override; "
-            "installed plists are read from there, loaded jobs from launchctl list",
-            file=sys.stderr,
-        )
+    if notice:
+        print(notice, file=sys.stderr)
     elif home.resolve() != agents_at.resolve():
         print(
             f"warning: HOME={home} is not the account home {agents_at}; the spare goes "
@@ -928,6 +988,21 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
+    # One run at a time: two runs share the spare label, plist, socket and logs,
+    # and one's teardown would remove the other's agent.
+    try:
+        lock_fd = acquire_run_lock(run_lock_path())
+    except GuardRefused as exc:
+        return refuse("lock", str(exc))
+    try:
+        return _locked_main(args, env, results, refuse, agents_at)
+    finally:
+        os.close(lock_fd)
+
+
+def _locked_main(args, env, results, refuse, agents_at) -> int:
+    """Everything after the run lock: guard, start state, snapshot, checks,
+    teardown, re-snapshot."""
     try:
         uid = current_uid()
         plistless = plistless_agents(uid)
@@ -969,6 +1044,15 @@ def main(argv=None) -> int:
         before = snapshot_real_agents()
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         return refuse("snapshot", f"cannot snapshot the real agents: {exc}")
+    # An unreadable baseline listener can never compare as unchanged, so the run
+    # could not prove it left that agent alone: refuse before the first install.
+    unknown = snapshot_unknowns(before)
+    if unknown:
+        return refuse(
+            "snapshot",
+            f"cannot read the listener of {', '.join(unknown)} (lsof failed, or no "
+            "endpoint in its plist or arguments); nothing was installed",
+        )
 
     state = {"tearing_down": False}
     old = {s: signal.signal(s, signal_handler(state)) for s in (signal.SIGINT, signal.SIGTERM)}
