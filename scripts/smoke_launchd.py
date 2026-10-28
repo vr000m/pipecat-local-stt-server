@@ -129,8 +129,10 @@ import squat_check  # noqa: E402
 
 SPARE_LABEL = _smoke_lib.SPARE_LABEL
 AGENT_LABEL_GLOB = _smoke_lib.AGENT_GLOB[: -len(".plist")]
-# A snapshot listener the harness could not read; never equal to anything.
-UNKNOWN = "unknown"
+# A snapshot field the harness could not read; never equal to anything. The
+# same object as _smoke_lib.UNKNOWN (one definition, which connect_verified
+# also refuses as a runs counter).
+UNKNOWN = _smoke_lib.UNKNOWN
 DEFAULT_PORT = 9998
 HOST = "127.0.0.1"
 # Installer backends with a canonical port (the justfile's "whisper" is "mlx").

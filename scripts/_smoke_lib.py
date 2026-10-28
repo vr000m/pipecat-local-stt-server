@@ -228,6 +228,11 @@ def assert_chain_traversable(sock: str) -> None:
 # and lsof's view of an accepted socket are macOS facts the stubbed tests
 # cannot prove; the live run does.
 
+# A value the reader could not read (a job's runs counter, a snapshot field):
+# never equal to anything, and never an identity to verify against. The one
+# definition; smoke_launchd.UNKNOWN is this same object.
+UNKNOWN = "unknown"
+
 SOL_LOCAL = 0  # <sys/un.h>, macOS
 LOCAL_PEERPID = 2  # <sys/un.h>, macOS: pid of the peer at connect time
 SERVER_END_SETTLE = 3.0  # how long lsof gets to see the accepted server end
@@ -325,7 +330,7 @@ def connect_verified(
     nothing sent on it (steps 2-4 of the contract above). READ_IDENTITY()
     re-reads the job and must return ``(PID, RUNS)``. Raises EndpointRefused
     otherwise."""
-    if not pid or not runs or runs == "unknown":
+    if not pid or not runs or runs == UNKNOWN:
         raise EndpointRefused(f"no launchd pid and runs to verify against (pid {pid}, runs {runs})")
 
     def still_same(where: str) -> str | None:

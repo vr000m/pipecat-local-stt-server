@@ -47,6 +47,15 @@ SPARE = "pipecat.stt-server.smoke"
 AGENTS_HOME_WRAPPER = Path(__file__).resolve().parent / "_with_agents_home.py"
 CANONICAL = (9565, 9665, 9765, 9865)
 
+# The one "could not read" sentinel (_smoke_lib.UNKNOWN), for the parametrize
+# tables below; the harness's UNKNOWN is this same object.
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+try:
+    import _smoke_lib as _LIB
+finally:
+    sys.path.remove(str(REPO_ROOT / "scripts"))
+UNKNOWN = _LIB.UNKNOWN
+
 pytestmark = pytest.mark.skipif(
     not VENV_PYTHON.exists(), reason=f"{VENV_PYTHON} not found; run 'uv sync'"
 )
@@ -407,8 +416,8 @@ def test_compare_snapshots_identical(smoke):
         ("endpoint", ("unix", "/s.sock"), False),
         ("plist", "other-digest", False),
         ("plist", None, False),
-        ("plist", "unknown", False),
-        ("listener", "unknown", False),
+        ("plist", UNKNOWN, False),
+        ("listener", UNKNOWN, False),
         ("runs", "1", True),
         ("pid", "100", True),
     ],
@@ -486,7 +495,7 @@ def test_snapshot_ports_unreadable_plist_refuses(smoke, env):
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("PATH", env.path)
         snap = smoke.snapshot_real_agents(home=env.home)
-    assert snap["pipecat.stt-server.broken"].plist_port == "unknown"
+    assert snap["pipecat.stt-server.broken"].plist_port == UNKNOWN
     assert smoke.snapshot_unknowns(snap) == ["pipecat.stt-server.broken (plist_port)"]
     with pytest.raises(smoke.GuardRefused):
         smoke.snapshot_ports(snap)
@@ -838,12 +847,12 @@ def test_unreadable_baseline_snapshot_refuses_before_any_install(env):
         ({}, []),
         ({"a": ("1", "1", "1", "d")}, []),
         ({"a": (None, None, None, None)}, []),
-        ({"a": ("1", "1", "unknown", "d")}, ["a (listener)"]),
-        ({"a": (None, None, None, "unknown")}, ["a (plist)"]),
-        ({"a": ("1", "unknown", "1", "d")}, ["a (runs)"]),
-        ({"a": (None, None, "unknown", "d"), "b": ("2", "1", "2", "d")}, ["a (listener)"]),
+        ({"a": ("1", "1", UNKNOWN, "d")}, ["a (listener)"]),
+        ({"a": (None, None, None, UNKNOWN)}, ["a (plist)"]),
+        ({"a": ("1", UNKNOWN, "1", "d")}, ["a (runs)"]),
+        ({"a": (None, None, UNKNOWN, "d"), "b": ("2", "1", "2", "d")}, ["a (listener)"]),
         (
-            {"b": ("2", "1", "unknown", "d"), "a": ("1", "unknown", "1", "unknown")},
+            {"b": ("2", "1", UNKNOWN, "d"), "a": ("1", UNKNOWN, "1", UNKNOWN)},
             ["a (runs, plist)", "b (listener)"],
         ),
     ],
@@ -1201,12 +1210,12 @@ def test_snapshot_state_space(smoke, env, tmp_path, job, transport, plist):
 @pytest.mark.parametrize(
     ("transport", "lock", "listeners", "want", "lsof_calls"),
     [
-        ("tcp", False, None, "unknown", 1),
+        ("tcp", False, None, UNKNOWN, 1),
         ("tcp", False, [], None, 1),
-        ("unix", True, None, "unknown", 1),
+        ("unix", True, None, UNKNOWN, 1),
         ("unix", True, [], None, 1),
         ("unix", False, ["777"], None, 0),
-        ("none", False, ["777"], "unknown", 0),
+        ("none", False, ["777"], UNKNOWN, 0),
     ],
 )
 def test_snapshot_running_listener_state_space(
@@ -1224,7 +1233,7 @@ def test_snapshot_running_listener_state_space(
     snap = smoke.snapshot_real_agents(run, home=env.home)
     assert snap[_LABEL].listener == want
     assert len([c for c in calls if Path(c[0]).name == "lsof"]) == lsof_calls
-    assert (smoke.snapshot_unknowns(snap) == [f"{_LABEL} (listener)"]) == (want == "unknown")
+    assert (smoke.snapshot_unknowns(snap) == [f"{_LABEL} (listener)"]) == (want == UNKNOWN)
 
 
 # Transient mutation: a restart that came back to the same pid and listener moves
@@ -2008,7 +2017,7 @@ def test_production_harness_has_no_inject_hook(smoke, env, mode):
         ("loaded", False, False, None, False),
         ("loaded", False, True, "3", False),
         ("loaded", True, True, "3", False),
-        ("loaded", True, False, "unknown", True),
+        ("loaded", True, False, UNKNOWN, True),
     ],
 )
 def test_read_job_runs_state_space(smoke, env, job, pid, runs, want_runs, refused):
@@ -2106,7 +2115,7 @@ def test_check_token_sends_only_over_verified_connections(
     jobs = {
         "running": (True, "777", "3", None),
         "no-runs": (True, "777", None, None),
-        "unknown-runs": (True, "777", "unknown", None),
+        "unknown-runs": (True, "777", UNKNOWN, None),
         "no-pid": (True, None, "3", None),
     }
     reads = []
@@ -2423,3 +2432,45 @@ def test_budget_bounds_are_the_ones_the_code_uses(smoke, monkeypatch):
         4 * (smoke.CMD_TIMEOUT + smoke.squat_check.LSOF_TIMEOUT)
     )
     assert smoke.run_budget(4) > smoke.run_budget(0) > smoke.teardown_budget(0)
+
+
+# One "could not read" sentinel: the harness's UNKNOWN IS _smoke_lib's (the
+# same object, not an equal copy), and connect_verified refuses it as a runs
+# counter (identity runs x pid -> refused before any connect).
+@pytest.mark.parametrize(
+    ("pid", "runs", "refused"),
+    [("777", "3", False), ("777", UNKNOWN, True), ("777", None, True), (None, "3", True)],
+)
+def test_unknown_is_one_definition_and_never_an_identity(smoke, pid, runs, refused):
+    assert smoke.UNKNOWN is smoke._smoke_lib.UNKNOWN
+    # An identifier-like literal is interned, so `is` alone cannot see a copy:
+    # the scripts spell the sentinel exactly once, at its definition.
+    copies = [
+        f"{p.name}:{n}"
+        for p in sorted((REPO_ROOT / "scripts").glob("*.py"))
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if repr(smoke.UNKNOWN) in line or f'"{smoke.UNKNOWN}"' in line
+    ]
+    assert len(copies) == 1 and copies[0].startswith("_smoke_lib.py:"), copies
+    connected = []
+
+    class _Sock:
+        def close(self):
+            pass
+
+    def held_by(endpoint, want, still_same, owner, **k):
+        connected.append(endpoint)
+        return _Sock()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(smoke._smoke_lib, "_connect_held_by", held_by)
+        call = lambda: smoke._smoke_lib.connect_verified(  # noqa: E731
+            ("tcp", "127.0.0.1", "1"), pid, runs, lambda: (pid, runs)
+        )
+        if refused:
+            with pytest.raises(smoke._smoke_lib.EndpointRefused, match="no launchd pid and runs"):
+                call()
+            assert connected == []
+        else:
+            call()
+            assert connected == [("tcp", "127.0.0.1", "1")]

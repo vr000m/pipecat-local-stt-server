@@ -162,8 +162,9 @@ def test_connect_verified_state_space(lib, monkeypatch, transport, owners, after
 
 # Without a pid and a readable runs counter to verify against, nothing is even
 # connected.
-@pytest.mark.parametrize(("pid", "runs"), [(None, "7"), ("4242", None), ("4242", "unknown")])
+@pytest.mark.parametrize(("pid", "runs"), [(None, "7"), ("4242", None), ("4242", "UNKNOWN")])
 def test_connect_verified_needs_an_identity(lib, pid, runs):
+    runs = lib.UNKNOWN if runs == "UNKNOWN" else runs  # the one sentinel, not a copy
     srv = Listener("tcp")
     try:
         with pytest.raises(lib.EndpointRefused):
