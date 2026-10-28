@@ -28,12 +28,14 @@ the next step still runs. Stdlib only; every step runs in a subprocess through
 ``run_command`` with ``sys.executable`` (never ``uv run``, which would prune the
 backend extras).
 
-Each step runs in its own session. On a step timeout the step gets SIGTERM, on
-Ctrl-C (or a SIGINT or SIGTERM sent to this runner) SIGINT; either way it has
-``TEARDOWN_GRACE`` to exit before its whole process group is SIGKILLed. A signal
-to the runner during that grace is held until the step has stopped, then stops
-the run. An interrupted run marks the current step FAIL and the later steps
-SKIPPED (not run), prints the table and exits 1.
+Each step runs in its own session (``_smoke_lib.run_owned``). On a step timeout
+the step gets SIGTERM, on Ctrl-C (or a SIGINT or SIGTERM sent to this runner)
+SIGINT; either way it has ``TEARDOWN_GRACE`` to exit. A signal to the runner
+during that grace is held until the step has stopped, then stops the run. When
+the step has exited (or the grace ran out) its whole process group is SIGKILLed
+before the step is reaped, so nothing it started outlives it and the kill can
+never reach a reused pid. An interrupted run marks the current step FAIL and
+the later steps SKIPPED (not run), prints the table and exits 1.
 """
 
 import argparse
@@ -45,14 +47,9 @@ import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
-PASS = "PASS"
-FAIL = "FAIL"
-SKIPPED = "SKIPPED"
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
@@ -60,6 +57,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import _smoke_lib  # noqa: E402
 
+PASS, FAIL, SKIPPED = _smoke_lib.PASS, _smoke_lib.FAIL, _smoke_lib.SKIPPED
 SPARE_LABEL = _smoke_lib.SPARE_LABEL
 CLIP_TEXT = "Hello, this is a smoke test of the speech to text server."
 CLIP_KEYWORD = "hello"
@@ -76,8 +74,6 @@ LAUNCHD_TIMEOUT = 900.0
 # teardown runs the installer's uninstall (up to 120 s) and waits on the spare
 # .lock.
 TEARDOWN_GRACE = 180.0
-STOP_POLL = 0.5  # how often _stop checks whether the stopped child has exited
-STOP_DRAIN = 5.0  # pipe drain after the group is killed (a holder may escape it)
 
 # smoke_peercred.py's own skip lines (it exits 0 on both); it prints these
 # same constants, so a rewording cannot turn a SKIP into a PASS.
@@ -113,97 +109,41 @@ def run_command(
 ) -> subprocess.CompletedProcess:
     """The only place this module spawns a subprocess for a step.
 
-    The child runs in its own session (process group), so a terminal Ctrl-C
-    reaches only this runner, which forwards it. On timeout the child is sent
-    SIGTERM, on Ctrl-C (``KeyboardInterrupt``, which a SIGTERM to this runner
-    also raises under ``main``) SIGINT; then ``_stop`` gives it ``TEARDOWN_GRACE``
-    to clean up and SIGKILLs its group, and the exception propagates.
+    The step runs in its own session, so a terminal Ctrl-C reaches only this
+    runner, through ``_smoke_lib.run_owned``'s one lifecycle: SIGINT and SIGTERM
+    to the runner are held while the step runs. On TIMEOUT the step gets
+    SIGTERM, on the first held signal SIGINT; either way it has
+    ``TEARDOWN_GRACE`` to run its own cleanup, and a second signal cannot cut
+    that short. Then, however the step ended (its own exit included), its whole
+    process group is SIGKILLed while the step is still unreaped, so the signal
+    can only reach the step's own group, never a reused pid or group. Afterwards
+    a held signal is raised as KeyboardInterrupt (``main`` turns a SIGTERM into
+    one too) and a timeout as ``subprocess.TimeoutExpired``.
     """
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        cwd=str(REPO),
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
+    res, timed_out = _smoke_lib.run_owned(
+        cmd, timeout, env=env, cwd=str(REPO), grace=TEARDOWN_GRACE
     )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _stop(proc, signal.SIGTERM)
-        raise
-    except KeyboardInterrupt:
-        _stop(proc, signal.SIGINT)
-        raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=res.stdout, stderr=res.stderr)
+    return res
 
 
 @contextlib.contextmanager
 def _signals_held(*, reraise: bool = False):
     """Hold SIGINT and SIGTERM to this process for the block (main thread only),
-    so a second Ctrl-C cannot cut a child's teardown short. A signal that arrives
-    is dropped, or with ``reraise`` raised as KeyboardInterrupt once the old
-    handlers are back, so the run still stops."""
-    if threading.current_thread() is not threading.main_thread():
+    so a signal cannot cut a cleanup short. A signal that arrives is dropped,
+    or with ``reraise`` raised as KeyboardInterrupt once the old handlers are
+    back, so the run still stops."""
+    with _smoke_lib.held_signals() as (got, _old):
         yield
-        return
-    got: list[int] = []
-
-    def hold(signum, _frame):
-        got.append(signum)
-
-    old = {s: signal.signal(s, hold) for s in (signal.SIGINT, signal.SIGTERM)}
-    try:
-        yield
-    finally:
-        for s, h in old.items():
-            if h is not None:
-                signal.signal(s, h)
     if reraise and got:
         raise KeyboardInterrupt(f"signal {got[0]}")
-
-
-def _stop(proc: subprocess.Popen, sig: int) -> None:
-    """Send SIG to PROC, wait up to TEARDOWN_GRACE for it to exit, then SIGKILL
-    its process group so nothing it started (a server, a sleep) outlives it.
-
-    It follows the child's exit, not the pipes' EOF: a grandchild still holding
-    the pipes does not stretch the wait. A signal to the runner meanwhile is held
-    and raised as KeyboardInterrupt afterwards, so no further step starts."""
-    with _signals_held(reraise=True):
-        with contextlib.suppress(ProcessLookupError):
-            proc.send_signal(sig)
-        deadline = time.monotonic() + TEARDOWN_GRACE
-        drained = False
-        while not drained:
-            try:
-                # Keep reading the pipes so a chatty teardown cannot block on them.
-                proc.communicate(timeout=STOP_POLL)
-                drained = True
-            except subprocess.TimeoutExpired:
-                if proc.poll() is not None:
-                    break  # the child exited; something else holds the pipes
-                if time.monotonic() >= deadline:
-                    proc.kill()
-                    break
-        # The group: a grandchild holding the pipes would block the read below.
-        _kill_group(proc)
-        if not drained:
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.communicate(timeout=STOP_DRAIN)
-
-
-def _kill_group(proc: subprocess.Popen) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, signal.SIGKILL)
 
 
 @contextlib.contextmanager
 def _term_as_interrupt():
     """Make a SIGTERM to this runner raise KeyboardInterrupt, like Ctrl-C, so the
-    active step is stopped through ``_stop`` instead of being orphaned."""
+    active step is stopped through ``run_command`` instead of being orphaned."""
 
     def handler(signum, _frame):
         raise KeyboardInterrupt(f"signal {signum}")

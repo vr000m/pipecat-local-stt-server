@@ -18,6 +18,7 @@ ever run for real.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import re
@@ -483,41 +484,141 @@ def test_run_command_kills_child_that_ignores_sigterm(smoke, monkeypatch):
     assert __import__("time").monotonic() - start < 20
 
 
-def test_run_command_ctrl_c_forwards_sigint_and_waits(smoke, monkeypatch):
-    events = []
+# One step lifecycle (``_smoke_lib.run_owned``) over its whole state space:
+# leader behaviour x trigger x a grandchild holding the pipes in the group. In
+# every cell the runner signals (``os.kill`` / ``os.killpg``) a step pid only
+# while that step is still unreaped, so the signal cannot reach a reused pid or
+# process group; the grandchild never outlives the step; and the outcome is the
+# step's result, TimeoutExpired, or KeyboardInterrupt for a signal.
+_LIFECYCLE_LEADER = """
+import signal, subprocess, sys, time
+marker, mode, gc = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+if gc:
+    child = subprocess.Popen(["sleep", "60"])  # inherits the pipes and the group
+    open(marker + ".gc", "w").write(str(child.pid))
+def bye(*_):
+    open(marker, "w").write("teardown ran")
+    sys.exit(1)
+for s in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(s, bye if mode == "trap" else signal.SIG_IGN)
+open(marker + ".ready", "w").write("")
+if mode == "exit":
+    sys.exit(0)
+time.sleep(60)
+"""
 
-    class FakePopen:
-        returncode = 0
-        pid = 4242
 
+@pytest.mark.parametrize(
+    ("mode", "trigger", "gc", "want"),
+    [
+        ("exit", "none", False, "result"),
+        ("exit", "none", True, "result"),
+        ("trap", "timeout", False, "timeout"),
+        ("trap", "timeout", True, "timeout"),
+        ("ignore", "timeout", True, "timeout"),
+        ("trap", "sigint", True, "interrupt"),
+        ("trap", "sigterm", False, "interrupt"),
+        ("trap", "sigterm-default", False, "interrupt"),
+        ("ignore", "sigint", True, "interrupt"),
+        ("ignore", "sigint+sigint", False, "interrupt"),
+        ("ignore", "timeout+sigint", False, "interrupt"),
+    ],
+)
+def test_step_lifecycle_state_space(smoke, monkeypatch, tmp_path, mode, trigger, gc, want):
+    lib = smoke._smoke_lib
+    grace = 1.5
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", grace)
+    spawned: dict[int, subprocess.Popen] = {}
+    real_popen, real_kill, real_killpg = subprocess.Popen, os.kill, os.killpg
+    violations: list[str] = []
+
+    class Recorded(real_popen):
         def __init__(self, *a, **k):
-            self.calls = 0
-            events.append(("new session", k.get("start_new_session")))
+            super().__init__(*a, **k)
+            spawned[self.pid] = self
 
-        def communicate(self, timeout=None):
-            self.calls += 1
-            if self.calls == 1:
-                raise KeyboardInterrupt
-            events.append(("waited", timeout))
-            return "", ""
+    def owned(what, pid):
+        proc = spawned.get(abs(pid))
+        if proc is not None and proc.returncode is not None:
+            violations.append(f"{what}({pid}) after the step was reaped")
 
-        def kill(self):
-            events.append(("kill", None))
+    def kill(pid, sig):
+        owned("kill", pid)
+        return real_kill(pid, sig)
 
-        def send_signal(self, sig):
-            events.append(("signal", sig))
+    def killpg(pgid, sig):
+        owned("killpg", pgid)
+        return real_killpg(pgid, sig)
 
-    monkeypatch.setattr(smoke.subprocess, "Popen", FakePopen)
-    monkeypatch.setattr(smoke.os, "killpg", lambda pg, sig: events.append(("killpg", pg, sig)))
-    with pytest.raises(KeyboardInterrupt):
-        smoke.run_command(["x"], 5)
-    assert events == [
-        ("new session", True),
-        ("signal", signal.SIGINT),
-        # _stop reads the pipes in STOP_POLL slices until EOF (here at once).
-        ("waited", smoke.STOP_POLL),
-        ("killpg", 4242, signal.SIGKILL),
-    ]
+    monkeypatch.setattr(lib.subprocess, "Popen", Recorded)
+    monkeypatch.setattr(lib.os, "kill", kill)
+    monkeypatch.setattr(lib.os, "killpg", killpg)
+    marker = tmp_path / "marker"
+    sigs = {
+        "sigint": [signal.SIGINT],
+        "sigterm": [signal.SIGTERM],
+        "sigterm-default": [signal.SIGTERM],
+        "sigint+sigint": [signal.SIGINT, signal.SIGINT],
+        "timeout+sigint": [signal.SIGINT],
+    }.get(trigger, [])
+    delay = 1.8 if trigger == "timeout+sigint" else 0.3  # after the 1 s timeout fired
+
+    def fire():
+        _wait_for(Path(f"{marker}.ready"))
+        time.sleep(delay)
+        for sig in sigs:
+            real_kill(os.getpid(), sig)
+            time.sleep(0.3)
+
+    timeout = 1.0 if trigger.startswith("timeout") else 30.0
+    cmd = [sys.executable, "-c", _LIFECYCLE_LEADER, str(marker), mode, "1" if gc else "0"]
+    t = threading.Thread(target=fire)
+    ctx = smoke._term_as_interrupt() if trigger == "sigterm" else contextlib.nullcontext()
+    start = time.monotonic()
+    got = None
+    with ctx:
+        t.start()
+        try:
+            got = ("result", smoke.run_command(cmd, timeout))
+        except subprocess.TimeoutExpired:
+            got = ("timeout", None)
+        except KeyboardInterrupt:
+            got = ("interrupt", None)
+        finally:
+            t.join()
+    elapsed = time.monotonic() - start
+    assert got[0] == want, got
+    assert violations == []
+    assert all(p.returncode is not None for p in spawned.values()), "a step was left unreaped"
+    if want == "result":
+        assert got[1].returncode == 0
+    if mode == "trap" and want != "result":
+        assert marker.read_text() == "teardown ran"
+    if mode == "ignore" and want != "result":
+        assert elapsed >= grace, "a second signal or the timeout cut the grace short"
+    if gc:
+        gpid = int(Path(f"{marker}.gc").read_text())
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                real_kill(gpid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, f"grandchild {gpid} outlived the step"
+            time.sleep(0.1)
+    assert elapsed < 20
+
+
+def test_owned_group_refuses_to_signal_after_the_reap(smoke):
+    group = smoke._smoke_lib.OwnedGroup([sys.executable, "-c", "pass"])
+    while not group.exited():
+        time.sleep(0.05)
+    group.kill_group()  # leader exited but unreaped: still ours
+    group.reap()
+    with pytest.raises(RuntimeError):
+        group.kill_group()
+    with pytest.raises(RuntimeError):
+        group.signal_leader(signal.SIGTERM)
 
 
 _TRAPS_INT = """

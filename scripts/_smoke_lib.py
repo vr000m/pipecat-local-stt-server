@@ -39,11 +39,25 @@ unset).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pwd
 import shutil
+import signal
 import stat
+import subprocess
+import tempfile
+import threading
+import time
 from pathlib import Path
+
+# Step outcomes, shared by smoke.py's table and smoke_launchd.py's.
+PASS = "PASS"
+FAIL = "FAIL"
+SKIPPED = "SKIPPED"
+# The first stdout line smoke_launchd.py prints (exit 0) when a precondition is
+# absent; smoke.py maps it to SKIPPED, never PASS.
+LAUNCHD_SKIP_MARK = "SKIPPED: launchd checks not run: "
 
 SPARE_LABEL = "pipecat.stt-server.smoke"
 AGENT_GLOB = "pipecat.stt-server*.plist"
@@ -237,3 +251,222 @@ def assert_token_gate(host: str, port: int, token_file: str) -> None:
             f"{host}:{port} answered {accepted} to a request with the token from "
             f"{token_file}; expected 101"
         )
+
+
+def write_policy_token_file(home: Path, prefix: str) -> tuple[Path, Path]:
+    """Create (directory, token file) that pass ``stt_server.auth``'s token-file
+    policy: a fresh 0700 directory directly under HOME (``/tmp`` fails the
+    ancestor-directory check) holding a 0600 file created with ``O_EXCL``. The
+    caller removes the directory."""
+    import secrets
+
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=str(home)))
+    os.chmod(directory, 0o700)
+    token_file = directory / "token"
+    fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(secrets.token_urlsafe(24) + "\n")
+    return directory, token_file
+
+
+# --- owned process groups ------------------------------------------------------
+#
+# One mechanism for every child whose whole process group a smoke script may
+# have to kill: smoke.py's steps and smoke_launchd.py's installer calls.
+#
+# Invariant: the group is signalled only while its leader is this process's
+# own, not yet reaped, child. An exited child stays a zombie until it is
+# reaped, and while it exists neither its pid nor the process group it leads
+# can be handed to another process; so a signal sent then reaches this group
+# and nothing else. Exit is therefore watched WITHOUT reaping (waitid(WNOWAIT)
+# where the platform has it, else a kqueue NOTE_EXIT), the group is SIGKILLed
+# while the leader is still unreaped, and only then is the leader reaped, once.
+# After the reap both signal methods refuse.
+
+GROUP_POLL = 0.1  # how often the leader's exit, the clock and held signals are checked
+GROUP_DRAIN = 5.0  # pipe drain after the group is killed (a holder may have left it)
+
+
+@contextlib.contextmanager
+def held_signals():
+    """Record SIGINT and SIGTERM instead of acting on them for the block (main
+    thread only; elsewhere nothing is held). Yields ``(got, old)``: the signals
+    that arrived and the handlers that were in place, restored on exit."""
+    got: list[int] = []
+    if threading.current_thread() is not threading.main_thread():
+        yield got, {}
+        return
+
+    def hold(signum, _frame):
+        got.append(signum)
+
+    old = {s: signal.signal(s, hold) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield got, old
+    finally:
+        for s, h in old.items():
+            if h is not None:
+                signal.signal(s, h)
+
+
+def redeliver(sig: int, handler) -> None:
+    """Hand a held SIG to HANDLER (what was in place before it was held): a
+    function is called, SIG_IGN drops it, anything else is KeyboardInterrupt."""
+    if callable(handler):
+        handler(sig, None)
+    elif handler != signal.SIG_IGN:
+        raise KeyboardInterrupt(f"signal {sig}")
+
+
+def _drain(fd: int, sink: list[bytes]) -> None:
+    with contextlib.suppress(OSError):
+        while chunk := os.read(fd, 65536):
+            sink.append(chunk)
+
+
+class OwnedGroup:
+    """A child started in its own session (so it leads its own process group),
+    signalled only while this process owns that group (see the invariant
+    above). Its stdout and stderr are drained by two daemon threads."""
+
+    def __init__(self, cmd, *, env=None, cwd=None):
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+        )
+        self.pid = self.proc.pid
+        self.reaped = False
+        self._exited = False
+        self._kq = None
+        self._out: list[bytes] = []
+        self._err: list[bytes] = []
+        self._readers: list[threading.Thread] = []
+        try:
+            if not hasattr(os, "waitid"):
+                import select
+
+                self._kq = select.kqueue()
+                ev = select.kevent(
+                    self.pid,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                try:
+                    self._kq.control([ev], 0, 0)
+                except ProcessLookupError:
+                    # Already exited: still a zombie, since only reap() reaps it.
+                    self._exited = True
+            for pipe, sink in ((self.proc.stdout, self._out), (self.proc.stderr, self._err)):
+                t = threading.Thread(target=_drain, args=(pipe.fileno(), sink), daemon=True)
+                t.start()
+                self._readers.append(t)
+        except BaseException:
+            self.kill_group()
+            self.reap()
+            raise
+
+    def exited(self) -> bool:
+        """True once the leader has exited; it is NOT reaped here."""
+        if not (self._exited or self.reaped):
+            if self._kq is not None:
+                self._exited = bool(self._kq.control(None, 1, 0))
+            else:
+                flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+                self._exited = os.waitid(os.P_PID, self.pid, flags) is not None
+        return self._exited or self.reaped
+
+    def _require_owned(self) -> None:
+        if self.reaped:
+            raise RuntimeError(
+                f"pid {self.pid} was reaped; its process group is no longer ours to signal"
+            )
+
+    def signal_leader(self, sig: int) -> None:
+        self._require_owned()
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(self.pid, sig)
+
+    def kill_group(self) -> None:
+        """SIGKILL the whole group, the leader included (a session leader cannot
+        leave its group). macOS answers EPERM for a group that holds only the
+        zombie leader: nothing is left to kill."""
+        self._require_owned()
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self.pid, signal.SIGKILL)
+
+    def reap(self, drain: float = GROUP_DRAIN) -> None:
+        """Reap the leader (the last use of its pid), then give the pipe readers
+        DRAIN seconds; a holder that left the group cannot stall this."""
+        end = time.monotonic() + drain
+        if not self.reaped:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.proc.wait(drain)
+            self.reaped = self.proc.returncode is not None
+            if self._kq is not None:
+                self._kq.close()
+                self._kq = None
+        for t in self._readers:
+            t.join(max(0.0, end - time.monotonic()))
+
+    def output(self) -> tuple[str, str]:
+        dec = lambda chunks: b"".join(chunks).decode(errors="replace")  # noqa: E731
+        return dec(list(self._out)), dec(list(self._err))
+
+
+def run_owned(
+    cmd,
+    timeout: float,
+    *,
+    env=None,
+    cwd=None,
+    grace: float = 0.0,
+    stop_on_signal: bool = True,
+    interrupt_signal: int | None = signal.SIGINT,
+    timeout_signal: int | None = signal.SIGTERM,
+) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run CMD in its own process group; return (completed, timed_out).
+
+    One lifecycle for every way the run can end. SIGINT and SIGTERM to this
+    process are held throughout. The leader's exit is awaited without reaping
+    it. On TIMEOUT the leader gets TIMEOUT_SIGNAL; on a held signal (when
+    STOP_ON_SIGNAL) INTERRUPT_SIGNAL; either way it then has GRACE seconds to
+    exit, and further signals change nothing. Then, on every path, the whole
+    group is SIGKILLed while the leader is still unreaped, the leader is reaped
+    and the pipes are drained. Last, the first held signal is handed to the
+    handler that was in place (``redeliver``)."""
+    with held_signals() as (got, old):
+        group = OwnedGroup(cmd, env=env, cwd=cwd)
+        timed_out = False
+        try:
+            deadline = time.monotonic() + timeout
+            stop_at = None
+            while not group.exited():
+                now = time.monotonic()
+                if stop_at is None:
+                    sig = None
+                    if got and stop_on_signal:
+                        sig = interrupt_signal
+                    elif now >= deadline:
+                        timed_out, sig = True, timeout_signal
+                    else:
+                        time.sleep(GROUP_POLL)
+                        continue
+                    if sig is not None:
+                        group.signal_leader(sig)
+                    stop_at = now + grace
+                if now >= stop_at:
+                    break  # grace over: the kill below takes the leader too
+                time.sleep(GROUP_POLL)
+        finally:
+            group.kill_group()
+            group.reap()
+    if got:
+        redeliver(got[0], old.get(got[0]))
+    out, err = group.output()
+    return subprocess.CompletedProcess(cmd, group.proc.returncode, out, err), timed_out
