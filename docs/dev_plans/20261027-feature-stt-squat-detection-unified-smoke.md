@@ -1,6 +1,6 @@
 # Task: Port-squat detection, one smoke entry point and launchd verification (0.5.1)
 
-**Status**: Implemented (all phases done; live launchd run and PR pending)
+**Status**: Implemented (all phases done; the launchd harness ran live 2026-10-28; PR #18 open)
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: Medium
@@ -184,7 +184,7 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-28 @ 44cc5d034158b5ead9cbd21f2490c767e7bb8fd2 -->
+<!-- reviewed: 2026-10-28 @ 09677cc4ffc31ecff252ee615ac6c8fd768fd19c -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 

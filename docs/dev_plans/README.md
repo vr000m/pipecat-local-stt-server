@@ -12,7 +12,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [UDS server-side trust-boundary hardening](20260626-feature-uds-trust-boundary-hardening.md) | Server Transport | ✅ Shipped — PR #13 merged 2026-06-28 |
 | [PR #14 review findings](20261024-bug-pr14-review-findings.md) | Server Runtime | ✅ Complete (PR #15) |
 | [STT LaunchAgents on loopback TCP ports (0.5.0)](20261025-feature-stt-agents-loopback-tcp.md) | Install & Packaging | ✅ Shipped in 0.5.0 (PR #16); token-file auth was checked live on a spare port, the port-collision loop, socket rollback and login persistence were not (follow-up: 0.5.1 plan below) |
-| [Port-squat detection, one smoke entry point and launchd verification (0.5.1)](20261027-feature-stt-squat-detection-unified-smoke.md) | Install & Packaging | 🚧 Implemented; live launchd run and PR pending |
+| [Port-squat detection, one smoke entry point and launchd verification (0.5.1)](20261027-feature-stt-squat-detection-unified-smoke.md) | Install & Packaging | 🚧 Implemented; harness ran live, PR #18 open |
 
 ## Conventions
 
