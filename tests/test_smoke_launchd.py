@@ -2528,3 +2528,62 @@ def test_running_identity_is_one_precondition(smoke, env, monkeypatch, job, call
     finally:
         if h.token_dir is not None:
             shutil.rmtree(h.token_dir, ignore_errors=True)
+
+
+# The renderer sys.exit()s when stt_server does not import; that must reach the
+# start state as a FAIL row carrying the renderer's own message (and the
+# failure-channel line smoke.py reads), never a bare exit 1. stt_server
+# importable? x where the renderer is first imported -> outcome.
+def _break_stt_server(mp):
+    mp.setitem(sys.modules, "stt_server", None)  # `import stt_server.*` -> ImportError
+    for name in ("stt_server.auth", "stt_server.env", "render_stt_plist"):
+        mp.delitem(sys.modules, name, raising=False)
+
+
+@pytest.mark.parametrize("importable", [True, False])
+@pytest.mark.parametrize("where", ["run", "teardown"])
+def test_unimportable_renderer_is_a_start_state_fail_row(
+    smoke, env, monkeypatch, capsys, importable, where
+):
+    import argparse
+
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
+    if not importable:
+        _break_stt_server(monkeypatch)
+    if where == "teardown":
+        monkeypatch.setattr(smoke, "run_installer", lambda *a, **k: _cp(["bash"], 0))
+        monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
+        if importable:
+            assert smoke.Harness(SPARE, _free_port()).teardown() == []
+        else:
+            with pytest.raises(smoke.RendererUnavailable, match="cannot import stt_server"):
+                smoke.Harness(SPARE, _free_port()).teardown()
+        return
+    monkeypatch.setattr(smoke, "snapshot_real_agents", lambda *a, **k: {})
+    monkeypatch.setattr(smoke, "canonical_ports", lambda *a, **k: set(CANONICAL))
+    monkeypatch.setattr(smoke, "is_listening", lambda port, run=None: False)
+    monkeypatch.setattr(smoke, "acquire_run_lock", lambda path: os.open(os.devnull, os.O_RDONLY))
+    ran = []
+    # Past the start state the run would install: stop it there instead.
+    monkeypatch.setattr(smoke.subprocess, "run", lambda *a, **k: ran.append(a) or _cp(a, 1))
+    monkeypatch.setenv("PIPECAT_STT_LABEL", SPARE)
+    monkeypatch.setenv("KODA_STT_LABEL", SPARE)
+    rc = smoke._scrubbed_main(argparse.Namespace(label=SPARE, port=_free_port()))
+    out = capsys.readouterr().out
+    assert rc == 1
+    rows = [ln for ln in out.splitlines() if ln.startswith(smoke.FAIL)]
+    fails = smoke._smoke_lib.launchd_failures(out)
+    if importable:
+        # The renderer imported; the run went on to the stt_server -I check.
+        assert ran and "render_stt_plist.py" not in out
+        assert fails == [
+            "start state: stt_server does not import under python -I (editable install?)"
+        ]
+    else:
+        assert ran == []  # refused before the import check, nothing run
+        assert rows and "start state" in rows[0]
+        assert len(fails) == 1 and fails[0].startswith("start state: cannot read the start state: ")
+        assert "render_stt_plist.py does not import" in fails[0]
+        assert "cannot import stt_server" in fails[0]  # the renderer's own message

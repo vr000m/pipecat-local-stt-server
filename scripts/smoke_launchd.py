@@ -311,16 +311,37 @@ def _log_dir() -> Path:
     return Path(custom) if custom else _home() / "Library" / "Logs" / "pipecat-stt"
 
 
+class RendererUnavailable(RuntimeError):
+    """``render_stt_plist`` would not import: it ``sys.exit``s (after one
+    stderr line) when ``stt_server`` does not import. A RuntimeError, so the
+    start state reports it as a FAIL row instead of the harness exiting."""
+
+
+def _log_basename(label: str) -> str:
+    """``render_stt_plist.log_basename(label)``. The renderer's import-time
+    ``sys.exit`` (and the stderr line before it) is caught here, at the one
+    import, and raised as RendererUnavailable carrying that line."""
+    import io
+
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            from render_stt_plist import log_basename
+    except SystemExit as exc:
+        why = " ".join(err.getvalue().split()) or f"exit {exc.code}"
+        raise RendererUnavailable(f"scripts/render_stt_plist.py does not import: {why}") from exc
+    return log_basename(label)
+
+
 def _log_paths(label: str) -> list[Path]:
     """[err log, out log] for the spare: StandardErrorPath / StandardOutPath from
     the installed plist; for a key the plist lacks, or before there is a plist,
     the name ``render_stt_plist.log_basename`` (the public function that
     writes those keys) gives the label. Imported here, not at module load: the
-    renderer exits when ``stt_server`` does not import, which the start state
-    reports."""
-    from render_stt_plist import log_basename
-
-    base = log_basename(label)
+    renderer exits when ``stt_server`` does not import, which
+    ``_log_basename`` turns into RendererUnavailable (the start state's FAIL
+    row)."""
+    base = _log_basename(label)
     paths = {
         "StandardErrorPath": _log_dir() / f"{base}.err",
         "StandardOutPath": _log_dir() / f"{base}.log",
