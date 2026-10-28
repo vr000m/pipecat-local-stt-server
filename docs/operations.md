@@ -96,7 +96,10 @@ server moves. What this adds is a warning, not a gate.
 
 `just stt-list` and `just stt-status <backend>` compare the pid listening on a
 TCP agent's port (from `lsof`) with the pid launchd reports for that agent
-(`launchctl print`). They warn on stderr, after a 1-second re-check so a restart
+(`launchctl print`; the recipes hand that answer to `scripts/squat_check.py` on
+stdin, never as an argument, because it carries the job's environment block and
+a plist from before 0.5.0 keeps its bearer token there, while any local user can
+read a process's arguments with `ps`). They warn on stderr, after a 1-second re-check so a restart
 in flight stays quiet (the re-check reads the launchd pid before and after its
 `lsof` read; a pid that changed in between gives no warning), when:
 
@@ -499,7 +502,7 @@ scripts/smoke.py`, never `uv run` (which prunes the backend extras).
 | `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
 | `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
 | `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101` |
-| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist (installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). Read-only: no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
+| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). Before anything is sent, the token included, one `launchctl print` gives the agent's pid and the endpoint must be served by exactly that pid (`lsof`: the TCP listeners, or the holders of a socket's `<socket>.lock`), before and again after the decode; a job that is not running, a foreign or extra listener, or an answer that cannot be read makes that agent FAIL with nothing sent. Read-only: one `launchctl print` per agent, no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
 | `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
 
 `--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
@@ -510,7 +513,7 @@ their own, but `just smoke` is the entry point.
 
 Every step has a timeout (`scripts/smoke.py`): `supervised` 600 s, `peercred`
 180 s, `token-file` 90 s, `launchd` 900 s; in `agents`, 60 s for each `say` /
-`afconvert` call, 30 s for each plist field read and 180 s for each decode. A
+`afconvert` call and 180 s for each decode. A
 timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT or SIGTERM sent to the
 runner) sends the running step SIGINT; the step then has 180 s to clean up (the
 harness runs its teardown). Once the step has exited, or the 180 s ran out, its
@@ -527,6 +530,28 @@ installer's whole group before teardown starts, so teardown never runs beside a
 half-finished install. The teardown's uninstall is not interrupted. An agent
 gets 60 s to answer after each install, and the collision check polls its log
 for 30 s.
+
+The harness's proof that it left the real agents alone is a snapshot of each
+one (every installed `pipecat.stt-server*` plist and every loaded such job):
+from one `launchctl print` of the job, its loaded state, pid, `runs` counter
+(which moves on a restart even when the pid is reused) and the endpoint the job
+is serving; a digest of its plist (the plist is only the intended endpoint and
+can change without a reload); and the pid holding the job's endpoint (a socket
+job's `<socket>.lock`). A job with no pid serves nothing; anything it cannot read
+on a running job refuses the run before the first install. The baseline is taken
+before the guard (which refuses every port a real job serves or a real plist
+records) and compared before every check and after teardown; a difference stops
+the remaining checks. A real agent that was not loaded, then loaded and unloaded
+again between two of those comparisons with its plist untouched, leaves nothing
+to compare. A real agent that restarts on its own during the run (a crash loop)
+fails the comparison too: fix it before the run.
+
+Teardown removes the spare socket and its `.lock` only while it holds that
+`.lock`'s `flock` itself, so no live server can own them; anything it cannot prove
+is its own and unheld is left and reported. A removal that fails, or anything
+still there afterwards, makes the `teardown` row FAIL. On a FAIL the harness
+prints one `FAIL: launchd check failed: <check>: <detail>` line per failed row,
+and `just smoke` shows those in its `launchd` row.
 
 Only one `smoke_launchd.py` run at a time: it takes an exclusive lock on
 `~/Library/Caches/pipecat-stt-smoke-launchd.lock` (in the account home, not

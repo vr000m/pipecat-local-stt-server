@@ -137,7 +137,7 @@ just smoke-peercred        # local UDS peer-cred smoke (cross-uid leg needs a 2n
 
 ```bash
 just smoke             # supervised (echo), peer-cred, token-file: one PASS/FAIL/SKIPPED table
-just smoke --agents    # also decode a generated clip through each installed agent (read-only)
+just smoke --agents    # also decode a clip through each installed agent its own launchd job serves (read-only)
 just smoke --launchd   # also run the launchd harness on the spare label (macOS only, opt-in)
 ```
 
