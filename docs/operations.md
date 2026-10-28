@@ -533,13 +533,6 @@ Only one `smoke_launchd.py` run at a time: it takes an exclusive lock on
 `$HOME`) before touching anything, and a second run is refused. The lock is
 released when the run exits; the file stays.
 
-`PIPECAT_STT_SMOKE_TEST_AGENTS_HOME` is test-only: the stubbed test suites point
-it at a temp home so they never read your real `~/Library/LaunchAgents`. It is
-honoured only while `launchctl` on `PATH` is a stub, never with the real
-`/bin/launchctl`; there `just smoke --agents` warns that it is ignored and
-`smoke_launchd.py` refuses to run. `just smoke` never passes it to the harness.
-Do not export it.
-
 The launchd harness uses spare port 9998 by default; when that port is busy, run
 it on another spare port with `scripts/smoke_launchd.py --port <port>` (the guard
 still refuses a canonical port, a port recorded by an installed or loaded agent,

@@ -24,16 +24,9 @@ plist, logs and socket. ``agents_home()`` is where both scripts look for the
 installed real agents (``smoke.py --agents`` and the harness's port guard and
 before/after snapshot): the account's home from the password database, so an
 overridden ``HOME`` can neither empty the snapshot nor hide an agent from the
-port guard. The only way to move ``agents_home()`` is the test-only variable
-``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` (``TEST_AGENTS_HOME_ENV``), which the
-stubbed test suites set to a temp directory so they never read the developer's
-real ``~/Library/LaunchAgents``. It is honoured only while the ``launchctl`` on
-PATH is not the system ``/bin/launchctl`` (the suites' stub), so a stale export
-can never hide a real agent from a run that reaches real launchd: there it is
-ignored, ``smoke.py --agents`` says so on stderr and ``smoke_launchd.py``
-refuses to run. ``smoke.py`` drops it from the harness's environment, the
-installer's environment is scrubbed of it, and both scripts print the same
-``agents_home_notice()`` line whenever it is set.
+port guard. No environment variable moves it; the stubbed test suites patch
+``agents_home`` (in-process, or through ``tests/_with_agents_home.py`` for a
+subprocess) so they never read the developer's real ``~/Library/LaunchAgents``.
 
 The launchd checks are SKIPPED when ``CI`` is present in the environment with
 any value, the empty string included (Decision 8: they run only when ``CI`` is
@@ -64,8 +57,6 @@ LAUNCHD_SKIP_MARK = "SKIPPED: launchd checks not run: "
 
 SPARE_LABEL = "pipecat.stt-server.smoke"
 AGENT_GLOB = "pipecat.stt-server*.plist"
-TEST_AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
-SYSTEM_LAUNCHCTL = "/bin/launchctl"
 # smoke_peercred.py's skip lines start with these (it exits 0 on both), and
 # smoke.py maps them to SKIPPED; one definition so the two cannot drift.
 PEERCRED_NO_UID_MARK = "skipped: needs a second local uid"
@@ -82,52 +73,11 @@ def account_home() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
-def launchctl_stubbed(env=None) -> bool:
-    """True when the ``launchctl`` on PATH is not the system ``/bin/launchctl``
-    (a test's stub). No ``launchctl`` at all is not a stub."""
-    env = os.environ if env is None else env
-    found = shutil.which("launchctl", path=env.get("PATH") or os.defpath)
-    return found is not None and os.path.realpath(found) != os.path.realpath(SYSTEM_LAUNCHCTL)
-
-
-def agents_home_override(env=None) -> Path | None:
-    """The test-only agents home, or None. Honoured only while ``launchctl`` is
-    stubbed, when no real launchd state can be reached; otherwise it is ignored
-    (``ignored_agents_home_override``)."""
-    env = os.environ if env is None else env
-    val = env.get(TEST_AGENTS_HOME_ENV)
-    return Path(val) if val and launchctl_stubbed(env) else None
-
-
-def ignored_agents_home_override(env=None) -> str | None:
-    """The override's value when it is set but not honoured (a stale export
-    with the real ``launchctl``), else None."""
-    env = os.environ if env is None else env
-    val = env.get(TEST_AGENTS_HOME_ENV)
-    return val if val and not launchctl_stubbed(env) else None
-
-
-def agents_home_notice(env=None) -> str | None:
-    """The stderr line both scripts print about the override, or None."""
-    override = agents_home_override(env)
-    if override is not None:
-        return (
-            f"warning: {TEST_AGENTS_HOME_ENV}={override} is a test-only override "
-            "(launchctl is stubbed); installed agent plists are read from there"
-        )
-    ignored = ignored_agents_home_override(env)
-    if ignored is not None:
-        return (
-            f"warning: {TEST_AGENTS_HOME_ENV}={ignored} is set but ignored: it is "
-            "test-only and launchctl is not stubbed; unset it"
-        )
-    return None
-
-
-def agents_home(env=None) -> Path:
-    """Where the installed real agents are read from: the account home, or the
-    test-only override while launchctl is stubbed. ``$HOME`` never moves it."""
-    return agents_home_override(env) or account_home()
+def agents_home() -> Path:
+    """Where the installed real agents are read from: the account home.
+    ``$HOME`` never moves it, and no environment variable does; the stubbed
+    test suites patch this function (``tests/_with_agents_home.py``)."""
+    return account_home()
 
 
 def launch_agents_dir(home: Path) -> Path:

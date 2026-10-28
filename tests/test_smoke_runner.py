@@ -8,9 +8,9 @@ on a PATH led by a stub dir, with a temp ``HOME``; the fixture asserts the stub
 
 Assumptions (contract is silent): the table prints one line per step holding
 the step name and its outcome word; ``--agents`` discovers plists under
-``_smoke_lib.agents_home()``, which the fixtures point at the temp home through
-the test-only ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` (``HOME`` alone does not
-move it, so no test reads the developer's real ``~/Library/LaunchAgents``);
+``_smoke_lib.agents_home()``, which the fixtures patch to the temp home
+(``HOME`` alone does not move it, and production code has no override, so no
+test reads the developer's real ``~/Library/LaunchAgents``);
 commands whose argv[0] is not a stubbed tool (launchctl/id/uv/say/afconvert/
 lsof) are faked as success in the ``--agents`` test, so only the stubbed tools
 ever run for real.
@@ -37,7 +37,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SMOKE = REPO_ROOT / "scripts" / "smoke.py"
 RENDERER = REPO_ROOT / "scripts" / "render_stt_plist.py"
 SPARE = "pipecat.stt-server.smoke"
-AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
 
 
 def _load():
@@ -86,7 +85,7 @@ def seam(smoke, monkeypatch, tmp_path):
     home = tmp_path / "home"
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: home)
     monkeypatch.delenv("CI", raising=False)
     calls: list[tuple[list[str], dict | None]] = []
     behaviour = {"default": _cp(0), "by_script": {}}
@@ -381,7 +380,7 @@ def agents_env(smoke, monkeypatch, tmp_path):
     home = tmp_path / "home"
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: home)
     monkeypatch.delenv("CI", raising=False)
     log = _stub_env(tmp_path, monkeypatch)
     ran: list[list[str]] = []
@@ -462,7 +461,7 @@ def test_agents_skipped_when_say_absent(smoke, monkeypatch, tmp_path, capsys):
     home = tmp_path / "home"
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: home)
     monkeypatch.delenv("CI", raising=False)
     _render_plist(home, "pipecat.stt-server", port=9565)
     log = _stub_env(tmp_path, monkeypatch, with_say=False)
@@ -796,74 +795,30 @@ def test_launchd_skip_state_space(smoke, platform, ci):
     assert skips == (platform != "darwin" or ci is not None)
 
 
-def _launchctl_paths(tmp_path: Path) -> dict[str, str]:
-    """PATH values: a stub launchctl first, the system dirs only, no launchctl."""
+# The agents home is the account home, full stop: no environment variable, HOME
+# included, moves it, whatever launchctl is on PATH. Tests move it only by
+# patching _smoke_lib.agents_home (in-process) or through
+# tests/_with_agents_home.py (a subprocess); production code has no override.
+@pytest.mark.parametrize("path", ["stub", "system", "none"])
+def test_agents_home_has_no_environment_override(smoke, monkeypatch, tmp_path, path):
+    import _smoke_lib
+
     stub = tmp_path / "stub"
     stub.mkdir(exist_ok=True)
     _exe(stub / "launchctl", "#!/bin/sh\nexit 0\n")
     empty = tmp_path / "empty"
     empty.mkdir(exist_ok=True)
-    return {"stub": f"{stub}:/usr/bin:/bin", "system": "/usr/bin:/bin", "none": str(empty)}
-
-
-def test_agents_home_ignores_home_and_honours_only_the_test_override(smoke, monkeypatch, tmp_path):
-    import _smoke_lib
-
-    monkeypatch.setenv("PATH", _launchctl_paths(tmp_path)["stub"])
+    paths = {"stub": f"{stub}:/usr/bin:/bin", "system": "/usr/bin:/bin", "none": str(empty)}
+    monkeypatch.setenv("PATH", paths[path])
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(AGENTS_HOME_ENV, raising=False)
+    monkeypatch.setenv("PIPECAT_STT_SMOKE_TEST_AGENTS_HOME", str(tmp_path))
     assert _smoke_lib.agents_home() == _smoke_lib.account_home() != tmp_path
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(tmp_path))
-    assert _smoke_lib.agents_home() == tmp_path
-    monkeypatch.setenv(AGENTS_HOME_ENV, "")
-    assert _smoke_lib.agents_home() == _smoke_lib.account_home()
+    for script in ("_smoke_lib.py", "smoke.py", "smoke_launchd.py"):
+        assert "SMOKE_TEST_AGENTS_HOME" not in (REPO_ROOT / "scripts" / script).read_text()
 
 
-# launchctl on PATH x the override -> (agents home moved, override ignored).
-# The override moves the agents home only while launchctl is a stub (nothing real
-# can be mutated); set with the real launchctl, or none, it is ignored and said so.
-@pytest.mark.parametrize("launchctl", ["stub", "system", "none"])
-@pytest.mark.parametrize("override", [None, "", "set"])
-def test_agents_home_override_state_space(smoke, tmp_path, launchctl, override):
-    import _smoke_lib
-
-    env = {"PATH": _launchctl_paths(tmp_path)[launchctl]}
-    if override is not None:
-        env[AGENTS_HOME_ENV] = str(tmp_path / "fake-home") if override == "set" else ""
-    honoured = launchctl == "stub" and override == "set"
-    ignored = launchctl != "stub" and override == "set"
-    home = _smoke_lib.agents_home(env)
-    assert (home == tmp_path / "fake-home") == honoured
-    if not honoured:
-        assert home == _smoke_lib.account_home()
-    assert (_smoke_lib.ignored_agents_home_override(env) is not None) == ignored
-    notice = _smoke_lib.agents_home_notice(env)
-    assert (notice is not None) == (honoured or ignored)
-    if notice:
-        assert AGENTS_HOME_ENV in notice and ("ignored" in notice) == ignored
-
-
-def test_stale_override_does_not_move_the_agents_step(smoke, monkeypatch, tmp_path, capsys):
-    # Exported outside a stubbed test (real or no launchctl), the override must
-    # not change which plists --agents reads, and must say it was ignored.
-    import _smoke_lib
-
-    stale = tmp_path / "stale"
-    (stale / "Library" / "LaunchAgents").mkdir(parents=True)
-    (stale / "Library" / "LaunchAgents" / "pipecat.stt-server.x.plist").write_text("")
-    account = tmp_path / "account"
-    (account / "Library" / "LaunchAgents").mkdir(parents=True)
-    monkeypatch.setattr(_smoke_lib, "account_home", lambda: account)
-    monkeypatch.setenv("PATH", _launchctl_paths(tmp_path)["none"])
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(stale))
-    assert smoke.agent_plists() == []
-    err = capsys.readouterr().err
-    assert AGENTS_HOME_ENV in err and "ignored" in err
-
-
-def test_launchd_env_drops_the_test_only_override(smoke):
-    env = smoke.launchd_env({"PATH": "/usr/bin", AGENTS_HOME_ENV: "/somewhere"})
-    assert AGENTS_HOME_ENV not in env
+def test_launchd_env_sets_both_spare_labels(smoke):
+    env = smoke.launchd_env({"PATH": "/usr/bin"})
     assert env["PIPECAT_STT_LABEL"] == env["KODA_STT_LABEL"] == SPARE
 
 

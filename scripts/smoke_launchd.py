@@ -38,10 +38,7 @@ The real agents are every installed ``pipecat.stt-server*`` plist under
 every loaded ``pipecat.stt-server*`` job ``launchctl list`` reports, plist or not;
 the spare is excluded. A loaded job without a plist has its pid and endpoint
 read from one ``launchctl print`` (its ``pid =`` line and ``arguments`` block).
-The test-only ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` moves the plist home only
-while ``launchctl`` is a stub (announced on stderr); set with the real
-``launchctl`` it is refused (see ``_smoke_lib``). It cannot hide a loaded job,
-which ``launchctl list`` still reports. A listener the harness cannot read never
+No environment variable moves the agents home. A listener the harness cannot read never
 compares as unchanged, so one in the baseline snapshot refuses the run before
 the first install.
 
@@ -412,8 +409,7 @@ def preconditions(env=os.environ, platform=sys.platform) -> str | None:
 
 
 def run_lock_path() -> Path:
-    """The run lock. Under the agents home (the account home; the test override
-    in stubbed runs), not ``$HOME``: the spare label lives in the per-uid launchd
+    """The run lock. Under the agents home (the account home), not ``$HOME``: the spare label lives in the per-uid launchd
     domain, so two runs with different ``$HOME`` values still share it."""
     return _smoke_lib.agents_home() / "Library" / "Caches" / "pipecat-stt-smoke-launchd.lock"
 
@@ -1070,15 +1066,8 @@ def main(argv=None) -> int:
             print(f"  cleanup: {cmd}")
         return 1
 
-    # A stale export of the test-only override (launchctl is the real one) would
-    # hide installed agents from the guard and snapshot: refuse before any call.
-    notice = _smoke_lib.agents_home_notice()
-    if _smoke_lib.ignored_agents_home_override() is not None:
-        return refuse("guard", notice)
     home, agents_at = _home(), _smoke_lib.agents_home()
-    if notice:
-        print(notice, file=sys.stderr)
-    elif home.resolve() != agents_at.resolve():
+    if home.resolve() != agents_at.resolve():
         print(
             f"warning: HOME={home} is not the account home {agents_at}; the spare goes "
             f"under $HOME, the real-agent snapshot and port guard read {agents_at}, and "

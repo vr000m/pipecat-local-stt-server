@@ -212,8 +212,6 @@ def launchd_cmd() -> list[str]:
 
 def launchd_env(base: dict | None = None) -> dict:
     env = dict(os.environ if base is None else base)
-    # Test-only; a stale export must never reach the harness's guard.
-    env.pop(_smoke_lib.TEST_AGENTS_HOME_ENV, None)
     env["PIPECAT_STT_LABEL"] = SPARE_LABEL
     env["KODA_STT_LABEL"] = SPARE_LABEL
     return env
@@ -267,9 +265,6 @@ def agent_plists() -> list[Path]:
     """Installed real-agent plists, from the home the launchd harness snapshots.
     Plists only: a loaded job with no plist has no endpoint to decode through
     here (the launchd harness's snapshot does cover such jobs)."""
-    notice = _smoke_lib.agents_home_notice()
-    if notice:
-        print(notice, file=sys.stderr)
     return _smoke_lib.agent_plists(_smoke_lib.agents_home())
 
 

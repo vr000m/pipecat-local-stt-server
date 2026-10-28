@@ -5,10 +5,11 @@ stub dir (``launchctl``, ``id``, ``lsof``) and a temp ``HOME``; the fixture
 asserts the stub ``launchctl`` is the one resolved first. The real installer
 runs against the stubs, as in ``tests/test_install_migration.py``.
 
-The subprocess runs also set the test-only ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME``
-to the temp home, so the real-agent plist scan never reads the developer's
-``~/Library/LaunchAgents`` (``HOME`` alone does not move it), and use a free
-``--port``; ``test_stubbed_run_reads_no_real_library_path`` audits that.
+The subprocess runs go through ``tests/_with_agents_home.py``, which patches
+``_smoke_lib.agents_home`` to the temp home, so the real-agent plist scan never
+reads the developer's ``~/Library/LaunchAgents`` (``HOME`` alone does not move
+it, and production code has no override), and use a free ``--port``;
+``test_stubbed_run_reads_no_real_library_path`` audits that.
 
 Assumptions (contract is silent): the harness honours ``PIPECAT_STT_SOCKET``
 from its environment for the spare socket path when set; the spare plist lives
@@ -40,7 +41,7 @@ AUDIT_WRAPPER = Path(__file__).resolve().parent / "_audit_library_reads.py"
 
 FAKE_UID = "501"
 SPARE = "pipecat.stt-server.smoke"
-AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
+AGENTS_HOME_WRAPPER = Path(__file__).resolve().parent / "_with_agents_home.py"
 CANONICAL = (9565, 9665, 9765, 9865)
 
 pytestmark = pytest.mark.skipif(
@@ -143,7 +144,7 @@ exec /usr/bin/id "$@"
         return f"{self.stub}:/usr/bin:/bin:/usr/sbin:/sbin"
 
     def env(self, **extra: str) -> dict[str, str]:
-        e = {"HOME": str(self.home), "PATH": self.path, AGENTS_HOME_ENV: str(self.home)}
+        e = {"HOME": str(self.home), "PATH": self.path}
         e.update(extra)
         e.pop("CI", None)
         return e
@@ -157,15 +158,22 @@ exec /usr/bin/id "$@"
     def run(self, args: list[str], env: dict[str, str], timeout: int = 180, audit=None):
         assert env["PATH"].split(":")[0] == str(self.stub)
         assert "CI" not in env
-        pre = [str(AUDIT_WRAPPER), str(audit)] if audit is not None else []
         return subprocess.run(
-            [str(VENV_PYTHON), *pre, str(HARNESS), *args],
+            self.cmd(*args, audit=audit),
             capture_output=True,
             text=True,
             timeout=timeout,
             env=env,
             cwd=str(REPO_ROOT),
         )
+
+    def cmd(self, *args: str, audit=None) -> list[str]:
+        """The harness command line, run through tests/_with_agents_home.py so
+        the real-agent scan reads the temp home, never the account's
+        ~/Library/LaunchAgents (optionally under the audit wrapper first)."""
+        pre = [str(AUDIT_WRAPPER), str(audit)] if audit is not None else []
+        wrap = [str(AGENTS_HOME_WRAPPER), str(self.home)]
+        return [str(VENV_PYTHON), *pre, *wrap, str(HARNESS), *args]
 
     def spare_residue(self) -> list[Path]:
         out = []
@@ -328,7 +336,7 @@ def test_cli_ci_skips_with_exit_zero(env):
     # Env.env() pops CI by default; the skip path is exercised explicitly here.
     e["CI"] = "1"
     r = subprocess.run(
-        [str(VENV_PYTHON), str(HARNESS)],
+        env.cmd(),
         capture_output=True,
         text=True,
         timeout=60,
@@ -747,33 +755,6 @@ def test_inject_fail_still_tears_down(env):
     _assert_torn_down(env)
 
 
-def test_stale_agents_home_override_is_refused_before_anything_runs(env, tmp_path):
-    # Exported outside a stubbed run (launchctl is not a stub; here there is no
-    # launchctl at all, so nothing real can be reached), the test-only override
-    # would hide installed agents from the guard: the harness refuses up front.
-    empty = tmp_path / "nopath"
-    empty.mkdir()
-    e = {
-        "HOME": str(env.home),
-        "PATH": str(empty),
-        AGENTS_HOME_ENV: str(env.home),
-        "PIPECAT_STT_LABEL": SPARE,
-        "KODA_STT_LABEL": SPARE,
-    }
-    r = subprocess.run(
-        [str(VENV_PYTHON), str(HARNESS), "--port", str(_free_port())],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env=e,
-        cwd=str(REPO_ROOT),
-    )
-    assert r.returncode == 1, (r.stdout, r.stderr)
-    assert "FAIL" in r.stdout and "guard" in r.stdout
-    assert AGENTS_HOME_ENV in r.stdout and "ignored" in r.stdout
-    assert env.argv() == []  # not even id or lsof ran
-
-
 def _endpointless_plist(path: Path) -> None:
     import plistlib
 
@@ -891,7 +872,6 @@ def test_stubbed_run_reads_no_real_library_path(env, tmp_path):
     audit = tmp_path / "audit.log"
     r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env(), audit=audit)
     assert r.returncode == 1, (r.stdout, r.stderr)
-    assert "test-only override" in r.stderr
     assert audit.exists(), "the audit hook never ran"
     lines = audit.read_text().splitlines()
     assert lines[0] == "audit: on"
@@ -902,7 +882,7 @@ def test_stubbed_run_reads_no_real_library_path(env, tmp_path):
 def test_signal_during_hang_still_tears_down(env, sig):
     e = env.spare_env()
     p = subprocess.Popen(
-        [str(VENV_PYTHON), str(HARNESS), "--inject", "hang", "--port", str(_free_port())],
+        env.cmd("--inject", "hang", "--port", str(_free_port())),
         env=e,
         cwd=str(REPO_ROOT),
         stdout=subprocess.PIPE,
@@ -1298,7 +1278,7 @@ def test_start_state_sees_a_spare_plist_in_either_home(smoke, env, monkeypatch, 
     (account / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(env.home))
     monkeypatch.setenv("PATH", env.path)
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(account))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: account)
     in_home = env.agents / f"{SPARE}.plist"
     in_account = account / "Library" / "LaunchAgents" / f"{SPARE}.plist"
     if where in ("home", "both"):
@@ -1327,7 +1307,7 @@ def test_cleanup_commands_round_trip_through_the_shell(smoke, env, monkeypatch, 
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("PATH", env.path)
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: home)
     plist = home / "Library" / "LaunchAgents" / f"{SPARE}.plist"
     plist.write_text("<plist><dict/></plist>")
     sock = home / "Library" / "Caches" / "pipecat-stt-smoke-launchd" / "spare.sock"
@@ -1458,7 +1438,7 @@ def test_launchctl_stub_models_bootstrap_and_bootout(env):
 def test_teardown_verdict_follows_the_launchd_state(smoke, env, monkeypatch, loaded, bootout):
     monkeypatch.setenv("HOME", str(env.home))
     monkeypatch.setenv("PATH", env.path)
-    monkeypatch.setenv(AGENTS_HOME_ENV, str(env.home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
     monkeypatch.setattr(smoke, "UNLOAD_WAIT", 2)
     env.bootout_mode.write_text(bootout)
     if loaded:
