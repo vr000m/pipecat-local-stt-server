@@ -30,18 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the spare socket only under its own `.lock` flock, and failing on any cleanup
   it could not do), and compares each real agent's loaded job (pid, restart
   count, served endpoint), plist and listener with a baseline before every check
-  and after teardown. The shared
+  and after teardown; a field it cannot read refuses the run. The shared
   `assert_token_gate` in `scripts/_smoke_lib.py` checks that a request without
-  the token gets 401 and with it is accepted.
+  the token gets 401 and with it is accepted, sending the token only over a
+  connection whose server end is the expected process. Covered by stubbed tests
+  only; the first live run against launchd is still to do.
 
 - **Unified `just smoke [--agents] [--launchd]`**. `scripts/smoke.py` runs the
   supervised (echo), peer-cred and token-file checks and prints one table of
   PASS, FAIL or SKIPPED with a reason; the exit status is 1 on any FAIL.
   `--agents` decodes a clip (generated with `say`/`afconvert`) through each
-  installed agent from its plist endpoint, read-only, and only when the agent's
-  own launchd job serves that endpoint (nothing, a token included, is sent to a
-  foreign listener); `--launchd` adds the launchd
-  harness (macOS only, opt-in, never in CI).
+  installed agent from its plist endpoint, read-only, with the agent's token
+  (its token file, or a legacy `PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN`
+  in the plist) passed on stdin. The token is sent only over a connection whose
+  server end is the agent's own launchd process (same pid and restart count
+  before and after); a foreign or unidentifiable listener gets nothing.
+  `--launchd` adds the launchd harness (macOS only, opt-in, never in CI). The
+  `--agents` decode is stub-tested only until the first live run.
 
 ### Changed
 
