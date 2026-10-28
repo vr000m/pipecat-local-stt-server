@@ -308,12 +308,13 @@ def _drain(fd: int, sink: list[bytes]) -> None:
 class OwnedGroup:
     """A child started in its own session (so it leads its own process group),
     signalled only while this process owns that group (see the invariant
-    above). Its stdout and stderr are drained by two daemon threads."""
+    above). Its stdout and stderr are drained by two daemon threads; INPUT, when
+    given, is written to its stdin, which is then closed."""
 
-    def __init__(self, cmd, *, env=None, cwd=None):
+    def __init__(self, cmd, *, env=None, cwd=None, input: bytes | None = None):
         self.proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
@@ -328,6 +329,12 @@ class OwnedGroup:
         self._err: list[bytes] = []
         self._readers: list[threading.Thread] = []
         try:
+            if input is not None:
+                # Small (a token); a child that exits without reading it is fine.
+                with contextlib.suppress(BrokenPipeError):
+                    self.proc.stdin.write(input)
+                with contextlib.suppress(BrokenPipeError):
+                    self.proc.stdin.close()
             if not hasattr(os, "waitid"):
                 import select
 
@@ -410,8 +417,11 @@ def run_owned(
     stop_on_signal: bool = True,
     interrupt_signal: int | None = signal.SIGINT,
     timeout_signal: int | None = signal.SIGTERM,
+    input: bytes | None = None,
 ) -> tuple[subprocess.CompletedProcess, bool]:
     """Run CMD in its own process group; return (completed, timed_out).
+    INPUT (bytes) is written to its stdin, which is then closed; without it
+    stdin is ``/dev/null``. A secret goes this way, never on argv.
 
     One lifecycle for every way the run can end. SIGINT and SIGTERM to this
     process are held throughout. The leader's exit is awaited without reaping
@@ -420,34 +430,42 @@ def run_owned(
     exit, and further signals change nothing. Then, on every path, the whole
     group is SIGKILLed while the leader is still unreaped, the leader is reaped
     and the pipes are drained. Last, the first held signal is handed to the
-    handler that was in place (``redeliver``)."""
-    with held_signals() as (got, old):
-        group = OwnedGroup(cmd, env=env, cwd=cwd)
-        timed_out = False
-        try:
-            deadline = time.monotonic() + timeout
-            stop_at = None
-            while not group.exited():
-                now = time.monotonic()
-                if stop_at is None:
-                    sig = None
-                    if got and stop_on_signal:
-                        sig = interrupt_signal
-                    elif now >= deadline:
-                        timed_out, sig = True, timeout_signal
-                    else:
-                        time.sleep(GROUP_POLL)
-                        continue
-                    if sig is not None:
-                        group.signal_leader(sig)
-                    stop_at = now + grace
-                if now >= stop_at:
-                    break  # grace over: the kill below takes the leader too
-                time.sleep(GROUP_POLL)
-        finally:
-            group.kill_group()
-            group.reap()
-    if got:
-        redeliver(got[0], old.get(got[0]))
+    handler that was in place (``redeliver``), on EVERY path: also when the
+    group cannot be started or the wait raises (then after the kill and reap,
+    and the handler's own exception, e.g. KeyboardInterrupt, takes over from
+    the one in flight). A held signal is never dropped."""
+    held: tuple[list[int], dict] = ([], {})
+    try:
+        with held_signals() as held:
+            got, _old = held
+            group = OwnedGroup(cmd, env=env, cwd=cwd, input=input)
+            timed_out = False
+            try:
+                deadline = time.monotonic() + timeout
+                stop_at = None
+                while not group.exited():
+                    now = time.monotonic()
+                    if stop_at is None:
+                        sig = None
+                        if got and stop_on_signal:
+                            sig = interrupt_signal
+                        elif now >= deadline:
+                            timed_out, sig = True, timeout_signal
+                        else:
+                            time.sleep(GROUP_POLL)
+                            continue
+                        if sig is not None:
+                            group.signal_leader(sig)
+                        stop_at = now + grace
+                    if now >= stop_at:
+                        break  # grace over: the kill below takes the leader too
+                    time.sleep(GROUP_POLL)
+            finally:
+                group.kill_group()
+                group.reap()
+    finally:
+        got, old = held
+        if got:
+            redeliver(got[0], old.get(got[0]))
     out, err = group.output()
     return subprocess.CompletedProcess(cmd, group.proc.returncode, out, err), timed_out

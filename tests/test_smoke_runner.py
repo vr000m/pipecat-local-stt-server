@@ -1225,3 +1225,53 @@ def test_token_fixture_passes_the_server_policy(smoke, monkeypatch, tmp_path):
         assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+# run_owned re-delivers a held SIGINT/SIGTERM on every path: raise point
+# (none, OwnedGroup construction, the exit wait) x signal -> the handler that
+# was in place gets the signal exactly once, and a raised error still surfaces.
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("raise_at", ["none", "construct", "exited"])
+def test_run_owned_redelivers_a_held_signal_on_every_path(smoke, monkeypatch, raise_at, sig):
+    lib = smoke._smoke_lib
+    got: list[int] = []
+    real_group = lib.OwnedGroup
+
+    class Group(real_group):
+        def __init__(self, *a, **k):
+            os.kill(os.getpid(), sig)  # arrives while held
+            if raise_at == "construct":
+                raise OSError("cannot start")
+            super().__init__(*a, **k)
+
+        def exited(self):
+            if raise_at == "exited":
+                raise RuntimeError("wait failed")
+            return super().exited()
+
+    monkeypatch.setattr(lib, "OwnedGroup", Group)
+    old = {
+        s: signal.signal(s, lambda n, _f: got.append(n)) for s in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        if raise_at == "none":
+            res, timed_out = lib.run_owned([sys.executable, "-c", "pass"], 30, grace=1)
+            assert res.returncode is not None and not timed_out
+        else:
+            want = OSError if raise_at == "construct" else RuntimeError
+            with pytest.raises(want):
+                lib.run_owned([sys.executable, "-c", "pass"], 30, grace=1)
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+    assert got == [sig]
+
+
+# INPUT reaches the child's stdin (a secret travels this way, never on argv);
+# without it stdin is /dev/null.
+@pytest.mark.parametrize(("payload", "want"), [(b"s3cret\n", "s3cret\n"), (None, "")])
+def test_run_owned_input_reaches_stdin_only(smoke, payload, want):
+    cmd = [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"]
+    res, _ = smoke._smoke_lib.run_owned(cmd, 30, input=payload)
+    assert res.stdout == want
+    assert all("s3cret" not in a for a in cmd)
