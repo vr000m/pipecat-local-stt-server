@@ -2180,3 +2180,86 @@ def test_installer_group_not_stopped_is_a_failure(smoke, env, monkeypatch, where
         monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
         problems = smoke.Harness(SPARE, _free_port()).teardown()
         assert any("uninstall failed" in p and "EPERM" in p for p in problems), problems
+
+
+# Every --port syntax the server's parser accepts (argparse type=int over the
+# serve grammar: "--port N" or "--port=N", last one wins) x where it is
+# recorded (an unloaded agent's plist, a loaded job's arguments block) -> the
+# guard's port set holds 9998, or the snapshot is UNKNOWN and the run refuses.
+# An unparseable value is never "no port".
+_PORT_FORMS = [
+    (["--port", "9998"], 9998),
+    (["--port=9998"], 9998),
+    (["--port", "+9998"], 9998),
+    (["--port=+9998"], 9998),
+    (["--port", " 9998 "], 9998),
+    (["--port", "09998"], 9998),
+    (["--port", "9_998"], 9998),
+    (["--port", "٩٩٩٨"], 9998),  # Arabic-Indic digits: int() takes them
+    (["--port", "1", "--port", "+9998"], 9998),  # the last occurrence wins
+    (["--port", "abc"], "refuse"),
+    (["--port="], "refuse"),
+    (["--port", "--host"], "refuse"),
+    (["--port", "99.98"], "refuse"),
+]
+
+
+@pytest.mark.parametrize(("argv", "want"), _PORT_FORMS)
+def test_port_guard_reads_every_server_port_syntax_from_a_plist(smoke, env, argv, want):
+    import plistlib
+
+    args = [sys.executable, "-m", "stt_server", "serve", "--host", "127.0.0.1", *argv]
+    plist = env.agents / "pipecat.stt-server.custom.plist"
+    plist.write_bytes(plistlib.dumps({"Label": plist.stem, "ProgramArguments": args}))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PATH", env.path)
+        snap = smoke.snapshot_real_agents(home=env.home)
+    if want == "refuse":
+        assert smoke.snapshot_unknowns(snap) == ["pipecat.stt-server.custom (plist_port)"]
+        with pytest.raises(smoke.GuardRefused):
+            smoke.snapshot_ports(snap)
+    else:
+        assert smoke.snapshot_unknowns(snap) == []
+        assert smoke.snapshot_ports(snap) == {want: "pipecat.stt-server.custom"}
+
+
+@pytest.mark.parametrize(("argv", "want"), _PORT_FORMS)
+def test_port_guard_reads_every_server_port_syntax_from_a_job(smoke, argv, want):
+    body = "\n".join(
+        ["\tpid = 4242", "\truns = 3", "\targuments = {", "\t\t/py", "\t\tserve",
+         "\t\t--host", "\t\t127.0.0.1", *(f"\t\t{a}" for a in argv), "\t}", ""]
+    )  # fmt: skip
+
+    def run(cmd, **_k):
+        if cmd[:2] == ["launchctl", "print"]:
+            return _cp(cmd, 0, body)
+        return _cp(cmd, 1)  # lsof: no listener
+
+    loaded, pid, runs, endpoint = smoke.read_job("pipecat.stt-server.x", "501", run)
+    st = smoke.AgentState(
+        loaded, pid, runs, endpoint, None, smoke.endpoint_listener(loaded, pid, endpoint, run)
+    )
+    snap = {"pipecat.stt-server.x": st}
+    if want == "refuse":
+        assert endpoint == smoke.UNKNOWN
+        assert smoke.snapshot_unknowns(snap) == ["pipecat.stt-server.x (endpoint, listener)"]
+        with pytest.raises(smoke.GuardRefused):
+            smoke.snapshot_ports(snap)
+    else:
+        assert endpoint == ("tcp", "127.0.0.1", str(want))
+        assert smoke.snapshot_ports(snap) == {want: "pipecat.stt-server.x"}
+
+
+# parse_port IS the server's parse: for each form above, the serve parser's
+# own answer (or its refusal) equals read_stt_plist.parse_port's.
+@pytest.mark.parametrize(("argv", "_want"), _PORT_FORMS)
+def test_parse_port_matches_the_server_parser(smoke, argv, _want):
+    sys.path.insert(0, str(REPO_ROOT))
+    from stt_server.__main__ import _build_parser
+
+    flags = smoke.read_stt_plist.read_argv_flags(argv)
+    try:
+        server = _build_parser().parse_args(["serve", "--backend", "echo", *argv]).port
+    except SystemExit:
+        server = None
+    assert smoke.read_stt_plist.parse_port(flags["--port"]) == server

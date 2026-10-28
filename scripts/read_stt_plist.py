@@ -45,8 +45,8 @@ VALUE is consumed in the step after its flag, so a value that looks like a flag
 (``--log-level --socket-path``) is never read as one. tests/test_justfile_recipes.py
 checks this against the real parser. The justfile (stt-list, stt-status,
 stt-enable), scripts/install_stt_agent.sh and scripts/smoke.py all call this, and
-scripts/smoke_launchd.py imports it (``load``, ``loads``, ``read_field``,
-``read_argv_flags``),
+scripts/smoke_launchd.py imports it (``load``, ``loads``, ``read_flags``,
+``read_field``, ``read_argv_flags``, ``parse_port``),
 so they cannot disagree about what an installed plist says. Stdlib only: it must run under the
 system python3 when the project venv is absent.
 """
@@ -143,6 +143,18 @@ def read_argv_flags(args: list) -> dict[str, str]:
             elif el not in _SWITCHES:
                 expect = el
     return found
+
+
+def parse_port(value: str) -> int | None:
+    """The port the server takes from a ``--port VALUE``: its parser has
+    ``type=int``, so this is Python's ``int()`` (``+9998``, `` 9998 ``,
+    ``9_998``, ``09998`` and non-ASCII digits all parse). None when ``int()``
+    refuses VALUE (an empty one included): the server would not start, and a
+    caller guarding ports must treat that as unknown, never as "no port"."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def read_field(plist: dict, name: str) -> str:

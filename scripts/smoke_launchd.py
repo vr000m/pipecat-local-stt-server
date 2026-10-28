@@ -509,15 +509,18 @@ def check_guard(
 #       the source of truth for what launchd is running: `loaded`/`pid` through
 #       squat_check.classify_print (the recipes' rule), `runs` (launchd's spawn
 #       counter, which moves on every restart even when a pid is reused) and the
-#       endpoint the job is SERVING, from its `arguments` block. An unreadable
-#       answer raises LaunchdUnreadable (never "not loaded").
+#       endpoint the job is SERVING, from its `arguments` block (its port
+#       canonical, as the server parses it; a --port int() refuses is UNKNOWN).
+#       An unreadable answer raises LaunchdUnreadable (never "not loaded").
 #       A loaded job with a pid whose answer has no `runs =` line is UNKNOWN
 #       (None would compare equal to None and blind the restart check).
 #   plist  sha256 of the installed plist's bytes (None: no plist). The plist is
 #       only the INTENDED endpoint (it can change without a reload), so it is
 #       never where the listener is read; any rewrite of it is a change.
-#   plist_port  the TCP port recorded in those same bytes (None: none, or no
-#       plist; UNKNOWN: unreadable). The guard's port set comes from the
+#   plist_port  the TCP port recorded in those same bytes, as the server would
+#       parse it (read_stt_plist.parse_port: int(), so `--port +9998` and
+#       `--port=09998` are 9998), stored canonical (None: no --port, or no
+#       plist; UNKNOWN: unreadable, or a --port value int() refuses). The guard's port set comes from the
 #       baseline's `endpoint` and `plist_port`, never from a later plist read.
 #   listener  the pids holding the JOB's endpoint (squat_check.endpoint_holders:
 #       TCP listeners on its port and host; a socket job's `<socket>.lock`
@@ -546,22 +549,37 @@ class AgentState:
     loaded: bool
     pid: str | None
     runs: str | None
-    endpoint: tuple[str, ...] | None  # ("tcp", host, port) | ("unix", path) | None
+    endpoint: tuple[str, ...] | str | None  # ("tcp", host, port) | ("unix", path) | None | UNKNOWN
     plist: str | None
     listener: str | None
     plist_port: str | None = None
 
 
-def job_endpoint(text: str) -> tuple[str, ...] | None:
+def canonical_port(flags: dict[str, str]) -> str | None:
+    """The ``--port`` in serve FLAGS (``read_stt_plist.read_argv_flags``) as
+    the server parses it, canonical (``str(int(value))``): None when there is
+    no ``--port``; UNKNOWN when its value is one ``int()`` refuses (an empty
+    one included), never "no port"."""
+    if "--port" not in flags:
+        return None
+    port = read_stt_plist.parse_port(flags["--port"])
+    return UNKNOWN if port is None else str(port)
+
+
+def job_endpoint(text: str) -> tuple[str, ...] | str | None:
     """The endpoint a job serves, from its ``launchctl print`` arguments block:
-    ("unix", path), ("tcp", host, port) or None when it names neither."""
+    ("unix", path), ("tcp", host, canonical port), None when it names neither,
+    or UNKNOWN when its ``--port`` cannot be parsed the server's way."""
     m = _JOB_ARGS_RE.search(text or "")
     args = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()] if m else []
     flags = read_stt_plist.read_argv_flags(args)
     if flags.get("--socket-path"):
         return ("unix", flags["--socket-path"])
-    if flags.get("--port"):
-        return ("tcp", flags.get("--host", ""), flags["--port"])
+    port = canonical_port(flags)
+    if port == UNKNOWN:
+        return UNKNOWN
+    if port is not None:
+        return ("tcp", flags.get("--host", ""), port)
     return None
 
 
@@ -595,7 +613,7 @@ def endpoint_listener(loaded: bool, pid, endpoint, run=subprocess.run) -> str | 
     UNKNOWN when it cannot be read. A job with no pid serves nothing: None."""
     if not loaded or not pid:
         return None
-    if endpoint is None:
+    if endpoint is None or endpoint == UNKNOWN:
         return UNKNOWN
     if endpoint[0] == "unix":
         pids = squat_check.endpoint_holders(None, None, endpoint[1], run)
@@ -614,7 +632,7 @@ def _plist_record(plist: Path) -> tuple[str | None, str | None]:
     except OSError:
         return UNKNOWN, UNKNOWN
     try:
-        port = read_stt_plist.read_field(read_stt_plist.loads(raw), "port").strip() or None
+        port = canonical_port(read_stt_plist.read_flags(read_stt_plist.loads(raw)))
     except read_stt_plist.MalformedPlist:
         port = UNKNOWN
     return hashlib.sha256(raw).hexdigest(), port
@@ -651,9 +669,12 @@ def snapshot_ports(snap: dict[str, AgentState]) -> dict[int, str]:
     for label, st in sorted(snap.items()):
         if st.plist_port == UNKNOWN:
             raise GuardRefused(f"cannot read the port recorded in the {label} plist")
-        if st.endpoint and st.endpoint[0] == "tcp" and st.endpoint[2].isdigit():
+        if st.endpoint == UNKNOWN:
+            raise GuardRefused(f"cannot parse the port the loaded {label} job serves")
+        # Both are canonical (canonical_port): int() is the server's own parse.
+        if st.endpoint and st.endpoint[0] == "tcp":
             ports[int(st.endpoint[2])] = label
-        if st.plist_port and st.plist_port.isdigit():
+        if st.plist_port:
             ports[int(st.plist_port)] = label
     return ports
 

@@ -1374,3 +1374,22 @@ def test_run_owned_reports_a_failed_group_kill(smoke, monkeypatch, kill, leader,
                 with contextlib.suppress(OSError):
                     real_killpg(p.pid, signal.SIGKILL)
                 p.wait(10)
+
+
+# --agents reads the plist port as the server parses it: recorded value ->
+# the canonical port it decodes through, or that agent's error (no decode).
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [("9998", "9998"), ("+9998", "9998"), ("09998", "9998"), ("abc", None), ("", None)],
+)
+def test_read_endpoint_parses_the_port_the_server_way(smoke, tmp_path, value, want):
+    import plistlib
+
+    plist = tmp_path / "pipecat.stt-server.x.plist"
+    args = ["/py", "-m", "stt_server", "serve", "--host", "127.0.0.1", "--port", value]
+    plist.write_bytes(plistlib.dumps({"ProgramArguments": args}))
+    endpoint, token, err = smoke.read_endpoint(plist)
+    if want is None:
+        assert endpoint is None and token is None and "--port" in err
+    else:
+        assert err == "" and endpoint["port"] == want

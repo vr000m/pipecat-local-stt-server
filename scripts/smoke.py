@@ -316,6 +316,13 @@ def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str | None, str]:
         return None, None, f"{plist.name} is gone"
     # Exactly as recorded: read_field adds nothing.
     endpoint = {f: read_stt_plist.read_field(data, f) for f in ENDPOINT_FIELDS}
+    if "--port" in read_stt_plist.read_flags(data):
+        # The port as the server parses it (int(): "+9998" is 9998); one it
+        # would refuse is an error, never "no port".
+        port = read_stt_plist.parse_port(endpoint["port"])
+        if port is None:
+            return None, None, f"cannot parse its --port {endpoint['port']!r}"
+        endpoint["port"] = str(port)
     if not endpoint["socket-path"] and not (endpoint["host"] and endpoint["port"]):
         return None, None, "plist has no endpoint"
     token_file = endpoint["auth-token-file"]
