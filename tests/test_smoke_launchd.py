@@ -88,16 +88,35 @@ class Env:
         self.logs = self.home / "Library" / "Logs" / "pipecat-stt"
         self.loaded_marker = tmp_path / "loaded"
         self.print_fails = tmp_path / "print-fails"
+        # "ok" (default), "noop" (exit 0, job stays loaded) or "fail" (exit 1).
+        self.bootout_mode = tmp_path / "bootout-mode"
+        # The spare job's launchd state is the loaded marker, and the stub moves
+        # it the way launchd does: bootstrap of the spare plist loads it (a
+        # second bootstrap while loaded fails with 5, as launchd's does) and
+        # bootout of the spare label unloads it (fails with 3 when not loaded).
         # Not loaded is launchctl's own answer: exit 113, "Could not find service".
         _exe(
             self.stub / "launchctl",
             f"""#!/usr/bin/env bash
 printf 'launchctl %s\\n' "$*" >> {self.log!s}
+LOADED={self.loaded_marker!s}
 if [[ "$1" == "print" ]]; then
     if [[ -e {self.print_fails!s} ]]; then echo "launchctl: boom" >&2; exit 5; fi
-    if [[ -e {self.loaded_marker!s} && "$2" == *"{SPARE}" ]]; then exit 0; fi
+    if [[ -e "$LOADED" && "$2" == *"{SPARE}" ]]; then exit 0; fi
     echo "Could not find service \\"${{2##*/}}\\" in domain for user gui: {FAKE_UID}" >&2
     exit 113
+fi
+if [[ "$1" == "bootstrap" && "${{3:-}}" == *"/{SPARE}.plist" ]]; then
+    if [[ -e "$LOADED" ]]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
+    : > "$LOADED"
+    exit 0
+fi
+if [[ "$1" == "bootout" && "$2" == *"/{SPARE}" ]]; then
+    mode=$(cat {self.bootout_mode!s} 2>/dev/null || echo ok)
+    if [[ "$mode" == fail ]]; then echo "Boot-out failed: 5: Input/output error" >&2; exit 1; fi
+    if [[ ! -e "$LOADED" ]]; then echo "Boot-out failed: 3: No such process" >&2; exit 3; fi
+    if [[ "$mode" == ok ]]; then rm -f "$LOADED"; fi
+    exit 0
 fi
 exit 0
 """,
@@ -711,6 +730,9 @@ def test_start_state_refusal(env, plant, expect):
 
 def _assert_torn_down(env: Env):
     assert f"launchctl bootout gui/{FAKE_UID}/{SPARE}" in env.argv()
+    # The stub's bootout really unloads: a teardown that only logged a bootout
+    # (or one launchd ignored) would leave the spare loaded here.
+    assert not env.loaded_marker.exists(), "the spare job is still loaded after teardown"
     assert not env.spare_residue()
     # Never touches any other label.
     for ln in env.argv():
@@ -1401,3 +1423,50 @@ def test_installer_group_never_outlives_run_installer(
         assert res.returncode == 0 and "done" in res.stdout
     if want == "interrupt":
         assert state["tearing_down"] is True  # the harness's own handler saw the signal
+
+
+# --------------------------------------------------------------------------
+# the launchctl stub's state transitions drive teardown's verdict (G)
+# --------------------------------------------------------------------------
+
+
+def test_launchctl_stub_models_bootstrap_and_bootout(env):
+    lc = str(env.stub / "launchctl")
+    plist = str(env.agents / f"{SPARE}.plist")
+    target = f"gui/{FAKE_UID}/{SPARE}"
+
+    def call(*a):
+        return subprocess.run([lc, *a], capture_output=True, text=True).returncode
+
+    assert call("print", target) == 113
+    assert call("bootout", target) == 3  # not loaded
+    assert call("bootstrap", f"gui/{FAKE_UID}", plist) == 0
+    assert call("print", target) == 0
+    assert call("bootstrap", f"gui/{FAKE_UID}", plist) == 5  # already loaded
+    assert call("bootout", target) == 0
+    assert call("print", target) == 113
+    # Another label never changes the spare's state.
+    assert call("bootstrap", f"gui/{FAKE_UID}", str(env.agents / "pipecat.stt-server.plist")) == 0
+    assert call("print", target) == 113
+
+
+# whether the spare is loaded when teardown starts x what bootout does ->
+# teardown's problems. Teardown runs the real installer's uninstall against
+# the stub; only a bootout that really unloads the job leaves no problem.
+@pytest.mark.parametrize("loaded", [True, False])
+@pytest.mark.parametrize("bootout", ["ok", "noop", "fail"])
+def test_teardown_verdict_follows_the_launchd_state(smoke, env, monkeypatch, loaded, bootout):
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(env.home))
+    monkeypatch.setattr(smoke, "UNLOAD_WAIT", 2)
+    env.bootout_mode.write_text(bootout)
+    if loaded:
+        env.loaded_marker.write_text("")
+    h = smoke.Harness(SPARE, _free_port(), None)
+    problems = h.teardown()
+    stays_loaded = loaded and bootout != "ok"
+    assert env.loaded_marker.exists() == stays_loaded
+    assert any("still loaded" in p for p in problems) == stays_loaded, problems
+    if not stays_loaded:
+        assert problems == []
