@@ -459,7 +459,7 @@ def test_guard_refuses_port_recorded_in_installed_agent_plist(smoke, env):
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("PATH", env.path)
         snap = smoke.snapshot_real_agents(home=env.home)
-    ports = smoke.snapshot_ports(snap, home=env.home)
+    ports = smoke.snapshot_ports(snap)
     assert ports == {9123: "pipecat.stt-server.custom"}
     with pytest.raises(smoke.GuardRefused, match="pipecat.stt-server.custom"):
         smoke.check_guard(
@@ -474,9 +474,13 @@ def test_guard_refuses_port_recorded_in_installed_agent_plist(smoke, env):
 
 def test_snapshot_ports_unreadable_plist_refuses(smoke, env):
     (env.agents / "pipecat.stt-server.broken.plist").write_text("not a plist")
-    snap = {"pipecat.stt-server.broken": smoke.AgentState(False, None, None, None, "d", None)}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PATH", env.path)
+        snap = smoke.snapshot_real_agents(home=env.home)
+    assert snap["pipecat.stt-server.broken"].plist_port == "unknown"
+    assert smoke.snapshot_unknowns(snap) == ["pipecat.stt-server.broken (plist_port)"]
     with pytest.raises(smoke.GuardRefused):
-        smoke.snapshot_ports(snap, home=env.home)
+        smoke.snapshot_ports(snap)
 
 
 # --------------------------------------------------------------------------
@@ -823,18 +827,22 @@ def test_unreadable_baseline_snapshot_refuses_before_any_install(env):
     ("snap", "unknown"),
     [
         ({}, []),
-        ({"a": ("1", "1", "d")}, []),
-        ({"a": (None, None, None)}, []),
-        ({"a": ("1", "unknown", "d")}, ["a"]),
-        ({"a": (None, None, "unknown")}, ["a"]),
-        ({"a": (None, "unknown", "d"), "b": ("2", "2", "d")}, ["a"]),
-        ({"b": ("2", "unknown", "d"), "a": ("1", "1", "unknown")}, ["a", "b"]),
+        ({"a": ("1", "1", "1", "d")}, []),
+        ({"a": (None, None, None, None)}, []),
+        ({"a": ("1", "1", "unknown", "d")}, ["a (listener)"]),
+        ({"a": (None, None, None, "unknown")}, ["a (plist)"]),
+        ({"a": ("1", "unknown", "1", "d")}, ["a (runs)"]),
+        ({"a": (None, None, "unknown", "d"), "b": ("2", "1", "2", "d")}, ["a (listener)"]),
+        (
+            {"b": ("2", "1", "unknown", "d"), "a": ("1", "unknown", "1", "unknown")},
+            ["a (runs, plist)", "b (listener)"],
+        ),
     ],
 )
 def test_snapshot_unknowns_state_space(smoke, snap, unknown):
     states = {
-        k: smoke.AgentState(pid is not None, pid, None, None, plist, listener)
-        for k, (pid, listener, plist) in snap.items()
+        k: smoke.AgentState(pid is not None, pid, runs, None, plist, listener)
+        for k, (pid, runs, listener, plist) in snap.items()
     }
     assert smoke.snapshot_unknowns(states) == unknown
 
@@ -1033,6 +1041,7 @@ _GHOST = "pipecat.stt-server.ghost"
 _GHOST_PRINT = f"""gui/{FAKE_UID}/{_GHOST} = {{
 \tstate = running
 \tpid = 777
+\truns = 2
 \targuments = {{
 \t\t/venv/bin/python
 \t\t-m
@@ -1163,7 +1172,7 @@ def test_snapshot_state_space(smoke, env, tmp_path, job, transport, plist):
             assert lsof[0][-1] == f"{job_sock}.lock"  # the job's lock, never the plist's
     else:
         assert st.listener is None and lsof == []
-    ports = smoke.snapshot_ports({_LABEL: st}, home=env.home)
+    ports = smoke.snapshot_ports({_LABEL: st})
     want_ports = set()
     if transport == "tcp" and job != "unloaded":
         want_ports.add(9123)
@@ -1200,7 +1209,7 @@ def test_snapshot_running_listener_state_space(
     snap = smoke.snapshot_real_agents(run, home=env.home)
     assert snap[_LABEL].listener == want
     assert len([c for c in calls if Path(c[0]).name == "lsof"]) == lsof_calls
-    assert (smoke.snapshot_unknowns(snap) == [_LABEL]) == (want == "unknown")
+    assert (smoke.snapshot_unknowns(snap) == [f"{_LABEL} (listener)"]) == (want == "unknown")
 
 
 # Transient mutation: a restart that came back to the same pid and listener moves
@@ -1237,7 +1246,7 @@ def test_snapshot_includes_a_loaded_agent_with_no_plist(smoke, env):
 
 def test_plistless_agent_port_reaches_the_guard(smoke, env):
     run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT})
-    ports = smoke.snapshot_ports(smoke.snapshot_real_agents(run, home=env.home), home=env.home)
+    ports = smoke.snapshot_ports(smoke.snapshot_real_agents(run, home=env.home))
     assert ports == {9123: _GHOST}
     with pytest.raises(smoke.GuardRefused, match=_GHOST):
         smoke.check_guard(
@@ -1967,3 +1976,101 @@ def test_production_harness_has_no_inject_hook(smoke, env, mode):
     assert "unrecognized arguments: --inject" in r.stderr
     assert _mutating(env.argv()) == []
     assert not env.spare_residue()
+
+
+# --------------------------------------------------------------------------
+# real-agent snapshot fails closed, one source of truth (review round 6)
+# --------------------------------------------------------------------------
+
+
+# launchctl print of a real job: loaded? x pid line? x runs line? -> the runs
+# field, and whether the baseline refuses the run. A loaded job with a pid and
+# no `runs =` line is UNKNOWN (None == None would blind the restart check).
+@pytest.mark.parametrize(
+    ("job", "pid", "runs", "want_runs", "refused"),
+    [
+        ("unloaded", False, False, None, False),
+        ("loaded", False, False, None, False),
+        ("loaded", False, True, "3", False),
+        ("loaded", True, True, "3", False),
+        ("loaded", True, False, "unknown", True),
+    ],
+)
+def test_read_job_runs_state_space(smoke, env, job, pid, runs, want_runs, refused):
+    prints = {}
+    if job == "loaded":
+        body = _job_print(_LABEL, running=pid, runs="3")
+        if not runs:
+            body = body.replace("\truns = 3\n", "")
+        prints[_LABEL] = body
+    listed = f"PID\tStatus\tLabel\n777\t0\t{_LABEL}\n" if job == "loaded" else ""
+    _plist_for(env.agents / f"{_LABEL}.plist")
+    snap = smoke.snapshot_real_agents(_fake_launchd(listed, prints, ["777"]), home=env.home)
+    assert snap[_LABEL].runs == want_runs
+    assert bool(smoke.snapshot_unknowns(snap)) is refused
+    if refused:
+        assert smoke.snapshot_unknowns(snap) == [f"{_LABEL} (runs)"]
+        assert [d for d in smoke.compare_snapshots(snap, snap) if "runs unreadable" in d]
+
+
+# Every AgentState field is compared (derived from dataclasses.fields, no
+# hand-kept list): changing any one field is a difference naming it.
+def test_compare_snapshots_covers_every_field(smoke):
+    import dataclasses
+
+    base = _st(smoke, plist_port="9565")
+    for f in dataclasses.fields(smoke.AgentState):
+        changed = dataclasses.replace(base, **{f.name: ("x", "changed")})
+        diffs = smoke.compare_snapshots({"a": base}, {"a": changed})
+        assert [d for d in diffs if f"a: {f.name} " in d], (f.name, diffs)
+
+
+# The guard's port set comes from the baseline: a plist rewritten (or removed)
+# after the baseline -> the guard still sees the port the baseline recorded.
+@pytest.mark.parametrize("after", ["same", "rewritten", "removed", "malformed"])
+def test_guard_ports_come_from_the_baseline(smoke, env, after):
+    plist = env.agents / "pipecat.stt-server.custom.plist"
+    _plist_for(plist, port="9123")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PATH", env.path)
+        before = smoke.snapshot_real_agents(home=env.home)
+    if after == "rewritten":
+        _plist_for(plist, port="9124")
+    elif after == "removed":
+        plist.unlink()
+    elif after == "malformed":
+        plist.write_text("not a plist")
+    assert before["pipecat.stt-server.custom"].plist_port == "9123"
+    assert smoke.snapshot_ports(before) == {9123: "pipecat.stt-server.custom"}
+
+
+# job_endpoint reads the job's argv through read_stt_plist.read_argv_flags (no
+# fake plist dict); the argv reader agrees with the plist reader on every case.
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["/py", "-m", "stt_server", "serve", "--port", "9123"],
+        ["/py", "serve", "--host", "::1", "--port=9124"],
+        ["/py", "serve", "--socket-path", "/s.sock", "--port", "1"],
+        ["/py", "serve", "--log-level", "--socket-path", "--port", "9"],
+        ["/py", "serve", "--supervised", "--port", "9125"],
+    ],
+)
+def test_read_argv_flags_matches_read_flags(smoke, monkeypatch, argv):
+    rsp = smoke.read_stt_plist
+    want = rsp.read_flags({"ProgramArguments": argv})
+    assert rsp.read_argv_flags(argv) == want
+    body = "\targuments = {\n" + "".join(f"\t\t{a}\n" for a in argv) + "\t}\n"
+
+    def no_dict(_plist):
+        raise AssertionError("job_endpoint must not build a fake plist dict")
+
+    monkeypatch.setattr(rsp, "read_flags", no_dict)
+    ep = smoke.job_endpoint(body)
+    if want.get("--socket-path"):
+        assert ep == ("unix", want["--socket-path"])
+    elif want.get("--port"):
+        assert ep == ("tcp", want.get("--host", ""), want["--port"])
+    else:
+        assert ep is None

@@ -45,7 +45,8 @@ VALUE is consumed in the step after its flag, so a value that looks like a flag
 (``--log-level --socket-path``) is never read as one. tests/test_justfile_recipes.py
 checks this against the real parser. The justfile (stt-list, stt-status,
 stt-enable), scripts/install_stt_agent.sh and scripts/smoke.py all call this, and
-scripts/smoke_launchd.py imports it (``load``, ``read_field``, ``read_flags``),
+scripts/smoke_launchd.py imports it (``load``, ``loads``, ``read_field``,
+``read_argv_flags``),
 so they cannot disagree about what an installed plist says. Stdlib only: it must run under the
 system python3 when the project venv is absent.
 """
@@ -74,12 +75,23 @@ def _load(path: str) -> dict:
     """Return the plist dict; ``{}`` when absent; raise ``MalformedPlist`` otherwise."""
     try:
         with open(path, "rb") as fh:
-            data = plistlib.load(fh)
+            raw = fh.read()
     except FileNotFoundError:
         return {}
+    except Exception as exc:  # an unreadable file or a directory: malformed
+        raise MalformedPlist(type(exc).__name__) from exc
+    return loads(raw)
+
+
+def loads(raw: bytes) -> dict:
+    """The plist in RAW (bytes already read) as a dict; ``MalformedPlist`` when
+    malformed. The same checks as ``load``, so a caller that hashes the bytes
+    can parse exactly those bytes."""
+    try:
+        data = plistlib.loads(raw)
     # Anything else is malformed: plistlib raises InvalidFileException, ValueError,
-    # xml.parsers.expat.ExpatError (truncated XML), TypeError, ... and open() an
-    # OSError for an unreadable file or a directory. The sweep must not trace back.
+    # xml.parsers.expat.ExpatError (truncated XML), TypeError, ... (an unreadable
+    # file or a directory is caught in _load). The sweep must not trace back.
     # Only the exception's type is reported: a parse message can quote plist
     # content, and an old plist may carry a token in EnvironmentVariables.
     except Exception as exc:
@@ -105,10 +117,18 @@ def load(path: str) -> dict:
 
 
 def read_flags(plist: dict) -> dict[str, str]:
+    """The serve flags in a loaded plist's ``ProgramArguments``."""
     args = plist.get("ProgramArguments")
-    found: dict[str, str] = {}
     if not isinstance(args, list):
-        return found
+        return {}
+    return read_argv_flags(args)
+
+
+def read_argv_flags(args: list) -> dict[str, str]:
+    """The serve flags (``--host``, ``--port``, ``--socket-path``,
+    ``--auth-token-file``) in an argv list, with the serve grammar above. The
+    launchd harness reads a running job's ``arguments`` block through this."""
+    found: dict[str, str] = {}
     expect = ""
     for el in (str(a) for a in args):
         if expect:

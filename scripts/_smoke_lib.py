@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pwd
+import re
 import shutil
 import signal
 import stat
@@ -77,6 +78,16 @@ def launchd_failures(stdout: str) -> list[str]:
         for ln in (stdout or "").splitlines()
         if ln.startswith(LAUNCHD_FAIL_MARK)
     ]
+
+
+_RUNS_RE = re.compile(r"^\s*runs = (\d+)", re.MULTILINE)
+
+
+def parse_runs(text: str) -> str | None:
+    """The ``runs = N`` of a ``launchctl print`` body (launchd's spawn counter,
+    which moves on every restart even when a pid is reused), or None."""
+    m = _RUNS_RE.search(text or "")
+    return m.group(1) if m else None
 
 
 SPARE_LABEL = "pipecat.stt-server.smoke"

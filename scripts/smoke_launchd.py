@@ -393,15 +393,13 @@ def read_plist_field(label: str, field: str) -> str:
     return read_plist_field_path(_plist_path(label), field)
 
 
-def read_plist_field_path(plist: Path, field: str, *, strict=False) -> str:
+def read_plist_field_path(plist: Path, field: str) -> str:
     """One field from PLIST, exactly as recorded, through ``read_stt_plist`` (the
-    one plist reader; in-process). '' when the plist is absent or lacks it;
-    a malformed plist is '' too, or with ``strict`` a CheckFailed."""
+    one plist reader; in-process). '' when the plist is absent, malformed or
+    lacks it."""
     try:
         data = read_stt_plist.load(str(plist))
-    except read_stt_plist.MalformedPlist as exc:
-        if strict:
-            raise CheckFailed(f"cannot read {field} from {plist}: {exc}") from exc
+    except read_stt_plist.MalformedPlist:
         data = {}
     return read_stt_plist.read_field(data, field)
 
@@ -502,9 +500,14 @@ def check_guard(
 #       counter, which moves on every restart even when a pid is reused) and the
 #       endpoint the job is SERVING, from its `arguments` block. An unreadable
 #       answer raises LaunchdUnreadable (never "not loaded").
+#       A loaded job with a pid whose answer has no `runs =` line is UNKNOWN
+#       (None would compare equal to None and blind the restart check).
 #   plist  sha256 of the installed plist's bytes (None: no plist). The plist is
 #       only the INTENDED endpoint (it can change without a reload), so it is
 #       never where the listener is read; any rewrite of it is a change.
+#   plist_port  the TCP port recorded in those same bytes (None: none, or no
+#       plist; UNKNOWN: unreadable). The guard's port set comes from the
+#       baseline's `endpoint` and `plist_port`, never from a later plist read.
 #   listener  the pids holding the JOB's endpoint (squat_check.endpoint_holders:
 #       TCP listeners on its port and host; a socket job's `<socket>.lock`
 #       holders, the file the server flocks, since lsof on an AF_UNIX path lists
@@ -513,8 +516,9 @@ def check_guard(
 #       A running job whose endpoint cannot be read (lsof failed, no endpoint in
 #       its arguments) is UNKNOWN.
 #
-# Invariant: two snapshots are equal only when every field of every agent is
-# equal and neither holds UNKNOWN. The harness takes the baseline before the
+# Invariant: two snapshots are equal only when every field of every agent (all
+# of dataclasses.fields(AgentState), no hand-kept list) is equal and neither
+# holds UNKNOWN; a baseline holding UNKNOWN anywhere refuses the run. The harness takes the baseline before the
 # guard (whose port set is derived from it: job and plist ports alike), and
 # compares a fresh snapshot with it before EVERY check (so a mutation is caught
 # at the next boundary, and the later, mutating checks do not run) and after
@@ -524,7 +528,6 @@ def check_guard(
 # state to observe.
 
 _JOB_ARGS_RE = re.compile(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", re.MULTILINE | re.DOTALL)
-_RUNS_RE = re.compile(r"^\s*runs = (\d+)", re.MULTILINE)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -535,6 +538,7 @@ class AgentState:
     endpoint: tuple[str, ...] | None  # ("tcp", host, port) | ("unix", path) | None
     plist: str | None
     listener: str | None
+    plist_port: str | None = None
 
 
 def job_endpoint(text: str) -> tuple[str, ...] | None:
@@ -542,7 +546,7 @@ def job_endpoint(text: str) -> tuple[str, ...] | None:
     ("unix", path), ("tcp", host, port) or None when it names neither."""
     m = _JOB_ARGS_RE.search(text or "")
     args = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()] if m else []
-    flags = read_stt_plist.read_flags({"ProgramArguments": args})
+    flags = read_stt_plist.read_argv_flags(args)
     if flags.get("--socket-path"):
         return ("unix", flags["--socket-path"])
     if flags.get("--port"):
@@ -567,8 +571,12 @@ def read_job(
     loaded, pid = state
     if not loaded:
         return False, None, None, None
-    m = _RUNS_RE.search(out)
-    return True, pid, (m.group(1) if m else None), job_endpoint(out)
+    runs = _smoke_lib.parse_runs(out)
+    if runs is None and pid:
+        # A running job always has a spawn counter; an answer without one
+        # cannot prove a restart did not happen (None == None), so it is UNKNOWN.
+        runs = UNKNOWN
+    return True, pid, runs, job_endpoint(out)
 
 
 def endpoint_listener(loaded: bool, pid, endpoint, run=subprocess.run) -> str | None:
@@ -585,13 +593,20 @@ def endpoint_listener(loaded: bool, pid, endpoint, run=subprocess.run) -> str | 
     return UNKNOWN if pids is None else (",".join(pids) or None)
 
 
-def _plist_digest(plist: Path) -> str | None:
+def _plist_record(plist: Path) -> tuple[str | None, str | None]:
+    """(sha256, recorded TCP port) from ONE read of PLIST's bytes: (None, None)
+    when absent; UNKNOWN for what cannot be read."""
     try:
-        return hashlib.sha256(plist.read_bytes()).hexdigest()
+        raw = plist.read_bytes()
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError:
-        return UNKNOWN
+        return UNKNOWN, UNKNOWN
+    try:
+        port = read_stt_plist.read_field(read_stt_plist.loads(raw), "port").strip() or None
+    except read_stt_plist.MalformedPlist:
+        port = UNKNOWN
+    return hashlib.sha256(raw).hexdigest(), port
 
 
 def snapshot_real_agents(run=subprocess.run, home: Path | None = None) -> dict[str, AgentState]:
@@ -603,43 +618,44 @@ def snapshot_real_agents(run=subprocess.run, home: Path | None = None) -> dict[s
     snap: dict[str, AgentState] = {}
     for label in sorted(labels):
         loaded, pid, runs, endpoint = read_job(label, uid, run)
+        digest, plist_port = _plist_record(agents / f"{label}.plist")
         snap[label] = AgentState(
             loaded,
             pid,
             runs,
             endpoint,
-            _plist_digest(agents / f"{label}.plist"),
+            digest,
             endpoint_listener(loaded, pid, endpoint, run),
+            plist_port,
         )
     return snap
 
 
-def snapshot_ports(snap: dict[str, AgentState], home: Path | None = None) -> dict[int, str]:
+def snapshot_ports(snap: dict[str, AgentState]) -> dict[int, str]:
     """port -> label for every TCP port a real agent serves (its loaded job's
-    arguments) or intends to (its installed plist): the guard's port set."""
+    arguments) or intends to (the port its installed plist recorded when the
+    snapshot was taken): the guard's port set, from the snapshot alone, so the
+    guard and the baseline cannot read the real agents differently."""
     ports: dict[int, str] = {}
-    agents = _smoke_lib.launch_agents_dir(home if home is not None else _smoke_lib.agents_home())
     for label, st in sorted(snap.items()):
+        if st.plist_port == UNKNOWN:
+            raise GuardRefused(f"cannot read the port recorded in the {label} plist")
         if st.endpoint and st.endpoint[0] == "tcp" and st.endpoint[2].isdigit():
             ports[int(st.endpoint[2])] = label
-        if st.plist is None:
-            continue
-        plist = agents / f"{label}.plist"
-        try:
-            port = read_plist_field_path(plist, "port", strict=True).strip()
-        except (CheckFailed, OSError) as exc:
-            raise GuardRefused(f"cannot read the port recorded in {plist}: {exc}") from exc
-        if port.isdigit():
-            ports[int(port)] = label
+        if st.plist_port and st.plist_port.isdigit():
+            ports[int(st.plist_port)] = label
     return ports
 
 
 def snapshot_unknowns(snap) -> list[str]:
-    """Labels whose listener or plist the snapshot could not read (sorted)."""
-    return sorted(label for label, st in snap.items() if UNKNOWN in (st.listener, st.plist))
-
-
-_FIELDS = ("loaded", "pid", "runs", "endpoint", "plist", "listener")
+    """ "label (field, ...)" for each agent with a field the snapshot could not
+    read (sorted by label); every field of AgentState counts."""
+    out = []
+    for label, st in sorted(snap.items()):
+        bad = [f.name for f in dataclasses.fields(st) if getattr(st, f.name) == UNKNOWN]
+        if bad:
+            out.append(f"{label} ({', '.join(bad)})")
+    return out
 
 
 def compare_snapshots(before, after) -> list[str]:
@@ -654,7 +670,7 @@ def compare_snapshots(before, after) -> list[str]:
             diffs.append(f"{label}: appeared ({after[label]})")
             continue
         b, a = before[label], after[label]
-        for name in _FIELDS:
+        for name in (f.name for f in dataclasses.fields(AgentState)):
             bv, av = getattr(b, name), getattr(a, name)
             if UNKNOWN in (bv, av):
                 diffs.append(
@@ -1248,9 +1264,10 @@ def _locked_main(args, env, results, refuse, agents_at) -> int:
     if unknown:
         return refuse(
             "snapshot",
-            f"cannot read the listener or plist of {', '.join(unknown)} (lsof failed, "
-            "a running job with no endpoint in its arguments, or an unreadable plist); "
-            "nothing was installed",
+            f"cannot read {'; '.join(unknown)} (listener: lsof failed or a running job "
+            "with no endpoint in its arguments; runs: launchctl print showed a pid but "
+            "no `runs =` line; plist/plist_port: an unreadable plist); nothing was "
+            "installed",
         )
     try:
         ports = snapshot_ports(before)
