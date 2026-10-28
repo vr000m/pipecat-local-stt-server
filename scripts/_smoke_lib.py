@@ -26,7 +26,9 @@ The module holds several separate concerns; each section below is used by:
   to the socket; otherwise it fails at path resolution, before the peer-cred
   gate, and the verdict would reflect the filesystem boundary.
 * Verified connections (``smoke.py --agents``' decode child, the token-file
-  step, the harness's token check): ``connect_verified``, the one rule for
+  step, the harness's token check and its transport-recovery waits):
+  ``connect_verified`` (a launchd job) and ``connect_verified_child`` (the
+  token-file step's own child server), the one rule for
   sending a token, and ``launchd_identity`` / ``parse_runs`` (a job's pid and
   spawn counter from one ``launchctl print``). Contract at that section.
 * Token gate (``smoke.py``'s token-file step, the harness's token check): the
@@ -286,11 +288,59 @@ def connect_verified(
     sleep=time.sleep,
 ):
     """A connected socket to ENDPOINT (``("unix", path)`` or ``("tcp", host,
-    port)``) whose server end belongs to pid PID, with nothing sent on it
-    (steps 2-4 of the contract above). READ_IDENTITY() re-reads the job and
-    must return ``(PID, RUNS)``. Raises EndpointRefused otherwise."""
+    port)``) whose server end belongs to the launchd job's pid PID, with
+    nothing sent on it (steps 2-4 of the contract above). READ_IDENTITY()
+    re-reads the job and must return ``(PID, RUNS)``. Raises EndpointRefused
+    otherwise."""
     if not pid or not runs or runs == "unknown":
         raise EndpointRefused(f"no launchd pid and runs to verify against (pid {pid}, runs {runs})")
+
+    def still_same(where: str) -> str | None:
+        again = read_identity()
+        if again == (pid, runs):
+            return None
+        return f"the job changed while {where} was verified (pid {pid}, runs {runs} -> {again})"
+
+    return _connect_held_by(
+        endpoint, pid, still_same, f"the launchd job (pid {pid})",
+        timeout=timeout, run=run, settle=settle, sleep=sleep,
+    )  # fmt: skip
+
+
+def connect_verified_child(
+    endpoint: tuple,
+    child: subprocess.Popen,
+    *,
+    timeout: float = 5.0,
+    run=subprocess.run,
+    settle: float = SERVER_END_SETTLE,
+    sleep=time.sleep,
+):
+    """``connect_verified`` for a server that is this process's OWN child
+    (smoke.py's token-file step), not a launchd job: the identity is CHILD's
+    pid. While CHILD is unreaped (``poll()`` is None) its pid cannot be handed
+    to another process, so "still running" stands in for launchd's
+    ``(pid, runs)`` re-read in step 4. Raises EndpointRefused when CHILD has
+    exited, before or during the check."""
+    pid = str(child.pid)
+    if child.poll() is not None:
+        raise EndpointRefused(f"the server (pid {pid}) has exited")
+
+    def still_same(where: str) -> str | None:
+        if child.poll() is None:
+            return None
+        return f"the server (pid {pid}) exited while {where} was verified"
+
+    return _connect_held_by(
+        endpoint, pid, still_same, f"the server this process started (pid {pid})",
+        timeout=timeout, run=run, settle=settle, sleep=sleep,
+    )  # fmt: skip
+
+
+def _connect_held_by(endpoint, pid, still_same, owner, *, timeout, run, settle, sleep):
+    """Steps 2-4: connect to ENDPOINT, send nothing, require the server end's
+    pid set to be exactly [PID], then STILL_SAME(where) (None, or why the
+    identity no longer holds). OWNER names PID in a refusal."""
     try:
         if endpoint[0] == "unix":
             where = endpoint[1]
@@ -325,14 +375,11 @@ def connect_verified(
             )
         if owners != [pid]:
             raise EndpointRefused(
-                f"the server end of {where} is held by pid {', '.join(owners)}, "
-                f"not the launchd job (pid {pid})"
+                f"the server end of {where} is held by pid {', '.join(owners)}, not {owner}"
             )
-        again = read_identity()
-        if again != (pid, runs):
-            raise EndpointRefused(
-                f"the job changed while {where} was verified (pid {pid}, runs {runs} -> {again})"
-            )
+        changed = still_same(where)
+        if changed:
+            raise EndpointRefused(changed)
     except BaseException:
         sock.close()
         raise

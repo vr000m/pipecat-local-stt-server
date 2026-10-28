@@ -310,11 +310,68 @@ def test_token_check_passes_end_to_end_over_verified_connections(monkeypatch, tm
     sys.modules["smoke_runner_token"] = smoke
     spec.loader.exec_module(smoke)
     calls = []
-    real = smoke._smoke_lib.connect_verified
+    real = smoke._smoke_lib.connect_verified_child
     monkeypatch.setattr(
-        smoke._smoke_lib, "connect_verified", lambda *a, **k: calls.append(a) or real(*a, **k)
+        smoke._smoke_lib,
+        "connect_verified_child",
+        lambda *a, **k: calls.append(a) or real(*a, **k),
     )
     assert smoke._token_check() == 0, capsys.readouterr()
     assert "token gate OK" in capsys.readouterr().out
     assert len(calls) == 3
     assert not list(home.glob("stt-smoke-token.*"))
+
+
+class _Child:
+    """A stand-in Popen: pid 4242; POLLS lists what successive poll() calls
+    answer (None: still running and unreaped)."""
+
+    def __init__(self, polls):
+        self.pid = 4242
+        self._polls = list(polls)
+
+    def poll(self):
+        return self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
+
+
+# The token-file step's identity is its own unreaped child (no launchd runs
+# value exists, none is faked): who holds the server end x the child's state
+# before and after the check -> a socket only for (child, running, running);
+# otherwise EndpointRefused, and the listener receives zero bytes in every cell.
+@pytest.mark.parametrize(
+    ("owners", "polls", "ok"),
+    [
+        ("job", [None, None], True),
+        ("foreign", [None, None], False),
+        ("invisible", [None, None], False),
+        ("unreadable", [None, None], False),
+        ("job", [0], False),  # exited before: nothing is even connected
+        ("job", [None, 0], False),  # exited during the check
+    ],
+)
+def test_connect_verified_child_state_space(lib, owners, polls, ok):
+    srv = Listener("tcp")
+    try:
+        RUN_PORT[0] = srv.endpoint[2]
+        kw = {"run": _lsof_for(_OWNERS[owners]), "settle": 0.2}
+        child = _Child(polls)
+        if ok:
+            lib.connect_verified_child(srv.endpoint, child, **kw).close()
+        else:
+            with pytest.raises(lib.EndpointRefused):
+                lib.connect_verified_child(srv.endpoint, child, **kw)
+        if polls == [0]:
+            time.sleep(0.3)
+            assert srv.accepted == 0
+        time.sleep(0.2)
+        assert srv.received == []
+    finally:
+        srv.close()
+
+
+# connect_verified keeps its launchd precondition: no caller passes a made-up
+# runs value, and the token-file step has none to pass.
+def test_no_caller_fakes_a_launchd_runs_value():
+    text = (SCRIPTS / "smoke.py").read_text()
+    assert '"self"' not in text
+    assert "connect_verified_child(" in text

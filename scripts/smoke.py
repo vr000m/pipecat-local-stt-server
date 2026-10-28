@@ -513,15 +513,12 @@ def _token_check() -> int:
         else:
             print(f"server did not listen on 127.0.0.1:{port} within 30s", file=sys.stderr)
             return 1
+
         # The token goes only over a connection whose server end is the server
-        # this child started (lsof), the same contract as the agents' decode.
-        me = (str(server.pid), "self")
-
-        def identity():
-            return me if server.poll() is None else None
-
+        # this child started (lsof): its own unreaped child, so its pid is the
+        # identity (connect_verified_child), the same contract as the decode.
         def connect():
-            return _smoke_lib.connect_verified(("tcp", "127.0.0.1", str(port)), *me, identity)
+            return _smoke_lib.connect_verified_child(("tcp", "127.0.0.1", str(port)), server)
 
         try:
             assert_token_gate("127.0.0.1", port, token_file, connect=connect)
