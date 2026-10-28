@@ -104,6 +104,10 @@ in flight stays quiet, when:
 - the agent is not running and something holds the port
   (`port N held by pid X; label not running`).
 
+A listener counts when its address could block the agent's bind: either side is
+a wildcard (`*`, `::`, `0.0.0.0`), the addresses are equal, or the agent's host is
+`localhost` and the listener is on `127.0.0.1` or `::1` (IPv6 brackets ignored).
+
 Stdout and exit codes do not change. Socket agents are not checked, and neither
 is the canonical-port fallback used when no plist is installed.
 
@@ -499,12 +503,24 @@ name the spare label; the runner sets both itself, so do the same when calling
 `scripts/smoke_launchd.py` directly. The individual scripts below still run on
 their own, but `just smoke` is the entry point.
 
-**Not yet run live against real launchd.** As of 0.5.1 these steps are covered
-only by stubbed tests (stub `launchctl`, `lsof` and `id`, a temp `HOME`): the
-launchd harness (`scripts/smoke_launchd.py`), the `token-file` child (a real echo
-server, but never run outside the test suite), the `--agents` decode against
-installed agents, and the `peercred` SKIPPED marker (`skipped: needs a second
-local uid`). Their PASS/SKIPPED results are unverified until the first live
+Every step has a timeout. A timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT
+or SIGTERM sent to the runner) sends the running step SIGINT; the step then has
+180 s to clean up (the harness runs its teardown) before its whole process group
+is killed. Further signals to the runner are ignored during that grace.
+
+The launchd harness uses spare port 9998 by default; when that port is busy, run
+it on another spare port with `scripts/smoke_launchd.py --port <port>` (the guard
+still refuses a canonical port, a port recorded by an installed or loaded agent,
+and a port that is already listening).
+
+**What has been verified live.** The checks themselves were run by hand at 0.5.0
+(token-file refusal and acceptance on a spare port without launchd, a decode
+through each real agent, `smoke_supervised.py --backend echo`, same-uid
+peer-cred). New in 0.5.1, and so far covered only by stubbed tests (stub
+`launchctl`, `lsof` and `id`, a temp home): the launchd harness
+(`scripts/smoke_launchd.py`), and the `smoke.py` code that now automates the
+0.5.0 checks — the `token-file` child, the `--agents` decode and the `peercred`
+SKIPPED mapping. Treat their results as unverified until the first live
 `just smoke --agents --launchd` run; a FAIL there may be a harness bug rather
 than an agent fault.
 

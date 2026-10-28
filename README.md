@@ -146,9 +146,12 @@ Exit status is 1 if any step FAILED; SKIPPED never fails. `--launchd` needs both
 the runner sets itself; it never runs in CI. Details and the individual scripts:
 [docs/operations.md](docs/operations.md#smoke-tests-just-smoke).
 
-Not yet run live: the launchd harness (`--launchd`), the `token-file` child, the
-`--agents` decode and the `peercred` SKIPPED marker are tested only with stubs so
-far. Treat their results as unverified until the first live `just smoke` run.
+The checks were verified by hand at 0.5.0 (token-file on a spare port without
+launchd, a decode through each agent). New in 0.5.1 and tested only with stubs so
+far: the launchd harness (`--launchd`) and the `smoke.py` code that automates the
+0.5.0 checks (the `token-file` child, the `--agents` decode, the `peercred`
+SKIPPED mapping). Treat their results as unverified until the first live
+`just smoke` run.
 
 `<backend>` is one of `whisper` / `parakeet` / `nemotron` / `kyutai`, mapped to
 the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)
