@@ -16,8 +16,14 @@ Run it as ``just smoke [--agents] [--launchd]``. Steps, in order:
   ``_smoke_lib.agents_home()`` (the account home, the same one the launchd
   harness snapshots; ``$HOME`` does not move it). Installed plists only: a loaded
   job with no plist is not decoded (the launchd harness's real-agent snapshot,
-  which also reads ``launchctl list``, does cover it). Strictly read-only: it
-  never calls bootout, bootstrap, kickstart or the installer.
+  which also reads ``launchctl list``, does cover it). Each plist is read once,
+  in-process (``read_stt_plist.load``), and every endpoint field comes from that
+  one read. Before anything is sent (a token included) the endpoint must be
+  served by the agent's own launchd job: one read-only ``launchctl print``
+  gives its pid, and the endpoint's holders (``squat_check.endpoint_holders``)
+  must be exactly that pid, before and again after the decode; otherwise the
+  agent's row is FAIL and nothing was sent. Strictly read-only: it never calls
+  bootout, bootstrap, kickstart or the installer.
 * ``launchd`` (``--launchd``): ``smoke_launchd.py`` on the spare label and port.
   macOS only, never in CI, and it needs both ``PIPECAT_STT_LABEL`` and
   ``KODA_STT_LABEL`` set to the spare label, which this runner does explicitly.
@@ -56,6 +62,8 @@ SCRIPTS = REPO / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import _smoke_lib  # noqa: E402
+import read_stt_plist  # noqa: E402
+import squat_check  # noqa: E402
 
 PASS, FAIL, SKIPPED = _smoke_lib.PASS, _smoke_lib.FAIL, _smoke_lib.SKIPPED
 SPARE_LABEL = _smoke_lib.SPARE_LABEL
@@ -66,7 +74,6 @@ SUPERVISED_TIMEOUT = 600.0
 PEERCRED_TIMEOUT = 180.0
 TOKEN_TIMEOUT = 90.0
 CLIP_TIMEOUT = 60.0
-PLIST_READ_TIMEOUT = 30.0
 DECODE_TIMEOUT = 180.0
 LAUNCHD_TIMEOUT = 900.0
 # After a step's timeout (SIGTERM) or Ctrl-C (SIGINT) the child gets this long to
@@ -268,15 +275,61 @@ def agent_plists() -> list[Path]:
     return _smoke_lib.agent_plists(_smoke_lib.agents_home())
 
 
-def read_plist_cmd(field: str, plist: Path) -> list[str]:
-    return [
-        sys.executable,
-        str(SCRIPTS / "read_stt_plist.py"),
-        "--strict",
-        "--field",
-        field,
-        str(plist),
-    ]
+ENDPOINT_FIELDS = ("socket-path", "host", "port", "auth-token-file")
+
+
+def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str]:
+    """(endpoint, error): every endpoint field from ONE in-process read of PLIST
+    (``read_stt_plist.load``), so the fields always come from the same version
+    of the file even while an installer replaces it."""
+    try:
+        data = read_stt_plist.load(str(plist))
+    except read_stt_plist.MalformedPlist as exc:
+        return None, f"cannot read {plist.name}: {exc}"
+    if not data:
+        return None, f"{plist.name} is gone"
+    # Exactly as recorded: read_field adds nothing.
+    endpoint = {f: read_stt_plist.read_field(data, f) for f in ENDPOINT_FIELDS}
+    if not endpoint["socket-path"] and not (endpoint["host"] and endpoint["port"]):
+        return None, "plist has no endpoint"
+    return endpoint, ""
+
+
+def _holders(endpoint: dict[str, str]) -> list[str] | None:
+    return squat_check.endpoint_holders(
+        endpoint["host"] or None, endpoint["port"], endpoint["socket-path"]
+    )
+
+
+def agent_identity(label: str, endpoint: dict[str, str]) -> tuple[str | None, str]:
+    """(launchd pid, reason): the pid that serves ENDPOINT when it is the
+    agent's own launchd job, else (None, why not).
+
+    The contract before any request (and so any token) goes to ENDPOINT: ONE
+    read-only ``launchctl print`` of LABEL, classified by
+    ``squat_check.classify_print``, must show a running job with pid P, and the
+    holders of the endpoint (``squat_check.endpoint_holders``: the TCP listeners
+    on its host and port, or the holders of the socket's ``.lock``) must be
+    exactly [P]. Not loaded, no pid, nothing listening, a foreign or extra
+    holder, or an answer that cannot be read: no request is sent."""
+    state = squat_check.launchd_state(label)
+    if state is None:
+        return None, "cannot read its launchd state (launchctl print failed)"
+    loaded, pid = state
+    if not loaded:
+        return None, "not loaded in launchd"
+    if not pid:
+        return None, "loaded but not running (launchd has no pid)"
+    holders = _holders(endpoint)
+    if holders is None:
+        return None, "cannot tell who serves its endpoint (lsof failed)"
+    if not holders:
+        return None, f"nothing serves its endpoint (launchd pid {pid})"
+    if holders != [pid]:
+        return None, (
+            f"its endpoint is held by pid {', '.join(holders)}, not the launchd job (pid {pid})"
+        )
+    return pid, ""
 
 
 def decode_cmd(endpoint: dict, wav: str) -> list[str]:
@@ -322,26 +375,25 @@ def agents_step(requested: bool) -> StepResult:
             return StepResult("agents", FAIL, err)
         for plist in plists:
             label = plist.name[: -len(".plist")]
-            endpoint: dict[str, str] = {}
-            bad = ""
-            for field in ("socket-path", "host", "port", "auth-token-file"):
-                outcome, detail, proc = _execute(read_plist_cmd(field, plist), PLIST_READ_TIMEOUT)
-                if outcome != PASS or proc is None:
-                    bad = f"cannot read {field}: {detail}"
-                    break
-                # Exactly as recorded: read_stt_plist.py adds no newline.
-                endpoint[field] = proc.stdout or ""
-            if (
-                not bad
-                and not endpoint["socket-path"]
-                and not (endpoint["host"] and endpoint["port"])
-            ):
-                bad = "plist has no endpoint"
+            endpoint, bad = read_endpoint(plist)
+            pid = None
+            if endpoint is not None:
+                pid, why = agent_identity(label, endpoint)
+                if pid is None:
+                    bad = f"{why}; not decoded, no token sent"
             if bad:
                 failed = True
                 parts.append(f"{label}: FAIL {bad}")
                 continue
             outcome, detail, _ = _execute(decode_cmd(endpoint, wav), DECODE_TIMEOUT)
+            # The PASS must come from the agent: the endpoint is still held by
+            # the same launchd pid after the decode (a restart or a takeover
+            # during it is a FAIL).
+            if outcome == PASS and _holders(endpoint) != [pid]:
+                outcome, detail = (
+                    FAIL,
+                    f"its endpoint changed hands during the decode (was pid {pid})",
+                )
             failed = failed or outcome != PASS
             parts.append(f"{label}: {outcome}" + (f" {detail}" if detail else ""))
     return StepResult("agents", FAIL if failed else PASS, "; ".join(parts))

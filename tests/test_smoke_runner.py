@@ -410,26 +410,34 @@ def test_agents_skipped_when_none_installed(smoke, agents_env, capsys):
 
 
 def test_agents_read_only_with_tcp_and_socket_plists(smoke, agents_env, monkeypatch, capsys):
-    # The plists are read for real (read_stt_plist.py); only the decode child is
-    # faked. Each plist gets exactly one decode at the endpoint it records, the
-    # row is PASS, and nothing mutating (or any launchctl / uv call) happens.
+    # The plists are read for real (read_stt_plist.load, in-process, once each);
+    # only the decode child is faked. The stubbed launchd reports pid 4242 and
+    # the stubbed lsof says 4242 serves every endpoint, so each plist gets
+    # exactly one decode at the endpoint it records and the row is PASS. The
+    # only launchctl calls are one read-only print per agent; nothing mutating.
     home, log, _ran, tmp_path = agents_env
     _render_plist(home, "pipecat.stt-server", port=9565)
     _render_plist(home, "pipecat.stt-server.parakeet", port=9765, backend="parakeet")
     sock = tmp_path / "s.sock"
+    (tmp_path / "s.sock.lock").write_text("")
     _render_plist(home, "pipecat.stt-server.sock", socket_path=sock)
+    _exe(
+        tmp_path / "stubbin" / "lsof",
+        f"#!/usr/bin/env bash\nprintf 'lsof %s\\n' \"$*\" >> {log}\n"
+        'port=0; for a in "$@"; do case "$a" in -iTCP:*) port=${a#-iTCP:};; esac; done\n'
+        "printf 'p4242\\nn127.0.0.1:%s\\n' \"$port\"\n",
+    )
     ran: list[list[str]] = []
     decodes: list[list[str]] = []
-    reads: list[list[str]] = []
+    loads: list[str] = []
     real = subprocess.run
+    real_load = smoke.read_stt_plist.load
+    monkeypatch.setattr(smoke.read_stt_plist, "load", lambda p: loads.append(p) or real_load(p))
 
     def seam_run(cmd, timeout, env=None, **kw):
         cmd = [str(c) for c in cmd]
         ran.append(cmd)
         if Path(cmd[0]).name in STUBBED_TOOLS:
-            return real(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        if any(c.endswith("read_stt_plist.py") for c in cmd):
-            reads.append(cmd)
             return real(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         assert "--_decode" in cmd, cmd  # the only other child this step may start
         decodes.append(cmd)
@@ -439,7 +447,7 @@ def test_agents_read_only_with_tcp_and_socket_plists(smoke, agents_env, monkeypa
     row = smoke.agents_step(True)
     capsys.readouterr()
     assert row.outcome == "PASS", row
-    assert len(reads) == 3 * 4  # four fields per plist, all read for real
+    assert sorted(loads) == sorted(str(p) for p in smoke.agent_plists())  # one read each
 
     def flag(cmd, name):
         return cmd[cmd.index(name) + 1] if name in cmd else ""
@@ -451,10 +459,80 @@ def test_agents_read_only_with_tcp_and_socket_plists(smoke, agents_env, monkeypa
     lines = _argv(log)
     assert any(ln.startswith("say ") for ln in lines), "the clip was never generated"
     assert any(ln.startswith("afconvert ") for ln in lines)
-    assert not [ln for ln in lines if ln.split()[0] in ("launchctl", "uv")], lines
+    launchctl = [ln for ln in lines if ln.split()[0] == "launchctl"]
+    assert sorted(ln.split()[-1].rsplit("/", 1)[-1] for ln in launchctl) == sorted(
+        ["pipecat.stt-server", "pipecat.stt-server.parakeet", "pipecat.stt-server.sock"]
+    )
+    assert all(ln.split()[1] == "print" for ln in launchctl), launchctl
+    assert not [ln for ln in lines if ln.split()[0] == "uv"], lines
+    # The socket agent's holder is read from its .lock, never the socket path.
+    assert any(ln.endswith(f"{sock}.lock") for ln in lines if ln.startswith("lsof "))
     for cmd in ran:
         assert not any(w in " ".join(cmd) for w in FORBIDDEN), cmd
         assert Path(cmd[0]).name not in ("launchctl", "uv"), cmd
+
+
+# Before any request (a token included) goes to an agent's endpoint, the agent's
+# own launchd job must serve it: launchctl state x who holds the endpoint
+# (before the decode, and after it) x transport -> decoded? and the row.
+_LAUNCHD = {
+    "unreadable": None,
+    "unloaded": (False, None),
+    "no-pid": (True, None),
+    "running": (True, "4242"),
+}
+_HOLDERS = {
+    "lsof-fails": None,
+    "none": [],
+    "agent": ["4242"],
+    "foreign": ["777"],
+    "both": ["4242", "777"],
+}
+
+
+@pytest.mark.parametrize("transport", ["tcp", "unix"])
+@pytest.mark.parametrize("after", ["agent", "foreign"])
+@pytest.mark.parametrize("holders", list(_HOLDERS))
+@pytest.mark.parametrize("launchd", list(_LAUNCHD))
+def test_agents_identity_gate_state_space(
+    smoke, agents_env, monkeypatch, capsys, launchd, holders, after, transport
+):
+    home, _log, _ran, tmp_path = agents_env
+    if transport == "tcp":
+        _render_plist(home, "pipecat.stt-server", port=9565)
+    else:
+        _render_plist(home, "pipecat.stt-server", socket_path=tmp_path / "s.sock")
+    reads = {"n": 0}
+
+    def fake_holders(host, port, socket_path, run=None):
+        assert (bool(socket_path), port or "") == (
+            (transport == "unix"),
+            "" if transport == "unix" else "9565",
+        )
+        reads["n"] += 1
+        return _HOLDERS[holders] if reads["n"] == 1 else _HOLDERS[after]
+
+    monkeypatch.setattr(
+        smoke.squat_check, "launchd_state", lambda label, *a, **k: _LAUNCHD[launchd]
+    )
+    monkeypatch.setattr(smoke.squat_check, "endpoint_holders", fake_holders)
+    decodes: list[list[str]] = []
+
+    def seam_run(cmd, timeout, env=None, **kw):
+        cmd = [str(c) for c in cmd]
+        if "--_decode" in cmd:
+            decodes.append(cmd)
+        return _cp(0)
+
+    monkeypatch.setattr(smoke, "run_command", seam_run)
+    row = smoke.agents_step(True)
+    capsys.readouterr()
+    ours = launchd == "running" and holders == "agent"
+    assert (len(decodes) == 1) == ours, (row, decodes)
+    if not ours:
+        assert "no token sent" in row.detail and row.outcome == "FAIL", row
+    else:
+        assert row.outcome == ("PASS" if after == "agent" else "FAIL"), row
 
 
 def test_agents_skipped_when_say_absent(smoke, monkeypatch, tmp_path, capsys):
@@ -1024,22 +1102,26 @@ def test_agents_step_passes_plist_paths_byte_for_byte(smoke, agents_env, monkeyp
             fh,
         )
     decodes: list[list[str]] = []
-    real = subprocess.run
+    checked: list[str] = []
 
     def seam_run(cmd, timeout, env=None, **kw):
         cmd = [str(c) for c in cmd]
-        if any(c.endswith("read_stt_plist.py") for c in cmd):
-            return real(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         if "--_decode" in cmd:
             decodes.append(cmd)
         return _cp(0)
 
+    def holders(host, port, socket_path, run=None):
+        checked.append(socket_path)
+        return ["4242"]  # the stubbed launchctl's pid: the agent serves it
+
     monkeypatch.setattr(smoke, "run_command", seam_run)
+    monkeypatch.setattr(smoke.squat_check, "endpoint_holders", holders)
     result = smoke.agents_step(True)
     capsys.readouterr()
     assert result.outcome == "PASS", result
     assert len(decodes) == 1
     assert decodes[0][decodes[0].index("--socket-path") + 1] == sock
+    assert checked == [sock, sock]  # the identity check reads the same exact path
 
 
 def _peercred_module():
