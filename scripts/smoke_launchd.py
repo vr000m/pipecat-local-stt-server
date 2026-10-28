@@ -1448,8 +1448,9 @@ def run_checks(harness, checks, rows: list) -> list:
 
 def signal_handler(state: dict):
     """SIGINT/SIGTERM handler: the first signal sets ``tearing_down`` and raises
-    KeyboardInterrupt; every later one is ignored, so a second signal cannot
-    escape main or cut the teardown short."""
+    KeyboardInterrupt; every later one (and any once ``begin_teardown`` ran)
+    is ignored, so it raises at most once and a second signal cannot escape
+    main or cut the teardown short (``checks_then_teardown``)."""
 
     def on_signal(signum, _frame):
         if not state["tearing_down"]:
@@ -1585,35 +1586,80 @@ def _locked_main(args, env, results, refuse, agents_at) -> int:
             "start state", "stt_server does not import under python -I (editable install?)"
         )
 
-    state = {"tearing_down": False}
-    old = {s: signal.signal(s, signal_handler(state)) for s in (signal.SIGINT, signal.SIGTERM)}
     harness = Harness(args.label, args.port, baseline=before)
+    checks = (
+        ("port collision", harness.check_collision),
+        ("socket rollback", harness.check_rollback),
+        ("token file", harness.check_token),
+    )
+    return checks_then_teardown(harness, checks, results, before, agents_at)
+
+
+def begin_teardown(state: dict, old: dict) -> None:
+    """The switch to "ignore further signals, finish teardown": from here on
+    ``signal_handler`` raises nothing. Also installs that handler for any
+    signal it is not yet on (a signal that landed while they were being
+    installed), so nothing can stop the teardown."""
+    state["tearing_down"] = True
+    for s in (signal.SIGINT, signal.SIGTERM):
+        if s not in old:
+            old[s] = signal.signal(s, signal_handler(state))
+
+
+def _record_stop(results: list, exc: BaseException) -> None:
+    """The one row for whatever stopped the checks (a signal, a SystemExit,
+    a crash outside any check); recorded once."""
+    if any(name == "interrupted" for name, _s, _d in results):
+        return
+    detail = str(exc) or type(exc).__name__
+    if not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        detail = f"crashed: {type(exc).__name__}: {detail}"
+    results.append(("interrupted", FAIL, detail))
+
+
+def checks_then_teardown(harness, checks, results: list, before, agents_at) -> int:
+    """Run CHECKS, then ALWAYS the teardown, the final re-snapshot and the
+    table; return the exit status.
+
+    Invariant: no signal can escape before the teardown verdict is printed.
+    ``signal_handler`` raises KeyboardInterrupt at most once (the first
+    signal, while ``tearing_down`` is False, sets it). Every path out of the
+    two nested ``try`` blocks below sets it first (``begin_teardown`` is the
+    try body's last statement and the first one of each except body), and
+    each block catches BaseException, so that one KeyboardInterrupt lands in
+    one of them wherever it arrives: in a check, after run_checks returned
+    but before the switch, or in the inner except body before its switch
+    (then the outer one catches it). After the blocks the handler is a
+    no-op, so the teardown, the re-snapshot and the table run to the end;
+    the handlers are restored only after the table is printed."""
+    state = {"tearing_down": False}
+    old: dict = {}
     interrupted = False
     try:
-        run_checks(
-            harness,
-            (
-                ("port collision", harness.check_collision),
-                ("socket rollback", harness.check_rollback),
-                ("token file", harness.check_token),
-            ),
-            results,
-        )
-    except (KeyboardInterrupt, SystemExit) as exc:
+        try:
+            for s in (signal.SIGINT, signal.SIGTERM):
+                old[s] = signal.signal(s, signal_handler(state))
+            run_checks(harness, checks, results)
+            begin_teardown(state, old)
+        except BaseException as exc:  # noqa: BLE001 - whatever stopped the checks
+            begin_teardown(state, old)
+            interrupted = True
+            _record_stop(results, exc)
+    except BaseException as exc:  # noqa: BLE001 - the one signal, raised above before the switch
+        begin_teardown(state, old)
         interrupted = True
-        results.append(("interrupted", FAIL, str(exc) or type(exc).__name__))
-    finally:
-        state["tearing_down"] = True
+        _record_stop(results, exc)
+    try:
         try:
             problems = harness.teardown()
-        except Exception as exc:  # teardown must not mask the checks' results
-            problems = [f"teardown crashed: {exc}"]
+        except BaseException as exc:  # noqa: BLE001 - teardown must not mask the results
+            problems = [f"teardown crashed: {type(exc).__name__}: {exc}"]
         results.append(
             ("teardown", FAIL if problems else PASS, "; ".join(problems) or "spare agent removed")
         )
         try:
             diffs = compare_snapshots(before, snapshot_real_agents())
-        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        except Exception as exc:  # noqa: BLE001 - the verdict row must still print
             diffs = [f"cannot re-snapshot the real agents: {exc}"]
         results.append(
             (
@@ -1624,10 +1670,10 @@ def _locked_main(args, env, results, refuse, agents_at) -> int:
                 "same launchd state, plists and listeners",
             )
         )
+        _print_table(results)
+    finally:
         for s, h in old.items():
             signal.signal(s, h)
-
-    _print_table(results)
     failed = interrupted or any(s == FAIL for _n, s, _d in results)
     return 1 if failed else 0
 

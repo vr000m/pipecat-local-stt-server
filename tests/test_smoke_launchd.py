@@ -2655,3 +2655,72 @@ def test_squat_timeout_and_budget_follow_cli_bound(smoke, monkeypatch):
     for n, b in before.items():
         assert smoke.run_budget(n) - b == pytest.approx(step)
     assert smoke.teardown_budget(0) == tear
+
+
+# No signal escapes the teardown path (finding 1). A real SIGINT/SIGTERM sent to
+# this process at each boundary: inside a check; after run_checks returned but
+# before the switch to "ignore further signals" (begin_teardown's first call);
+# inside the except body before its switch (a check's SystemExit led there);
+# a second signal in the except body after the first one; twice during
+# teardown -> teardown ran exactly once, its verdict and the re-snapshot row
+# printed, the old handlers are back.
+_BOUNDARIES = ("in-check", "before-switch", "except-body", "second-in-except", "teardown")
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("boundary", _BOUNDARIES)
+def test_signal_at_every_boundary_still_tears_down(smoke, monkeypatch, capsys, boundary, sig):
+    def kill():
+        os.kill(os.getpid(), sig)
+        time.sleep(0.05)  # the handler runs here at the latest
+
+    tore = []
+
+    class H:
+        def ensure_real_agents_unchanged(self):
+            pass
+
+        def ensure_port_ours(self):
+            pass
+
+        def release_holder(self):
+            pass
+
+        def teardown(self):
+            tore.append(1)
+            if boundary == "teardown":
+                kill()
+                kill()
+            return []
+
+    def check():
+        if boundary in ("in-check", "second-in-except"):
+            kill()
+        if boundary == "except-body":
+            raise SystemExit("a check exited")
+        return "ok"
+
+    real_begin, calls = smoke.begin_teardown, []
+
+    def begin(state, old):
+        calls.append(state["tearing_down"])
+        if len(calls) == 1 and boundary in ("before-switch", "except-body", "second-in-except"):
+            kill()
+        real_begin(state, old)
+
+    monkeypatch.setattr(smoke, "begin_teardown", begin)
+    monkeypatch.setattr(smoke, "snapshot_real_agents", lambda *a, **k: {})
+    old = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    results: list = []
+    rc = smoke.checks_then_teardown(H(), (("port collision", check),), results, {}, Path("/x"))
+    out = capsys.readouterr().out
+    assert tore == [1]
+    assert [r[0] for r in results][-2:] == ["teardown", "real agents unchanged"]
+    assert any(ln.startswith("PASS") and "teardown" in ln for ln in out.splitlines()), out
+    assert "real agents unchanged" in out
+    interrupted = [r for r in results if r[0] == "interrupted"]
+    if boundary == "teardown":
+        assert rc == 0 and interrupted == []  # the checks had finished
+    else:
+        assert rc == 1 and len(interrupted) == 1
+    assert {s: signal.getsignal(s) for s in old} == old
