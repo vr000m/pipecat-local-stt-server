@@ -69,6 +69,15 @@ def smoke():
         sys.path.remove(str(REPO_ROOT / "scripts"))
 
 
+@pytest.fixture(autouse=True)
+def _stub_path_is_the_harness_path(smoke, monkeypatch):
+    """The harness's PATH is fixed (``_smoke_lib.SAFE_PATH``); in-process
+    tests run it with the test's own PATH (the stub launchctl / lsof / id
+    first), exactly as ``tests/_with_agents_home.py`` does for a subprocess,
+    so no test can reach the real launchctl through the fixed PATH."""
+    monkeypatch.setattr(smoke._smoke_lib, "safe_path", lambda: os.environ.get("PATH", ""))
+
+
 def _exe(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -2314,3 +2323,64 @@ def test_transport_recovery_requires_the_spare_jobs_server_end(
         assert up() is (status == 101)
     if job == "running":
         assert connects == [(want_ep, "777", "3")]
+
+
+# A hostile caller environment never reaches the installer or any harness
+# subprocess: each name below (bash startup files, an exported launchctl
+# function, Python startup and loader variables, a raw token, the caller's
+# PATH) x the child (the installer through install_env, a harness subprocess
+# under scrubbed_environ) -> absent from the child's environment, PATH is the
+# fixed SAFE_PATH, and BASH_ENV's file was never sourced.
+_HOSTILE = {
+    "BASH_ENV": None,  # set to a file that leaves a marker when sourced
+    "ENV": "/nonexistent/env",
+    "BASH_FUNC_launchctl%%": "() {  echo hijacked; }",
+    "PYTHONPATH": "/evil",
+    "PYTHONSTARTUP": "/evil/s.py",
+    "PYTHONHOME": "/evil",
+    "DYLD_INSERT_LIBRARIES": "/evil.dylib",
+    "LD_PRELOAD": "/evil.so",
+    "PIPECAT_STT_AUTH_TOKEN": "raw-secret",
+    "IFS": "x",
+}
+
+
+@pytest.mark.parametrize("child", ["installer", "harness-subprocess"])
+def test_hostile_environment_never_reaches_a_harness_child(smoke, monkeypatch, tmp_path, child):
+    # The production PATH, not the stub one: the children below call only
+    # absolute paths, never launchctl.
+    monkeypatch.setattr(smoke._smoke_lib, "safe_path", lambda: smoke._smoke_lib.SAFE_PATH)
+    marker = tmp_path / "bash_env_sourced"
+    startup = tmp_path / "startup.sh"
+    startup.write_text(f": > {marker}\n")
+    hostile = {**_HOSTILE, "BASH_ENV": str(startup)}
+    base = {"HOME": str(tmp_path), "USER": "me", "TMPDIR": str(tmp_path), "PATH": "/evil/bin"}
+    fake = tmp_path / "fake_installer.sh"
+    _exe(fake, "#!/bin/bash\n/usr/bin/env\n")
+    if child == "installer":
+        monkeypatch.setattr(smoke, "INSTALLER", fake)
+        out = smoke.run_installer(
+            "install", smoke.install_env(SPARE, 9998, base={**base, **hostile})
+        ).stdout
+    else:
+        for k, v in {**base, **hostile}.items():
+            monkeypatch.setenv(k, v)
+        with smoke.scrubbed_environ():
+            out = subprocess.run([smoke.BASH, str(fake)], capture_output=True, text=True).stdout
+        assert os.environ["PATH"] == "/evil/bin"  # restored afterwards
+    names = {ln.split("=", 1)[0]: ln.split("=", 1)[1] for ln in out.splitlines() if "=" in ln}
+    for name in hostile:
+        assert name not in names, (name, out)
+    assert "hijacked" not in out and "/evil" not in out
+    assert names["PATH"] == smoke._smoke_lib.SAFE_PATH
+    assert names["HOME"] == str(tmp_path)
+    assert not marker.exists(), "BASH_ENV was sourced"
+    if child == "installer":
+        assert names["PIPECAT_STT_LABEL"] == SPARE
+
+
+def test_the_harness_never_resolves_bash_through_path(smoke):
+    seen = []
+    smoke.canonical_ports(run=lambda cmd, **k: seen.append(cmd) or _cp(cmd, 0, "9565\n"))
+    assert {c[0] for c in seen} == {"/bin/bash"}
+    assert smoke._smoke_lib.SAFE_PATH == "/usr/bin:/bin:/usr/sbin:/sbin"

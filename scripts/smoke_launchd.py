@@ -81,9 +81,17 @@ When a precondition is absent the harness prints
 ``_smoke_lib.LAUNCHD_SKIP_MARK`` + the reason and exits 0; ``smoke.py`` maps
 that line to SKIPPED. After its table it prints one
 ``_smoke_lib.LAUNCHD_FAIL_MARK`` + "<check>: <detail>" line per FAIL row, which
-``smoke.py`` uses as its launchd row's detail. Exit 0 unless a requested step FAILed. The external tools
-(``launchctl``, ``lsof``, ``bash``, ``python3``) are called by bare name
-through PATH.
+``smoke.py`` uses as its launchd row's detail. Exit 0 unless a requested step FAILed.
+
+Environment: after the preconditions the harness replaces its own
+environment with ``_smoke_lib.harness_env`` (``scrubbed_environ``) for the
+rest of the run, so every subprocess inherits only HOME, USER, TMPDIR, the
+spare label and log-dir names and ``PATH=_smoke_lib.SAFE_PATH``
+(``/usr/bin:/bin:/usr/sbin:/sbin``): no ``BASH_ENV``, ``ENV``, exported
+``BASH_FUNC_*``, ``PYTHON*``, ``DYLD_*`` or ``LD_*``. The installer gets
+``install_env`` (the same, with the installer's own names set per call).
+Bash is ``/bin/bash``; ``launchctl``, ``lsof`` and ``python3`` resolve through
+that fixed PATH.
 """
 
 from __future__ import annotations
@@ -107,6 +115,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 INSTALLER = SCRIPTS / "install_stt_agent.sh"
+BASH = "/bin/bash"  # never PATH-resolved
 SQUAT_CHECK = SCRIPTS / "squat_check.py"
 
 # Importing the shared helpers (and, lazily, stt_server.auth) needs these on the
@@ -467,7 +476,7 @@ def canonical_ports(run=subprocess.run) -> set[int]:
     ports: set[int] = set()
     for backend in CANONICAL_BACKENDS:
         try:
-            res = _run(["bash", str(INSTALLER), "port", backend], run)
+            res = _run([BASH, str(INSTALLER), "port", backend], run)
         except (OSError, subprocess.SubprocessError) as exc:
             raise GuardRefused(f"cannot read the canonical port of {backend}: {exc}") from exc
         out = (res.stdout or "").strip()
@@ -756,9 +765,13 @@ def start_state_problems(label: str, uid: str, sock: Path, run=subprocess.run) -
 
 
 def install_env(label: str, port: int, *, socket_path=None, token_file=None, base=None) -> dict:
+    """The installer's whole environment: ``_smoke_lib.harness_env`` of BASE
+    (the fixed PATH, HOME, USER, TMPDIR, the label and log-dir names; nothing
+    else inherited), the inherited labels dropped and the spare's own values
+    set."""
     env = {
         k: v
-        for k, v in (base if base is not None else os.environ).items()
+        for k, v in _smoke_lib.harness_env(base if base is not None else os.environ).items()
         if not k.startswith(_SCRUB_PREFIXES) or k in _KEEP
     }
     env.update(
@@ -791,7 +804,7 @@ def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.
     group and raises subprocess.TimeoutExpired. A group that cannot be shown
     stopped (the SIGKILL failed, or the leader was not reaped) raises
     InstallerNotStopped, never a result."""
-    cmd = ["bash", str(INSTALLER), sub]
+    cmd = [BASH, str(INSTALLER), sub]
     try:
         res, timed_out = _smoke_lib.run_owned(
             cmd,
@@ -1301,6 +1314,22 @@ def signal_handler(state: dict):
     return on_signal
 
 
+@contextlib.contextmanager
+def scrubbed_environ():
+    """Replace this process's environment with ``_smoke_lib.harness_env`` of
+    it for the block (so every subprocess inherits only that), and restore it
+    afterwards."""
+    saved = dict(os.environ)
+    clean = _smoke_lib.harness_env(saved)
+    os.environ.clear()
+    os.environ.update(clean)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Opt-in launchd verification on a spare label and port. "
@@ -1316,7 +1345,12 @@ def main(argv=None) -> int:
     if reason:
         print(_smoke_lib.LAUNCHD_SKIP_MARK + reason)
         return 0
+    with scrubbed_environ():
+        return _scrubbed_main(args)
 
+
+def _scrubbed_main(args) -> int:
+    """main after the preconditions, in the scrubbed environment."""
     # Both label variables must already name the spare; the environment goes to
     # the guard as-is (unset or differing is refused, never filled in).
     env = dict(os.environ)

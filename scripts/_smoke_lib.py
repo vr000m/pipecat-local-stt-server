@@ -36,6 +36,8 @@ The module holds several separate concerns; each section below is used by:
   (``ws_handshake_status``, which sends a token only over a socket the caller
   verified) and the 401/401/101 assertion (``assert_token_gate``, Decision 9),
   whose every request goes over a ``connect_verified`` socket.
+* The harness's environment (``smoke_launchd.py``): ``harness_env`` and
+  ``SAFE_PATH``, what every harness subprocess and the installer inherit.
 * Owned process groups (``smoke.py``'s steps, the harness's installer calls):
   ``run_owned`` and ``OwnedGroup``, the one lifecycle for a child whose whole
   process group may have to be killed (invariant at that section).
@@ -133,6 +135,36 @@ def agent_plists(home: Path) -> list[Path]:
     """Installed ``pipecat.stt-server*`` plists under HOME, the spare excluded."""
     found = sorted(launch_agents_dir(home).glob(AGENT_GLOB))
     return [p for p in found if p.name != f"{SPARE_LABEL}.plist"]
+
+
+# The harness's environment. Every subprocess the launchd harness runs, the
+# installer included, inherits only these, so nothing the caller's shell
+# exported steers it: no BASH_ENV / ENV (sourced by bash before the
+# installer reads its label), no exported BASH_FUNC_* (a `launchctl`
+# function), no PYTHON*, DYLD_* or LD_*, and a fixed PATH instead of the
+# caller's. Kept: HOME, USER, TMPDIR, and of the PIPECAT_STT_* / KODA_STT_*
+# names only the two the harness reads (the spare label, which the guard
+# checks, and the log dir); install_env sets the installer's own per call.
+SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_HARNESS_KEEP = (
+    "HOME", "USER", "TMPDIR",
+    "PIPECAT_STT_LABEL", "KODA_STT_LABEL", "PIPECAT_STT_LOG_DIR", "KODA_STT_LOG_DIR",
+)  # fmt: skip
+
+
+def safe_path() -> str:
+    """The harness's PATH: ``SAFE_PATH``. No environment variable moves it;
+    the stubbed test suites patch this function (in-process, or through
+    ``tests/_with_agents_home.py`` for a subprocess) to put their stub
+    ``launchctl`` / ``lsof`` / ``id`` first."""
+    return SAFE_PATH
+
+
+def harness_env(base) -> dict[str, str]:
+    """The kept names from BASE (see above) plus ``PATH=safe_path()``."""
+    env = {k: v for k, v in base.items() if k in _HARNESS_KEEP}
+    env["PATH"] = safe_path()
+    return env
 
 
 def launchd_skip_reason(env, platform: str) -> str | None:

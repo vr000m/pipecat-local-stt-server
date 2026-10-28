@@ -9,7 +9,9 @@ home from the password database, which ``$HOME`` does not move). The wrapper
 imports ``scripts/_smoke_lib.py`` first, replaces ``agents_home`` with one that
 returns HOME, then runs SCRIPT as ``__main__``; the script's own
 ``import _smoke_lib`` finds the patched module in ``sys.modules``. Production
-code carries no override: this is the only way the agents home moves.
+code carries no override: this is the only way the agents home moves. It
+also makes the harness's fixed PATH (``_smoke_lib.safe_path``) the test's own
+PATH, so the stubs stay first; production never inherits PATH.
 
 ``--inject MODE`` (the launchd harness only) is the tests' failure injection,
 kept out of the production script: SCRIPT is imported as a module, its
@@ -23,6 +25,7 @@ _with_agents_home.py HOME SCRIPT ...``).
 """
 
 import importlib.util
+import os
 import runpy
 import sys
 import time
@@ -35,6 +38,10 @@ sys.path.insert(0, str(SCRIPTS))
 import _smoke_lib  # noqa: E402
 
 _smoke_lib.agents_home = lambda: HOME
+# The tests' PATH (stub launchctl / lsof / id first) is the harness's PATH;
+# production code uses the fixed _smoke_lib.SAFE_PATH and has no override.
+_TEST_PATH = os.environ.get("PATH", "")
+_smoke_lib.safe_path = lambda: _TEST_PATH
 rest = sys.argv[2:]
 inject = None
 if rest[:1] == ["--inject"]:
