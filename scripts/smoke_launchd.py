@@ -74,7 +74,7 @@ When a precondition is absent the harness prints
 that line to SKIPPED. After its table it prints one
 ``_smoke_lib.LAUNCHD_FAIL_MARK`` + "<check>: <detail>" line per FAIL row, which
 ``smoke.py`` uses as its launchd row's detail. Exit 0 unless a requested step FAILed. The external tools
-(``launchctl``, ``lsof``, ``id``, ``bash``, ``python3``) are called by bare name
+(``launchctl``, ``lsof``, ``bash``, ``python3``) are called by bare name
 through PATH.
 """
 
@@ -298,12 +298,10 @@ def _run(cmd, run=subprocess.run, timeout=CMD_TIMEOUT, **kw):
     return run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
 
 
-def current_uid(run=subprocess.run) -> str:
-    res = _run(["id", "-u"], run)
-    uid = (res.stdout or "").strip()
-    if res.returncode != 0 or not uid.isdigit():
-        raise RuntimeError("cannot read the uid with `id -u`")
-    return uid
+def current_uid() -> str:
+    """This process's uid (the per-uid launchd domain ``gui/<uid>``), from the
+    kernel (``os.getuid``), never from a PATH-resolved ``id``."""
+    return str(os.getuid())
 
 
 def require_launchd_state(label: str, uid: str, run=subprocess.run) -> tuple[bool, str | None]:
@@ -599,7 +597,7 @@ def _plist_digest(plist: Path) -> str | None:
 def snapshot_real_agents(run=subprocess.run, home: Path | None = None) -> dict[str, AgentState]:
     """label -> AgentState for each real agent (see the contract above).
     Read-only calls only."""
-    uid = current_uid(run)
+    uid = current_uid()
     agents = _smoke_lib.launch_agents_dir(home if home is not None else _smoke_lib.agents_home())
     labels = {p.name[: -len(".plist")] for p in real_agent_plists(home)} | loaded_agent_labels(run)
     snap: dict[str, AgentState] = {}

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import http.server
 import importlib.util
+import os
 import shutil
 import signal
 import socket
@@ -39,7 +40,9 @@ LIB = REPO_ROOT / "scripts" / "_smoke_lib.py"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 AUDIT_WRAPPER = Path(__file__).resolve().parent / "_audit_library_reads.py"
 
-FAKE_UID = "501"
+# The harness reads its uid from os.getuid(); the stub `id` (for the installer)
+# answers the same value, so both name one gui/<uid> domain.
+FAKE_UID = str(os.getuid())
 SPARE = "pipecat.stt-server.smoke"
 AGENTS_HOME_WRAPPER = Path(__file__).resolve().parent / "_with_agents_home.py"
 CANONICAL = (9565, 9665, 9765, 9865)
@@ -1929,3 +1932,19 @@ def test_runner_reads_the_harness_failure_channel(smoke, env, monkeypatch, case,
     assert row.outcome == "FAIL" and want in row.detail, row
     if case == "inject-fail":
         assert "real agents unchanged" not in row.detail
+
+
+# The uid comes from the kernel, never from a PATH-resolved `id`: os.getuid()
+# x a hostile `id` on PATH -> current_uid().
+@pytest.mark.parametrize("uid", [0, 501, 4242])
+@pytest.mark.parametrize("id_answer", ["999\n", "", "not-a-number\n"])
+def test_current_uid_state_space(smoke, monkeypatch, uid, id_answer):
+    calls = []
+    monkeypatch.setattr(smoke.os, "getuid", lambda: uid)
+    monkeypatch.setattr(
+        smoke.subprocess,
+        "run",
+        lambda argv, **k: calls.append(argv) or _cp(argv, 0, id_answer),
+    )
+    assert smoke.current_uid() == str(uid)
+    assert calls == []
