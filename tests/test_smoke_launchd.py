@@ -1026,8 +1026,14 @@ def test_assert_token_gate_raises_on_broken_gate(tmp_path, handler):
     tok.chmod(0o600)
     srv = _serve(handler)
     try:
+        port = srv.server_address[1]
         with pytest.raises(AssertionError):
-            lib.assert_token_gate("127.0.0.1", srv.server_address[1], str(tok))
+            lib.assert_token_gate(
+                "127.0.0.1",
+                port,
+                str(tok),
+                connect=lambda: socket.create_connection(("127.0.0.1", port)),
+            )
     finally:
         srv.shutdown()
         srv.server_close()
@@ -2074,3 +2080,73 @@ def test_read_argv_flags_matches_read_flags(smoke, monkeypatch, argv):
         assert ep == ("tcp", want.get("--host", ""), want["--port"])
     else:
         assert ep is None
+
+
+# check_token sends its throwaway token only over connect_verified sockets for
+# the spare job's (pid, runs) from one read_job, and PASSes only when a fresh
+# read_job after the gate shows the same pair: job state before x the verified
+# connection's answer x the job after -> verdict, and whether a token was sent.
+@pytest.mark.parametrize("after", ["same", "restarted"])
+@pytest.mark.parametrize("conn", ["verified", "refused"])
+@pytest.mark.parametrize("job", ["running", "no-runs", "unknown-runs", "no-pid"])
+def test_check_token_sends_only_over_verified_connections(
+    smoke, env, monkeypatch, job, conn, after
+):
+    monkeypatch.setenv("HOME", str(env.home))
+    h = smoke.Harness(SPARE, _free_port())
+    jobs = {
+        "running": (True, "777", "3", None),
+        "no-runs": (True, "777", None, None),
+        "unknown-runs": (True, "777", "unknown", None),
+        "no-pid": (True, None, "3", None),
+    }
+    reads = []
+
+    def read_job(label, uid, run=None):
+        reads.append(label)
+        if len(reads) == 1:
+            return jobs[job]
+        return (True, "777", "3" if after == "same" else "4", None)
+
+    monkeypatch.setattr(smoke, "read_job", read_job)
+    monkeypatch.setattr(smoke, "install", lambda e, what: "")
+    monkeypatch.setattr(
+        smoke, "read_plist_field", lambda label, f: str(env.home.resolve()) if f else ""
+    )
+    monkeypatch.setattr(smoke.Harness, "wait_for", lambda self, what, pred, **k: True)
+    monkeypatch.setattr(
+        "stt_server.auth.load_token_file", lambda p, uid=None: (str(env.home.resolve()), "t")
+    )
+    connects, sent = [], []
+
+    def connect_verified(endpoint, pid, runs, identity, **k):
+        connects.append((endpoint, pid, runs))
+        if conn == "refused":
+            raise smoke._smoke_lib.EndpointRefused("held by pid 666")
+        return object()
+
+    def gate(host, port, token_file, *, connect):
+        connect()
+        sent.append(token_file)
+
+    monkeypatch.setattr(smoke._smoke_lib, "connect_verified", connect_verified)
+    monkeypatch.setattr(smoke._smoke_lib, "assert_token_gate", gate)
+    try:
+        if job != "running":
+            with pytest.raises(smoke.CheckFailed, match="no token sent"):
+                h.check_token()
+            assert connects == [] and sent == []
+            return
+        if conn == "refused":
+            with pytest.raises(smoke.CheckFailed, match="token not sent"):
+                h.check_token()
+            assert sent == []
+        elif after == "restarted":
+            with pytest.raises(smoke.CheckFailed, match="changed during the token check"):
+                h.check_token()
+        else:
+            assert "verified" in h.check_token()
+        assert connects == [(("tcp", "127.0.0.1", str(h.port)), "777", "3")]
+    finally:
+        if h.token_dir is not None:
+            shutil.rmtree(h.token_dir, ignore_errors=True)

@@ -153,6 +153,22 @@ def read_field(plist: dict, name: str) -> str:
     return read_flags(plist).get(f"--{name}", "")
 
 
+def env_token(plist: dict) -> str:
+    """The legacy bearer token in a loaded plist's ``EnvironmentVariables``, the
+    way the server resolves it when it has no ``--auth-token-file``
+    (``stt_server.__main__._resolve_auth_token``): the first of
+    ``PIPECAT_STT_AUTH_TOKEN``, ``KODA_STT_AUTH_TOKEN`` that is set and not
+    blank, stripped; '' when neither is. Never printed by the CLI."""
+    env = plist.get("EnvironmentVariables")
+    if not isinstance(env, dict):
+        return ""
+    for name in _ENV_TOKENS:
+        val = env.get(name)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 def has_auth(plist: dict) -> bool:
     env = plist.get("EnvironmentVariables")
     if isinstance(env, dict) and any(env.get(k) for k in _ENV_TOKENS):

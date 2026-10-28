@@ -57,6 +57,11 @@ Two reads live here: the job list (``launchctl list``) and a real job's
 ``launchctl print`` (``read_job``: classified by ``squat_check.classify_print``,
 plus its runs counter and arguments block). A ``launchctl`` or ``lsof`` answer the
 harness cannot read refuses or FAILs, never reads as "not loaded" or "free".
+The token check sends its throwaway token (and the wrong one) only over
+``_smoke_lib.connect_verified`` connections whose server end is the spare job
+(its pid and ``runs`` from one ``read_job``), and PASSes only when a fresh
+``read_job`` afterwards shows the same pair; until then it waits for the agent
+with requests that carry no token.
 
 Every installer call runs in its own process group through
 ``_smoke_lib.run_owned`` (``run_installer``): a SIGINT/SIGTERM during an install
@@ -821,8 +826,13 @@ class Harness:
                 raise CheckFailed(f"timed out after {timeout:.0f}s waiting for {what}{extra}")
             time.sleep(every)
 
-    def tcp_up(self, token: str | None = None) -> bool:
-        return _smoke_lib.ws_handshake_status(host=HOST, port=self.port, token=token) == 101
+    def tcp_status(self) -> int:
+        """The spare port's answer to an upgrade with NO token (nothing secret
+        goes to an unverified listener)."""
+        return _smoke_lib.ws_handshake_status(host=HOST, port=self.port)
+
+    def tcp_up(self) -> bool:
+        return self.tcp_status() == 101
 
     def sock_up(self) -> bool:
         return _smoke_lib.ws_handshake_status(unix_path=str(self.sock)) == 101
@@ -986,19 +996,52 @@ class Harness:
         )
         # The server's own policy must accept it before launchd is asked to.
         try:
-            resolved, token = load_token_file(str(token_file), uid=int(self.uid))
+            resolved, _token = load_token_file(str(token_file), uid=int(self.uid))
         except ValueError as exc:
             raise CheckFailed(f"token file policy refused the harness file: {exc}") from exc
 
         install(install_env(self.label, self.port, token_file=token_file), "token")
         if read_plist_field(self.label, "auth-token-file") != resolved:
             raise CheckFailed("plist does not record the resolved token file path")
-        self.wait_for("the token agent to accept the token", lambda: self.tcp_up(token))
+        # Up = refuses a request with no token; nothing secret is sent yet.
+        self.wait_for("the token agent to refuse a request with no token", self._refuses)
+        # The token (and the wrong one, nearly the token) goes only over a
+        # connection whose server end is the spare job (pid P, runs R from one
+        # launchctl print), and a fresh print after the gate must still give
+        # (P, R): _smoke_lib.connect_verified's contract.
+        loaded, pid, runs, _ep = read_job(self.label, self.uid)
+        if not (loaded and pid and runs and runs != UNKNOWN):
+            raise CheckFailed(
+                f"the spare job is not running with a readable pid and runs "
+                f"(loaded {loaded}, pid {pid}, runs {runs}); no token sent"
+            )
+
+        def connect():
+            return _smoke_lib.connect_verified(
+                ("tcp", HOST, str(self.port)), pid, runs, self._identity
+            )
+
         try:
-            _smoke_lib.assert_token_gate(HOST, self.port, str(token_file))
+            _smoke_lib.assert_token_gate(HOST, self.port, str(token_file), connect=connect)
+        except _smoke_lib.EndpointRefused as exc:
+            raise CheckFailed(f"token not sent: {exc}") from exc
         except AssertionError as exc:
             raise CheckFailed(str(exc)) from exc
-        return "no token -> 401, wrong token -> 401, token -> 101"
+        now = self._identity()
+        if now != (pid, runs):
+            raise CheckFailed(
+                f"the spare job changed during the token check: {(pid, runs)} -> {now}"
+            )
+        return "no token -> 401, wrong token -> 401, token -> 101 (server end verified)"
+
+    def _refuses(self) -> bool:
+        return self.tcp_status() == 401
+
+    def _identity(self):
+        """(pid, runs) of the spare job from one fresh ``launchctl print``; None
+        when it is not loaded. An unreadable answer raises LaunchdUnreadable."""
+        loaded, pid, runs, _ep = read_job(self.label, self.uid)
+        return (pid, runs) if loaded else None
 
     # -- teardown
 

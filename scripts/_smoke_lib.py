@@ -25,10 +25,15 @@ The module holds several separate concerns; each section below is used by:
   the filesystem) rejects a foreign uid only if that uid can traverse the path
   to the socket; otherwise it fails at path resolution, before the peer-cred
   gate, and the verdict would reflect the filesystem boundary.
+* Verified connections (``smoke.py --agents``' decode child, the token-file
+  step, the harness's token check): ``connect_verified``, the one rule for
+  sending a token, and ``launchd_identity`` / ``parse_runs`` (a job's pid and
+  spawn counter from one ``launchctl print``). Contract at that section.
 * Token gate (``smoke.py``'s token-file step, the harness's token check): the
   token-file fixture (``write_policy_token_file``), a raw websocket handshake
-  (``ws_handshake_status``) and the 401/401/101 assertion
-  (``assert_token_gate``, Decision 9).
+  (``ws_handshake_status``, which sends a token only over a socket the caller
+  verified) and the 401/401/101 assertion (``assert_token_gate``, Decision 9),
+  whose every request goes over a ``connect_verified`` socket.
 * Owned process groups (``smoke.py``'s steps, the harness's installer calls):
   ``run_owned`` and ``OwnedGroup``, the one lifecycle for a child whose whole
   process group may have to be killed (invariant at that section).
@@ -42,8 +47,11 @@ import pwd
 import re
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -159,25 +167,204 @@ def assert_chain_traversable(sock: str) -> None:
         d = parent
 
 
+# --- verified connections -------------------------------------------------------
+#
+# The contract for sending a token (or anything secret) to an agent endpoint:
+# the token goes only over a connection whose SERVER END was verified to belong
+# to the job, on that same connection; a check on one connection and a send on
+# another leaves a window in which a squatter can take the endpoint.
+#
+#   1. The caller reads the job's pid P and spawn counter R from ONE
+#      `launchctl print` (launchd_identity, or the harness's read_job).
+#   2. connect_verified opens the connection and sends NOTHING.
+#   3. It identifies the process holding the server end of THAT connection:
+#      AF_UNIX -> getsockopt(SOL_LOCAL, LOCAL_PEERPID) on the connected socket
+#      (macOS; anything else cannot tell); TCP -> lsof for the socket whose
+#      endpoints are (server address -> our ephemeral address), polled briefly
+#      because a connection is not in any process until the server accepts it.
+#      The pid set must be exactly [P]; unreadable, invisible (lsof cannot see
+#      another uid's sockets) or different -> EndpointRefused, socket closed.
+#   4. A second `launchctl print` (READ_IDENTITY) must still give (P, R); only
+#      then is the socket returned, for the caller to write the token on.
+#   5. The caller requires a FRESH read to give (P, R) after the exchange
+#      before it reports a PASS.
+#
+# Residuals: a same-uid process cannot hold the job's pid, so a lookalike fails
+# step 3; a root process (which can do anything) is out of scope; LOCAL_PEERPID
+# and lsof's view of an accepted socket are macOS facts the stubbed tests
+# cannot prove; the live run does.
+
+SOL_LOCAL = 0  # <sys/un.h>, macOS
+LOCAL_PEERPID = 2  # <sys/un.h>, macOS: pid of the peer at connect time
+SERVER_END_SETTLE = 3.0  # how long lsof gets to see the accepted server end
+
+
+class EndpointRefused(Exception):
+    """The endpoint's server end is not provably the expected job's; nothing
+    was sent on the connection (it is closed)."""
+
+
+def launchd_identity(label: str, uid=None, run=subprocess.run):
+    """(loaded, pid, runs) from ONE read-only ``launchctl print gui/<uid>/LABEL``
+    (``squat_check.classify_print``'s rule plus ``parse_runs``); None when the
+    answer cannot be read. ``runs`` is None when the line is absent."""
+    import squat_check
+
+    uid = os.getuid() if uid is None else uid
+    try:
+        res = run(
+            ["launchctl", "print", f"gui/{uid}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = res.stdout or ""
+    state = squat_check.classify_print(res.returncode, out + "\n" + (res.stderr or ""))
+    if state is None:
+        return None
+    loaded, pid = state
+    return loaded, pid, (parse_runs(out) if loaded else None)
+
+
+def _lsof_addr(addr) -> str:
+    """A socket address as ``lsof -nP`` prints it: ``host:port``, ``[v6]:port``."""
+    host, port = addr[0], addr[1]
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def unix_peer_pid(sock) -> str | None:
+    """The pid at the other end of a connected AF_UNIX socket (macOS
+    ``LOCAL_PEERPID``), or None when it cannot be read (fail closed)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        raw = sock.getsockopt(SOL_LOCAL, LOCAL_PEERPID, struct.calcsize("i"))
+        pid = struct.unpack("i", raw)[0]
+    except (OSError, struct.error):
+        return None
+    return str(pid) if pid > 0 else None
+
+
+def tcp_server_end_pids(
+    sock, run=subprocess.run, settle: float = SERVER_END_SETTLE, sleep=time.sleep
+) -> list[str] | None:
+    """Pids holding the server end of the connected TCP socket SOCK: the lsof
+    entries whose name is ``<server address>-><our address>``. [] when none is
+    visible within SETTLE seconds, None when lsof cannot tell."""
+    import squat_check
+
+    local, remote = _lsof_addr(sock.getsockname()), _lsof_addr(sock.getpeername())
+    want = f"{remote}->{local}"
+    deadline = time.monotonic() + settle
+    while True:
+        out = squat_check.lsof_output([f"-iTCP@{local}", "-Fpn"], run)
+        if out is None:
+            return None
+        pids: set[str] = set()
+        cur = None
+        for line in out.splitlines():
+            if line.startswith("p"):
+                cur = line[1:]
+            elif line.startswith("n") and line[1:] == want and cur:
+                pids.add(cur)
+        if pids or time.monotonic() >= deadline:
+            return sorted(pids)
+        sleep(0.1)
+
+
+def connect_verified(
+    endpoint: tuple,
+    pid: str | None,
+    runs: str | None,
+    read_identity,
+    *,
+    timeout: float = 5.0,
+    run=subprocess.run,
+    settle: float = SERVER_END_SETTLE,
+    sleep=time.sleep,
+):
+    """A connected socket to ENDPOINT (``("unix", path)`` or ``("tcp", host,
+    port)``) whose server end belongs to pid PID, with nothing sent on it
+    (steps 2-4 of the contract above). READ_IDENTITY() re-reads the job and
+    must return ``(PID, RUNS)``. Raises EndpointRefused otherwise."""
+    if not pid or not runs or runs == "unknown":
+        raise EndpointRefused(f"no launchd pid and runs to verify against (pid {pid}, runs {runs})")
+    try:
+        if endpoint[0] == "unix":
+            where = endpoint[1]
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(timeout)
+                sock.connect(endpoint[1])
+            except BaseException:
+                sock.close()
+                raise
+        else:
+            host, port = endpoint[1], endpoint[2]
+            if not host:
+                raise EndpointRefused(f"the TCP endpoint has no host (port {port})")
+            where = f"{host}:{port}"
+            sock = socket.create_connection((host, int(port)), timeout=timeout)
+    except OSError as exc:
+        raise EndpointRefused(f"cannot connect to {where}: {exc}") from exc
+    try:
+        if endpoint[0] == "unix":
+            peer = unix_peer_pid(sock)
+            owners = None if peer is None else [peer]
+            how = "LOCAL_PEERPID"
+        else:
+            owners = tcp_server_end_pids(sock, run, settle, sleep)
+            how = "lsof"
+        if owners is None:
+            raise EndpointRefused(f"cannot identify the server end of {where} ({how} failed)")
+        if not owners:
+            raise EndpointRefused(
+                f"the server end of {where} is not visible ({how}; another user's socket?)"
+            )
+        if owners != [pid]:
+            raise EndpointRefused(
+                f"the server end of {where} is held by pid {', '.join(owners)}, "
+                f"not the launchd job (pid {pid})"
+            )
+        again = read_identity()
+        if again != (pid, runs):
+            raise EndpointRefused(
+                f"the job changed while {where} was verified (pid {pid}, runs {runs} -> {again})"
+            )
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
 def ws_handshake_status(
     *,
     host: str | None = None,
     port: int | None = None,
     unix_path: str | None = None,
+    sock=None,
     token: str | None = None,
     timeout: float = 5.0,
 ) -> int:
     """Send a websocket upgrade request and return the HTTP status code.
 
-    Connects over TCP (``host`` + ``port``) or a Unix socket (``unix_path``) and
-    reads only the response status line, then closes. The server runs its bearer
-    check (``_process_request``) before it validates the upgrade, so a missing or
-    wrong token is a 401 and an accepted request is a 101. Stdlib only.
+    Uses SOCK (a connected socket, closed afterwards) or connects over TCP
+    (``host`` + ``port``) or a Unix socket (``unix_path``), and reads only the
+    response status line, then closes. The server runs its bearer check
+    (``_process_request``) before it validates the upgrade, so a missing or
+    wrong token is a 401 and an accepted request is a 101. A TOKEN (or a wrong
+    one, which is nearly the token) is sent only over SOCK, which the caller
+    got from ``connect_verified``; with an address it is a ValueError.
     """
     import base64
-    import socket
 
-    if unix_path is not None:
+    if token is not None and sock is None:
+        raise ValueError("a token is sent only over a verified socket (sock=connect_verified())")
+    if sock is not None:
+        sock.settimeout(timeout)
+    elif unix_path is not None:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         sock.connect(unix_path)
@@ -211,29 +398,32 @@ def ws_handshake_status(
         sock.close()
 
 
-def assert_token_gate(host: str, port: int, token_file: str) -> None:
+def assert_token_gate(host: str, port: int, token_file: str, *, connect) -> None:
     """Require the server at HOST:PORT to enforce the bearer token in TOKEN_FILE.
 
     A websocket upgrade without a token must be refused with ``401`` (the
     server's reply to a missing or wrong ``Authorization: Bearer`` header), and
     the same request carrying the token read from ``token_file`` must be accepted
-    (``101 Switching Protocols``). Raises ``AssertionError`` otherwise.
+    (``101 Switching Protocols``). Raises ``AssertionError`` otherwise. Each of
+    the three requests goes over a fresh ``CONNECT()`` socket (a
+    ``connect_verified`` one: required, so no caller can send the token to an
+    unverified listener); its EndpointRefused propagates.
     """
     with open(token_file, encoding="utf-8") as fh:
         token = fh.read().strip()
     if not token:
         raise AssertionError(f"token file {token_file} holds no token")
-    without = ws_handshake_status(host=host, port=port)
+    without = ws_handshake_status(sock=connect())
     if without != 401:
         raise AssertionError(
             f"{host}:{port} answered {without} to a request with no token; expected 401"
         )
-    wrong = ws_handshake_status(host=host, port=port, token=token + "x")
+    wrong = ws_handshake_status(sock=connect(), token=token + "x")
     if wrong != 401:
         raise AssertionError(
             f"{host}:{port} answered {wrong} to a request with a wrong token; expected 401"
         )
-    accepted = ws_handshake_status(host=host, port=port, token=token)
+    accepted = ws_handshake_status(sock=connect(), token=token)
     if accepted != 101:
         raise AssertionError(
             f"{host}:{port} answered {accepted} to a request with the token from "

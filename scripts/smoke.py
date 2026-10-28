@@ -17,13 +17,20 @@ Run it as ``just smoke [--agents] [--launchd]``. Steps, in order:
   harness snapshots; ``$HOME`` does not move it). Installed plists only: a loaded
   job with no plist is not decoded (the launchd harness's real-agent snapshot,
   which also reads ``launchctl list``, does cover it). Each plist is read once,
-  in-process (``read_stt_plist.load``), and every endpoint field comes from that
-  one read. Before anything is sent (a token included) the endpoint must be
-  served by the agent's own launchd job: one read-only ``launchctl print``
-  gives its pid, and the endpoint's holders (``squat_check.endpoint_holders``)
-  must be exactly that pid, before and again after the decode; otherwise the
-  agent's row is FAIL and nothing was sent. Strictly read-only: it never calls
-  bootout, bootstrap, kickstart or the installer.
+  in-process (``read_stt_plist.load``), and every endpoint field and the token
+  come from that one read; the token is resolved as the server resolves it
+  (``--auth-token-file``, else ``PIPECAT_STT_AUTH_TOKEN``, else
+  ``KODA_STT_AUTH_TOKEN`` in the plist's ``EnvironmentVariables``) and handed to
+  the decode child on stdin, never on argv. The token goes only over a
+  connection whose server end is the agent's own launchd job
+  (``_smoke_lib.connect_verified``): one read-only ``launchctl print`` gives its
+  pid P and spawn counter ``runs`` R; the child opens the connection, sends
+  nothing until the process holding the server end of THAT connection is P
+  (``LOCAL_PEERPID`` for a socket, ``lsof`` for TCP) and a second print still
+  gives (P, R), then decodes over that same socket. After the decode a fresh
+  print must still give (P, R) for a PASS. Otherwise the agent's row is FAIL,
+  and when the check refused, nothing was sent. Strictly read-only: it never
+  calls bootout, bootstrap, kickstart or the installer.
 * ``launchd`` (``--launchd``): ``smoke_launchd.py`` on the spare label and port.
   macOS only, never in CI, and it needs both ``PIPECAT_STT_LABEL`` and
   ``KODA_STT_LABEL`` set to the spare label, which this runner does explicitly.
@@ -63,7 +70,6 @@ sys.path.insert(0, str(SCRIPTS))
 
 import _smoke_lib  # noqa: E402
 import read_stt_plist  # noqa: E402
-import squat_check  # noqa: E402
 
 PASS, FAIL, SKIPPED = _smoke_lib.PASS, _smoke_lib.FAIL, _smoke_lib.SKIPPED
 SPARE_LABEL = _smoke_lib.SPARE_LABEL
@@ -75,6 +81,9 @@ PEERCRED_TIMEOUT = 180.0
 TOKEN_TIMEOUT = 90.0
 CLIP_TIMEOUT = 60.0
 DECODE_TIMEOUT = 180.0
+# The decode child's exit status when connect_verified refused the endpoint:
+# nothing (no token) was sent.
+DECODE_REFUSED = 3
 LAUNCHD_TIMEOUT = 900.0
 # After a step's timeout (SIGTERM) or Ctrl-C (SIGINT) the child gets this long to
 # run its own cleanup before its process group is SIGKILLed: smoke_launchd.py's
@@ -112,7 +121,7 @@ def exit_code(results: list[StepResult]) -> int:
 
 
 def run_command(
-    cmd: list[str], timeout: float, env: dict | None = None
+    cmd: list[str], timeout: float, env: dict | None = None, *, input: bytes | None = None
 ) -> subprocess.CompletedProcess:
     """The only place this module spawns a subprocess for a step.
 
@@ -125,10 +134,11 @@ def run_command(
     process group is SIGKILLed while the step is still unreaped, so the signal
     can only reach the step's own group, never a reused pid or group. Afterwards
     a held signal is raised as KeyboardInterrupt (``main`` turns a SIGTERM into
-    one too) and a timeout as ``subprocess.TimeoutExpired``.
+    one too) and a timeout as ``subprocess.TimeoutExpired``. INPUT goes to the
+    step's stdin (a token travels this way, never on argv).
     """
     res, timed_out = _smoke_lib.run_owned(
-        cmd, timeout, env=env, cwd=str(REPO), grace=TEARDOWN_GRACE
+        cmd, timeout, env=env, cwd=str(REPO), grace=TEARDOWN_GRACE, input=input
     )
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, timeout, output=res.stdout, stderr=res.stderr)
@@ -168,10 +178,13 @@ def _tail(proc: subprocess.CompletedProcess) -> str:
     return lines[-1][:200] if lines else ""
 
 
-def _execute(cmd, timeout, env=None):
+def _execute(cmd, timeout, env=None, input=None):
     """Run one command; return (outcome, detail, proc-or-None)."""
     try:
-        proc = run_command(cmd, timeout, env)
+        if input is None:
+            proc = run_command(cmd, timeout, env)
+        else:
+            proc = run_command(cmd, timeout, env, input=input)
     except subprocess.TimeoutExpired:
         return FAIL, f"timed out after {timeout:g}s", None
     except Exception as exc:  # noqa: BLE001 - a crash is a FAIL, never a traceback
@@ -285,69 +298,71 @@ def agent_plists() -> list[Path]:
 ENDPOINT_FIELDS = ("socket-path", "host", "port", "auth-token-file")
 
 
-def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str]:
-    """(endpoint, error): every endpoint field from ONE in-process read of PLIST
-    (``read_stt_plist.load``), so the fields always come from the same version
-    of the file even while an installer replaces it."""
+def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str | None, str]:
+    """(endpoint, token, error): every endpoint field AND the bearer token from
+    ONE in-process read of PLIST (``read_stt_plist.load``), so they always come
+    from the same version of the file even while an installer replaces it.
+
+    The token is resolved the way the server resolves it: the file named by
+    ``--auth-token-file`` (read here, stripped; an unreadable or empty file is
+    an error, never "no token"), else the plist's legacy environment token
+    (``read_stt_plist.env_token``: ``PIPECAT_STT_AUTH_TOKEN``, then
+    ``KODA_STT_AUTH_TOKEN``); None when the agent requires none."""
     try:
         data = read_stt_plist.load(str(plist))
     except read_stt_plist.MalformedPlist as exc:
-        return None, f"cannot read {plist.name}: {exc}"
+        return None, None, f"cannot read {plist.name}: {exc}"
     if not data:
-        return None, f"{plist.name} is gone"
+        return None, None, f"{plist.name} is gone"
     # Exactly as recorded: read_field adds nothing.
     endpoint = {f: read_stt_plist.read_field(data, f) for f in ENDPOINT_FIELDS}
     if not endpoint["socket-path"] and not (endpoint["host"] and endpoint["port"]):
-        return None, "plist has no endpoint"
-    return endpoint, ""
+        return None, None, "plist has no endpoint"
+    token_file = endpoint["auth-token-file"]
+    if token_file:
+        try:
+            with open(token_file, encoding="utf-8") as fh:
+                token = fh.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, None, f"cannot read its token file: {type(exc).__name__}"
+        if not token:
+            return None, None, "its token file is empty"
+        return endpoint, token, ""
+    return endpoint, read_stt_plist.env_token(data) or None, ""
 
 
-def _holders(endpoint: dict[str, str]) -> list[str] | None:
-    return squat_check.endpoint_holders(
-        endpoint["host"] or None, endpoint["port"], endpoint["socket-path"]
-    )
+def endpoint_tuple(endpoint: dict[str, str]) -> tuple[str, ...]:
+    """The ``connect_verified`` form: ("unix", path) or ("tcp", host, port)."""
+    if endpoint["socket-path"]:
+        return ("unix", endpoint["socket-path"])
+    return ("tcp", endpoint["host"], endpoint["port"])
 
 
-def agent_identity(label: str, endpoint: dict[str, str]) -> tuple[str | None, str]:
-    """(launchd pid, reason): the pid that serves ENDPOINT when it is the
-    agent's own launchd job, else (None, why not).
-
-    The contract before any request (and so any token) goes to ENDPOINT: ONE
-    read-only ``launchctl print`` of LABEL, classified by
-    ``squat_check.classify_print``, must show a running job with pid P, and the
-    holders of the endpoint (``squat_check.endpoint_holders``: the TCP listeners
-    on its host and port, or the holders of the socket's ``.lock``) must be
-    exactly [P]. Not loaded, no pid, nothing listening, a foreign or extra
-    holder, or an answer that cannot be read: no request is sent."""
-    state = squat_check.launchd_state(label)
+def job_identity(label: str) -> tuple[tuple[str, str] | None, str]:
+    """((pid, runs), "") of LABEL's running launchd job from ONE read-only
+    ``launchctl print`` (``_smoke_lib.launchd_identity``), else (None, why)."""
+    state = _smoke_lib.launchd_identity(label)
     if state is None:
         return None, "cannot read its launchd state (launchctl print failed)"
-    loaded, pid = state
+    loaded, pid, runs = state
     if not loaded:
         return None, "not loaded in launchd"
     if not pid:
         return None, "loaded but not running (launchd has no pid)"
-    holders = _holders(endpoint)
-    if holders is None:
-        return None, "cannot tell who serves its endpoint (lsof failed)"
-    if not holders:
-        return None, f"nothing serves its endpoint (launchd pid {pid})"
-    if holders != [pid]:
-        return None, (
-            f"its endpoint is held by pid {', '.join(holders)}, not the launchd job (pid {pid})"
-        )
-    return pid, ""
+    if not runs:
+        return None, f"launchctl print shows pid {pid} but no `runs =` line"
+    return (pid, runs), ""
 
 
-def decode_cmd(endpoint: dict, wav: str) -> list[str]:
+def decode_cmd(label: str, endpoint: dict, wav: str, pid: str, runs: str) -> list[str]:
+    """The decode child's argv: the endpoint and the identity it must verify
+    (label, pid, runs). Never the token: that goes on stdin."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "--_decode", "--wav", wav]
-    cmd += ["--keyword", CLIP_KEYWORD]
+    cmd += ["--keyword", CLIP_KEYWORD, "--label", label, "--pid", pid, "--runs", runs]
     if endpoint.get("socket-path"):
         cmd += ["--socket-path", endpoint["socket-path"]]
     else:
         cmd += ["--host", endpoint["host"], "--port", endpoint["port"]]
-    if endpoint.get("auth-token-file"):
-        cmd += ["--auth-token-file", endpoint["auth-token-file"]]
     return cmd
 
 
@@ -382,25 +397,35 @@ def agents_step(requested: bool) -> StepResult:
             return StepResult("agents", FAIL, err)
         for plist in plists:
             label = plist.name[: -len(".plist")]
-            endpoint, bad = read_endpoint(plist)
-            pid = None
+            endpoint, token, bad = read_endpoint(plist)
+            ident = None
             if endpoint is not None:
-                pid, why = agent_identity(label, endpoint)
-                if pid is None:
+                ident, why = job_identity(label)
+                if ident is None:
                     bad = f"{why}; not decoded, no token sent"
             if bad:
                 failed = True
                 parts.append(f"{label}: FAIL {bad}")
                 continue
-            outcome, detail, _ = _execute(decode_cmd(endpoint, wav), DECODE_TIMEOUT)
-            # The PASS must come from the agent: the endpoint is still held by
-            # the same launchd pid after the decode (a restart or a takeover
-            # during it is a FAIL).
-            if outcome == PASS and _holders(endpoint) != [pid]:
-                outcome, detail = (
-                    FAIL,
-                    f"its endpoint changed hands during the decode (was pid {pid})",
-                )
+            pid, runs = ident
+            outcome, detail, proc = _execute(
+                decode_cmd(label, endpoint, wav, pid, runs),
+                DECODE_TIMEOUT,
+                input=token.encode() if token else None,
+            )
+            if outcome == FAIL and proc is not None and proc.returncode == DECODE_REFUSED:
+                detail = f"{detail}; not decoded, no token sent"
+            # The PASS must come from the agent: a FRESH launchctl print after
+            # the decode still shows the same pid and runs (a restart, even
+            # one back to the same pid, or an unload during it is a FAIL).
+            if outcome == PASS:
+                now = _smoke_lib.launchd_identity(label)
+                if now != (True, pid, runs):
+                    outcome, detail = (
+                        FAIL,
+                        f"the launchd job changed during the decode (pid {pid}, runs {runs} "
+                        f"-> {now})",
+                    )
             failed = failed or outcome != PASS
             parts.append(f"{label}: {outcome}" + (f" {detail}" if detail else ""))
     return StepResult("agents", FAIL if failed else PASS, "; ".join(parts))
@@ -488,9 +513,19 @@ def _token_check() -> int:
         else:
             print(f"server did not listen on 127.0.0.1:{port} within 30s", file=sys.stderr)
             return 1
+        # The token goes only over a connection whose server end is the server
+        # this child started (lsof), the same contract as the agents' decode.
+        me = (str(server.pid), "self")
+
+        def identity():
+            return me if server.poll() is None else None
+
+        def connect():
+            return _smoke_lib.connect_verified(("tcp", "127.0.0.1", str(port)), *me, identity)
+
         try:
-            assert_token_gate("127.0.0.1", port, token_file)
-        except (AssertionError, OSError) as exc:
+            assert_token_gate("127.0.0.1", port, token_file, connect=connect)
+        except (AssertionError, OSError, _smoke_lib.EndpointRefused) as exc:
             print(f"token gate: {exc}", file=sys.stderr)
             return 1
         print(f"token gate OK on 127.0.0.1:{port}")
@@ -509,29 +544,67 @@ def _token_check() -> int:
         signal.signal(signal.SIGTERM, old_term)
 
 
+def _verified_client(sock, uri: str, token: str | None):
+    """A ``TranscriptionClient`` that speaks over SOCK, a connection
+    ``connect_verified`` already checked, instead of opening its own (the
+    production client is unchanged): the same handshake, ``server.hello``
+    then ``session.created``."""
+    from websockets.asyncio.client import connect as ws_connect
+
+    from stt_server import protocol as P
+    from stt_server.client import TranscriptionClient
+
+    class VerifiedSocketClient(TranscriptionClient):
+        async def connect(self) -> dict:
+            headers = {"Authorization": f"Bearer {self._auth_token}"} if self._auth_token else None
+            self._ws = await ws_connect(
+                self._uri, sock=sock, additional_headers=headers, max_size=P.MAX_APPEND_BYTES
+            )
+            hello = await self._recv_json()
+            if hello.get("type") != P.EVT_SERVER_HELLO:
+                raise RuntimeError(f"expected server.hello, got {hello.get('type')}")
+            created = await self._recv_json()
+            if created.get("type") != P.EVT_SESSION_CREATED:
+                raise RuntimeError(f"expected session.created, got {created.get('type')}")
+            return hello
+
+    return VerifiedSocketClient(uri=uri, auth_token=token)
+
+
 def _decode(args: argparse.Namespace) -> int:
-    """Decode a wav through one endpoint; require the key word in the transcript."""
+    """Decode a wav through one endpoint; require the key word in the transcript.
+
+    The token arrives on stdin. Before anything is sent, the connection's
+    server end must be the launchd job (ARGS.pid, ARGS.runs) of ARGS.label
+    (``_smoke_lib.connect_verified``); a refusal exits ``DECODE_REFUSED``."""
     import asyncio
     import wave
 
     sys.path.insert(0, str(REPO))
-    from stt_server.client import TranscriptionClient
+    from stt_server.client import format_host_for_uri
     from stt_server.protocol import EVT_TRANSCRIPT_COMPLETED
 
-    token = None
-    if args.auth_token_file:
-        with open(args.auth_token_file, encoding="utf-8") as fh:
-            token = fh.read().strip()
+    token = sys.stdin.read().strip() or None
     with wave.open(args.wav) as w:
         data = w.readframes(w.getnframes())
+    if args.socket_path:
+        endpoint, uri = ("unix", args.socket_path), "ws://localhost/"
+    else:
+        endpoint = ("tcp", args.host, args.port)
+        uri = f"ws://{format_host_for_uri(args.host)}:{args.port}/"
+
+    def identity():
+        state = _smoke_lib.launchd_identity(args.label)
+        return (state[1], state[2]) if state and state[0] else None
+
+    try:
+        sock = _smoke_lib.connect_verified(endpoint, args.pid, args.runs, identity)
+    except _smoke_lib.EndpointRefused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return DECODE_REFUSED
 
     async def go() -> str:
-        kwargs = {"auth_token": token}
-        if args.socket_path:
-            kwargs["socket_path"] = args.socket_path
-        else:
-            kwargs["host"], kwargs["port"] = args.host, int(args.port)
-        async with TranscriptionClient(**kwargs) as c:
+        async with _verified_client(sock, uri, token) as c:
             await c.update_session(turn_detection=None)
             for i in range(0, len(data), 3200):
                 await c.send_audio(data[i : i + 3200])
@@ -562,10 +635,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.add_argument("--_decode", action="store_true")
         ap.add_argument("--wav", required=True)
         ap.add_argument("--keyword", required=True)
+        ap.add_argument("--label", required=True)
+        ap.add_argument("--pid", required=True)
+        ap.add_argument("--runs", required=True)
         ap.add_argument("--socket-path")
         ap.add_argument("--host")
         ap.add_argument("--port")
-        ap.add_argument("--auth-token-file")
         return _decode(ap.parse_args(argv))
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
