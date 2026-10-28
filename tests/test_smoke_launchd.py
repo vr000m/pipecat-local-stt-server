@@ -2150,3 +2150,33 @@ def test_check_token_sends_only_over_verified_connections(
     finally:
         if h.token_dir is not None:
             shutil.rmtree(h.token_dir, ignore_errors=True)
+
+
+# An installer group that cannot be shown stopped is never a result: in a
+# check it is InstallerNotStopped (a STOP_CHECKS failure, so no later check
+# installs beside it); in teardown it is a problem, so teardown cannot PASS.
+@pytest.mark.parametrize("where", ["check", "teardown"])
+def test_installer_group_not_stopped_is_a_failure(smoke, env, monkeypatch, where):
+    def run_owned(*a, **k):
+        raise smoke._smoke_lib.GroupNotStopped("cannot SIGKILL process group 1: EPERM")
+
+    monkeypatch.setattr(smoke._smoke_lib, "run_owned", run_owned)
+    if where == "check":
+        with pytest.raises(smoke.InstallerNotStopped):
+            smoke.run_installer("install", {})
+        assert issubclass(smoke.InstallerNotStopped, smoke.STOP_CHECKS)
+        rows = smoke.run_checks(
+            type("H", (), {"ensure_real_agents_unchanged": lambda s: None,
+                           "ensure_port_ours": lambda s: None,
+                           "release_holder": lambda s: None})(),
+            (("a", lambda: smoke.install({}, "a")), ("b", lambda: "ran")),
+            [],
+        )  # fmt: skip
+        assert [r[1] for r in rows] == [smoke.FAIL, smoke.SKIPPED]
+        assert rows[0][2].startswith("installer not stopped")
+    else:
+        monkeypatch.setenv("HOME", str(env.home))
+        monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
+        monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
+        problems = smoke.Harness(SPARE, _free_port()).teardown()
+        assert any("uninstall failed" in p and "EPERM" in p for p in problems), problems

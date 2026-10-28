@@ -1318,3 +1318,59 @@ def test_run_owned_input_reaches_stdin_only(smoke, payload, want):
     res, _ = smoke._smoke_lib.run_owned(cmd, 30, input=payload)
     assert res.stdout == want
     assert all("s3cret" not in a for a in cmd)
+
+
+# The group kill's outcome x whether the leader is still running -> run_owned
+# returns the result only when the group is provably stopped: the SIGKILL
+# landed (or the group is gone: ESRCH; or macOS's EPERM for a zombie-only
+# group, accepted only once the leader exited) AND the leader was reaped.
+# Anything else is GroupNotStopped, never a result.
+@pytest.mark.parametrize(
+    ("kill", "leader", "want"),
+    [
+        ("real", "exits", "result"),
+        ("esrch", "exits", "result"),
+        ("eperm", "exits", "result"),
+        ("einval", "exits", "not-stopped"),
+        ("eperm", "runs", "not-stopped"),
+        ("noop", "runs", "not-stopped"),  # killpg "succeeds" but the leader survives
+        ("real", "runs", "result"),
+    ],
+)
+def test_run_owned_reports_a_failed_group_kill(smoke, monkeypatch, kill, leader, want):
+    import errno
+
+    lib = smoke._smoke_lib
+    real_killpg = os.killpg
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class Recorded(real_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            spawned.append(self)
+
+    def killpg(pgid, sig):
+        if kill == "real":
+            return real_killpg(pgid, sig)
+        if kill == "noop":
+            return None
+        code = {"esrch": errno.ESRCH, "eperm": errno.EPERM, "einval": errno.EINVAL}[kill]
+        raise OSError(code, os.strerror(code))  # OSError maps the errno to its subclass
+
+    monkeypatch.setattr(lib.subprocess, "Popen", Recorded)
+    monkeypatch.setattr(lib.os, "killpg", killpg)
+    body = "pass" if leader == "exits" else "import time; time.sleep(30)"
+    try:
+        if want == "result":
+            res, _ = lib.run_owned([sys.executable, "-c", body], 0.5, timeout_signal=None)
+            assert res.returncode is not None
+        else:
+            with pytest.raises(lib.GroupNotStopped):
+                lib.run_owned([sys.executable, "-c", body], 0.5, timeout_signal=None)
+    finally:
+        for p in spawned:
+            if p.returncode is None:
+                with contextlib.suppress(OSError):
+                    real_killpg(p.pid, signal.SIGKILL)
+                p.wait(10)

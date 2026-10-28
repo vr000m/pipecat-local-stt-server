@@ -506,6 +506,12 @@ def _drain(fd: int, sink: list[bytes]) -> None:
             sink.append(chunk)
 
 
+class GroupNotStopped(RuntimeError):
+    """``run_owned`` could not prove the child's group stopped: the SIGKILL
+    failed, or the leader was still not reaped after it. Something the child
+    started may still be running; the caller must treat this as a failure."""
+
+
 class OwnedGroup:
     """A child started in its own session (so it leads its own process group),
     signalled only while this process owns that group (see the invariant
@@ -581,13 +587,29 @@ class OwnedGroup:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(self.pid, sig)
 
-    def kill_group(self) -> None:
+    def kill_group(self) -> str | None:
         """SIGKILL the whole group, the leader included (a session leader cannot
-        leave its group). macOS answers EPERM for a group that holds only the
-        zombie leader: nothing is left to kill."""
+        leave its group). None when the group is gone or was killed; otherwise
+        why it could not be (the caller must treat that as a failure).
+
+        ESRCH: nothing is left. EPERM: macOS's answer for a group that holds
+        only the zombie leader, so it is accepted only once the leader has
+        exited; EPERM while the leader is still running, or any other error,
+        is a failure."""
         self._require_owned()
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        try:
             os.killpg(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            if self.exited():
+                return None
+            return (
+                f"cannot SIGKILL process group {self.pid}: permission denied, leader still running"
+            )
+        except OSError as exc:
+            return f"cannot SIGKILL process group {self.pid}: {exc}"
+        return None
 
     def reap(self, drain: float = GROUP_DRAIN) -> None:
         """Reap the leader (the last use of its pid), then give the pipe readers
@@ -634,7 +656,12 @@ def run_owned(
     handler that was in place (``redeliver``), on EVERY path: also when the
     group cannot be started or the wait raises (then after the kill and reap,
     and the handler's own exception, e.g. KeyboardInterrupt, takes over from
-    the one in flight). A held signal is never dropped."""
+    the one in flight). A held signal is never dropped.
+
+    Raises GroupNotStopped when the group could not be shown stopped: the
+    SIGKILL failed (anything but ESRCH, or EPERM once the leader has exited,
+    macOS's answer for a zombie-only group) or the leader was not reaped
+    after it. No result is returned as success then."""
     held: tuple[list[int], dict] = ([], {})
     try:
         with held_signals() as held:
@@ -662,11 +689,14 @@ def run_owned(
                         break  # grace over: the kill below takes the leader too
                     time.sleep(GROUP_POLL)
             finally:
-                group.kill_group()
+                kill_error = group.kill_group()
                 group.reap()
     finally:
         got, old = held
         if got:
             redeliver(got[0], old.get(got[0]))
     out, err = group.output()
+    if kill_error is not None or not group.reaped:
+        why = kill_error or f"pid {group.pid} was still running after SIGKILL and the reap wait"
+        raise GroupNotStopped(f"{why}; its process group may still be running")
     return subprocess.CompletedProcess(cmd, group.proc.returncode, out, err), timed_out

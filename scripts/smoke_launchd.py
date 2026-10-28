@@ -171,11 +171,17 @@ class RealAgentsChanged(CheckFailed):
     """A real agent's snapshot differs from the baseline (or cannot be re-read)."""
 
 
+class InstallerNotStopped(CheckFailed):
+    """An installer call's process group could not be shown stopped
+    (``_smoke_lib.GroupNotStopped``): it may still be changing the spare."""
+
+
 # A check that raises one of these leaves the harness unable to prove the spare
 # port and label are still its own, or that the real agents are untouched, so no
 # later (mutating) check may run.
-STOP_CHECKS = (PortLost, LaunchdUnreadable, RealAgentsChanged)
+STOP_CHECKS = (PortLost, LaunchdUnreadable, RealAgentsChanged, InstallerNotStopped)
 _STOP_REASONS = {
+    InstallerNotStopped: ("installer not stopped", "an installer may still be running"),
     PortLost: ("port lost", "the spare port was lost"),
     LaunchdUnreadable: ("launchd state unreadable", "the spare's launchd state cannot be read"),
     RealAgentsChanged: ("real agents changed", "a real agent changed"),
@@ -758,17 +764,22 @@ def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.
     its leader is unreaped, and only then does the signal reach the harness's
     handler (KeyboardInterrupt, teardown follows). With ``teardown`` (the
     uninstall) a signal does not stop the installer. INSTALL_TIMEOUT kills the
-    group and raises subprocess.TimeoutExpired."""
+    group and raises subprocess.TimeoutExpired. A group that cannot be shown
+    stopped (the SIGKILL failed, or the leader was not reaped) raises
+    InstallerNotStopped, never a result."""
     cmd = ["bash", str(INSTALLER), sub]
-    res, timed_out = _smoke_lib.run_owned(
-        cmd,
-        INSTALL_TIMEOUT,
-        env=env,
-        cwd=str(REPO_ROOT),
-        stop_on_signal=not teardown,
-        interrupt_signal=None,
-        timeout_signal=None,
-    )
+    try:
+        res, timed_out = _smoke_lib.run_owned(
+            cmd,
+            INSTALL_TIMEOUT,
+            env=env,
+            cwd=str(REPO_ROOT),
+            stop_on_signal=not teardown,
+            interrupt_signal=None,
+            timeout_signal=None,
+        )
+    except _smoke_lib.GroupNotStopped as exc:
+        raise InstallerNotStopped(f"installer {sub}: {exc}") from exc
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, INSTALL_TIMEOUT, output=res.stdout, stderr=res.stderr)
     return res
@@ -1137,7 +1148,7 @@ class Harness:
                 problems.append(
                     f"uninstall: exit {res.returncode}: {(res.stderr or '').strip()[-200:]}"
                 )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, InstallerNotStopped) as exc:
             problems.append(f"uninstall failed: {exc}")
 
         self.remove_spare_socket(problems)
