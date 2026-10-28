@@ -410,29 +410,52 @@ def test_agents_skipped_when_none_installed(smoke, agents_env, capsys):
     assert not any(ln.startswith("say ") for ln in _argv(log))
 
 
-def test_agents_read_only_with_tcp_and_socket_plists(smoke, agents_env, capsys):
-    home, log, ran, tmp_path = agents_env
+def test_agents_read_only_with_tcp_and_socket_plists(smoke, agents_env, monkeypatch, capsys):
+    # The plists are read for real (read_stt_plist.py); only the decode child is
+    # faked. Each plist gets exactly one decode at the endpoint it records, the
+    # row is PASS, and nothing mutating (or any launchctl / uv call) happens.
+    home, log, _ran, tmp_path = agents_env
     _render_plist(home, "pipecat.stt-server", port=9565)
     _render_plist(home, "pipecat.stt-server.parakeet", port=9765, backend="parakeet")
     sock = tmp_path / "s.sock"
     _render_plist(home, "pipecat.stt-server.sock", socket_path=sock)
-    smoke.main(["--agents"])
+    ran: list[list[str]] = []
+    decodes: list[list[str]] = []
+    reads: list[list[str]] = []
+    real = subprocess.run
+
+    def seam_run(cmd, timeout, env=None, **kw):
+        cmd = [str(c) for c in cmd]
+        ran.append(cmd)
+        if Path(cmd[0]).name in STUBBED_TOOLS:
+            return real(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        if any(c.endswith("read_stt_plist.py") for c in cmd):
+            reads.append(cmd)
+            return real(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        assert "--_decode" in cmd, cmd  # the only other child this step may start
+        decodes.append(cmd)
+        return _cp(0)
+
+    monkeypatch.setattr(smoke, "run_command", seam_run)
+    row = smoke.agents_step(True)
     capsys.readouterr()
+    assert row.outcome == "PASS", row
+    assert len(reads) == 3 * 4  # four fields per plist, all read for real
+
+    def flag(cmd, name):
+        return cmd[cmd.index(name) + 1] if name in cmd else ""
+
+    got = sorted((flag(d, "--socket-path"), flag(d, "--host"), flag(d, "--port")) for d in decodes)
+    assert got == sorted(
+        [("", "127.0.0.1", "9565"), ("", "127.0.0.1", "9765"), (str(sock), "", "")]
+    )
     lines = _argv(log)
-    assert lines, "agents step should have consulted launchctl/uv stubs"
-    for ln in lines:
-        tool, _, rest = ln.partition(" ")
-        if tool == "launchctl":
-            assert rest.split()[0] in {"print", "list", "print-disabled"}, ln
-        assert not any(w in ln for w in FORBIDDEN), ln
-        if tool == "uv" and rest.startswith("run"):
-            assert "--no-sync" in rest, ln
+    assert any(ln.startswith("say ") for ln in lines), "the clip was never generated"
+    assert any(ln.startswith("afconvert ") for ln in lines)
+    assert not [ln for ln in lines if ln.split()[0] in ("launchctl", "uv")], lines
     for cmd in ran:
-        joined = " ".join(cmd)
-        assert not any(w in joined for w in FORBIDDEN), cmd
-        if Path(cmd[0]).name == "uv" and "run" in cmd:
-            assert "--no-sync" in cmd, cmd
-        assert Path(cmd[0]).name != "launchctl" or cmd[1] in {"print", "list", "print-disabled"}
+        assert not any(w in " ".join(cmd) for w in FORBIDDEN), cmd
+        assert Path(cmd[0]).name not in ("launchctl", "uv"), cmd
 
 
 def test_agents_skipped_when_say_absent(smoke, monkeypatch, tmp_path, capsys):
