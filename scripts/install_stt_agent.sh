@@ -167,7 +167,7 @@ CANONICAL_PORT="$(canonical_port "$BACKEND")" || CANONICAL_PORT=""
 PORT="${PIPECAT_STT_PORT:-$CANONICAL_PORT}"
 
 # Derive a per-agent log basename. Two explicit literal branches keep this in
-# lockstep with render_stt_plist.py's _log_basename(): the new default maps to
+# lockstep with render_stt_plist.py's log_basename(): the new default maps to
 # pipecat-stt, the retained legacy label keeps the historical koda-stt names,
 # and any other label replaces '.' with '-' so two agents never share a log.
 # The branches match string literals, NOT the LABEL default, so the new default

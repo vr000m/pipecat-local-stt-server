@@ -54,7 +54,7 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 _PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
 
-def _log_basename(label: str) -> str:
+def log_basename(label: str) -> str:
     """Derive a per-agent log-file basename from the launchd label.
 
     Two explicit literal branches keep the mapping stable and lockstep with
@@ -118,7 +118,7 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    log_basename = _log_basename(label)
+    basename = log_basename(label)
 
     python = _require("PYTHON", os.environ.get("PYTHON"), _ABSPATH_RE, "absolute path")
     cwd = _require("REPO_ROOT", os.environ.get("REPO_ROOT"), _ABSPATH_RE, "absolute path")
@@ -200,8 +200,8 @@ def main() -> None:
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
             "HOME": home,
         },
-        "StandardOutPath": str(Path(log_dir) / f"{log_basename}.log"),
-        "StandardErrorPath": str(Path(log_dir) / f"{log_basename}.err"),
+        "StandardOutPath": str(Path(log_dir) / f"{basename}.log"),
+        "StandardErrorPath": str(Path(log_dir) / f"{basename}.err"),
     }
 
     if auth_token_file:
