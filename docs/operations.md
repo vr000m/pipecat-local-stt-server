@@ -495,7 +495,7 @@ scripts/smoke.py`, never `uv run` (which prunes the backend extras).
 | `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
 | `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
 | `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101` |
-| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist. Read-only: no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
+| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist (installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). Read-only: no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
 | `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
 
 `--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
@@ -507,7 +507,22 @@ their own, but `just smoke` is the entry point.
 Every step has a timeout. A timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT
 or SIGTERM sent to the runner) sends the running step SIGINT; the step then has
 180 s to clean up (the harness runs its teardown) before its whole process group
-is killed. Further signals to the runner are ignored during that grace.
+is killed. A further signal to the runner during that grace is held until the
+step has stopped and then stops the run: no later step starts, the interrupted
+step is FAIL, the rest are SKIPPED, and the table still prints. A step that
+crashes is a FAIL row and the run goes on to the next step.
+
+Only one `smoke_launchd.py` run at a time: it takes an exclusive lock on
+`~/Library/Caches/pipecat-stt-smoke-launchd.lock` (in the account home, not
+`$HOME`) before touching anything, and a second run is refused. The lock is
+released when the run exits; the file stays.
+
+`PIPECAT_STT_SMOKE_TEST_AGENTS_HOME` is test-only: the stubbed test suites point
+it at a temp home so they never read your real `~/Library/LaunchAgents`. It is
+honoured only while `launchctl` on `PATH` is a stub, never with the real
+`/bin/launchctl`; there `just smoke --agents` warns that it is ignored and
+`smoke_launchd.py` refuses to run. `just smoke` never passes it to the harness.
+Do not export it.
 
 The launchd harness uses spare port 9998 by default; when that port is busy, run
 it on another spare port with `scripts/smoke_launchd.py --port <port>` (the guard

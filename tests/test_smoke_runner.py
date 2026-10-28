@@ -514,7 +514,8 @@ def test_run_command_ctrl_c_forwards_sigint_and_waits(smoke, monkeypatch):
     assert events == [
         ("new session", True),
         ("signal", signal.SIGINT),
-        ("waited", smoke.TEARDOWN_GRACE),
+        # _stop reads the pipes in STOP_POLL slices until EOF (here at once).
+        ("waited", smoke.STOP_POLL),
         ("killpg", 4242, signal.SIGKILL),
     ]
 
@@ -660,12 +661,6 @@ def test_peercred_outcome_state_space(smoke, monkeypatch, rc, out, want):
     assert smoke.peercred_step().outcome == want
 
 
-def test_peercred_marks_match_smoke_peercred_output():
-    text = (REPO_ROOT / "scripts" / "smoke_peercred.py").read_text()
-    assert 'print("  skipped: needs a second local uid' in text
-    assert 'print(f"skipped: peer-cred smoke needs macOS/Linux' in text
-
-
 # CI value x platform -> launchd skip: CI present with ANY value (empty too) skips.
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
 @pytest.mark.parametrize("ci", [None, "", "0", "false", "1", "true"])
@@ -677,9 +672,20 @@ def test_launchd_skip_state_space(smoke, platform, ci):
     assert skips == (platform != "darwin" or ci is not None)
 
 
+def _launchctl_paths(tmp_path: Path) -> dict[str, str]:
+    """PATH values: a stub launchctl first, the system dirs only, no launchctl."""
+    stub = tmp_path / "stub"
+    stub.mkdir(exist_ok=True)
+    _exe(stub / "launchctl", "#!/bin/sh\nexit 0\n")
+    empty = tmp_path / "empty"
+    empty.mkdir(exist_ok=True)
+    return {"stub": f"{stub}:/usr/bin:/bin", "system": "/usr/bin:/bin", "none": str(empty)}
+
+
 def test_agents_home_ignores_home_and_honours_only_the_test_override(smoke, monkeypatch, tmp_path):
     import _smoke_lib
 
+    monkeypatch.setenv("PATH", _launchctl_paths(tmp_path)["stub"])
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv(AGENTS_HOME_ENV, raising=False)
     assert _smoke_lib.agents_home() == _smoke_lib.account_home() != tmp_path
@@ -687,6 +693,54 @@ def test_agents_home_ignores_home_and_honours_only_the_test_override(smoke, monk
     assert _smoke_lib.agents_home() == tmp_path
     monkeypatch.setenv(AGENTS_HOME_ENV, "")
     assert _smoke_lib.agents_home() == _smoke_lib.account_home()
+
+
+# launchctl on PATH x the override -> (agents home moved, override ignored).
+# The override moves the agents home only while launchctl is a stub (nothing real
+# can be mutated); set with the real launchctl, or none, it is ignored and said so.
+@pytest.mark.parametrize("launchctl", ["stub", "system", "none"])
+@pytest.mark.parametrize("override", [None, "", "set"])
+def test_agents_home_override_state_space(smoke, tmp_path, launchctl, override):
+    import _smoke_lib
+
+    env = {"PATH": _launchctl_paths(tmp_path)[launchctl]}
+    if override is not None:
+        env[AGENTS_HOME_ENV] = str(tmp_path / "fake-home") if override == "set" else ""
+    honoured = launchctl == "stub" and override == "set"
+    ignored = launchctl != "stub" and override == "set"
+    home = _smoke_lib.agents_home(env)
+    assert (home == tmp_path / "fake-home") == honoured
+    if not honoured:
+        assert home == _smoke_lib.account_home()
+    assert (_smoke_lib.ignored_agents_home_override(env) is not None) == ignored
+    notice = _smoke_lib.agents_home_notice(env)
+    assert (notice is not None) == (honoured or ignored)
+    if notice:
+        assert AGENTS_HOME_ENV in notice and ("ignored" in notice) == ignored
+
+
+def test_stale_override_does_not_move_the_agents_step(smoke, monkeypatch, tmp_path, capsys):
+    # Exported outside a stubbed test (real or no launchctl), the override must
+    # not change which plists --agents reads, and must say it was ignored.
+    import _smoke_lib
+
+    stale = tmp_path / "stale"
+    (stale / "Library" / "LaunchAgents").mkdir(parents=True)
+    (stale / "Library" / "LaunchAgents" / "pipecat.stt-server.x.plist").write_text("")
+    account = tmp_path / "account"
+    (account / "Library" / "LaunchAgents").mkdir(parents=True)
+    monkeypatch.setattr(_smoke_lib, "account_home", lambda: account)
+    monkeypatch.setenv("PATH", _launchctl_paths(tmp_path)["none"])
+    monkeypatch.setenv(AGENTS_HOME_ENV, str(stale))
+    assert smoke.agent_plists() == []
+    err = capsys.readouterr().err
+    assert AGENTS_HOME_ENV in err and "ignored" in err
+
+
+def test_launchd_env_drops_the_test_only_override(smoke):
+    env = smoke.launchd_env({"PATH": "/usr/bin", AGENTS_HOME_ENV: "/somewhere"})
+    assert AGENTS_HOME_ENV not in env
+    assert env["PIPECAT_STT_LABEL"] == env["KODA_STT_LABEL"] == SPARE
 
 
 def test_runner_and_harness_share_spare_label_and_preconditions(smoke):
@@ -713,3 +767,232 @@ def test_main_turns_sigterm_into_an_interrupt_while_steps_run(smoke, seam, monke
     with pytest.raises(KeyboardInterrupt):
         seen[0](signal.SIGTERM, None)
     assert signal.getsignal(signal.SIGTERM) == before
+
+
+# --------------------------------------------------------------------------
+# Decision 8 for every step: a crash or an interrupt is a FAIL row, the table
+# still prints, and an interrupt starts no further step.
+# --------------------------------------------------------------------------
+
+_STEP_FNS = {
+    "supervised": "supervised_step",
+    "peercred": "peercred_step",
+    "token-file": "token_file_step",
+    "agents": "agents_step",
+    "launchd": "launchd_step",
+}
+
+
+def _stub_steps(smoke, monkeypatch, failing: str, exc: BaseException) -> list[str]:
+    ran: list[str] = []
+    for name, attr in _STEP_FNS.items():
+
+        def step(*_a, _name=name):
+            ran.append(_name)
+            if _name == failing:
+                raise exc
+            return smoke.StepResult(_name, smoke.PASS)
+
+        monkeypatch.setattr(smoke, attr, step)
+    return ran
+
+
+@pytest.mark.parametrize("failing", list(_STEP_FNS))
+def test_step_crash_is_a_fail_row_and_the_run_continues(smoke, seam, monkeypatch, capsys, failing):
+    ran = _stub_steps(smoke, monkeypatch, failing, OSError("boom"))
+    rc = smoke.main(["--agents", "--launchd"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert ran == list(_STEP_FNS)
+    for name in _STEP_FNS:
+        want = "FAIL" if name == failing else "PASS"
+        assert _outcome(_row(out, name)) == want
+    assert "crashed: OSError: boom" in _row(out, failing)
+
+
+def test_agents_step_crash_is_a_fail_row(smoke, seam, monkeypatch, capsys):
+    # The reported path: agents_step itself raising (here: plist discovery).
+    def boom():
+        raise PermissionError("LaunchAgents unreadable")
+
+    monkeypatch.setattr(smoke, "agent_plists", boom)
+    rc = smoke.main(["--agents"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert _outcome(_row(out, "agents")) == "FAIL"
+    assert "PermissionError" in _row(out, "agents")
+    assert _outcome(_row(out, "launchd")) == "SKIPPED"
+
+
+@pytest.mark.parametrize("failing", list(_STEP_FNS))
+def test_interrupt_stops_the_run_and_still_prints_the_table(
+    smoke, seam, monkeypatch, capsys, failing
+):
+    ran = _stub_steps(smoke, monkeypatch, failing, KeyboardInterrupt())
+    rc = smoke.main(["--agents", "--launchd"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    names = list(_STEP_FNS)
+    k = names.index(failing)
+    assert ran == names[: k + 1], "no step may start after an interrupt"
+    assert _outcome(_row(out, failing)) == "FAIL" and "interrupted" in _row(out, failing)
+    for name in names[:k]:
+        assert _outcome(_row(out, name)) == "PASS"
+    for name in names[k + 1 :]:
+        assert _outcome(_row(out, name)) == "SKIPPED"
+
+
+# _signals_held(reraise) x the signal that arrives in the block -> raised?
+@pytest.mark.parametrize("reraise", [False, True])
+@pytest.mark.parametrize("sig", [None, signal.SIGINT, signal.SIGTERM])
+def test_signals_held_state_space(smoke, reraise, sig):
+    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+
+    def body():
+        with smoke._signals_held(reraise=reraise):
+            if sig is not None:
+                os.kill(os.getpid(), sig)
+                time.sleep(0.2)  # let the handler run inside the block
+
+    if reraise and sig is not None:
+        with pytest.raises(KeyboardInterrupt):
+            body()
+    else:
+        body()
+    assert {s: signal.getsignal(s) for s in before} == before
+
+
+_IGNORES_TERM_THEN_EXITS = """
+import signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(sys.argv[1], "w").write("")
+time.sleep(6)
+"""
+
+
+def test_signal_during_timeout_teardown_stops_the_run(smoke, monkeypatch, tmp_path):
+    # The step times out; while _stop waits for its teardown, Ctrl-C hits the
+    # runner. That signal must not be dropped: run_command raises
+    # KeyboardInterrupt (not TimeoutExpired) once the step has stopped.
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", 30.0)
+    ready = tmp_path / "ready"
+
+    def fire():
+        _wait_for(ready)
+        time.sleep(3)  # the 1 s step timeout has fired; _stop is waiting
+        os.kill(os.getpid(), signal.SIGINT)
+
+    t = threading.Thread(target=fire)
+    t.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            smoke.run_command([sys.executable, "-c", _IGNORES_TERM_THEN_EXITS, str(ready)], 1)
+    finally:
+        t.join()
+
+
+_EXITS_ON_TERM_LEAVING_A_PIPE_HOLDER = """
+import signal, subprocess, sys, time
+child = subprocess.Popen(["sleep", "60"])  # inherits stdout/stderr: holds the pipes
+open(sys.argv[1], "w").write(str(child.pid))
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+time.sleep(60)
+"""
+
+
+def test_stop_returns_when_the_child_exits_though_a_grandchild_holds_the_pipe(
+    smoke, monkeypatch, tmp_path
+):
+    # The step dies on SIGTERM at once, but a grandchild keeps its pipes open:
+    # _stop must follow the child's exit, not wait the whole grace for EOF.
+    monkeypatch.setattr(smoke, "TEARDOWN_GRACE", 30.0)
+    pidfile = tmp_path / "grandchild"
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        smoke.run_command(
+            [sys.executable, "-c", _EXITS_ON_TERM_LEAVING_A_PIPE_HOLDER, str(pidfile)], 2
+        )
+    assert time.monotonic() - start < 15
+    gpid = int(pidfile.read_text())
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"grandchild {gpid} outlived the stopped step")
+
+
+def test_agents_step_passes_plist_paths_byte_for_byte(smoke, agents_env, monkeypatch, capsys):
+    import plistlib
+
+    home, _log, _ran, tmp_path = agents_env
+    sock = f"{tmp_path}/ odd dir /s.sock "
+    with open(home / "Library" / "LaunchAgents" / "pipecat.stt-server.sp.plist", "wb") as fh:
+        plistlib.dump(
+            {
+                "Label": "pipecat.stt-server.sp",
+                "ProgramArguments": [
+                    sys.executable,
+                    "-m",
+                    "stt_server",
+                    "serve",
+                    "--socket-path",
+                    sock,
+                ],
+            },
+            fh,
+        )
+    decodes: list[list[str]] = []
+    real = subprocess.run
+
+    def seam_run(cmd, timeout, env=None, **kw):
+        cmd = [str(c) for c in cmd]
+        if any(c.endswith("read_stt_plist.py") for c in cmd):
+            return real(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        if "--_decode" in cmd:
+            decodes.append(cmd)
+        return _cp(0)
+
+    monkeypatch.setattr(smoke, "run_command", seam_run)
+    result = smoke.agents_step(True)
+    capsys.readouterr()
+    assert result.outcome == "PASS", result
+    assert len(decodes) == 1
+    assert decodes[0][decodes[0].index("--socket-path") + 1] == sock
+
+
+def _peercred_module():
+    path = REPO_ROOT / "scripts" / "smoke_peercred.py"
+    spec = importlib.util.spec_from_file_location("smoke_peercred_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("case", ["platform", "no-second-uid"])
+def test_peercred_skip_lines_round_trip_to_skipped(smoke, monkeypatch, capsys, case):
+    # Both sides of the SKIP contract: what smoke_peercred.py actually prints on
+    # each skip path, fed to the runner's mapping, must come back SKIPPED.
+    import asyncio
+
+    pc = _peercred_module()
+    if case == "platform":
+        monkeypatch.setattr(pc.sys, "platform", "win32")
+        assert asyncio.run(pc._run(None)) == 0
+    else:
+        monkeypatch.setattr(pc, "_find_second_uid", lambda: None)
+        assert asyncio.run(pc._run_cross_uid("/nonexistent.sock")) is False
+    printed = capsys.readouterr().out
+    monkeypatch.setattr(smoke, "run_command", lambda *a, **k: _cp(0, out=printed))
+    assert smoke.peercred_step().outcome == "SKIPPED"
+
+
+def test_peercred_skip_marks_are_shared_constants(smoke):
+    import _smoke_lib
+
+    assert smoke.PEERCRED_NO_UID_MARK is _smoke_lib.PEERCRED_NO_UID_MARK
+    assert smoke.PEERCRED_PLATFORM_MARK is _smoke_lib.PEERCRED_PLATFORM_MARK
+    text = (REPO_ROOT / "scripts" / "smoke_peercred.py").read_text()
+    assert "PEERCRED_NO_UID_MARK" in text and "PEERCRED_PLATFORM_MARK" in text

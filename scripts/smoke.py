@@ -14,21 +14,26 @@ Run it as ``just smoke [--agents] [--launchd]``. Steps, in order:
 * ``agents`` (``--agents``): decode a short generated clip through every installed
   ``pipecat.stt-server*`` agent from its plist endpoint. The plists are read from
   ``_smoke_lib.agents_home()`` (the account home, the same one the launchd
-  harness snapshots; ``$HOME`` does not move it). Strictly read-only: it never
-  calls bootout, bootstrap, kickstart or the installer.
+  harness snapshots; ``$HOME`` does not move it). Installed plists only: a loaded
+  job with no plist is not decoded (the launchd harness's real-agent snapshot,
+  which also reads ``launchctl list``, does cover it). Strictly read-only: it
+  never calls bootout, bootstrap, kickstart or the installer.
 * ``launchd`` (``--launchd``): ``smoke_launchd.py`` on the spare label and port.
   macOS only, never in CI, and it needs both ``PIPECAT_STT_LABEL`` and
   ``KODA_STT_LABEL`` set to the spare label, which this runner does explicitly.
 
 Each step is PASS, FAIL or SKIPPED with a reason. The exit status is 1 if any
-step FAILED, else 0 (SKIPPED never fails). Stdlib only; every step runs in a
-subprocess through ``run_command`` with ``sys.executable`` (never ``uv run``,
-which would prune the backend extras).
+step FAILED, else 0 (SKIPPED never fails). A step that crashes is a FAIL row and
+the next step still runs. Stdlib only; every step runs in a subprocess through
+``run_command`` with ``sys.executable`` (never ``uv run``, which would prune the
+backend extras).
 
 Each step runs in its own session. On a step timeout the step gets SIGTERM, on
 Ctrl-C (or a SIGINT or SIGTERM sent to this runner) SIGINT; either way it has
-``TEARDOWN_GRACE`` to clean up before its whole process group is SIGKILLed, and
-further signals to the runner are ignored until then.
+``TEARDOWN_GRACE`` to exit before its whole process group is SIGKILLed. A signal
+to the runner during that grace is held until the step has stopped, then stops
+the run. An interrupted run marks the current step FAIL and the later steps
+SKIPPED (not run), prints the table and exits 1.
 """
 
 import argparse
@@ -71,10 +76,13 @@ LAUNCHD_TIMEOUT = 900.0
 # teardown runs the installer's uninstall (up to 120 s) and waits on the spare
 # .lock.
 TEARDOWN_GRACE = 180.0
+STOP_POLL = 0.5  # how often _stop checks whether the stopped child has exited
+STOP_DRAIN = 5.0  # pipe drain after the group is killed (a holder may escape it)
 
-# smoke_peercred.py's own skip lines (it exits 0 on both).
-PEERCRED_NO_UID_MARK = "skipped: needs a second local uid"
-PEERCRED_PLATFORM_MARK = "skipped: peer-cred smoke needs"
+# smoke_peercred.py's own skip lines (it exits 0 on both); it prints these
+# same constants, so a rewording cannot turn a SKIP into a PASS.
+PEERCRED_NO_UID_MARK = _smoke_lib.PEERCRED_NO_UID_MARK
+PEERCRED_PLATFORM_MARK = _smoke_lib.PEERCRED_PLATFORM_MARK
 
 
 @dataclass
@@ -133,35 +141,58 @@ def run_command(
 
 
 @contextlib.contextmanager
-def _signals_held():
-    """Ignore SIGINT and SIGTERM to this process for the block (main thread only),
-    so a second Ctrl-C cannot cut a child's teardown short."""
+def _signals_held(*, reraise: bool = False):
+    """Hold SIGINT and SIGTERM to this process for the block (main thread only),
+    so a second Ctrl-C cannot cut a child's teardown short. A signal that arrives
+    is dropped, or with ``reraise`` raised as KeyboardInterrupt once the old
+    handlers are back, so the run still stops."""
     if threading.current_thread() is not threading.main_thread():
         yield
         return
-    old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+    got: list[int] = []
+
+    def hold(signum, _frame):
+        got.append(signum)
+
+    old = {s: signal.signal(s, hold) for s in (signal.SIGINT, signal.SIGTERM)}
     try:
         yield
     finally:
         for s, h in old.items():
             if h is not None:
                 signal.signal(s, h)
+    if reraise and got:
+        raise KeyboardInterrupt(f"signal {got[0]}")
 
 
 def _stop(proc: subprocess.Popen, sig: int) -> None:
     """Send SIG to PROC, wait up to TEARDOWN_GRACE for it to exit, then SIGKILL
-    its process group so nothing it started (a server, a sleep) outlives it."""
-    with _signals_held():
+    its process group so nothing it started (a server, a sleep) outlives it.
+
+    It follows the child's exit, not the pipes' EOF: a grandchild still holding
+    the pipes does not stretch the wait. A signal to the runner meanwhile is held
+    and raised as KeyboardInterrupt afterwards, so no further step starts."""
+    with _signals_held(reraise=True):
         with contextlib.suppress(ProcessLookupError):
             proc.send_signal(sig)
-        try:
-            proc.communicate(timeout=TEARDOWN_GRACE)
-        except subprocess.TimeoutExpired:
-            # The group first: a grandchild holding the pipes would block the read.
-            _kill_group(proc)
-            proc.kill()
-            proc.communicate()
+        deadline = time.monotonic() + TEARDOWN_GRACE
+        drained = False
+        while not drained:
+            try:
+                # Keep reading the pipes so a chatty teardown cannot block on them.
+                proc.communicate(timeout=STOP_POLL)
+                drained = True
+            except subprocess.TimeoutExpired:
+                if proc.poll() is not None:
+                    break  # the child exited; something else holds the pipes
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    break
+        # The group: a grandchild holding the pipes would block the read below.
         _kill_group(proc)
+        if not drained:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=STOP_DRAIN)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -241,6 +272,8 @@ def launchd_cmd() -> list[str]:
 
 def launchd_env(base: dict | None = None) -> dict:
     env = dict(os.environ if base is None else base)
+    # Test-only; a stale export must never reach the harness's guard.
+    env.pop(_smoke_lib.TEST_AGENTS_HOME_ENV, None)
     env["PIPECAT_STT_LABEL"] = SPARE_LABEL
     env["KODA_STT_LABEL"] = SPARE_LABEL
     return env
@@ -248,6 +281,25 @@ def launchd_env(base: dict | None = None) -> dict:
 
 def launchd_skip_reason() -> str | None:
     return _smoke_lib.launchd_skip_reason(os.environ, sys.platform)
+
+
+def supervised_step() -> StepResult:
+    return run_step("supervised", supervised_cmd(), SUPERVISED_TIMEOUT)
+
+
+def token_file_step() -> StepResult:
+    return run_step("token-file", token_file_cmd(), TOKEN_TIMEOUT)
+
+
+def launchd_step(requested: bool) -> StepResult:
+    return run_step(
+        "launchd",
+        launchd_cmd(),
+        LAUNCHD_TIMEOUT,
+        requested=requested,
+        skip_reason=launchd_skip_reason() if requested else None,
+        env=launchd_env() if requested else None,
+    )
 
 
 def peercred_step() -> StepResult:
@@ -267,14 +319,12 @@ def peercred_step() -> StepResult:
 
 
 def agent_plists() -> list[Path]:
-    """Installed real-agent plists, from the home the launchd harness snapshots."""
-    override = _smoke_lib.agents_home_override()
-    if override is not None:
-        print(
-            f"warning: reading installed agents from {override} "
-            f"({_smoke_lib.TEST_AGENTS_HOME_ENV} is a test-only override)",
-            file=sys.stderr,
-        )
+    """Installed real-agent plists, from the home the launchd harness snapshots.
+    Plists only: a loaded job with no plist has no endpoint to decode through
+    here (the launchd harness's snapshot does cover such jobs)."""
+    notice = _smoke_lib.agents_home_notice()
+    if notice:
+        print(notice, file=sys.stderr)
     return _smoke_lib.agent_plists(_smoke_lib.agents_home())
 
 
@@ -339,7 +389,8 @@ def agents_step(requested: bool) -> StepResult:
                 if outcome != PASS or proc is None:
                     bad = f"cannot read {field}: {detail}"
                     break
-                endpoint[field] = (proc.stdout or "").strip()
+                # Exactly as recorded: read_stt_plist.py adds no newline.
+                endpoint[field] = proc.stdout or ""
             if (
                 not bad
                 and not endpoint["socket-path"]
@@ -357,20 +408,31 @@ def agents_step(requested: bool) -> StepResult:
 
 
 def build_and_run(agents: bool, launchd: bool) -> list[StepResult]:
-    results = [
-        run_step("supervised", supervised_cmd(), SUPERVISED_TIMEOUT),
-        peercred_step(),
-        run_step("token-file", token_file_cmd(), TOKEN_TIMEOUT),
-        agents_step(agents),
-        run_step(
-            "launchd",
-            launchd_cmd(),
-            LAUNCHD_TIMEOUT,
-            requested=launchd,
-            skip_reason=launchd_skip_reason() if launchd else None,
-            env=launchd_env() if launchd else None,
-        ),
+    """Run every step in order, one row each (Decision 8). A step that raises is
+    its FAIL row and the next step still runs; an interrupt (Ctrl-C, or SIGTERM
+    under ``main``) is the current step's FAIL row and the rest are not run."""
+    steps = [
+        ("supervised", supervised_step),
+        ("peercred", peercred_step),
+        ("token-file", token_file_step),
+        ("agents", lambda: agents_step(agents)),
+        ("launchd", lambda: launchd_step(launchd)),
     ]
+    results: list[StepResult] = []
+    for i, (name, step) in enumerate(steps):
+        try:
+            results.append(step())
+        except KeyboardInterrupt as exc:
+            results.append(
+                StepResult(name, FAIL, f"interrupted ({exc})" if str(exc) else "interrupted")
+            )
+            results += [
+                StepResult(n, SKIPPED, "not run: the run was interrupted")
+                for n, _s in steps[i + 1 :]
+            ]
+            break
+        except Exception as exc:  # noqa: BLE001 - a crash is a FAIL row, never a traceback
+            results.append(StepResult(name, FAIL, f"crashed: {type(exc).__name__}: {exc}"))
     return results
 
 
