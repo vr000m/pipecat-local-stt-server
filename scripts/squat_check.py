@@ -59,14 +59,19 @@ unloaded within the second is quiet again (Decision 2, case a).
 with no stderr, or with only ``lsof: WARNING:`` lines; any other exit 1 message,
 or an exit of 2 or more, is "cannot tell".
 
-Import surface: besides the CLI, ``scripts/smoke_launchd.py`` imports
-``lsof_output``, ``lsof_pids``, ``listener_pids``, ``endpoint_holders``,
-``parse_launchd_pid``, ``classify_print`` and ``launchd_state`` (with the
-``uid`` keyword), and ``scripts/_smoke_lib.py`` (``launchd_identity``,
-``connect_verified``, which ``smoke.py`` uses) imports ``classify_print`` and
-``lsof_output``, so the harness, the runner and the recipes share one listener
-and one launchd-state definition. Everything else
-here is private to this module.
+Import surface (besides the CLI), exactly what each importer uses:
+
+* ``scripts/smoke_launchd.py``: ``classify_print``, ``endpoint_holders``,
+  ``launchd_state`` (with the ``uid`` keyword), ``listener_pids``,
+  ``lsof_pids``, and the bounds ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its
+  time budget sums them).
+* ``scripts/_smoke_lib.py`` (imported lazily, inside ``launchd_identity`` and
+  ``tcp_server_end_pids``, which ``smoke.py`` and ``connect_verified`` use):
+  ``classify_print`` and ``lsof_output``.
+
+So the harness, the runner and the recipes share one listener and one
+launchd-state definition. Everything else here (``parse_launchd_pid``
+included) is private to this module.
 
 Stdlib only: it runs under the system python3 (``python3 -I``).
 """
