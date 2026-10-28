@@ -1631,3 +1631,63 @@ def test_token_check_server_stderr_never_blocks_the_server(
         assert "server exited early (4)" in err and "boom: cannot start" in err
     assert started and started[0].returncode is not None, "server left running"
     assert not list(home.glob("stt-smoke-token.*")), "token directory left behind"
+
+
+# smoke_supervised.py's servers never write stderr into an undrained pipe: a
+# server that logs far past a pipe buffer (64 KB) still reaches its ready /
+# error event on stdout, and its stderr tail is still reported. Which server
+# start (spawn: S1-S12; the bad-model scenario S13) x what the server does ->
+# the scenario sees the event.
+_FLOOD_SERVER = r"""
+import json, sys, time
+mode = sys.argv[1]
+sys.stderr.write("log line " * 30000 + "LAST-STDERR-LINE\n")  # ~270 KB
+sys.stderr.flush()
+if mode == "ready":
+    print(json.dumps({"event": "ready"}), flush=True)
+    time.sleep(30)
+else:
+    print(json.dumps({"event": "error", "code": "BADMODEL"}), flush=True)
+    sys.exit(3)
+"""
+
+
+@pytest.mark.parametrize("start", ["spawn", "bad-model"])
+def test_smoke_supervised_server_stderr_never_blocks(monkeypatch, tmp_path, start):
+    import wave
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    wav = tmp_path / "s.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\0\0" * 160)
+    fake = tmp_path / "fakepy"
+    script = tmp_path / "server.py"
+    script.write_text(_FLOOD_SERVER)
+    mode = "ready" if start == "spawn" else "error"
+    _exe(fake, f"#!/bin/bash\nexec {sys.executable} {script} {mode}\n")
+    argv = ["smoke_supervised.py", "--backend", "echo", "--python", str(fake), "--wav", str(wav)]
+    monkeypatch.setattr(sys, "argv", argv)
+    spec = importlib.util.spec_from_file_location(
+        "smoke_supervised_under_test", REPO_ROOT / "scripts" / "smoke_supervised.py"
+    )
+    sup = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sup)
+    if start == "spawn":
+        p = sup.spawn()
+        try:
+            evs, _bad = sup.read_events(p, lambda e: e.get("event") == "ready", 15)
+            assert [e.get("event") for e in evs] == ["ready"]
+            assert "LAST-STDERR-LINE" in sup.err_tail(p)
+        finally:
+            p.kill()
+            p.wait()
+    else:
+        sup.s_bad_model_then_sigterm()
+        name, ok, detail = sup.RESULTS[-1]
+        assert name.startswith("S13") and ok, detail
+        assert "LAST-STDERR-LINE" in detail
