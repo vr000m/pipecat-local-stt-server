@@ -2362,12 +2362,12 @@ def test_nested_just_calls_forward_the_variables_their_callee_reads():
 
 def test_no_plain_uv_run_python_in_smoke_surfaces():
     """Plain `uv run python` re-syncs and strips the optional backend extras
-    (crash-looping LaunchAgents). The justfile and every scripts/smoke_*.py
+    (crash-looping LaunchAgents). The justfile and every scripts/*.py
     must run `.venv/bin/python` (or `uv run --no-sync python`) instead; the
     README and docs/operations.md examples follow the same rule."""
     files = [
         JUSTFILE,
-        *sorted((REPO_ROOT / "scripts").glob("smoke_*.py")),
+        *sorted((REPO_ROOT / "scripts").glob("*.py")),
         REPO_ROOT / "README.md",
         REPO_ROOT / "docs" / "operations.md",
     ]
@@ -2437,6 +2437,8 @@ def test_stt_list_squat_warns_on_stderr_only_and_exits_zero(tmp_path):
     assert squat.returncode == 0, squat.stderr
     assert SQUAT_WARNING in squat.stderr
     assert "777" in squat.stderr and "9871" in squat.stderr
+    # The advisory recipe's exit 3 must not surface as a `just` error line.
+    assert "error: recipe" not in squat.stderr
     assert SQUAT_WARNING not in squat.stdout
     # The machine-readable surface is untouched by a squat.
     assert squat.stdout.encode() == clean.stdout.encode()

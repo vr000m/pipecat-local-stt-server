@@ -29,8 +29,10 @@ PID launchd reports for the agent. Two warnings break it:
 * (b) the job is running with pid P but some other pid (not P) listens on the
   port: a squatter holds the port. The message names the port, the listener
   pid(s), the launchd pid and the listener command(s).
-* (c) the job has no pid (not loaded, or loaded but not running) and something
-  listens on the port: ``port N held by pid X; label not running``.
+* (c) the job is loaded but has no pid (not running) and something listens on
+  the port: ``port N held by pid X; label not running``. A job that is not
+  loaded at all is quiet (Decision 2): a disabled agent holds no claim on its
+  port.
 
 A finding is only reported after a 1-second re-check, so a restart in flight (the
 launchd pid or the listener changing between the two reads) never warns. The
@@ -204,16 +206,8 @@ def _commands(pids, run):
     """Map each pid to its command name via ``lsof -Fc`` (best effort)."""
     cmds = {}
     for pid in pids:
-        try:
-            res = run(
-                ["lsof", "-nP", "-w", "-p", pid, "-Fc"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            name = next((ln[1:] for ln in res.stdout.splitlines() if ln.startswith("c")), None)
-        except (OSError, subprocess.SubprocessError):
-            name = None
+        out = lsof_output(["-p", pid, "-Fc"], run)
+        name = next((ln[1:] for ln in (out or "").splitlines() if ln.startswith("c")), None)
         cmds[pid] = name or "?"
     return cmds
 

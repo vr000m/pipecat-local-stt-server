@@ -94,6 +94,9 @@ _plist_field plist field strict='':
 # loaded; any other failure is "cannot tell", exit 2, never quiet). `label` is
 # for the 1-second re-check. Advisory: callers append `|| true`, so it never
 # changes an exit status or stdout. System python3 so a pruned venv cannot break it.
+# no-exit-message: just would otherwise add an "error: recipe `_squat_check` failed
+# with exit code 3" line after every warning (and after "cannot tell", exit 2).
+[no-exit-message]
 _squat_check host port label print_rc:
     #!/usr/bin/env bash
     exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --label {{quote(label)}} --launchctl-rc {{quote(print_rc)}}
@@ -344,11 +347,11 @@ smoke-peercred:
     set -uo pipefail
     exec .venv/bin/python "{{justfile_directory()}}/scripts/smoke_peercred.py"
 
-# One-command smoke: supervised (echo), peer-cred, token-file refuse/accept, and
-# one PASS/FAIL/SKIPPED table (exit 1 on any FAIL). `--agents` also decodes a
-# generated clip through each installed agent (read-only); `--launchd` also runs
-# the launchd harness on the spare label (macOS only, opt-in, never in CI).
 # Uses .venv/bin/python, never `uv run` (which prunes the backend extras).
+# `--agents` also decodes a generated clip through each installed agent
+# (read-only); `--launchd` also runs the launchd harness on the spare label
+# (macOS only, opt-in, never in CI). Exit 1 on any FAIL.
+# One-command smoke: supervised (echo), peer-cred, token-file, one PASS/FAIL/SKIPPED table.
 [positional-arguments]
 smoke *args:
     #!/usr/bin/env bash

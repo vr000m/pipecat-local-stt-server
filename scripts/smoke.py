@@ -365,13 +365,6 @@ def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str | None, str]:
     return endpoint, read_stt_plist.env_token(data) or None, ""
 
 
-def endpoint_tuple(endpoint: dict[str, str]) -> tuple[str, ...]:
-    """The ``connect_verified`` form: ("unix", path) or ("tcp", host, port)."""
-    if endpoint["socket-path"]:
-        return ("unix", endpoint["socket-path"])
-    return ("tcp", endpoint["host"], endpoint["port"])
-
-
 def job_identity(label: str) -> tuple[tuple[str, str] | None, str]:
     """((pid, runs), "") of LABEL's running launchd job from ONE read-only
     ``launchctl print`` (``_smoke_lib.launchd_identity``), else (None, why)."""
