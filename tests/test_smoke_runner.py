@@ -555,8 +555,11 @@ def test_agents_token_resolution_and_stdin_only(
     home, _log, _ran, tmp_path = agents_env
     args = [sys.executable, "-m", "stt_server", "serve", "--host", "127.0.0.1", "--port", "9565"]
     if file_token is not None:
-        tok = tmp_path / "tok"
+        tok_dir = tmp_path / "tokdir"
+        tok_dir.mkdir(mode=0o700)
+        tok = tok_dir / "tok"
         tok.write_text(file_token + "\n")
+        tok.chmod(0o600)  # the server's token-file policy
         args += ["--auth-token-file", str(tok)]
     plist = {"Label": "pipecat.stt-server", "ProgramArguments": args}
     if env:
@@ -1393,3 +1396,64 @@ def test_read_endpoint_parses_the_port_the_server_way(smoke, tmp_path, value, wa
         assert endpoint is None and token is None and "--port" in err
     else:
         assert err == "" and endpoint["port"] == want
+
+
+# --agents reads an agent's token file through the server's own policy
+# (stt_server.auth.load_token_file), never with a plain open(): what is at
+# --auth-token-file -> the token, or that agent's error (nothing sent). A FIFO
+# is refused at once (O_NONBLOCK + fstat), never a blocked runner; so is a FIFO
+# where the plist itself should be.
+@pytest.mark.parametrize(
+    ("kind", "want"),
+    [
+        ("good", "s3cret"),
+        ("group-readable", None),
+        ("symlink", None),
+        ("fifo", None),
+        ("empty", None),
+        ("inner-space", None),
+        ("missing", None),
+        ("relative", None),
+        ("plist-fifo", None),
+    ],
+)
+def test_read_endpoint_token_file_uses_the_server_policy(smoke, tmp_path, kind, want):
+    import plistlib
+
+    d = tmp_path / "tokdir"
+    d.mkdir(mode=0o700)
+    tok = d / "tok"
+    if kind in ("good", "group-readable", "symlink"):
+        tok.write_text("s3cret\n")
+        tok.chmod(0o640 if kind == "group-readable" else 0o600)
+    elif kind == "empty":
+        tok.write_text("\n")
+        tok.chmod(0o600)
+    elif kind == "inner-space":
+        tok.write_text("s3 cret\n")
+        tok.chmod(0o600)
+    elif kind == "fifo":
+        os.mkfifo(tok, 0o600)
+    path = str(tok)
+    if kind == "symlink":
+        (d / "link").symlink_to(tok)
+        path = str(d / "link")
+    elif kind == "relative":
+        path = "tokdir/tok"
+    plist = tmp_path / "pipecat.stt-server.x.plist"
+    args = ["/py", "serve", "--host", "127.0.0.1", "--port", "9565", "--auth-token-file", path]
+    if kind == "plist-fifo":
+        os.mkfifo(plist, 0o600)
+    else:
+        plist.write_bytes(plistlib.dumps({"ProgramArguments": args}))
+    got: list = []
+    t = threading.Thread(target=lambda: got.append(smoke.read_endpoint(plist)), daemon=True)
+    t.start()
+    t.join(10)
+    assert got, "read_endpoint blocked"
+    endpoint, token, err = got[0]
+    if want is None:
+        assert endpoint is None and token is None and err
+        assert "s3" not in err
+    else:
+        assert (token, err) == (want, "")

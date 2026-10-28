@@ -46,14 +46,16 @@ VALUE is consumed in the step after its flag, so a value that looks like a flag
 checks this against the real parser. The justfile (stt-list, stt-status,
 stt-enable), scripts/install_stt_agent.sh and scripts/smoke.py all call this, and
 scripts/smoke_launchd.py imports it (``load``, ``loads``, ``read_flags``,
-``read_field``, ``read_argv_flags``, ``parse_port``),
+``read_field``, ``read_argv_flags``, ``parse_port``, ``read_bytes``),
 so they cannot disagree about what an installed plist says. Stdlib only: it must run under the
 system python3 when the project venv is absent.
 """
 
 from __future__ import annotations
 
+import os
 import plistlib
+import stat
 import sys
 
 _FLAGS = ("--host", "--port", "--socket-path", "--auth-token-file")
@@ -71,16 +73,34 @@ class MalformedPlist(Exception):
     """The plist exists but cannot be read as an agent definition."""
 
 
+def read_bytes(path: str) -> bytes | None:
+    """PATH's bytes; None when absent; ``MalformedPlist`` when it is not a
+    readable regular file. Opened ``O_NONBLOCK`` and checked with ``fstat``
+    before any read, so a FIFO (or a device) at PATH is refused at once and
+    can never block the caller."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # unreadable: malformed
+        raise MalformedPlist(type(exc).__name__) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MalformedPlist("not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 65536):
+            chunks.append(chunk)
+    except OSError as exc:
+        raise MalformedPlist(type(exc).__name__) from exc
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
 def _load(path: str) -> dict:
     """Return the plist dict; ``{}`` when absent; raise ``MalformedPlist`` otherwise."""
-    try:
-        with open(path, "rb") as fh:
-            raw = fh.read()
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:  # an unreadable file or a directory: malformed
-        raise MalformedPlist(type(exc).__name__) from exc
-    return loads(raw)
+    raw = read_bytes(path)
+    return {} if raw is None else loads(raw)
 
 
 def loads(raw: bytes) -> dict:

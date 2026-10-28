@@ -626,11 +626,11 @@ def _plist_record(plist: Path) -> tuple[str | None, str | None]:
     """(sha256, recorded TCP port) from ONE read of PLIST's bytes: (None, None)
     when absent; UNKNOWN for what cannot be read."""
     try:
-        raw = plist.read_bytes()
-    except FileNotFoundError:
-        return None, None
-    except OSError:
+        raw = read_stt_plist.read_bytes(str(plist))  # never blocks on a FIFO
+    except read_stt_plist.MalformedPlist:
         return UNKNOWN, UNKNOWN
+    if raw is None:
+        return None, None
     try:
         port = canonical_port(read_stt_plist.read_flags(read_stt_plist.loads(raw)))
     except read_stt_plist.MalformedPlist:

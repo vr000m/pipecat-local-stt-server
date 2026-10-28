@@ -304,8 +304,12 @@ def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str | None, str]:
     from the same version of the file even while an installer replaces it.
 
     The token is resolved the way the server resolves it: the file named by
-    ``--auth-token-file`` (read here, stripped; an unreadable or empty file is
-    an error, never "no token"), else the plist's legacy environment token
+    ``--auth-token-file``, read through the server's own policy
+    (``stt_server.auth.load_token_file``: absolute path, ``O_NOFOLLOW`` and
+    ``O_NONBLOCK`` so a symlink or a FIFO is refused at once, a regular file
+    this user owns with no group/other access, the token's characters
+    checked); a file the server would refuse is an error, never "no token",
+    and nothing is sent to that agent. Else the plist's legacy environment token
     (``read_stt_plist.env_token``: ``PIPECAT_STT_AUTH_TOKEN``, then
     ``KODA_STT_AUTH_TOKEN``); None when the agent requires none."""
     try:
@@ -327,13 +331,15 @@ def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str | None, str]:
         return None, None, "plist has no endpoint"
     token_file = endpoint["auth-token-file"]
     if token_file:
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from stt_server.auth import load_token_file
+        from stt_server.errors import ConfigError
+
         try:
-            with open(token_file, encoding="utf-8") as fh:
-                token = fh.read().strip()
-        except (OSError, UnicodeDecodeError) as exc:
-            return None, None, f"cannot read its token file: {type(exc).__name__}"
-        if not token:
-            return None, None, "its token file is empty"
+            _resolved, token = load_token_file(token_file, uid=os.getuid())
+        except ConfigError as exc:  # its message never carries the token
+            return None, None, f"its token file is refused by the server's policy: {exc}"
         return endpoint, token, ""
     return endpoint, read_stt_plist.env_token(data) or None, ""
 
