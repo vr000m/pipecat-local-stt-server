@@ -15,8 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <backend>` warn on stderr when a TCP agent's port is held by a process other
   than the agent (listener pid vs launchd pid, confirmed after 1 second), or by
   any process while the agent is not running. Advisory only: stdout and exit
-  codes are unchanged. `scripts/squat_check.py` does the check; `lsof` shows only
-  your own processes' sockets. See `docs/operations.md`.
+  codes are unchanged. A `launchctl print` failure other than "could not find
+  service" prints a "cannot read the launchd state" note instead of passing as
+  not running. `scripts/squat_check.py` does the check; `lsof` shows only your
+  own processes' sockets. See `docs/operations.md`.
 
 - **launchd verification harness** (opt-in). `scripts/smoke_launchd.py` runs
   the checks 0.5.0 covered only with stubs against real launchd, on a spare

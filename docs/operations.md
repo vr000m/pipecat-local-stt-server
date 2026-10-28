@@ -110,7 +110,11 @@ a wildcard (`*`, `::`, `0.0.0.0`), the addresses are equal, or the agent's host 
 `localhost` and the listener is on `127.0.0.1` or `::1` (IPv6 brackets ignored).
 
 Stdout and exit codes do not change. Socket agents are not checked, and neither
-is the canonical-port fallback used when no plist is installed.
+is the canonical-port fallback used when no plist is installed. Only launchd's
+own "could not find service" answer counts as not running; when `launchctl
+print` fails any other way the check prints one `squat-check: cannot read the
+launchd state` note and no warning, so an unreadable state is never taken as
+"not loaded" (which would silence the check).
 
 **Limit:** `lsof` run as you lists only your own processes' sockets, so a
 squatter running as another user is invisible. No warning means no visible
@@ -504,13 +508,25 @@ name the spare label; the runner sets both itself, so do the same when calling
 `scripts/smoke_launchd.py` directly. The individual scripts below still run on
 their own, but `just smoke` is the entry point.
 
-Every step has a timeout. A timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT
-or SIGTERM sent to the runner) sends the running step SIGINT; the step then has
-180 s to clean up (the harness runs its teardown) before its whole process group
-is killed. A further signal to the runner during that grace is held until the
-step has stopped and then stops the run: no later step starts, the interrupted
-step is FAIL, the rest are SKIPPED, and the table still prints. A step that
-crashes is a FAIL row and the run goes on to the next step.
+Every step has a timeout (`scripts/smoke.py`): `supervised` 600 s, `peercred`
+180 s, `token-file` 90 s, `launchd` 900 s; in `agents`, 60 s for each `say` /
+`afconvert` call, 30 s for each plist field read and 180 s for each decode. A
+timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT or SIGTERM sent to the
+runner) sends the running step SIGINT; the step then has 180 s to clean up (the
+harness runs its teardown). Once the step has exited, or the 180 s ran out, its
+whole process group is killed, before the step's own process is reaped, so the
+kill can only reach that step's group. A further signal to the runner during
+that grace is held until the step has stopped and then stops the run: no later
+step starts, the interrupted step is FAIL, the rest are SKIPPED, and the table
+still prints. A step that crashes is a FAIL row and the run goes on to the next
+step.
+
+Inside the launchd harness each installer call runs in its own process group,
+with a 120 s timeout: a SIGINT or SIGTERM during an install kills the
+installer's whole group before teardown starts, so teardown never runs beside a
+half-finished install. The teardown's uninstall is not interrupted. An agent
+gets 60 s to answer after each install, and the collision check polls its log
+for 30 s.
 
 Only one `smoke_launchd.py` run at a time: it takes an exclusive lock on
 `~/Library/Caches/pipecat-stt-smoke-launchd.lock` (in the account home, not
@@ -527,7 +543,17 @@ Do not export it.
 The launchd harness uses spare port 9998 by default; when that port is busy, run
 it on another spare port with `scripts/smoke_launchd.py --port <port>` (the guard
 still refuses a canonical port, a port recorded by an installed or loaded agent,
-and a port that is already listening).
+and a port that is already listening). Its socket-rollback check always uses
+the fixed spare socket `$HOME/Library/Caches/pipecat-stt-smoke-launchd/spare.sock`
+(`PIPECAT_STT_SOCKET` is not read), so it can never be a real agent's socket.
+
+Before it installs anything the harness refuses leftover spare state, and
+prints the cleanup commands (shell-quoted, safe to paste): a loaded spare job, a
+spare plist under `$HOME` or under the account home's `~/Library/LaunchAgents`
+(the label is one launchd job per user, whatever `HOME` says), the spare socket
+or its `.lock`, and spare logs. An installer `warning:` line fails the install
+or the teardown unless it is one of three known harmless ones (socket mode
+ignoring TCP settings, a dropped token for a socket agent, a retried bootstrap).
 
 **What has been verified live.** The checks themselves were run by hand at 0.5.0
 (token-file refusal and acceptance on a spare port without launchd, a decode
