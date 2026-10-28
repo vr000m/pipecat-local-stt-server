@@ -30,7 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the spare socket only under its own `.lock` flock, and failing on any cleanup
   it could not do), and compares each real agent's loaded job (pid, restart
   count, served endpoint), plist and listener with a baseline before every check
-  and after teardown; a field it cannot read refuses the run. The shared
+  and after teardown; a field it cannot read refuses the run (a real agent's
+  `--port` is parsed as the server parses it, so `+9998` is 9998). Every
+  answer that proves the spare is up goes over a connection whose server end
+  is the spare job; the harness and its installer run with a scrubbed
+  environment and fixed `PATH`; its runner timeout is the harness's own
+  worst-case budget, teardown included. The shared
   `assert_token_gate` in `scripts/_smoke_lib.py` checks that a request without
   the token gets 401 and with it is accepted, sending the token only over a
   connection whose server end is the expected process. Covered by stubbed tests
@@ -42,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--agents` decodes a clip (generated with `say`/`afconvert`) through each
   installed agent from its plist endpoint, read-only, with the agent's token
   (its token file, or a legacy `PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN`
-  in the plist) passed on stdin. The token is sent only over a connection whose
+  in the plist; the file read under the server's own token-file policy)
+  passed on stdin. The token is sent only over a connection whose
   server end is the agent's own launchd process (same pid and restart count
   before and after); a foreign or unidentifiable listener gets nothing.
   `--launchd` adds the launchd harness (macOS only, opt-in, never in CI). The

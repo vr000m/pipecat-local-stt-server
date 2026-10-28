@@ -502,7 +502,7 @@ scripts/smoke.py`, never `uv run` (which prunes the backend extras).
 | `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
 | `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
 | `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101`; each request goes over a connection whose server end `lsof` shows is that server's own process |
-| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection. After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. A job that is not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or an answer that cannot be read makes that agent FAIL, and when the check refused, no token was sent. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner and two in the decode, no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
+| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (its `--port` parsed as the server parses it; installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, read under the server's own token-file policy (a symlink, a FIFO, a file with group or other access, or a token the server would refuse makes that agent FAIL with nothing sent), else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection. After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. A job that is not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or an answer that cannot be read makes that agent FAIL, and when the check refused, no token was sent. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
 | `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
 
 `--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
@@ -512,11 +512,15 @@ name the spare label; the runner sets both itself, so do the same when calling
 their own, but `just smoke` is the entry point.
 
 Every step has a timeout (`scripts/smoke.py`): `supervised` 600 s, `peercred`
-180 s, `token-file` 90 s, `launchd` 900 s; in `agents`, 60 s for each `say` /
-`afconvert` call and 180 s for each decode. A
+180 s, `token-file` 90 s; in `agents`, 60 s for each `say` / `afconvert` call
+and 180 s for each decode. The `launchd` step's timeout is the harness's own
+worst case, teardown included (`smoke_launchd.run_budget`, summed from the
+bounds it waits on, for the installed agents: about 31 minutes with none, plus
+about 2 minutes per agent). A
 timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT or SIGTERM sent to the
 runner) sends the running step SIGINT; the step then has 180 s to clean up (the
-harness runs its teardown). Once the step has exited, or the 180 s ran out, its
+`launchd` step: the harness's whole teardown, `smoke_launchd.teardown_budget`,
+about 3 minutes plus 25 s per agent). Once the step has exited, or that grace ran out, its
 whole process group is killed, before the step's own process is reaped, so the
 kill can only reach that step's group. A further signal to the runner during
 that grace is held until the step has stopped and then stops the run: no later
@@ -527,7 +531,14 @@ step.
 Inside the launchd harness each installer call runs in its own process group,
 with a 120 s timeout: a SIGINT or SIGTERM during an install kills the
 installer's whole group before teardown starts, so teardown never runs beside a
-half-finished install. The teardown's uninstall is not interrupted. An agent
+half-finished install. An installer group that cannot be shown stopped (its
+kill failed, or its leader was not reaped) is a failure that stops the
+remaining checks, never a result. The teardown's uninstall is not interrupted.
+The harness runs everything (the installer included) with a scrubbed
+environment: `HOME`, `USER`, `TMPDIR`, the spare label and log-dir variables
+and the fixed `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; `BASH_ENV`, `ENV`,
+exported shell functions, `PYTHON*`, `DYLD_*` and `LD_*` never reach it, and
+bash is `/bin/bash`. An agent
 gets 60 s to answer after each install, and the collision check polls its log
 for 30 s.
 
@@ -536,7 +547,9 @@ one (every installed `pipecat.stt-server*` plist and every loaded such job):
 from one `launchctl print` of the job, its loaded state, pid, `runs` counter
 (which moves on a restart even when the pid is reused) and the endpoint the job
 is serving; a digest of its plist (the plist is only the intended endpoint and
-can change without a reload) and the port recorded in those same bytes; and the
+can change without a reload) and the port recorded in those same bytes (parsed
+as the server parses `--port`, so `+9998` or `09998` is 9998; a value the
+server would refuse is unreadable and refuses the run); and the
 pid holding the job's endpoint (a socket job's `<socket>.lock`). A job with no
 pid serves nothing; anything it cannot read on a running job refuses the run
 before the first install, a running job whose `launchctl print` has no `runs =`
@@ -551,7 +564,9 @@ fails the comparison too: fix it before the run.
 The token check sends its throwaway token (and a wrong one) only over
 connections whose server end `lsof` shows is the spare job's pid, with the same
 pid and `runs` before and after; it waits for the agent with requests that carry
-no token.
+no token. The collision check's "agent up" and every rollback transport are
+proved the same way: their no-token request goes over a connection whose server
+end is the spare job, so a listener that is not the spare cannot pass them.
 
 Teardown removes the spare socket and its `.lock` only while it holds that
 `.lock`'s `flock` itself, so no live server can own them; anything it cannot prove
