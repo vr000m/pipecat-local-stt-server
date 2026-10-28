@@ -2429,7 +2429,7 @@ def test_budget_bounds_are_the_ones_the_code_uses(smoke, monkeypatch):
         )
     # More agents, more snapshot time, in both budgets.
     assert smoke.teardown_budget(4) - smoke.teardown_budget(0) == pytest.approx(
-        4 * (smoke.CMD_TIMEOUT + smoke.squat_check.LSOF_TIMEOUT)
+        4 * (smoke.squat_check.LAUNCHCTL_TIMEOUT + smoke.squat_check.LSOF_TIMEOUT)
     )
     assert smoke.run_budget(4) > smoke.run_budget(0) > smoke.teardown_budget(0)
 
@@ -2442,16 +2442,17 @@ def test_budget_bounds_are_the_ones_the_code_uses(smoke, monkeypatch):
     [("777", "3", False), ("777", UNKNOWN, True), ("777", None, True), (None, "3", True)],
 )
 def test_unknown_is_one_definition_and_never_an_identity(smoke, pid, runs, refused):
-    assert smoke.UNKNOWN is smoke._smoke_lib.UNKNOWN
+    assert smoke.UNKNOWN is smoke._smoke_lib.UNKNOWN is smoke.squat_check.UNKNOWN
     # An identifier-like literal is interned, so `is` alone cannot see a copy:
-    # the scripts spell the sentinel exactly once, at its definition.
+    # the scripts spell the sentinel exactly once, at its definition (in
+    # squat_check, which cannot import _smoke_lib).
     copies = [
         f"{p.name}:{n}"
         for p in sorted((REPO_ROOT / "scripts").glob("*.py"))
         for n, line in enumerate(p.read_text().splitlines(), 1)
         if repr(smoke.UNKNOWN) in line or f'"{smoke.UNKNOWN}"' in line
     ]
-    assert len(copies) == 1 and copies[0].startswith("_smoke_lib.py:"), copies
+    assert len(copies) == 1 and copies[0].startswith("squat_check.py:"), copies
     connected = []
 
     class _Sock:
@@ -2608,8 +2609,6 @@ def test_squat_warns_answer_state_space(smoke, monkeypatch, answer):
     timeouts = []
 
     def run(cmd, run=None, timeout=smoke.CMD_TIMEOUT, **kw):
-        if cmd[0] == "launchctl":
-            return _cp(cmd, 0, "\tpid = 4242\n")
         timeouts.append(timeout)
         if rc is subprocess.TimeoutExpired:
             raise subprocess.TimeoutExpired(cmd, timeout)
@@ -2618,6 +2617,9 @@ def test_squat_warns_answer_state_space(smoke, monkeypatch, answer):
         return _cp(cmd, rc, "", err)
 
     monkeypatch.setattr(smoke, "_run", run)
+    monkeypatch.setattr(
+        smoke.squat_check, "read_print", lambda label, run=None, uid=None: (0, "\tpid = 4242\n")
+    )
     h = object.__new__(smoke.Harness)
     h.label, h.port, h.uid = SPARE, 9998, FAKE_UID
     if isinstance(want, str):
@@ -2645,7 +2647,9 @@ def test_squat_timeout_and_budget_follow_cli_bound(smoke, monkeypatch):
     assert smoke.squat_cli_timeout() == (
         smoke.squat_check.cli_bound(smoke.SQUAT_LISTENERS) + smoke.SQUAT_START
     )
-    assert smoke._squat_warns_bound() == smoke.CMD_TIMEOUT + smoke.squat_cli_timeout()
+    assert smoke._squat_warns_bound() == (
+        smoke.squat_check.LAUNCHCTL_TIMEOUT + smoke.squat_cli_timeout()
+    )
     before = {n: smoke.run_budget(n) for n in (0, 3)}
     # A slower CLI (one more listener's lookup) moves the timeout and the
     # budget by exactly that much, and the teardown budget not at all.
@@ -2724,3 +2728,98 @@ def test_signal_at_every_boundary_still_tears_down(smoke, monkeypatch, capsys, b
     else:
         assert rc == 1 and len(interrupted) == 1
     assert {s: signal.getsignal(s) for s in old} == old
+
+
+# ONE `launchctl print` reader (squat_check.read_print + parse_print) behind
+# every wrapper: squat_check.launchd_state (and the CLI's classify_print),
+# _smoke_lib.launchd_identity (smoke.py --agents) and smoke_launchd.read_job
+# (the snapshot, the verified connections). One table of answers -> every
+# wrapper's projection of the same JobPrint, so they cannot diverge again. A
+# running job with no `runs =` line is UNKNOWN in every wrapper that reports
+# runs; a call that cannot run, or an answer that is neither loaded nor
+# launchctl's own "could not find service", is "cannot tell" everywhere.
+_ARGS_TCP = (
+    "\targuments = {\n\t\t/py\n\t\tserve\n\t\t--host\n\t\t127.0.0.1\n\t\t--port\n\t\t9123\n\t}\n"
+)
+_PRINTS = {
+    # name: (rc or an exception class, stdout, stderr, want JobPrint or None)
+    "running": (0, f"\tpid = 4242\n\truns = 7\n{_ARGS_TCP}", "", (True, "4242", "7", "tcp")),
+    "running-no-runs": (0, f"\tpid = 4242\n{_ARGS_TCP}", "", (True, "4242", UNKNOWN, "tcp")),
+    "loaded-no-pid": (0, "\tstate = waiting\n\truns = 3\n", "", (True, None, "3", None)),
+    "loaded-no-pid-no-runs": (0, "\tstate = waiting\n", "", (True, None, None, None)),
+    "loaded-empty": (0, "", "", (True, None, None, None)),
+    "odd-format": (
+        0,
+        "gui/501/x = {\r\n    runs = 12\r\n        pid = 99\r\n" + _ARGS_TCP.replace("\n", "\r\n"),
+        "",
+        (True, "99", "12", "tcp"),
+    ),
+    "socket-job": (
+        0,
+        "\tpid = 5\n\truns = 1\n\targuments = {\n\t\t/py\n\t\t--socket-path\n\t\t/s.sock\n\t}\n",
+        "",
+        (True, "5", "1", "unix"),
+    ),
+    "not-loaded-113": (113, "", 'Could not find service "x" in domain', (False, None, None, None)),
+    "not-loaded-message": (1, "", 'Could not find service "x"', (False, None, None, None)),
+    "exit-5": (5, "", "Input/output error", None),
+    "exit-1-silent": (1, "", "", None),
+    "exit-1-other": (1, "\tpid = 4242\n\truns = 7\n", "Operation not permitted", None),
+    "no-launchctl": (FileNotFoundError, "", "", None),
+    "timeout": (subprocess.TimeoutExpired, "", "", None),
+}
+
+
+@pytest.mark.parametrize("name", list(_PRINTS))
+def test_one_launchctl_print_reader_behind_every_wrapper(smoke, name):
+    rc, out, err, want = _PRINTS[name]
+    calls = []
+
+    def run(argv, **kw):
+        calls.append((list(argv), kw.get("timeout")))
+        if rc is FileNotFoundError:
+            raise FileNotFoundError("launchctl")
+        if rc is subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return _cp(argv, rc, out, err)
+
+    sq, lib = smoke.squat_check, smoke._smoke_lib
+    state = sq.launchd_state("x", run, uid=501)
+    ident = lib.launchd_identity("x", uid=501, run=run)
+    if want is None:
+        assert state is None and ident is None
+        with pytest.raises(smoke.LaunchdUnreadable):
+            smoke.read_job("x", "501", run)
+        if isinstance(rc, int):
+            assert sq.classify_print(rc, out + "\n" + err) is None
+    else:
+        loaded, pid, runs, kind = want
+        assert state == (loaded, pid)
+        assert ident == (loaded, pid, runs)
+        job = smoke.read_job("x", "501", run)
+        assert job[:3] == (loaded, pid, runs)
+        assert (job[3][0] if job[3] else None) == kind
+        assert sq.classify_print(rc, out + "\n" + err) == (loaded, pid)
+    # Every wrapper made the same one call, with the one reader's bound.
+    assert len(calls) == 3
+    assert {(tuple(a), t) for a, t in calls} == {
+        (("launchctl", "print", "gui/501/x"), sq.LAUNCHCTL_TIMEOUT)
+    }
+
+
+# No wrapper keeps a parser of its own: the pid, runs and arguments rules
+# live only in squat_check (one regex each).
+def test_no_second_launchctl_print_parser(smoke):
+    import re
+
+    scripts = REPO_ROOT / "scripts"
+    for name, pattern in (
+        ("pid", r"pid = \("),
+        ("runs", r"runs = \("),
+        ("arguments", r"arguments = \\\{"),
+    ):
+        hits = [p.name for p in sorted(scripts.glob("*.py")) if re.search(pattern, p.read_text())]
+        assert hits == ["squat_check.py"], (name, hits)
+    for p in ("_smoke_lib.py", "smoke_launchd.py", "smoke.py"):
+        src = (scripts / p).read_text()
+        assert '["launchctl", "print"' not in src, p  # an argv: a call of its own

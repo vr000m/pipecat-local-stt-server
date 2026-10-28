@@ -51,12 +51,13 @@ baseline snapshot refuses the run before the first install.
 The spare port is held for the whole run: if the collision check cannot bind it,
 or a later check finds a listener on it that is not the spare job, the run FAILs
 there (the remaining checks are not run) and teardown still runs.
-Listeners (``lsof``) and a labelled job's (loaded, pid) state (``launchctl
-print``) are read through ``squat_check.py``'s helpers (one definition each).
-Two reads live here: the job list (``launchctl list``) and a real job's
-``launchctl print`` (``read_job``: classified by ``squat_check.classify_print``,
-plus its runs counter and arguments block). A ``launchctl`` or ``lsof`` answer the
-harness cannot read refuses or FAILs, never reads as "not loaded" or "free".
+Listeners (``lsof``) and every ``launchctl print`` are read through
+``squat_check.py``'s helpers (one definition each): ``read_job`` (a job's
+loaded state, pid, runs counter and endpoint), ``require_launchd_state`` and
+``squat_warns`` are thin wrappers over its one reader (``read_print`` +
+``parse_print``). One read lives here: the job list (``launchctl list``). A
+``launchctl`` or ``lsof`` answer the harness cannot read refuses or FAILs,
+never reads as "not loaded" or "free".
 The token check sends its throwaway token (and the wrong one) only over
 ``_smoke_lib.connect_verified`` connections whose server end is the spare job
 (its pid and ``runs`` from one ``read_job``), and PASSes only when a fresh
@@ -173,8 +174,9 @@ def install_bound() -> float:
 
 def snapshot_bound(n_agents: int) -> float:
     """One real-agent snapshot: ``launchctl list``, then per agent one
-    ``launchctl print`` (read_job) and at most one lsof (endpoint_listener)."""
-    return CMD_TIMEOUT + n_agents * (CMD_TIMEOUT + squat_check.LSOF_TIMEOUT)
+    ``launchctl print`` (read_job, squat_check's reader) and at most one lsof
+    (endpoint_listener)."""
+    return CMD_TIMEOUT + n_agents * (squat_check.LAUNCHCTL_TIMEOUT + squat_check.LSOF_TIMEOUT)
 
 
 def _handshake_bound() -> float:
@@ -187,13 +189,13 @@ def _connect_verified_bound() -> float:
         _smoke_lib.HANDSHAKE_TIMEOUT
         + _smoke_lib.SERVER_END_SETTLE
         + squat_check.LSOF_TIMEOUT
-        + CMD_TIMEOUT
+        + squat_check.LAUNCHCTL_TIMEOUT
     )
 
 
 def _verified_status_bound() -> float:
     """Harness.verified_status: read_job, connect_verified, the handshake."""
-    return CMD_TIMEOUT + _connect_verified_bound() + _handshake_bound()
+    return squat_check.LAUNCHCTL_TIMEOUT + _connect_verified_bound() + _handshake_bound()
 
 
 def squat_cli_timeout() -> float:
@@ -204,7 +206,7 @@ def squat_cli_timeout() -> float:
 
 def _squat_warns_bound() -> float:
     """Harness.squat_warns: the spare's launchctl print, then the CLI."""
-    return CMD_TIMEOUT + squat_cli_timeout()
+    return squat_check.LAUNCHCTL_TIMEOUT + squat_cli_timeout()
 
 
 def _wait_bound(timeout: float, pred: float) -> float:
@@ -243,9 +245,9 @@ def run_budget(n_agents: int) -> float:
     token = (
         install_bound()
         + _wait_bound(UP_TIMEOUT, _handshake_bound())  # _refuses
-        + CMD_TIMEOUT  # read_job
+        + squat_check.LAUNCHCTL_TIMEOUT  # read_job
         + 3 * (_connect_verified_bound() + _handshake_bound())  # 401 / 401 / 101
-        + CMD_TIMEOUT  # the fresh read afterwards
+        + squat_check.LAUNCHCTL_TIMEOUT  # the fresh read afterwards
     )
     return setup + boundaries + collision + rollback + token + teardown_budget(n_agents)
 
@@ -648,14 +650,15 @@ def check_guard(
 # snapshot records an AgentState:
 #
 #   loaded, pid, runs, endpoint  from ONE read-only `launchctl print` of the job,
-#       the source of truth for what launchd is running: `loaded`/`pid` through
-#       squat_check.classify_print (the recipes' rule), `runs` (launchd's spawn
-#       counter, which moves on every restart even when a pid is reused) and the
-#       endpoint the job is SERVING, from its `arguments` block (its port
-#       canonical, as the server parses it; a --port int() refuses is UNKNOWN).
-#       An unreadable answer raises LaunchdUnreadable (never "not loaded").
-#       A loaded job with a pid whose answer has no `runs =` line is UNKNOWN
-#       (None would compare equal to None and blind the restart check).
+#       the source of truth for what launchd is running, through squat_check's
+#       one reader (read_print + parse_print, the recipes' rule too): `runs`
+#       (launchd's spawn counter, which moves on every restart even when a pid
+#       is reused) and the endpoint the job is SERVING, from its `arguments`
+#       block (its port canonical, as the server parses it; a --port int()
+#       refuses is UNKNOWN). An unreadable answer raises LaunchdUnreadable
+#       (never "not loaded"). A loaded job with a pid whose answer has no
+#       `runs =` line is UNKNOWN (None would compare equal to None and blind
+#       the restart check).
 #   plist  sha256 of the installed plist's bytes (None: no plist). The plist is
 #       only the INTENDED endpoint (it can change without a reload), so it is
 #       never where the listener is read; any rewrite of it is a change.
@@ -683,8 +686,6 @@ def check_guard(
 # entirely between two boundaries with its plist untouched, leaves no launchd
 # state to observe.
 
-_JOB_ARGS_RE = re.compile(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", re.MULTILINE | re.DOTALL)
-
 
 @dataclasses.dataclass(frozen=True)
 class AgentState:
@@ -708,13 +709,11 @@ def canonical_port(flags: dict[str, str]) -> str | None:
     return UNKNOWN if port is None else str(port)
 
 
-def job_endpoint(text: str) -> tuple[str, ...] | str | None:
-    """The endpoint a job serves, from its ``launchctl print`` arguments block:
-    ("unix", path), ("tcp", host, canonical port), None when it names neither,
-    or UNKNOWN when its ``--port`` cannot be parsed the server's way."""
-    m = _JOB_ARGS_RE.search(text or "")
-    args = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()] if m else []
-    flags = read_stt_plist.read_argv_flags(args)
+def argv_endpoint(argv) -> tuple[str, ...] | str | None:
+    """The endpoint a job's ARGV serves: ("unix", path), ("tcp", host,
+    canonical port), None when it names neither, or UNKNOWN when its
+    ``--port`` cannot be parsed the server's way."""
+    flags = read_stt_plist.read_argv_flags(list(argv))
     if flags.get("--socket-path"):
         return ("unix", flags["--socket-path"])
     port = canonical_port(flags)
@@ -725,29 +724,29 @@ def job_endpoint(text: str) -> tuple[str, ...] | str | None:
     return None
 
 
+def job_endpoint(text: str) -> tuple[str, ...] | str | None:
+    """``argv_endpoint`` of a ``launchctl print`` body's arguments block
+    (``squat_check.parse_job_argv``, the one reader's argv rule)."""
+    return argv_endpoint(squat_check.parse_job_argv(text))
+
+
 def read_job(
     label: str, uid: str, run=subprocess.run
 ) -> tuple[bool, str | None, str | None, tuple[str, ...] | None]:
-    """(loaded, pid, runs, endpoint) from ONE read-only ``launchctl print``.
-    Raises LaunchdUnreadable when the answer is neither loaded nor launchctl's
-    own "could not find service"."""
-    try:
-        res = _run(["launchctl", "print", f"gui/{uid}/{label}"], run)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise LaunchdUnreadable(f"cannot read {label} with launchctl print: {exc}") from exc
-    out = res.stdout or ""
-    state = squat_check.classify_print(res.returncode, out + "\n" + (res.stderr or ""))
-    if state is None:
-        raise LaunchdUnreadable(f"cannot read {label} with launchctl print (exit {res.returncode})")
-    loaded, pid = state
-    if not loaded:
+    """(loaded, pid, runs, endpoint) from ONE read-only ``launchctl print``,
+    through ``squat_check.read_print`` / ``parse_print`` (the one reader: a
+    running job with no ``runs =`` line has runs UNKNOWN). Raises
+    LaunchdUnreadable when the answer is neither loaded nor launchctl's own
+    "could not find service", or the call could not run."""
+    got = squat_check.read_print(label, run, uid)
+    if got is None:
+        raise LaunchdUnreadable(f"cannot read {label} with launchctl print (it did not run)")
+    job = squat_check.parse_print(*got)
+    if job is None:
+        raise LaunchdUnreadable(f"cannot read {label} with launchctl print (exit {got[0]})")
+    if not job.loaded:
         return False, None, None, None
-    runs = _smoke_lib.parse_runs(out)
-    if runs is None and pid:
-        # A running job always has a spawn counter; an answer without one
-        # cannot prove a restart did not happen (None == None), so it is UNKNOWN.
-        runs = UNKNOWN
-    return True, pid, runs, job_endpoint(out)
+    return True, job.pid, job.runs, argv_endpoint(job.argv)
 
 
 def endpoint_listener(loaded: bool, pid, endpoint, run=subprocess.run) -> str | None:
@@ -1145,23 +1144,20 @@ class Harness:
         tell the spare's state (the harness's own stop rule). A CLI that gives
         no answer within ``squat_cli_timeout()`` (its own worst case), or
         cannot be run, is "cannot tell": CheckFailed, the check's FAIL row."""
-        target = f"gui/{self.uid}/{self.label}"
-        try:
-            res = _run(["launchctl", "print", target])
-        except (OSError, subprocess.SubprocessError) as exc:
+        got = squat_check.read_print(self.label, uid=self.uid)
+        if got is None:
             raise LaunchdUnreadable(
-                f"cannot read the launchd state of {self.label}: {exc}"
-            ) from exc
-        answer = (res.stdout or "") + "\n" + (res.stderr or "")
-        if squat_check.classify_print(res.returncode, answer) is None:
+                f"cannot read the launchd state of {self.label} (launchctl print did not run)"
+            )
+        rc, answer = got
+        if squat_check.parse_print(rc, answer) is None:
             raise LaunchdUnreadable(
-                f"cannot read the launchd state of {self.label} "
-                f"(launchctl print exit {res.returncode})"
+                f"cannot read the launchd state of {self.label} (launchctl print exit {rc})"
             )
         timeout = squat_cli_timeout()
         try:
             sq = _run(
-                squat_cli(HOST, self.port, self.label, res.returncode),
+                squat_cli(HOST, self.port, self.label, rc),
                 input=answer,
                 timeout=timeout,
             )

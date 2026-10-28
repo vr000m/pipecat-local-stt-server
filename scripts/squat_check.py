@@ -63,18 +63,23 @@ or an exit of 2 or more, is "cannot tell".
 
 Import surface (besides the CLI), exactly what each importer uses:
 
-* ``scripts/smoke_launchd.py``: ``classify_print``, ``endpoint_holders``,
+* ``scripts/smoke_launchd.py``: ``read_print``, ``parse_print`` and
+  ``read_job_print`` (``read_job``, ``squat_warns``), ``endpoint_holders``,
   ``launchd_state`` (with the ``uid`` keyword), ``listener_pids``,
-  ``lsof_pids``, the bounds ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its
-  time budget sums them) and ``cli_bound`` (the CLI's own worst case, which
-  its squat-check timeout and budget derive from).
-* ``scripts/_smoke_lib.py`` (imported lazily, inside ``launchd_identity`` and
-  ``tcp_server_end_pids``, which ``smoke.py`` and ``connect_verified`` use):
-  ``classify_print`` and ``lsof_output``.
+  ``lsof_pids``, ``parse_job_argv`` (``job_endpoint``), the bounds
+  ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its time budget sums them) and
+  ``cli_bound`` (the CLI's own worst case, which its squat-check timeout and
+  budget derive from).
+* ``scripts/_smoke_lib.py``: ``UNKNOWN`` (re-exported as
+  ``_smoke_lib.UNKNOWN``), ``read_job_print`` (``launchd_identity``, which
+  ``smoke.py`` uses) and ``lsof_output`` (``tcp_server_end_pids``, which
+  ``connect_verified`` uses).
 
-So the harness, the runner and the recipes share one listener and one
-launchd-state definition. Everything else here (``parse_launchd_pid``
-included) is private to this module.
+So the harness, the runner and the recipes share one listener definition and
+ONE ``launchctl print`` reader (``read_print`` + ``parse_print``, see "the one
+``launchctl print`` reader" below); ``launchd_state``, ``launchd_identity``
+and ``read_job`` are thin wrappers over it. This module never imports
+``_smoke_lib`` (it runs alone under ``python3 -I``).
 
 Stdlib only: it runs under the system python3 (``python3 -I``).
 """
@@ -82,6 +87,7 @@ Stdlib only: it runs under the system python3 (``python3 -I``).
 from __future__ import annotations
 
 import argparse
+import collections
 import os
 import re
 import subprocess
@@ -224,29 +230,90 @@ def _commands(pids, run):
     return cmds
 
 
+# --- the one `launchctl print` reader -------------------------------------------
+#
+# Every reader of a job's `launchctl print` answer goes through read_print (the
+# call) and parse_print (the rule): this module's own re-check
+# (launchd_state), the recipes' CLI form (classify_print, the loaded/pid half
+# of parse_print), _smoke_lib.launchd_identity (smoke.py --agents) and
+# smoke_launchd.read_job / Harness.squat_warns. One rule each for:
+#
+#   loaded   exit 0. Not loaded is only launchctl's own "could not find
+#            service" (exit 113, or that message); any other answer, or a call
+#            that could not run, is "cannot tell" (None), never "not loaded".
+#   pid      the `pid = N` line; None when absent (loaded, not running).
+#   runs     the `runs = N` line (launchd's spawn counter, which moves on every
+#            restart even when a pid is reused). A RUNNING job (a pid) whose
+#            answer has no such line is UNKNOWN, never None: None == None
+#            would let a restart compare as unchanged. A job with no pid and no
+#            line is None; a job that is not loaded has none.
+#   argv     the job's `arguments = { ... }` block, one word per line; () when
+#            absent or not loaded. The endpoint is derived from it by the
+#            caller (smoke_launchd.job_endpoint parses it the way the server
+#            parses its flags; that parser is not stdlib-only).
+#
+# The text is the answer's stdout and stderr together (the CLI's `2>&1`).
+
+# A value a reader could not read (a running job's runs counter, a snapshot
+# field): never equal to anything, and never an identity to verify against.
+# The one definition; _smoke_lib.UNKNOWN and smoke_launchd.UNKNOWN are this
+# same object.
+UNKNOWN = "unknown"
+
+_PID_RE = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
+_RUNS_RE = re.compile(r"^\s*runs = (\d+)", re.MULTILINE)
+_ARGS_RE = re.compile(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", re.MULTILINE | re.DOTALL)
+
+
+# One parsed `launchctl print` answer.
+JobPrint = collections.namedtuple("JobPrint", "loaded pid runs argv")
+
+
 def parse_launchd_pid(text):
     """The ``pid = N`` of a ``launchctl print`` body, or None."""
-    m = re.search(r"^\s*pid = (\d+)", text or "", re.MULTILINE)
+    m = _PID_RE.search(text or "")
     return m.group(1) if m else None
 
 
-def classify_print(rc, text):
-    """(loaded, pid) from one ``launchctl print`` answer: its exit status RC and
-    its output TEXT (stdout and stderr). None when it can't tell.
+def parse_runs(text):
+    """The ``runs = N`` of a ``launchctl print`` body, or None (the raw line;
+    ``parse_print`` turns a running job's missing line into UNKNOWN)."""
+    m = _RUNS_RE.search(text or "")
+    return m.group(1) if m else None
 
-    Not loaded is only launchctl's own "could not find service" answer (exit
-    113, or that message); any other failure is "can't tell", never "not
-    loaded". The one rule for the recipes' read and this module's own."""
+
+def parse_job_argv(text):
+    """The words of a ``launchctl print`` body's ``arguments`` block; ()."""
+    m = _ARGS_RE.search(text or "")
+    return tuple(ln.strip() for ln in m.group(1).splitlines() if ln.strip()) if m else ()
+
+
+def parse_print(rc, text):
+    """JobPrint(loaded, pid, runs, argv) from one ``launchctl print`` answer:
+    its exit status RC and its output TEXT (stdout and stderr); None when it
+    can't tell. The rules are in the block above."""
     if rc == 0:
-        return True, parse_launchd_pid(text)
+        pid = parse_launchd_pid(text)
+        runs = parse_runs(text)
+        if runs is None and pid:
+            runs = UNKNOWN
+        return JobPrint(True, pid, runs, parse_job_argv(text))
     if rc == _NOT_LOADED_RC or _NOT_LOADED_RE.search(text or ""):
-        return False, None
+        return JobPrint(False, None, None, ())
     return None
 
 
-def launchd_state(label, run=subprocess.run, uid=None):
-    """(loaded, pid) from read-only ``launchctl print`` (``classify_print``);
-    None when it can't tell."""
+def classify_print(rc, text):
+    """(loaded, pid) from one ``launchctl print`` answer (``parse_print``'s
+    loaded/pid); None when it can't tell. The recipes' rule."""
+    job = parse_print(rc, text)
+    return None if job is None else (job.loaded, job.pid)
+
+
+def read_print(label, run=subprocess.run, uid=None):
+    """(rc, text) of one read-only ``launchctl print gui/<uid>/LABEL`` (TEXT is
+    stdout and stderr), bounded by LAUNCHCTL_TIMEOUT; None when it could not
+    run. The one call every reader makes."""
     uid = os.getuid() if uid is None else uid
     try:
         res = run(
@@ -257,7 +324,20 @@ def launchd_state(label, run=subprocess.run, uid=None):
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return classify_print(res.returncode, (res.stdout or "") + "\n" + (res.stderr or ""))
+    return res.returncode, (res.stdout or "") + "\n" + (res.stderr or "")
+
+
+def read_job_print(label, run=subprocess.run, uid=None):
+    """``parse_print`` of ``read_print``: a JobPrint, or None when it can't tell."""
+    got = read_print(label, run, uid)
+    return None if got is None else parse_print(*got)
+
+
+def launchd_state(label, run=subprocess.run, uid=None):
+    """(loaded, pid) from one read-only ``launchctl print`` (``read_job_print``);
+    None when it can't tell."""
+    job = read_job_print(label, run, uid)
+    return None if job is None else (job.loaded, job.pid)
 
 
 def _finding(listeners, pid):

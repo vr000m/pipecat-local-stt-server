@@ -376,7 +376,7 @@ def job_identity(label: str) -> tuple[tuple[str, str] | None, str]:
         return None, "not loaded in launchd"
     if not pid:
         return None, "loaded but not running (launchd has no pid)"
-    if not runs:
+    if not runs or runs == _smoke_lib.UNKNOWN:
         return None, f"launchctl print shows pid {pid} but no `runs =` line"
     return (pid, runs), ""
 

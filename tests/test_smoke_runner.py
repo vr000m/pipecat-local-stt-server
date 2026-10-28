@@ -470,11 +470,18 @@ def test_agents_read_only_with_tcp_and_socket_plists(smoke, agents_env, monkeypa
 # sent) x a FRESH identity read after it -> decoded? and the row. Only a
 # running job with a readable pid and runs is decoded; only an unchanged
 # (loaded, pid, runs) after a passing decode is a PASS.
+def _smoke_lib_unknown():
+    return _load()._smoke_lib.UNKNOWN  # the one sentinel, not a copy
+
+
 _IDENT = {
     "unreadable": None,
     "unloaded": (False, None, None),
     "no-pid": (True, None, "3"),
     "no-runs": (True, "4242", None),
+    # launchd_identity's own answer for a running job with no `runs =` line
+    # (squat_check's one reader): refused like None.
+    "unknown-runs": (True, "4242", _smoke_lib_unknown()),
     "running": (True, "4242", "7"),
 }
 _AFTER = {

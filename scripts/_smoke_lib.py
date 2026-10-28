@@ -29,8 +29,9 @@ The module holds several separate concerns; each section below is used by:
   step, the harness's token check and its transport-recovery waits):
   ``connect_verified`` (a launchd job) and ``connect_verified_child`` (the
   token-file step's own child server), the one rule for
-  sending a token, and ``launchd_identity`` / ``parse_runs`` (a job's pid and
-  spawn counter from one ``launchctl print``). Contract at that section.
+  sending a token, and ``launchd_identity`` (a job's loaded state, pid and
+  spawn counter from one ``launchctl print``, a thin wrapper over
+  ``squat_check``'s one reader). Contract at that section.
 * Token gate (``smoke.py``'s token-file step, the harness's token check): the
   token-file fixture (``write_policy_token_file``), a raw websocket handshake
   (``ws_handshake_status``, which sends a token only over a socket the caller
@@ -48,7 +49,6 @@ from __future__ import annotations
 import contextlib
 import os
 import pwd
-import re
 import shutil
 import signal
 import socket
@@ -60,6 +60,11 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+# squat_check sits beside this module (every importer has scripts/ on its
+# path) and is stdlib-only; it never imports this one. It owns the one
+# `launchctl print` reader and the UNKNOWN sentinel.
+import squat_check
 
 # Step outcomes, shared by smoke.py's table and smoke_launchd.py's.
 PASS = "PASS"
@@ -90,16 +95,6 @@ def launchd_failures(stdout: str) -> list[str]:
         for ln in (stdout or "").splitlines()
         if ln.startswith(LAUNCHD_FAIL_MARK)
     ]
-
-
-_RUNS_RE = re.compile(r"^\s*runs = (\d+)", re.MULTILINE)
-
-
-def parse_runs(text: str) -> str | None:
-    """The ``runs = N`` of a ``launchctl print`` body (launchd's spawn counter,
-    which moves on every restart even when a pid is reused), or None."""
-    m = _RUNS_RE.search(text or "")
-    return m.group(1) if m else None
 
 
 SPARE_LABEL = "pipecat.stt-server.smoke"
@@ -228,10 +223,11 @@ def assert_chain_traversable(sock: str) -> None:
 # and lsof's view of an accepted socket are macOS facts the stubbed tests
 # cannot prove; the live run does.
 
-# A value the reader could not read (a job's runs counter, a snapshot field):
-# never equal to anything, and never an identity to verify against. The one
-# definition; smoke_launchd.UNKNOWN is this same object.
-UNKNOWN = "unknown"
+# A value the reader could not read (a running job's runs counter, a snapshot
+# field): never equal to anything, and never an identity to verify against.
+# Defined once, in squat_check (which cannot import this module);
+# smoke_launchd.UNKNOWN is this same object too.
+UNKNOWN = squat_check.UNKNOWN
 
 SOL_LOCAL = 0  # <sys/un.h>, macOS
 LOCAL_PEERPID = 2  # <sys/un.h>, macOS: pid of the peer at connect time
@@ -246,26 +242,11 @@ class EndpointRefused(Exception):
 
 def launchd_identity(label: str, uid=None, run=subprocess.run):
     """(loaded, pid, runs) from ONE read-only ``launchctl print gui/<uid>/LABEL``
-    (``squat_check.classify_print``'s rule plus ``parse_runs``); None when the
-    answer cannot be read. ``runs`` is None when the line is absent."""
-    import squat_check
-
-    uid = os.getuid() if uid is None else uid
-    try:
-        res = run(
-            ["launchctl", "print", f"gui/{uid}/{label}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    out = res.stdout or ""
-    state = squat_check.classify_print(res.returncode, out + "\n" + (res.stderr or ""))
-    if state is None:
-        return None
-    loaded, pid = state
-    return loaded, pid, (parse_runs(out) if loaded else None)
+    through ``squat_check.read_job_print`` (the one reader and its rules);
+    None when the answer cannot be read. A running job whose answer has no
+    ``runs =`` line has runs UNKNOWN (never None)."""
+    job = squat_check.read_job_print(label, run, uid)
+    return None if job is None else (job.loaded, job.pid, job.runs)
 
 
 def _lsof_addr(addr) -> str:
@@ -293,8 +274,6 @@ def tcp_server_end_pids(
     """Pids holding the server end of the connected TCP socket SOCK: the lsof
     entries whose name is ``<server address>-><our address>``. [] when none is
     visible within SETTLE seconds, None when lsof cannot tell."""
-    import squat_check
-
     local, remote = _lsof_addr(sock.getsockname()), _lsof_addr(sock.getpeername())
     want = f"{remote}->{local}"
     deadline = time.monotonic() + settle
