@@ -2263,3 +2263,54 @@ def test_parse_port_matches_the_server_parser(smoke, argv, _want):
     except SystemExit:
         server = None
     assert smoke.read_stt_plist.parse_port(flags["--port"]) == server
+
+
+# The transport-recovery checks prove the SPARE answered, not any listener:
+# transport x the spare job's state x the verified connection -> tcp_up /
+# sock_up True only for (running, verified, 101); a lookalike listener is a
+# CheckFailed (wait_for retries it); no plain socket is ever the proof.
+@pytest.mark.parametrize("status", [101, 401])
+@pytest.mark.parametrize("conn", ["verified", "refused"])
+@pytest.mark.parametrize("job", ["running", "no-pid", "unknown-runs", "unloaded"])
+@pytest.mark.parametrize("transport", ["tcp", "unix"])
+def test_transport_recovery_requires_the_spare_jobs_server_end(
+    smoke, env, monkeypatch, transport, job, conn, status
+):
+    monkeypatch.setenv("HOME", str(env.home))
+    h = smoke.Harness(SPARE, _free_port())
+    jobs = {
+        "running": (True, "777", "3", None),
+        "no-pid": (True, None, None, None),
+        "unknown-runs": (True, "777", smoke.UNKNOWN, None),
+        "unloaded": (False, None, None, None),
+    }
+    monkeypatch.setattr(smoke, "read_job", lambda label, uid, run=None: jobs[job])
+    connects, handshakes = [], []
+
+    def connect_verified(endpoint, pid, runs, identity, **k):
+        connects.append((endpoint, pid, runs))
+        if conn == "refused":
+            raise smoke._smoke_lib.EndpointRefused("held by pid 666, not the launchd job")
+        return "verified-sock"
+
+    def ws_handshake_status(**kw):
+        handshakes.append(kw)
+        assert kw.get("sock") == "verified-sock", kw  # never a plain address
+        return status
+
+    monkeypatch.setattr(smoke._smoke_lib, "connect_verified", connect_verified)
+    monkeypatch.setattr(smoke._smoke_lib, "ws_handshake_status", ws_handshake_status)
+    up = h.tcp_up if transport == "tcp" else h.sock_up
+    want_ep = ("tcp", "127.0.0.1", str(h.port)) if transport == "tcp" else ("unix", str(h.sock))
+    if job != "running":
+        with pytest.raises(smoke.CheckFailed, match="pid and runs"):
+            up()
+        assert connects == [] and handshakes == []
+    elif conn == "refused":
+        with pytest.raises(smoke.CheckFailed, match="not the spare job"):
+            up()
+        assert handshakes == []
+    else:
+        assert up() is (status == 101)
+    if job == "running":
+        assert connects == [(want_ep, "777", "3")]

@@ -61,7 +61,10 @@ The token check sends its throwaway token (and the wrong one) only over
 ``_smoke_lib.connect_verified`` connections whose server end is the spare job
 (its pid and ``runs`` from one ``read_job``), and PASSes only when a fresh
 ``read_job`` afterwards shows the same pair; until then it waits for the agent
-with requests that carry no token.
+with requests that carry no token. Every answer that proves the SPARE is up
+(the collision check's recovery, each rollback transport) goes over such a
+verified connection too (``Harness.verified_status``), with no token; a plain
+no-token probe is only ever a readiness wait, never the proof.
 
 Every installer call runs in its own process group through
 ``_smoke_lib.run_owned`` (``run_installer``): a SIGINT/SIGTERM during an install
@@ -859,15 +862,38 @@ class Harness:
             time.sleep(every)
 
     def tcp_status(self) -> int:
-        """The spare port's answer to an upgrade with NO token (nothing secret
-        goes to an unverified listener)."""
+        """The spare port's answer to an upgrade with NO token, over a plain
+        connection: a readiness probe only (nothing secret is sent, and it
+        proves nothing about who answered)."""
         return _smoke_lib.ws_handshake_status(host=HOST, port=self.port)
 
+    def verified_status(self, endpoint: tuple) -> int:
+        """ENDPOINT's answer to an upgrade with no token, over a
+        ``_smoke_lib.connect_verified`` connection whose server end is the
+        spare job (its pid and runs from one ``read_job``; the same rule as
+        the token check): what proves the SPARE answered, not any listener.
+        A job without a readable pid and runs, or a server end that is not
+        its, is CheckFailed (``wait_for`` retries it); an unreadable launchd
+        state raises LaunchdUnreadable."""
+        loaded, pid, runs, _ep = read_job(self.label, self.uid)
+        if not (loaded and pid and runs and runs != UNKNOWN):
+            raise CheckFailed(
+                f"the spare job is not running with a readable pid and runs "
+                f"(loaded {loaded}, pid {pid}, runs {runs})"
+            )
+        try:
+            sock = _smoke_lib.connect_verified(endpoint, pid, runs, self._identity)
+        except _smoke_lib.EndpointRefused as exc:
+            raise CheckFailed(f"not the spare job: {exc}") from exc
+        return _smoke_lib.ws_handshake_status(sock=sock)
+
     def tcp_up(self) -> bool:
-        return self.tcp_status() == 101
+        """The spare JOB answers 101 on the spare port (server end verified)."""
+        return self.verified_status(("tcp", HOST, str(self.port))) == 101
 
     def sock_up(self) -> bool:
-        return _smoke_lib.ws_handshake_status(unix_path=str(self.sock)) == 101
+        """The spare JOB answers 101 on the spare socket (server end verified)."""
+        return self.verified_status(("unix", str(self.sock))) == 101
 
     def expect_transport(self, want: str) -> None:
         port = read_plist_field(self.label, "port")
@@ -921,7 +947,10 @@ class Harness:
         self.holder.close()
         self.holder = None
         self.wait_for("the agent to answer after the port was freed", self.tcp_up)
-        return f"{in_use} address-in-use lines, squat warning, agent up after free"
+        return (
+            f"{in_use} address-in-use lines, squat warning, agent up after free "
+            "(server end verified)"
+        )
 
     def ensure_port_ours(self) -> None:
         """Raise PortLost unless every listener on the spare port is the spare job
@@ -1014,8 +1043,8 @@ class Harness:
             raise CheckFailed(f"{lock} was removed; the installer must leave it")
         self.wait_for(f"{lock} to be unheld", lambda: lock_unheld(lock), timeout=10)
         return (
-            "tcp -> socket -> tcp; old socket removed on the installer's "
-            "unload-confirmed path, .lock left and unheld"
+            "tcp -> socket -> tcp (each answer's server end verified); old socket "
+            "removed on the installer's unload-confirmed path, .lock left and unheld"
         )
 
     # -- check: token file
