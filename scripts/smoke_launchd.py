@@ -29,8 +29,19 @@ bootout and before any installer call. Teardown always runs after that point
 label, then the spare ``.lock`` once nothing holds it, then the spare plist and
 logs. It never touches another label.
 
-The real agents are found under the account's home from the password database,
-not ``$HOME``, so an overridden ``HOME`` cannot empty the before/after snapshot.
+The real agents are every installed ``pipecat.stt-server*`` plist under
+``_smoke_lib.agents_home()`` (the account's home from the password database, not
+``$HOME``, so an overridden ``HOME`` cannot empty the before/after snapshot) plus
+every loaded ``pipecat.stt-server*`` job ``launchctl list`` reports, plist or not;
+the spare is excluded. A loaded job without a plist has its endpoint read from
+``launchctl print``'s ``arguments`` block. The test-only
+``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME`` moves the plist home (and is announced on
+stderr); it cannot hide a loaded job, which ``launchctl list`` still reports. A
+listener the harness cannot read never compares as unchanged.
+
+The spare port is held for the whole run: if the collision check cannot bind it,
+or a later check finds a listener on it that is not the spare job, the run FAILs
+there (the remaining checks are not run) and teardown still runs.
 ``launchctl print`` and ``lsof`` are read through ``squat_check.py``'s helpers
 (one listener definition); a ``launchctl`` or ``lsof`` answer the harness cannot
 read refuses or FAILs, never reads as "not loaded" or "free".
@@ -43,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fnmatch
 import os
 import plistlib
 import re
@@ -68,9 +80,13 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 import _smoke_lib  # noqa: E402
+import read_stt_plist  # noqa: E402
 import squat_check  # noqa: E402
 
 SPARE_LABEL = _smoke_lib.SPARE_LABEL
+AGENT_LABEL_GLOB = _smoke_lib.AGENT_GLOB[: -len(".plist")]
+# A snapshot listener the harness could not read; never equal to anything.
+UNKNOWN = "unknown"
 DEFAULT_PORT = 9998
 HOST = "127.0.0.1"
 # Installer backends with a canonical port (the justfile's "whisper" is "mlx").
@@ -101,6 +117,10 @@ class CheckFailed(Exception):
     """A check's assertion did not hold."""
 
 
+class PortLost(CheckFailed):
+    """Something other than the spare job holds (or may hold) the spare port."""
+
+
 # --- environment, paths ----------------------------------------------------
 
 
@@ -110,7 +130,7 @@ def _home() -> Path:
 
 
 def _plist_path(label: str) -> Path:
-    return _home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    return _smoke_lib.launch_agents_dir(_home()) / f"{label}.plist"
 
 
 def _log_dir() -> Path:
@@ -176,11 +196,25 @@ def _in_use_lines(text: str) -> int:
     return sum(1 for ln in text.splitlines() if _IN_USE_RE.search(ln))
 
 
-def prepare_private_dir(path: Path) -> bool:
+def _within(path: Path, root: Path) -> bool:
+    """True when PATH's nearest existing ancestor (itself if it exists) resolves
+    inside ROOT, so no symlinked component can carry a new directory out of it."""
+    probe = path
+    while not os.path.lexists(probe) and probe != probe.parent:
+        probe = probe.parent
+    real, real_root = os.path.realpath(probe), os.path.realpath(root)
+    return real == real_root or real.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def prepare_private_dir(path: Path, root: Path | None = None) -> bool:
     """Create PATH 0700, or make an existing directory of ours 0700.
 
     ``lstat`` first: a symlink or a non-directory is refused, so a planted link's
-    target is never chmod'ed or used. Returns True when it created PATH."""
+    target is never chmod'ed or used. With ROOT, PATH must also stay inside ROOT
+    after resolving every existing ancestor (``mkdir(parents=True)`` follows a
+    symlinked ancestor). Returns True when it created PATH."""
+    if root is not None and not _within(path, root):
+        raise CheckFailed(f"{path} resolves outside {root} (a symlinked ancestor); refusing it")
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -212,7 +246,7 @@ def current_uid(run=subprocess.run) -> str:
     return uid
 
 
-def launchd_state(label: str, uid: str, run=subprocess.run) -> tuple[bool, str | None]:
+def require_launchd_state(label: str, uid: str, run=subprocess.run) -> tuple[bool, str | None]:
     """(loaded, pid) from read-only ``launchctl print`` (squat_check's reader).
 
     Raises RuntimeError when launchctl's answer is not "loaded" or launchctl's
@@ -226,6 +260,40 @@ def launchd_state(label: str, uid: str, run=subprocess.run) -> tuple[bool, str |
 def tcp_listener_pids(port: int | str, run=subprocess.run) -> list[str] | None:
     """Pids listening on PORT on any address; None when lsof can't tell."""
     return squat_check.listener_pids(port, None, run)
+
+
+def loaded_agent_labels(run=subprocess.run) -> set[str]:
+    """Loaded ``pipecat.stt-server*`` job labels (the spare excluded) from
+    read-only ``launchctl list``. Raises RuntimeError when it cannot be read."""
+    try:
+        res = _run(["launchctl", "list"], run)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"cannot list the loaded launchd jobs: {exc}") from exc
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"cannot list the loaded launchd jobs (launchctl list exit {res.returncode})"
+        )
+    labels = set()
+    for line in (res.stdout or "").splitlines():
+        parts = line.split()
+        if parts and fnmatch.fnmatchcase(parts[-1], AGENT_LABEL_GLOB):
+            if parts[-1] != SPARE_LABEL:
+                labels.add(parts[-1])
+    return labels
+
+
+def print_endpoint(label: str, uid: str, run=subprocess.run) -> dict[str, str]:
+    """The serve flags (``--port``, ``--socket-path``, ...) in a loaded job's
+    ``launchctl print`` ``arguments`` block. Raises RuntimeError when unreadable."""
+    try:
+        res = _run(["launchctl", "print", f"gui/{uid}/{label}"], run)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"cannot read {label} with launchctl print: {exc}") from exc
+    if res.returncode != 0:
+        raise RuntimeError(f"cannot read {label} with launchctl print (exit {res.returncode})")
+    m = re.search(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", res.stdout or "", re.M | re.S)
+    args = [ln.strip() for ln in m.group(1).splitlines() if ln.strip()] if m else []
+    return read_stt_plist.read_flags({"ProgramArguments": args})
 
 
 def lock_holders(lock: Path, run=subprocess.run) -> list[str] | None:
@@ -293,13 +361,30 @@ def canonical_ports(run=subprocess.run) -> set[int]:
 
 
 def real_agent_plists(home: Path | None = None) -> list[Path]:
-    """Installed real-agent plists under the account home (never ``$HOME``)."""
-    return _smoke_lib.agent_plists(home if home is not None else _smoke_lib.account_home())
+    """Installed real-agent plists under ``agents_home()`` (never ``$HOME``)."""
+    return _smoke_lib.agent_plists(home if home is not None else _smoke_lib.agents_home())
 
 
-def agent_ports(home: Path | None = None, run=subprocess.run) -> dict[int, str]:
-    """port -> label for each installed real agent's recorded TCP port."""
+def plistless_agents(
+    uid: str, run=subprocess.run, home: Path | None = None
+) -> dict[str, dict[str, str]]:
+    """label -> serve flags for each loaded real job with no installed plist."""
+    have = {p.name[: -len(".plist")] for p in real_agent_plists(home)}
+    return {
+        label: print_endpoint(label, uid, run) for label in sorted(loaded_agent_labels(run) - have)
+    }
+
+
+def agent_ports(
+    home: Path | None = None, run=subprocess.run, *, plistless: dict | None = None
+) -> dict[int, str]:
+    """port -> label for each real agent's TCP port: recorded in its installed
+    plist, or (PLISTLESS, from ``plistless_agents``) in a loaded job's arguments."""
     ports: dict[int, str] = {}
+    for label, flags in (plistless or {}).items():
+        port = flags.get("--port", "")
+        if port.isdigit():
+            ports[int(port)] = label
     for plist in real_agent_plists(home):
         try:
             port = read_plist_field_path(plist, "port", run, strict=True).strip()
@@ -332,30 +417,41 @@ def check_guard(
 # --- real-agent snapshot ----------------------------------------------------
 
 
+def _listener(port: str, sock: str, run) -> str | None:
+    """Comma-joined listener (or ``.lock`` holder) pids, None when there is none,
+    UNKNOWN when lsof cannot tell or there is no endpoint to watch."""
+    if port:
+        pids = tcp_listener_pids(port, run)
+    elif sock:
+        pids = lock_holders(Path(sock), run)
+    else:
+        return UNKNOWN  # no endpoint: nothing can prove it unchanged
+    return UNKNOWN if pids is None else (",".join(pids) or None)
+
+
 def snapshot_real_agents(
     run=subprocess.run, home: Path | None = None
 ) -> dict[str, tuple[str | None, str | None]]:
-    """label -> (launchd pid, listener pid) for each installed pipecat.stt-server*
-    plist under the account home, except the spare. Read-only calls only; a
-    listener lsof cannot read is recorded as "unknown"."""
+    """label -> (launchd pid, listener pid) for each real agent: every installed
+    pipecat.stt-server* plist under ``agents_home()`` and every loaded
+    pipecat.stt-server* job without one, the spare excluded. Read-only calls
+    only; a launchd state it cannot read raises, a listener it cannot read (or a
+    plist it cannot parse) is UNKNOWN, which never compares as unchanged."""
     uid = current_uid(run)
     snap: dict[str, tuple[str | None, str | None]] = {}
     for plist in real_agent_plists(home):
         label = plist.name[: -len(".plist")]
-        _loaded, pid = launchd_state(label, uid, run)
-        listener = None
+        _loaded, pid = require_launchd_state(label, uid, run)
         try:
-            port = read_plist_field_path(plist, "port", run)
-            sock = read_plist_field_path(plist, "socket-path", run)
-            if port:
-                pids = tcp_listener_pids(port, run)
-            elif sock:
-                pids = lock_holders(Path(sock), run)
-            else:
-                pids = []
-            listener = "unknown" if pids is None else (",".join(pids) or None)
+            port = read_plist_field_path(plist, "port", run).strip()
+            sock = read_plist_field_path(plist, "socket-path", run).strip()
+            listener = _listener(port, sock, run)
         except (CheckFailed, OSError, subprocess.SubprocessError):
-            listener = None
+            listener = UNKNOWN
+        snap[label] = (pid, listener)
+    for label, flags in plistless_agents(uid, run, home).items():
+        _loaded, pid = require_launchd_state(label, uid, run)
+        listener = _listener(flags.get("--port", ""), flags.get("--socket-path", ""), run)
         snap[label] = (pid, listener)
     return snap
 
@@ -368,11 +464,15 @@ def compare_snapshots(before, after) -> list[str]:
             diffs.append(f"{label}: disappeared (was pid/listener {before[label]})")
         elif label not in before:
             diffs.append(f"{label}: appeared (pid/listener {after[label]})")
-        elif before[label] != after[label]:
+        else:
             b, a = before[label], after[label]
             if b[0] != a[0]:
                 diffs.append(f"{label}: launchd pid {b[0]} -> {a[0]}")
-            if b[1] != a[1]:
+            if UNKNOWN in (b[1], a[1]):
+                diffs.append(
+                    f"{label}: listener unreadable ({b[1]} -> {a[1]}); cannot prove it unchanged"
+                )
+            elif b[1] != a[1]:
                 diffs.append(f"{label}: listener pid {b[1]} -> {a[1]}")
     return diffs
 
@@ -383,13 +483,16 @@ def compare_snapshots(before, after) -> list[str]:
 def start_state_problems(label: str, uid: str, sock: Path, run=subprocess.run) -> list[str]:
     """Cleanup commands for each piece of spare state that already exists."""
     cmds = []
-    loaded, _pid = launchd_state(label, uid, run)
+    loaded, _pid = require_launchd_state(label, uid, run)
     if loaded:
         cmds.append(f"launchctl bootout gui/{uid}/{label}")
     plist = _plist_path(label)
     if plist.exists() or plist.is_symlink():
         cmds.append(f"rm -f {plist}")
-    for path in (sock, _lock_path(sock)):
+    # Teardown unlinks the spare's logs, so they must be the harness's own: logs
+    # already at those paths (an earlier run, or a label sharing the basename)
+    # refuse the run instead.
+    for path in (sock, _lock_path(sock), *_log_paths(label)):
         if path.exists() or path.is_symlink():
             cmds.append(f"rm -f {path}")
     return cmds
@@ -520,8 +623,12 @@ class Harness:
 
         # The guard's port check already ran; now the harness holds the port itself.
         self.holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.holder.bind((HOST, self.port))
-        self.holder.listen(1)
+        try:
+            self.holder.bind((HOST, self.port))
+            self.holder.listen(1)
+        except OSError as exc:
+            self.release_holder()
+            raise PortLost(f"cannot hold port {self.port} after the guard: {exc}") from exc
         # Only lines written after this install count: an earlier run's
         # address-in-use lines must not satisfy the assertion.
         offsets = {p: _size(p) for p in _log_paths(self.label)}  # no plist yet: naming rule
@@ -536,7 +643,7 @@ class Harness:
             text = _read_from(errlog, offset)
             in_use = _in_use_lines(text)
             if in_use >= 2:
-                loaded, pid = launchd_state(self.label, self.uid)
+                loaded, pid = require_launchd_state(self.label, self.uid)
                 warned = self.squat_warns(loaded, pid)
                 if warned:
                     break
@@ -551,6 +658,20 @@ class Harness:
         self.holder = None
         self.wait_for("the agent to answer after the port was freed", self.tcp_up)
         return f"{in_use} address-in-use lines, squat warning, agent up after free"
+
+    def ensure_port_ours(self) -> None:
+        """Raise PortLost unless every listener on the spare port is the spare job
+        (or there is none); an lsof answer it cannot read is a loss too."""
+        pids = tcp_listener_pids(self.port)
+        if pids is None:
+            raise PortLost(f"cannot tell who listens on port {self.port} (lsof failed)")
+        _loaded, pid = require_launchd_state(self.label, self.uid)
+        foreign = [p for p in pids if p != pid]
+        if foreign:
+            raise PortLost(
+                f"port {self.port} is held by pid {', '.join(foreign)}, not the spare job"
+                f" (pid {pid})"
+            )
 
     def release_holder(self) -> None:
         if self.holder is not None:
@@ -584,7 +705,7 @@ class Harness:
     def check_rollback(self) -> str:
         sock = self.sock
         lock = _lock_path(sock)
-        self.sock_dir_made = prepare_private_dir(sock.parent)
+        self.sock_dir_made = prepare_private_dir(sock.parent, _home())
 
         install(install_env(self.label, self.port), "rollback: TCP")
         self.expect_transport("tcp")
@@ -693,7 +814,7 @@ class Harness:
             with contextlib.suppress(OSError):
                 path.unlink()
         try:
-            loaded, _pid = launchd_state(label, self.uid)
+            loaded, _pid = require_launchd_state(label, self.uid)
         except RuntimeError as exc:
             problems.append(f"{exc}; check by hand: launchctl print gui/{self.uid}/{label}")
         else:
@@ -715,6 +836,44 @@ def _print_table(results) -> None:
     print()
     for name, status, detail in results:
         print(f"{status:<8} {name:<{width}}  {detail}".rstrip())
+
+
+def run_checks(harness, checks) -> list[tuple[str, str, str]]:
+    """Run CHECKS ((name, fn) pairs) in order, one row each. Any exception is that
+    check's FAIL row and the next check still runs, except PortLost: the spare
+    port is no longer the harness's, so the remaining checks are not run (they
+    would install the spare onto a port someone else holds)."""
+    rows: list[tuple[str, str, str]] = []
+    for i, (name, fn) in enumerate(checks):
+        try:
+            if i:
+                harness.ensure_port_ours()
+            rows.append((name, PASS, fn()))
+        except PortLost as exc:
+            rows.append((name, FAIL, f"port lost: {exc}"))
+            rows += [(n, SKIPPED, "not run: the spare port was lost") for n, _f in checks[i + 1 :]]
+            break
+        except Exception as exc:  # noqa: BLE001 - any crash is this check's FAIL row
+            detail = str(exc) or type(exc).__name__
+            if not isinstance(exc, (CheckFailed, AssertionError)):
+                detail = f"{type(exc).__name__}: {detail}"
+            rows.append((name, FAIL, detail))
+        finally:
+            harness.release_holder()
+    return rows
+
+
+def signal_handler(state: dict):
+    """SIGINT/SIGTERM handler: the first signal sets ``tearing_down`` and raises
+    KeyboardInterrupt; every later one is ignored, so a second signal cannot
+    escape main or cut the teardown short."""
+
+    def on_signal(signum, _frame):
+        if not state["tearing_down"]:
+            state["tearing_down"] = True
+            raise KeyboardInterrupt(f"signal {signum}")
+
+    return on_signal
 
 
 def main(argv=None) -> int:
@@ -754,14 +913,29 @@ def main(argv=None) -> int:
             print(f"  cleanup: {cmd}")
         return 1
 
-    home, account = _home(), _smoke_lib.account_home()
-    if home.resolve() != account.resolve():
+    home, agents_at = _home(), _smoke_lib.agents_home()
+    override = _smoke_lib.agents_home_override()
+    if override is not None:
         print(
-            f"warning: HOME={home} is not the account home {account}; the spare goes "
-            f"under $HOME, the real-agent snapshot and port guard read {account}",
+            f"warning: {_smoke_lib.TEST_AGENTS_HOME_ENV}={override} is a test-only override; "
+            "installed plists are read from there, loaded jobs from launchctl list",
+            file=sys.stderr,
+        )
+    elif home.resolve() != agents_at.resolve():
+        print(
+            f"warning: HOME={home} is not the account home {agents_at}; the spare goes "
+            f"under $HOME, the real-agent snapshot and port guard read {agents_at}",
             file=sys.stderr,
         )
 
+    try:
+        uid = current_uid()
+        plistless = plistless_agents(uid)
+        ports = agent_ports(plistless=plistless)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        return refuse("guard", f"cannot read the real agents: {exc}")
+    except GuardRefused as exc:
+        return refuse("guard", str(exc))
     try:
         check_guard(
             args.label,
@@ -769,13 +943,12 @@ def main(argv=None) -> int:
             env=env,
             canonical_ports=canonical_ports(),
             is_listening=is_listening,
-            agent_ports=agent_ports(),
+            agent_ports=ports,
         )
     except GuardRefused as exc:
         return refuse("guard", str(exc))
 
     try:
-        uid = current_uid()
         cmds = start_state_problems(args.label, uid, spare_socket_path())
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         return refuse("start state", f"cannot read the start state: {exc}")
@@ -798,29 +971,18 @@ def main(argv=None) -> int:
         return refuse("snapshot", f"cannot snapshot the real agents: {exc}")
 
     state = {"tearing_down": False}
-
-    def on_signal(signum, _frame):
-        if not state["tearing_down"]:
-            raise KeyboardInterrupt(f"signal {signum}")
-
-    old = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
+    old = {s: signal.signal(s, signal_handler(state)) for s in (signal.SIGINT, signal.SIGTERM)}
     harness = Harness(args.label, args.port, args.inject)
     interrupted = False
     try:
-        for name, fn in (
-            ("port collision", harness.check_collision),
-            ("socket rollback", harness.check_rollback),
-            ("token file", harness.check_token),
-        ):
-            try:
-                results.append((name, PASS, fn()))
-            except Exception as exc:  # noqa: BLE001 - any crash is this check's FAIL row
-                detail = str(exc) or type(exc).__name__
-                if not isinstance(exc, (CheckFailed, AssertionError)):
-                    detail = f"{type(exc).__name__}: {detail}"
-                results.append((name, FAIL, detail))
-            finally:
-                harness.release_holder()
+        results += run_checks(
+            harness,
+            (
+                ("port collision", harness.check_collision),
+                ("socket rollback", harness.check_rollback),
+                ("token file", harness.check_token),
+            ),
+        )
     except (KeyboardInterrupt, SystemExit) as exc:
         interrupted = True
         results.append(("interrupted", FAIL, str(exc) or type(exc).__name__))
@@ -842,7 +1004,7 @@ def main(argv=None) -> int:
                 "real agents unchanged",
                 FAIL if diffs else PASS,
                 "; ".join(diffs)
-                or f"{len(before)} agents under {_smoke_lib.account_home()}, same pids",
+                or f"{len(before)} agents (plists under {agents_at}, plus loaded jobs), same pids",
             )
         )
         for s, h in old.items():

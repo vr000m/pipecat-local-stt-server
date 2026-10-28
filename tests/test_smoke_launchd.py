@@ -5,6 +5,11 @@ stub dir (``launchctl``, ``id``, ``lsof``) and a temp ``HOME``; the fixture
 asserts the stub ``launchctl`` is the one resolved first. The real installer
 runs against the stubs, as in ``tests/test_install_migration.py``.
 
+The subprocess runs also set the test-only ``PIPECAT_STT_SMOKE_TEST_AGENTS_HOME``
+to the temp home, so the real-agent plist scan never reads the developer's
+``~/Library/LaunchAgents`` (``HOME`` alone does not move it), and use a free
+``--port``; ``test_stubbed_run_reads_no_real_library_path`` audits that.
+
 Assumptions (contract is silent): the harness honours ``PIPECAT_STT_SOCKET``
 from its environment for the spare socket path when set; the spare plist lives
 at ``$HOME/Library/LaunchAgents/<label>.plist`` and logs under
@@ -31,9 +36,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HARNESS = REPO_ROOT / "scripts" / "smoke_launchd.py"
 LIB = REPO_ROOT / "scripts" / "_smoke_lib.py"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+AUDIT_WRAPPER = Path(__file__).resolve().parent / "_audit_library_reads.py"
 
 FAKE_UID = "501"
 SPARE = "pipecat.stt-server.smoke"
+AGENTS_HOME_ENV = "PIPECAT_STT_SMOKE_TEST_AGENTS_HOME"
 CANONICAL = (9565, 9665, 9765, 9865)
 
 pytestmark = pytest.mark.skipif(
@@ -117,7 +124,7 @@ exec /usr/bin/id "$@"
         return f"{self.stub}:/usr/bin:/bin:/usr/sbin:/sbin"
 
     def env(self, **extra: str) -> dict[str, str]:
-        e = {"HOME": str(self.home), "PATH": self.path}
+        e = {"HOME": str(self.home), "PATH": self.path, AGENTS_HOME_ENV: str(self.home)}
         e.update(extra)
         e.pop("CI", None)
         return e
@@ -128,11 +135,12 @@ exec /usr/bin/id "$@"
     def argv(self) -> list[str]:
         return self.log.read_text().splitlines() if self.log.exists() else []
 
-    def run(self, args: list[str], env: dict[str, str], timeout: int = 180):
+    def run(self, args: list[str], env: dict[str, str], timeout: int = 180, audit=None):
         assert env["PATH"].split(":")[0] == str(self.stub)
         assert "CI" not in env
+        pre = [str(AUDIT_WRAPPER), str(audit)] if audit is not None else []
         return subprocess.run(
-            [str(VENV_PYTHON), str(HARNESS), *args],
+            [str(VENV_PYTHON), *pre, str(HARNESS), *args],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -416,9 +424,9 @@ def test_launchd_state_unreadable_is_not_unloaded(smoke, rc, err, want):
 
     if want == "raise":
         with pytest.raises(RuntimeError):
-            smoke.launchd_state(SPARE, FAKE_UID, run)
+            smoke.require_launchd_state(SPARE, FAKE_UID, run)
     else:
-        assert smoke.launchd_state(SPARE, FAKE_UID, run) == want
+        assert smoke.require_launchd_state(SPARE, FAKE_UID, run) == want
 
 
 def test_cli_unreadable_launchctl_refuses_start_state(env):
@@ -575,6 +583,16 @@ def _plant_lock(e: Env, sock: Path):
     Path(str(sock) + ".lock").write_text("")
 
 
+def _plant_err_log(e: Env, sock: Path):
+    e.logs.mkdir(parents=True, exist_ok=True)
+    (e.logs / "pipecat-stt-server-smoke.err").write_text("someone else's log\n")
+
+
+def _plant_out_log(e: Env, sock: Path):
+    e.logs.mkdir(parents=True, exist_ok=True)
+    (e.logs / "pipecat-stt-server-smoke.log").write_text("someone else's log\n")
+
+
 @pytest.mark.parametrize(
     ("plant", "expect"),
     [
@@ -582,6 +600,8 @@ def _plant_lock(e: Env, sock: Path):
         (_plant_loaded, f"launchctl bootout gui/{FAKE_UID}/{SPARE}"),
         (_plant_socket, "rm -f {sock}"),
         (_plant_lock, "rm -f {sock}.lock"),
+        (_plant_err_log, "rm -f {home}/Library/Logs/pipecat-stt/pipecat-stt-server-smoke.err"),
+        (_plant_out_log, "rm -f {home}/Library/Logs/pipecat-stt/pipecat-stt-server-smoke.log"),
     ],
 )
 def test_start_state_refusal(env, plant, expect):
@@ -589,12 +609,15 @@ def test_start_state_refusal(env, plant, expect):
     # PIPECAT_STT_SOCKET, so a stray variable cannot redirect it.
     sock = env.home / "Library" / "Caches" / "pipecat-stt-smoke-launchd" / "spare.sock"
     plant(env, sock)
-    r = env.run([], env.spare_env())
+    r = env.run(["--port", str(_free_port())], env.spare_env())
     assert r.returncode == 1, (r.stdout, r.stderr)
     out = r.stdout + r.stderr
     assert expect.format(home=env.home, sock=sock) in out
     # Print-only: no bootout/bootstrap actually issued, no installer run.
     assert _mutating(env.argv()) == []
+    # A refused run leaves the planted state alone (it is not the harness's).
+    if plant in (_plant_err_log, _plant_out_log):
+        assert any(env.logs.iterdir())
 
 
 # --------------------------------------------------------------------------
@@ -616,6 +639,20 @@ def test_inject_fail_still_tears_down(env):
     r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
     assert r.returncode == 1, (r.stdout, r.stderr)
     _assert_torn_down(env)
+
+
+def test_stubbed_run_reads_no_real_library_path(env, tmp_path):
+    # A whole stubbed run (guard, snapshot, checks, teardown, re-snapshot) under
+    # an audit hook: no open, scandir, mkdir or unlink of a path under the real
+    # account's ~/Library, and no subprocess handed one.
+    audit = tmp_path / "audit.log"
+    r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env(), audit=audit)
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "test-only override" in r.stderr
+    assert audit.exists(), "the audit hook never ran"
+    lines = audit.read_text().splitlines()
+    assert lines[0] == "audit: on"
+    assert lines[1:] == []
 
 
 @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
@@ -719,3 +756,257 @@ def test_assert_token_gate_raises_on_broken_gate(tmp_path, handler):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# --------------------------------------------------------------------------
+# real agents launchd knows without a plist; unreadable listeners (H3)
+# --------------------------------------------------------------------------
+
+_GHOST = "pipecat.stt-server.ghost"
+_GHOST_PRINT = f"""gui/{FAKE_UID}/{_GHOST} = {{
+\tstate = running
+\tpid = 777
+\targuments = {{
+\t\t/venv/bin/python
+\t\t-m
+\t\tstt_server
+\t\tserve
+\t\t--host
+\t\t127.0.0.1
+\t\t--port
+\t\t9123
+\t}}
+}}
+"""
+
+
+def _fake_launchd(listed="", prints=None, listeners=(), list_rc=0):
+    prints = prints or {}
+
+    def run(argv, **_kw):
+        tool = Path(str(argv[0])).name
+        if tool == "id":
+            return _cp(argv, 0, f"{FAKE_UID}\n")
+        if tool == "launchctl" and argv[1] == "list":
+            return _cp(argv, list_rc, listed, "" if not list_rc else "launchctl: boom")
+        if tool == "launchctl" and argv[1] == "print":
+            label = argv[2].rsplit("/", 1)[-1]
+            if label in prints:
+                return _cp(argv, 0, prints[label])
+            return _cp(argv, 113, "", f'Could not find service "{label}"')
+        if tool == "lsof":
+            if listeners is None:
+                return _cp(argv, 1, "", "lsof: boom")
+            body = "".join(f"p{p}\nn127.0.0.1:9123\n" for p in listeners)
+            return _cp(argv, 0 if body else 1, body)
+        raise AssertionError(f"unexpected {argv!r}")
+
+    return run
+
+
+_LIST = f"PID\tStatus\tLabel\n777\t0\t{_GHOST}\n-\t0\t{SPARE}\n12\t0\tcom.apple.x\n"
+
+
+def test_snapshot_includes_a_loaded_agent_with_no_plist(smoke, env):
+    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT}, listeners=["777"])
+    snap = smoke.snapshot_real_agents(run, home=env.home)
+    assert snap == {_GHOST: ("777", "777")}  # spare and non-pipecat labels excluded
+
+
+def test_plistless_agent_port_reaches_the_guard(smoke, env):
+    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT})
+    plistless = smoke.plistless_agents(FAKE_UID, run, env.home)
+    assert plistless[_GHOST]["--port"] == "9123"
+    ports = smoke.agent_ports(home=env.home, plistless=plistless)
+    assert ports == {9123: _GHOST}
+    with pytest.raises(smoke.GuardRefused, match=_GHOST):
+        smoke.check_guard(
+            SPARE,
+            9123,
+            env=_good_env(),
+            canonical_ports=set(CANONICAL),
+            is_listening=lambda p: False,
+            agent_ports=ports,
+        )
+
+
+def test_loaded_agent_with_a_plist_is_not_counted_twice(smoke, env):
+    _agent_plist(env.agents / f"{_GHOST}.plist", "9123")
+    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT})
+    assert smoke.plistless_agents(FAKE_UID, run, env.home) == {}
+
+
+def test_unreadable_launchctl_list_fails_closed(smoke, env):
+    with pytest.raises(RuntimeError):
+        smoke.snapshot_real_agents(_fake_launchd(list_rc=5), home=env.home)
+
+
+def test_unreadable_listener_is_unknown_in_the_snapshot(smoke, env):
+    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT}, listeners=None)
+    assert smoke.snapshot_real_agents(run, home=env.home) == {_GHOST: ("777", smoke.UNKNOWN)}
+
+
+# (listener before, listener after) -> unchanged? UNKNOWN on either side never is.
+@pytest.mark.parametrize(
+    ("b", "a", "same"),
+    [
+        ("100", "100", True),
+        (None, None, True),
+        ("100", "200", False),
+        ("100", None, False),
+        ("unknown", "unknown", False),
+        ("unknown", "100", False),
+        ("100", "unknown", False),
+        (None, "unknown", False),
+    ],
+)
+def test_compare_snapshots_listener_state_space(smoke, b, a, same):
+    diffs = smoke.compare_snapshots({"x": ("1", b)}, {"x": ("1", a)})
+    assert (diffs == []) is same
+
+
+# --------------------------------------------------------------------------
+# the spare port lost after the guard (H2)
+# --------------------------------------------------------------------------
+
+
+class _FakeHarness:
+    def __init__(self, lose_before=None):
+        self.lose_before = lose_before
+        self.ensured = 0
+        self.released = 0
+
+    def ensure_port_ours(self):
+        self.ensured += 1
+        if self.lose_before == self.ensured:
+            raise _SMOKE.PortLost("port 1 is held by pid 9, not the spare job")
+
+    def release_holder(self):
+        self.released += 1
+
+
+_SMOKE = None
+
+
+def _checks(ran, behaviours):
+    def make(name, how):
+        def fn():
+            ran.append(name)
+            if how == "lost":
+                raise _SMOKE.PortLost("cannot hold port 1 after the guard")
+            if how == "fail":
+                raise _SMOKE.CheckFailed("nope")
+            if how == "crash":
+                raise LookupError("boom")
+            return "ok"
+
+        return fn
+
+    return tuple((n, make(n, h)) for n, h in behaviours)
+
+
+_NAMES = ("port collision", "socket rollback", "token file")
+
+
+# where the port is lost (inside check i, or before check i) x what the other
+# checks do -> rows: the losing check FAILs, later ones are SKIPPED and never run.
+@pytest.mark.parametrize("other", ["ok", "fail", "crash"])
+@pytest.mark.parametrize(
+    "where", [("in", 0), ("in", 1), ("in", 2), ("before", 1), ("before", 2), (None, None)]
+)
+def test_run_checks_port_loss_state_space(smoke, where, other):
+    global _SMOKE
+    _SMOKE = smoke
+    kind, at = where
+    behaviours = [
+        (n, "lost" if (kind == "in" and i == at) else other) for i, n in enumerate(_NAMES)
+    ]
+    h = _FakeHarness(lose_before=at if kind == "before" else None)
+    ran: list[str] = []
+    rows = smoke.run_checks(h, _checks(ran, behaviours))
+    assert [r[0] for r in rows] == list(_NAMES)  # every check has a row
+    lost_at = at if kind is not None else None
+    for i, (name, status, detail) in enumerate(rows):
+        if lost_at is not None and i == lost_at:
+            assert status == smoke.FAIL and "port lost" in detail
+        elif lost_at is not None and i > lost_at:
+            assert status == smoke.SKIPPED and name not in ran
+        else:
+            assert status == (smoke.PASS if other == "ok" else smoke.FAIL)
+    assert h.released == len(rows) - (len(_NAMES) - 1 - lost_at if lost_at is not None else 0)
+
+
+def test_collision_check_fails_when_the_port_was_taken_after_the_guard(smoke, env, monkeypatch):
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    installs = []
+    monkeypatch.setattr(smoke, "install", lambda *a, **k: installs.append(a) or "")
+    with socket.socket() as squatter:
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(1)
+        port = squatter.getsockname()[1]
+        h = smoke.Harness(SPARE, port, None)
+        with pytest.raises(smoke.PortLost):
+            h.check_collision()
+    assert installs == [] and h.holder is None
+
+
+# lsof answer x launchd pid -> ensure_port_ours raises PortLost?
+@pytest.mark.parametrize(
+    ("listeners", "pid", "lost"),
+    [
+        ([], None, False),
+        ([], "100", False),
+        (["100"], "100", False),
+        (["200"], "100", True),
+        (["100", "200"], "100", True),
+        (["200"], None, True),
+        (None, "100", True),
+    ],
+)
+def test_ensure_port_ours_state_space(smoke, env, monkeypatch, listeners, pid, lost):
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    h = smoke.Harness(SPARE, _free_port(), None)
+    monkeypatch.setattr(smoke, "tcp_listener_pids", lambda port, run=None: listeners)
+    monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (True, pid))
+    if lost:
+        with pytest.raises(smoke.PortLost):
+            h.ensure_port_ours()
+    else:
+        assert h.ensure_port_ours() is None
+
+
+# --------------------------------------------------------------------------
+# a second signal; a symlinked socket-dir ancestor (H9, H8)
+# --------------------------------------------------------------------------
+
+
+def test_second_signal_is_ignored_once_teardown_starts(smoke):
+    state = {"tearing_down": False}
+    handler = smoke.signal_handler(state)
+    with pytest.raises(KeyboardInterrupt):
+        handler(signal.SIGINT, None)
+    assert state["tearing_down"] is True
+    assert handler(signal.SIGTERM, None) is None  # ignored, does not raise
+
+
+def test_prepare_private_dir_refuses_a_symlinked_ancestor_leaving_home(smoke, tmp_path):
+    home = tmp_path / "home"
+    (home / "Library").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / "Library" / "Caches").symlink_to(outside)
+    target = home / "Library" / "Caches" / "pipecat-stt-smoke-launchd"
+    with pytest.raises(smoke.CheckFailed, match="outside"):
+        smoke.prepare_private_dir(target, home)
+    assert list(outside.iterdir()) == []
+
+
+def test_prepare_private_dir_allows_a_symlink_that_stays_inside_home(smoke, tmp_path):
+    home = tmp_path / "home"
+    (home / "Library" / "RealCaches").mkdir(parents=True)
+    (home / "Library" / "Caches").symlink_to(home / "Library" / "RealCaches")
+    target = home / "Library" / "Caches" / "pipecat-stt-smoke-launchd"
+    assert smoke.prepare_private_dir(target, home) is True
+    assert (home / "Library" / "RealCaches" / "pipecat-stt-smoke-launchd").is_dir()
