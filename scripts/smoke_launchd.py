@@ -140,6 +140,98 @@ INSTALL_TIMEOUT = UNLOAD_WAIT + 90
 UP_TIMEOUT = 60  # how long an agent gets to answer after an install
 COLLISION_TIMEOUT = 30
 CMD_TIMEOUT = 15
+SOCKET_LOCK_WAIT = 10.0  # teardown's wait for the spare socket's .lock
+LOCK_UNHELD_WAIT = 10  # the rollback's wait for the .lock to be released
+WAIT_EVERY = 1.0  # Harness.wait_for's poll interval
+# Python start-up, imports, file work and the table: what no named bound covers.
+BUDGET_MARGIN = 30.0
+
+
+# --- the harness's time budget ------------------------------------------------
+#
+# smoke.py's launchd step gives the harness run_budget(n) before SIGTERM and
+# then teardown_budget(n) before SIGKILL, n = the installed real-agent plists
+# (each one adds a launchctl print and an lsof to every snapshot). Both are
+# sums of the bounds the code really waits on, named here; a new wait must be
+# added to them (tests/test_smoke_launchd.py pins the runner to these
+# functions and each bound to the constant the code uses). Residual: a loaded
+# real job with NO plist is in every snapshot but not in n; it can only cut
+# short the final re-snapshot, which follows the uninstall and file removal.
+
+
+def install_bound() -> float:
+    """One installer call: its timeout, one poll, the kill-and-reap drain."""
+    return INSTALL_TIMEOUT + _smoke_lib.GROUP_POLL + _smoke_lib.GROUP_DRAIN
+
+
+def snapshot_bound(n_agents: int) -> float:
+    """One real-agent snapshot: ``launchctl list``, then per agent one
+    ``launchctl print`` (read_job) and at most one lsof (endpoint_listener)."""
+    return CMD_TIMEOUT + n_agents * (CMD_TIMEOUT + squat_check.LSOF_TIMEOUT)
+
+
+def _handshake_bound() -> float:
+    return 2 * _smoke_lib.HANDSHAKE_TIMEOUT  # the connect, then the status line
+
+
+def _connect_verified_bound() -> float:
+    """connect, the lsof settle plus one last lsof, the launchd re-read."""
+    return (
+        _smoke_lib.HANDSHAKE_TIMEOUT
+        + _smoke_lib.SERVER_END_SETTLE
+        + squat_check.LSOF_TIMEOUT
+        + CMD_TIMEOUT
+    )
+
+
+def _verified_status_bound() -> float:
+    """Harness.verified_status: read_job, connect_verified, the handshake."""
+    return CMD_TIMEOUT + _connect_verified_bound() + _handshake_bound()
+
+
+def _wait_bound(timeout: float, pred: float) -> float:
+    """Harness.wait_for: a predicate may start just before the deadline."""
+    return timeout + WAIT_EVERY + pred
+
+
+def teardown_budget(n_agents: int) -> float:
+    """From a SIGTERM to the harness's exit: an in-flight installer group's
+    kill and reap, the uninstall, the socket lock wait, the launchd check,
+    the final snapshot and the margin."""
+    return (
+        _smoke_lib.GROUP_DRAIN
+        + install_bound()
+        + SOCKET_LOCK_WAIT
+        + squat_check.LAUNCHCTL_TIMEOUT
+        + snapshot_bound(n_agents)
+        + BUDGET_MARGIN
+    )
+
+
+def run_budget(n_agents: int) -> float:
+    """The harness's worst case from start to exit, teardown included."""
+    snap = snapshot_bound(n_agents)
+    setup = (
+        snap  # baseline
+        + len(CANONICAL_BACKENDS) * CMD_TIMEOUT  # canonical_ports
+        + squat_check.LSOF_TIMEOUT + 1  # is_listening: lsof, loopback connect
+        + squat_check.LAUNCHCTL_TIMEOUT  # start state
+        + 2 * CMD_TIMEOUT  # the stt_server import check
+    )  # fmt: skip
+    boundaries = 3 * snap + 2 * (squat_check.LSOF_TIMEOUT + squat_check.LAUNCHCTL_TIMEOUT)
+    up = _wait_bound(UP_TIMEOUT, _verified_status_bound())
+    squat = CMD_TIMEOUT + 2 * CMD_TIMEOUT  # squat_warns: print, then the CLI
+    collision = install_bound() + COLLISION_TIMEOUT + squat + WAIT_EVERY + up
+    rollback = 3 * (install_bound() + up) + _wait_bound(LOCK_UNHELD_WAIT, squat_check.LSOF_TIMEOUT)
+    token = (
+        install_bound()
+        + _wait_bound(UP_TIMEOUT, _handshake_bound())  # _refuses
+        + CMD_TIMEOUT  # read_job
+        + 3 * (_connect_verified_bound() + _handshake_bound())  # 401 / 401 / 101
+        + CMD_TIMEOUT  # the fresh read afterwards
+    )
+    return setup + boundaries + collision + rollback + token + teardown_budget(n_agents)
+
 
 # Env names the installer reads. All are scrubbed from the child env so nothing
 # inherited steers an install; the harness sets what it needs per call.
@@ -859,7 +951,7 @@ class Harness:
 
     # -- waits
 
-    def wait_for(self, what: str, pred, timeout: float = UP_TIMEOUT, every: float = 1.0):
+    def wait_for(self, what: str, pred, timeout: float = UP_TIMEOUT, every: float = WAIT_EVERY):
         deadline = time.monotonic() + timeout
         last = None
         while True:
@@ -1054,7 +1146,7 @@ class Harness:
             raise CheckFailed(f"old socket {sock} still exists after the move back to TCP")
         if not lock.exists():
             raise CheckFailed(f"{lock} was removed; the installer must leave it")
-        self.wait_for(f"{lock} to be unheld", lambda: lock_unheld(lock), timeout=10)
+        self.wait_for(f"{lock} to be unheld", lambda: lock_unheld(lock), timeout=LOCK_UNHELD_WAIT)
         return (
             "tcp -> socket -> tcp (each answer's server end verified); old socket "
             "removed on the installer's unload-confirmed path, .lock left and unheld"
@@ -1128,7 +1220,7 @@ class Harness:
         except OSError as exc:
             problems.append(f"cannot remove {path}: {exc}")
 
-    def remove_spare_socket(self, problems: list[str], wait: float = 10.0) -> None:
+    def remove_spare_socket(self, problems: list[str], wait: float = SOCKET_LOCK_WAIT) -> None:
         """Remove the spare socket and its ``.lock``, only while proving no live
         server owns them.
 

@@ -88,6 +88,9 @@ _LOCALHOST = frozenset({"127.0.0.1", "::1"})
 _NOT_LOADED_RC = 113
 _NOT_LOADED_RE = re.compile(r"could not find service", re.IGNORECASE)
 _LSOF_WARNING = "lsof: WARNING"
+# Each lsof / launchctl call's own bound (the launchd harness's budget adds them).
+LSOF_TIMEOUT = 10
+LAUNCHCTL_TIMEOUT = 10
 
 
 def _only_warnings(stderr):
@@ -102,7 +105,9 @@ def lsof_output(args, run=subprocess.run):
     ``args`` must carry its ``-F`` fields before any ``--`` (after ``--`` lsof
     reads every word as a file name)."""
     try:
-        res = run(["lsof", "-nP", "-w", *args], capture_output=True, text=True, timeout=10)
+        res = run(
+            ["lsof", "-nP", "-w", *args], capture_output=True, text=True, timeout=LSOF_TIMEOUT
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     # lsof exits 1 when nothing matches, with no stderr or (should -w not cover
@@ -237,7 +242,7 @@ def launchd_state(label, run=subprocess.run, uid=None):
             ["launchctl", "print", f"gui/{uid}/{label}"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=LAUNCHCTL_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError):
         return None

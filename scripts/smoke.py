@@ -84,11 +84,11 @@ DECODE_TIMEOUT = 180.0
 # The decode child's exit status when connect_verified refused the endpoint:
 # nothing (no token) was sent.
 DECODE_REFUSED = 3
-LAUNCHD_TIMEOUT = 900.0
+# The launchd step's timeout and grace are not numbers here: they are the
+# harness's own budget (smoke_launchd.run_budget / teardown_budget, summed
+# from the bounds it waits on, for the installed agents), so they cannot drift.
 # After a step's timeout (SIGTERM) or Ctrl-C (SIGINT) the child gets this long to
-# run its own cleanup before its process group is SIGKILLed: smoke_launchd.py's
-# teardown runs the installer's uninstall (up to 120 s) and waits on the spare
-# .lock.
+# run its own cleanup before its process group is SIGKILLed.
 TEARDOWN_GRACE = 180.0
 
 # smoke_peercred.py's own skip lines (it exits 0 on both); it prints these
@@ -121,7 +121,12 @@ def exit_code(results: list[StepResult]) -> int:
 
 
 def run_command(
-    cmd: list[str], timeout: float, env: dict | None = None, *, input: bytes | None = None
+    cmd: list[str],
+    timeout: float,
+    env: dict | None = None,
+    *,
+    input: bytes | None = None,
+    grace: float | None = None,
 ) -> subprocess.CompletedProcess:
     """The only place this module spawns a subprocess for a step.
 
@@ -135,10 +140,16 @@ def run_command(
     can only reach the step's own group, never a reused pid or group. Afterwards
     a held signal is raised as KeyboardInterrupt (``main`` turns a SIGTERM into
     one too) and a timeout as ``subprocess.TimeoutExpired``. INPUT goes to the
-    step's stdin (a token travels this way, never on argv).
+    step's stdin (a token travels this way, never on argv). GRACE replaces
+    ``TEARDOWN_GRACE`` for a step with its own teardown budget (``launchd``).
     """
     res, timed_out = _smoke_lib.run_owned(
-        cmd, timeout, env=env, cwd=str(REPO), grace=TEARDOWN_GRACE, input=input
+        cmd,
+        timeout,
+        env=env,
+        cwd=str(REPO),
+        grace=TEARDOWN_GRACE if grace is None else grace,
+        input=input,
     )
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, timeout, output=res.stdout, stderr=res.stderr)
@@ -178,13 +189,11 @@ def _tail(proc: subprocess.CompletedProcess) -> str:
     return lines[-1][:200] if lines else ""
 
 
-def _execute(cmd, timeout, env=None, input=None):
+def _execute(cmd, timeout, env=None, input=None, grace=None):
     """Run one command; return (outcome, detail, proc-or-None)."""
+    kw = {k: v for k, v in (("input", input), ("grace", grace)) if v is not None}
     try:
-        if input is None:
-            proc = run_command(cmd, timeout, env)
-        else:
-            proc = run_command(cmd, timeout, env, input=input)
+        proc = run_command(cmd, timeout, env, **kw)
     except subprocess.TimeoutExpired:
         return FAIL, f"timed out after {timeout:g}s", None
     except Exception as exc:  # noqa: BLE001 - a crash is a FAIL, never a traceback
@@ -237,6 +246,17 @@ def launchd_env(base: dict | None = None) -> dict:
     return env
 
 
+def launchd_budget() -> tuple[float, float]:
+    """(timeout, grace) for the launchd step: the harness's own worst-case run
+    with its teardown, then its teardown again, for the installed agents it
+    will snapshot (``smoke_launchd.run_budget`` / ``teardown_budget``), so a
+    SIGTERM can never SIGKILL the harness mid-uninstall."""
+    import smoke_launchd
+
+    n = len(agent_plists())
+    return smoke_launchd.run_budget(n), smoke_launchd.teardown_budget(n)
+
+
 def launchd_skip_reason() -> str | None:
     return _smoke_lib.launchd_skip_reason(os.environ, sys.platform)
 
@@ -260,7 +280,8 @@ def launchd_step(requested: bool) -> StepResult:
     reason = launchd_skip_reason()
     if reason:
         return StepResult("launchd", SKIPPED, reason)
-    outcome, detail, proc = _execute(launchd_cmd(), LAUNCHD_TIMEOUT, launchd_env())
+    timeout, grace = launchd_budget()
+    outcome, detail, proc = _execute(launchd_cmd(), timeout, launchd_env(), grace=grace)
     first = ((proc.stdout or "") if proc is not None else "").lstrip().split("\n", 1)[0]
     if outcome == PASS and first.startswith(_smoke_lib.LAUNCHD_SKIP_MARK):
         return StepResult("launchd", SKIPPED, first[len(_smoke_lib.LAUNCHD_SKIP_MARK) :].strip())

@@ -2384,3 +2384,42 @@ def test_the_harness_never_resolves_bash_through_path(smoke):
     smoke.canonical_ports(run=lambda cmd, **k: seen.append(cmd) or _cp(cmd, 0, "9565\n"))
     assert {c[0] for c in seen} == {"/bin/bash"}
     assert smoke._smoke_lib.SAFE_PATH == "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+# Each bound in the harness's budget is the one the code really waits on:
+# call site -> the timeout it uses == the named constant the budget sums.
+def test_budget_bounds_are_the_ones_the_code_uses(smoke, monkeypatch):
+    import inspect
+
+    seen = {}
+
+    def run_owned(cmd, timeout, **k):
+        seen["install"] = timeout
+        return _cp(cmd, 0), False
+
+    monkeypatch.setattr(smoke._smoke_lib, "run_owned", run_owned)
+    smoke.run_installer("install", {})
+    assert seen["install"] == smoke.INSTALL_TIMEOUT
+
+    def run(cmd, **k):
+        seen.setdefault(Path(cmd[0]).name, set()).add(k.get("timeout"))
+        return _cp(cmd, 1)
+
+    smoke.squat_check.lsof_output(["-Fp"], run)
+    smoke.squat_check.launchd_state("x", run)
+    smoke._run(["launchctl", "list"], run)
+    assert seen["lsof"] == {smoke.squat_check.LSOF_TIMEOUT}
+    assert seen["launchctl"] == {smoke.squat_check.LAUNCHCTL_TIMEOUT, smoke.CMD_TIMEOUT}
+    sig = inspect.signature(smoke.Harness.remove_spare_socket)
+    assert sig.parameters["wait"].default == smoke.SOCKET_LOCK_WAIT
+    assert inspect.signature(smoke.Harness.wait_for).parameters["every"].default == smoke.WAIT_EVERY
+    for name in ("connect_verified", "ws_handshake_status"):
+        fn = getattr(smoke._smoke_lib, name)
+        assert inspect.signature(fn).parameters["timeout"].default == (
+            smoke._smoke_lib.HANDSHAKE_TIMEOUT
+        )
+    # More agents, more snapshot time, in both budgets.
+    assert smoke.teardown_budget(4) - smoke.teardown_budget(0) == pytest.approx(
+        4 * (smoke.CMD_TIMEOUT + smoke.squat_check.LSOF_TIMEOUT)
+    )
+    assert smoke.run_budget(4) > smoke.run_budget(0) > smoke.teardown_budget(0)

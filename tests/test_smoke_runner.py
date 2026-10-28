@@ -1457,3 +1457,35 @@ def test_read_endpoint_token_file_uses_the_server_policy(smoke, tmp_path, kind, 
         assert "s3" not in err
     else:
         assert (token, err) == (want, "")
+
+
+# The launchd step's timeout and grace ARE the harness's own budget for the
+# installed agents (no copied number): agent count -> (timeout, grace) handed
+# to run_command, and the grace covers the harness's whole teardown.
+@pytest.mark.parametrize("n_agents", [0, 1, 4])
+def test_launchd_step_uses_the_harness_budget(smoke, seam, monkeypatch, n_agents):
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import smoke_launchd
+
+    for i in range(n_agents):
+        _render_plist(seam.home, f"pipecat.stt-server.a{i}", port=9100 + i)
+    got = {}
+
+    def fake(cmd, timeout, env=None, **kw):
+        got.update(timeout=timeout, grace=kw.get("grace"))
+        return _cp(0)
+
+    monkeypatch.setattr(smoke, "run_command", fake)
+    monkeypatch.setattr(smoke, "launchd_skip_reason", lambda: None)
+    smoke.launchd_step(True)
+    assert got == {
+        "timeout": smoke_launchd.run_budget(n_agents),
+        "grace": smoke_launchd.teardown_budget(n_agents),
+    }
+    assert got["grace"] >= (
+        smoke._smoke_lib.GROUP_DRAIN
+        + smoke_launchd.INSTALL_TIMEOUT
+        + smoke_launchd.SOCKET_LOCK_WAIT
+        + smoke_launchd.snapshot_bound(n_agents)
+    )
+    assert got["timeout"] > got["grace"]

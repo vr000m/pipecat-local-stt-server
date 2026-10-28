@@ -231,6 +231,7 @@ def assert_chain_traversable(sock: str) -> None:
 SOL_LOCAL = 0  # <sys/un.h>, macOS
 LOCAL_PEERPID = 2  # <sys/un.h>, macOS: pid of the peer at connect time
 SERVER_END_SETTLE = 3.0  # how long lsof gets to see the accepted server end
+HANDSHAKE_TIMEOUT = 5.0  # each socket operation's bound: connect, and each recv
 
 
 class EndpointRefused(Exception):
@@ -314,7 +315,7 @@ def connect_verified(
     runs: str | None,
     read_identity,
     *,
-    timeout: float = 5.0,
+    timeout: float = HANDSHAKE_TIMEOUT,
     run=subprocess.run,
     settle: float = SERVER_END_SETTLE,
     sleep=time.sleep,
@@ -343,7 +344,7 @@ def connect_verified_child(
     endpoint: tuple,
     child: subprocess.Popen,
     *,
-    timeout: float = 5.0,
+    timeout: float = HANDSHAKE_TIMEOUT,
     run=subprocess.run,
     settle: float = SERVER_END_SETTLE,
     sleep=time.sleep,
@@ -425,7 +426,7 @@ def ws_handshake_status(
     unix_path: str | None = None,
     sock=None,
     token: str | None = None,
-    timeout: float = 5.0,
+    timeout: float = HANDSHAKE_TIMEOUT,
 ) -> int:
     """Send a websocket upgrade request and return the HTTP status code.
 
