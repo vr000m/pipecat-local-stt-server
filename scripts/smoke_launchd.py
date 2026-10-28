@@ -340,6 +340,24 @@ def print_job(label: str, uid: str, run=subprocess.run) -> tuple[str | None, dic
     return pid, read_stt_plist.read_flags({"ProgramArguments": args})
 
 
+def squat_cli(host: str, port: int | str, label: str, launchctl_rc: int) -> list[str]:
+    """The one ``squat_check.py`` command line, the recipes' ``_squat_check``
+    form: the ``launchctl print`` answer itself goes on stdin, never argv."""
+    return [
+        "python3",
+        "-I",
+        str(SQUAT_CHECK),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--label",
+        label,
+        "--launchctl-rc",
+        str(launchctl_rc),
+    ]
+
+
 def lock_holders(lock: Path, run=subprocess.run) -> list[str] | None:
     """Pids holding LOCK open; None when lsof can't tell."""
     return squat_check.lsof_pids(["--", str(lock)], run)
@@ -774,8 +792,7 @@ class Harness:
             text = _read_from(errlog, offset)
             in_use = _in_use_lines(text)
             if in_use >= 2:
-                loaded, pid = require_launchd_state(self.label, self.uid)
-                warned = self.squat_warns(loaded, pid)
+                warned = self.squat_warns()
                 if warned:
                     break
             time.sleep(1)
@@ -810,26 +827,31 @@ class Harness:
                 self.holder.close()
             self.holder = None
 
-    def squat_warns(self, loaded: bool, pid: str | None) -> bool:
-        res = _run(
-            [
-                "python3",
-                "-I",
-                str(SQUAT_CHECK),
-                "--host",
-                HOST,
-                "--port",
-                str(self.port),
-                "--loaded",
-                "1" if loaded else "0",
-                "--pid",
-                pid or "",
-                "--label",
-                self.label,
-            ],
+    def squat_warns(self) -> bool:
+        """Run ``squat_check.py`` exactly as the recipes do: one read-only
+        ``launchctl print`` of the spare, its exit status on argv
+        (``--launchctl-rc``) and its output on stdin, classified there by
+        ``classify_print``. Raises LaunchdUnreadable when that same rule cannot
+        tell the spare's state (the harness's own stop rule)."""
+        target = f"gui/{self.uid}/{self.label}"
+        try:
+            res = _run(["launchctl", "print", target])
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise LaunchdUnreadable(
+                f"cannot read the launchd state of {self.label}: {exc}"
+            ) from exc
+        answer = (res.stdout or "") + "\n" + (res.stderr or "")
+        if squat_check.classify_print(res.returncode, answer) is None:
+            raise LaunchdUnreadable(
+                f"cannot read the launchd state of {self.label} "
+                f"(launchctl print exit {res.returncode})"
+            )
+        sq = _run(
+            squat_cli(HOST, self.port, self.label, res.returncode),
+            input=answer,
             timeout=CMD_TIMEOUT * 2,
         )
-        return res.returncode == 3 and "squat-check: warning:" in (res.stderr or "")
+        return sq.returncode == 3 and "squat-check: warning:" in (sq.stderr or "")
 
     # -- check: socket rollback
 

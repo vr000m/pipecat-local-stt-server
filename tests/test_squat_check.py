@@ -539,7 +539,8 @@ for pid, cmd, addr in {list(rows)!r}:
     return d
 
 
-def _cli(path_dir: Path, *args: str) -> subprocess.CompletedProcess:
+def _cli(path_dir: Path, *args: str, answer: str = "") -> subprocess.CompletedProcess:
+    """Run the CLI with ANSWER (the caller's launchctl print output) on stdin."""
     env = {"PATH": str(path_dir), "HOME": str(path_dir)}
     return subprocess.run(
         [sys.executable, "-I", str(SCRIPT), *args],
@@ -547,18 +548,23 @@ def _cli(path_dir: Path, *args: str) -> subprocess.CompletedProcess:
         text=True,
         timeout=30,
         env=env,
+        input=answer,
     )
+
+
+RUNNING_100 = "state = running\n\tpid = 100\n"
+CLI = ("--host", HOST, "--port", str(PORT))
 
 
 def test_cli_match_is_silent_exit_0(tmp_path):
     d = _stub_lsof(tmp_path, [(100, "python", f"{HOST}:{PORT}")])
-    res = _cli(d, "--host", HOST, "--port", str(PORT), "--loaded", "1", "--pid", "100")
+    res = _cli(d, *CLI, "--launchctl-rc", "0", answer=RUNNING_100)
     assert (res.returncode, res.stdout, res.stderr) == (0, "", "")
 
 
 def test_cli_squat_warns_on_stderr_exit_3_stdout_empty(tmp_path):
     d = _stub_lsof(tmp_path, [(200, "nc", f"*:{PORT}")])
-    res = _cli(d, "--host", HOST, "--port", str(PORT), "--loaded", "1", "--pid", "100")
+    res = _cli(d, *CLI, "--launchctl-rc", "0", answer=RUNNING_100)
     assert res.returncode == 3
     assert res.stdout == ""
     lines = res.stderr.strip().splitlines()
@@ -566,22 +572,22 @@ def test_cli_squat_warns_on_stderr_exit_3_stdout_empty(tmp_path):
     assert "200" in res.stderr and "nc" in res.stderr
 
 
-def test_cli_no_pid_flag_means_no_pid(tmp_path):
+def test_cli_no_pid_line_means_no_pid(tmp_path):
     d = _stub_lsof(tmp_path, [(321, "nc", f"{HOST}:{PORT}")])
-    res = _cli(d, "--host", HOST, "--port", str(PORT), "--loaded", "1")
+    res = _cli(d, *CLI, "--launchctl-rc", "0", answer="state = waiting\n")
     assert res.returncode == 3 and res.stdout == ""
     assert "not running" in res.stderr
 
 
 def test_cli_not_loaded_is_quiet(tmp_path):
     d = _stub_lsof(tmp_path, [(321, "nc", f"{HOST}:{PORT}")])
-    res = _cli(d, "--host", HOST, "--port", str(PORT), "--loaded", "0")
+    res = _cli(d, *CLI, "--launchctl-rc", "113", answer='Could not find service "x"')
     assert (res.returncode, res.stdout, res.stderr) == (0, "", "")
 
 
 def test_cli_lsof_failing_is_exit_2_without_warning(tmp_path):
     d = _stub_lsof(tmp_path, [], rc=1)
-    res = _cli(d, "--host", HOST, "--port", str(PORT), "--loaded", "1", "--pid", "100")
+    res = _cli(d, *CLI, "--launchctl-rc", "0", answer=RUNNING_100)
     assert res.returncode == 2 and res.stdout == ""
     assert PREFIX not in res.stderr
 
@@ -589,13 +595,14 @@ def test_cli_lsof_failing_is_exit_2_without_warning(tmp_path):
 def test_cli_lsof_absent_is_exit_2_without_warning(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
-    res = _cli(empty, "--host", HOST, "--port", str(PORT), "--loaded", "1", "--pid", "100")
+    res = _cli(empty, *CLI, "--launchctl-rc", "0", answer=RUNNING_100)
     assert res.returncode == 2 and res.stdout == ""
     assert PREFIX not in res.stderr
 
 
-# The recipes' form: the caller's launchctl print answer (exit, output) x a
-# foreign listener -> exit. classify_print is the one rule (launchd_state's too).
+# The one CLI form (recipes and harness): the caller's launchctl print answer,
+# exit status on argv and output on stdin, x a foreign listener -> exit.
+# classify_print is the one rule (launchd_state's too).
 @pytest.mark.parametrize(
     ("rc", "output", "want"),
     [
@@ -610,10 +617,7 @@ def test_cli_lsof_absent_is_exit_2_without_warning(tmp_path):
 )
 def test_cli_launchctl_answer_state_space(tmp_path, rc, output, want):
     d = _stub_lsof(tmp_path, [(200, "nc", f"{HOST}:{PORT}")])
-    res = _cli(
-        d, "--host", HOST, "--port", str(PORT), "--launchctl-rc", str(rc),
-        f"--launchctl-output={output}",
-    )  # fmt: skip
+    res = _cli(d, *CLI, "--launchctl-rc", str(rc), answer=output)
     assert res.returncode == want, res.stderr
     assert res.stdout == ""
     assert (PREFIX in res.stderr) == (want == 3)
@@ -625,7 +629,52 @@ def test_cli_launchctl_answer_state_space(tmp_path, rc, output, want):
     )
 
 
-def test_cli_pid_with_launchctl_answer_is_a_usage_error(tmp_path):
-    d = _stub_lsof(tmp_path, [])
-    res = _cli(d, "--host", HOST, "--port", str(PORT), "--launchctl-rc", "0", "--pid", "1")
+# The second (--loaded/--pid) form and the argv form of the answer are gone: the
+# answer can carry a legacy plist's token, so it must never ride on argv.
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--loaded", "1", "--pid", "100"),
+        ("--launchctl-rc", "0", "--pid", "100"),
+        ("--launchctl-rc", "0", f"--launchctl-output={RUNNING_100}"),
+    ],
+)
+def test_cli_has_one_form_and_takes_no_answer_on_argv(tmp_path, extra):
+    d = _stub_lsof(tmp_path, [(200, "nc", f"{HOST}:{PORT}")])
+    res = _cli(d, *CLI, *extra, answer=RUNNING_100)
     assert res.returncode == 2 and PREFIX not in res.stderr
+    assert "unrecognized arguments" in res.stderr or "required" in res.stderr
+
+
+# endpoint_holders: TCP reads listeners on the port; a socket reads the holders of
+# <socket>.lock (never the socket path); a missing .lock has no holder.
+@pytest.mark.parametrize(
+    ("socket", "lock", "lsof_rc", "want", "lsof_target"),
+    [
+        (False, False, 0, ["200"], f"-iTCP:{PORT}"),
+        (False, False, 2, None, f"-iTCP:{PORT}"),
+        (True, True, 0, ["200"], ".lock"),
+        (True, True, 2, None, ".lock"),
+        (True, False, 0, [], None),
+    ],
+)
+def test_endpoint_holders_state_space(tmp_path, socket, lock, lsof_rc, want, lsof_target):
+    sock = tmp_path / "a.sock"
+    if lock:
+        (tmp_path / "a.sock.lock").write_text("")
+    calls = []
+
+    def run(argv, **_kw):
+        calls.append(argv)
+        if lsof_rc:
+            return subprocess.CompletedProcess(argv, lsof_rc, "", "lsof: boom")
+        return subprocess.CompletedProcess(argv, 0, f"p200\nn{HOST}:{PORT}\n", "")
+
+    got = squat_check.endpoint_holders(HOST, PORT, str(sock) if socket else "", run)
+    assert got == want
+    if lsof_target is None:
+        assert calls == []
+    else:
+        assert len(calls) == 1 and any(lsof_target in a for a in calls[0]), calls
+        if socket:
+            assert calls[0][-1] == f"{sock}.lock" and str(sock) not in calls[0][:-1]

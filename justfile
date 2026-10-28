@@ -85,16 +85,18 @@ _plist_field plist field strict='':
 
 # Warn (stderr only) when a TCP agent's port is held by a process that is not the
 # agent: scripts/squat_check.py compares the lsof listener pid with the launchd pid.
-# `print_rc`/`print_out` are the exit status and output (stdout and stderr) of
-# the caller's one `launchctl print gui/<uid>/<label>`; squat_check.py reads the
-# loaded state and pid from them with the same rule as its own re-check (only
-# launchctl's "could not find service" is not loaded; any other failure is
-# "cannot tell", exit 2, never quiet). `label` is for the 1-second re-check.
-# Advisory: callers append `|| true`, so it never changes an exit status or
-# stdout. System python3 so a pruned venv cannot break it.
-_squat_check host port label print_rc print_out:
+# `print_rc` is the exit status of the caller's one `launchctl print
+# gui/<uid>/<label>`; its output (stdout and stderr) arrives on STDIN, never as an
+# argument: it carries the job's environment block, where a pre-0.5.0 plist keeps
+# its bearer token, and argv is readable by every local user through `ps`.
+# squat_check.py reads the loaded state and pid from that answer with the same
+# rule as its own re-check (only launchctl's "could not find service" is not
+# loaded; any other failure is "cannot tell", exit 2, never quiet). `label` is
+# for the 1-second re-check. Advisory: callers append `|| true`, so it never
+# changes an exit status or stdout. System python3 so a pruned venv cannot break it.
+_squat_check host port label print_rc:
     #!/usr/bin/env bash
-    exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --label {{quote(label)}} --launchctl-rc {{quote(print_rc)}} --launchctl-output={{quote(print_out)}}
+    exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --label {{quote(label)}} --launchctl-rc {{quote(print_rc)}}
 
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
@@ -108,8 +110,8 @@ stt-list:
       label=$(basename "$plist" .plist)
       target="gui/$uid/$label"
       # One read-only launchctl print per agent (stdout and stderr): its pid and
-      # state are shown here, and its answer goes to _squat_check as-is, which
-      # classifies it (an unreadable answer is "cannot tell" there, not "not
+      # state are shown here, and its answer goes to _squat_check as-is (on
+      # stdin), which classifies it (an unreadable answer is "cannot tell" there, not "not
       # loaded"). The display below shows any non-zero answer as stopped.
       pid=
       info=$(launchctl print "$target" 2>&1)
@@ -145,7 +147,8 @@ stt-list:
       elif [[ -n "$host" && -n "$port" ]]; then
         printf '         endpoint: %s:%s\n' "$host" "$port"
         probe=(--host "$host" --port "$port")
-        just _squat_check "$host" "$port" "$label" "$print_rc" "$info" || true
+        # The answer goes on stdin (printf is a builtin: no argv), never as an argument.
+        printf '%s\n' "$info" | just _squat_check "$host" "$port" "$label" "$print_rc" || true
       else
         printf '         endpoint: (no serve endpoint found in plist)\n'
         probe=()
@@ -226,7 +229,7 @@ stt-status target='':
         # one read-only launchctl print as stt-list; _squat_check classifies it.
         info=$(launchctl print "gui/$(id -u)/$label" 2>&1)
         print_rc=$?
-        just _squat_check "$p_host" "$p_port" "$label" "$print_rc" "$info" || true
+        printf '%s\n' "$info" | just _squat_check "$p_host" "$p_port" "$label" "$print_rc" || true
       fi
     else
       probe=(--host "$host" --port "$port")

@@ -2589,3 +2589,49 @@ def test_squat_verdict_follows_the_recipes_launchctl_answer(
     assert ("cannot read the launchd state" in res.stderr) == (verdict == "cannot-tell")
     checked = any("9871" in ln for ln in _lsof_log(tmp_path))
     assert checked == (verdict in ("quiet-checked", "warn"))
+
+
+# The launchctl print answer can carry a legacy plist's bearer token (its job
+# environment block), and every local user can read argv with `ps`. The recipes
+# hand it to squat_check.py on stdin: no process the recipes start (nested `just`
+# included) may carry it on argv, and the squat check still classifies it.
+LEGACY_SECRET = "legacy-token-must-not-reach-argv"
+
+
+@pytest.mark.parametrize("recipe", [["stt-list"], ["stt-status"], ["stt-status", "whisper"]])
+def test_launchctl_answer_never_reaches_argv(tmp_path, recipe):
+    stub_dir, _ = _make_stub_dir(tmp_path, lsof_listeners=((777, "nc", "127.0.0.1:9871"),))
+    _write_executable(
+        stub_dir / "launchctl",
+        f"""#!/usr/bin/env bash
+if [[ "$1" == "print" ]]; then
+    printf 'state = running\\n\\tpid = 4242\\n\\tenvironment = {{\\n'
+    printf '\\t\\tKODA_STT_AUTH_TOKEN => {LEGACY_SECRET}\\n\\t}}\\n'
+    exit 0
+fi
+exit 0
+""",
+    )
+    record = tmp_path / "argv-record.log"
+    real = {name: shutil.which(name) for name in ("just", "python3")}
+    for name, path in real.items():
+        assert path and not path.startswith(str(stub_dir)), name
+        _write_executable(
+            stub_dir / name,
+            f"""#!/usr/bin/env bash
+printf '{name} %s\\n' "$*" >> {record!s}
+exec {path} "$@"
+""",
+        )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    res = _run_just(recipe, home=home, stub_dir=stub_dir)
+    lines = record.read_text().splitlines()
+    squat = [ln for ln in lines if ln.startswith("python3 ") and "squat_check.py" in ln]
+    assert len(squat) == 1, lines
+    assert "--launchctl-rc 0" in squat[0] and "--label pipecat.stt-server" in squat[0]
+    assert all(LEGACY_SECRET not in ln for ln in lines), [ln for ln in lines if LEGACY_SECRET in ln]
+    # The answer reached squat_check.py on stdin: the pid it names (4242) is the
+    # one the warning compares the foreign listener (777) with.
+    assert SQUAT_WARNING in res.stderr and "pid 4242" in res.stderr, res.stderr
+    assert LEGACY_SECRET not in res.stdout + res.stderr

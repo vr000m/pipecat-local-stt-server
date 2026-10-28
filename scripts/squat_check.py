@@ -2,14 +2,18 @@
 """Warn when a TCP LaunchAgent's port is held by a process that is not the agent.
 
 Usage:
-    squat_check.py --host HOST --port PORT --loaded {0,1} [--pid PID] [--label LABEL]
-    squat_check.py --host HOST --port PORT --launchctl-rc RC [--launchctl-output TEXT] [--label LABEL]
+    launchctl print gui/<uid>/<label> 2>&1 | squat_check.py --host HOST --port PORT --launchctl-rc RC [--label LABEL]
 
-The second form is the recipes': RC and TEXT are the exit status and output
-(stdout and stderr) of the caller's own ``launchctl print gui/<uid>/<label>``,
-classified by ``classify_print``, the same rule ``launchd_state`` uses. An answer
-that is neither loaded nor launchctl's "could not find service" is "cannot
-tell" (exit 2, a note on stderr), never "not loaded".
+The one CLI form, used by the recipes (``stt-list``, ``stt-status``) and by the
+launchd harness alike: RC is the exit status of the caller's own ``launchctl
+print gui/<uid>/<label>`` and its output (stdout and stderr) arrives on STDIN,
+never on argv. That output carries the job's ``environment`` block, where a plist
+from before 0.5.0 keeps its bearer token (``KODA_STT_AUTH_TOKEN`` /
+``PIPECAT_STT_AUTH_TOKEN``), and every local user can read a process's argv
+with ``ps``. The answer is classified by ``classify_print``, the same rule
+``launchd_state`` uses. An answer that is neither loaded nor launchctl's "could
+not find service" is "cannot tell" (exit 2, a note on stderr), never "not
+loaded".
 
 Read-only: it runs ``lsof`` (and, for the confirm pass, ``launchctl print``),
 never starts, stops or signals anything. Stdout is always empty. Each warning is
@@ -31,7 +35,8 @@ PID launchd reports for the agent. Two warnings break it:
 A finding is only reported after a 1-second re-check, so a restart in flight (the
 launchd pid or the listener changing between the two reads) never warns. The
 re-check re-reads the listeners and, when ``--label`` is given, the pid with
-``launchctl print gui/<uid>/<label>``; without ``--label`` it reuses ``--pid``.
+``launchctl print gui/<uid>/<label>``; without ``--label`` it reuses the pid
+from the caller's answer.
 When that re-read fails, a finding that persists is "cannot tell" (exit 2), never a
 warning resting on the first pass's pid. With ``--label`` the pid is read once more
 after the second listener read; a pid that changed across that listener read (the
@@ -54,12 +59,12 @@ unloaded within the second is quiet again (Decision 2, case a).
 with no stderr, or with only ``lsof: WARNING:`` lines; any other exit 1 message,
 or an exit of 2 or more, is "cannot tell".
 
-Import surface: besides the CLI, ``scripts/smoke_launchd.py`` imports
-``lsof_output``, ``lsof_pids`` (its ``.lock`` holder read), ``listener_pids``,
-``parse_launchd_pid`` and ``launchd_state`` (with the ``uid`` keyword), and the
-recipes hand their ``launchctl print`` answer to ``classify_print`` through the
-CLI, so the harness and the recipes share one listener and one launchd-state
-definition. Everything else here is private to this module.
+Import surface: besides the CLI, ``scripts/smoke_launchd.py`` and
+``scripts/smoke.py`` import ``lsof_output``, ``lsof_pids``, ``listener_pids``,
+``endpoint_holders``, ``parse_launchd_pid``, ``classify_print`` and
+``launchd_state`` (with the ``uid`` keyword), so the harness, the runner and the
+recipes share one listener and one launchd-state definition. Everything else
+here is private to this module.
 
 Stdlib only: it runs under the system python3 (``python3 -I``).
 """
@@ -124,6 +129,22 @@ def listener_pids(port, host=None, run=subprocess.run):
     None when lsof can't tell."""
     out = _lsof(port, run)
     return None if out is None else _parse(out, host)
+
+
+def endpoint_holders(host, port, socket_path, run=subprocess.run):
+    """Pids serving an agent endpoint; [] when none, None when lsof can't tell.
+
+    TCP (no SOCKET_PATH): the listeners on PORT whose address matches HOST
+    (``listener_pids``). A Unix socket: the holders of ``<SOCKET_PATH>.lock``,
+    the file the server opens and ``flock``s for its whole life (``lsof`` on
+    the AF_UNIX path itself lists nothing on macOS). A ``.lock`` that does not
+    exist has no holder ([]); one that vanishes during the read is None."""
+    if socket_path:
+        lock = f"{socket_path}.lock"
+        if not os.path.lexists(lock):
+            return []
+        return lsof_pids(["--", lock], run)
+    return listener_pids(port, host, run)
 
 
 def _parse(out, host):
@@ -303,33 +324,28 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
     return 3
 
 
-def main(argv=None):
+def main(argv=None, stdin=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", required=True)
-    state = ap.add_mutually_exclusive_group(required=True)
-    state.add_argument("--loaded", choices=("0", "1"))
-    state.add_argument("--launchctl-rc", type=int)
-    ap.add_argument("--launchctl-output", default="")
-    ap.add_argument("--pid", default="")
+    ap.add_argument(
+        "--launchctl-rc",
+        type=int,
+        required=True,
+        help="exit status of the caller's launchctl print; its output is read from stdin",
+    )
     ap.add_argument("--label", default=None)
     args = ap.parse_args(argv)
-    if args.launchctl_rc is None:
-        loaded, pid = args.loaded == "1", args.pid
-    else:
-        if args.pid:
-            ap.error(
-                "--pid goes with --loaded; with --launchctl-rc the pid is read from the output"
-            )
-        got = classify_print(args.launchctl_rc, args.launchctl_output)
-        if got is None:
-            print(
-                "squat-check: cannot read the launchd state "
-                f"(launchctl print exit {args.launchctl_rc}); skipping port check",
-                file=sys.stderr,
-            )
-            return 2
-        loaded, pid = got
+    text = (sys.stdin if stdin is None else stdin).read()
+    got = classify_print(args.launchctl_rc, text)
+    if got is None:
+        print(
+            "squat-check: cannot read the launchd state "
+            f"(launchctl print exit {args.launchctl_rc}); skipping port check",
+            file=sys.stderr,
+        )
+        return 2
+    loaded, pid = got
     return check(args.host, args.port, pid, loaded, args.label or None)
 
 

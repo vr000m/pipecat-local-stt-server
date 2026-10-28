@@ -1516,3 +1516,58 @@ def test_audit_wrapper_sees_every_real_library_touch(tmp_path, probe):
     assert lines[0] == "audit: on"
     assert any(str(real) in ln for ln in lines[1:]), lines
     assert not os.path.lexists(real)
+
+
+# The harness drives squat_check.py in the recipes' one form: the launchctl print
+# exit status on argv, its output (which can carry a legacy token) on stdin. The
+# listener cells prove the pid came from stdin: the agent's own pid is quiet.
+@pytest.mark.parametrize(("listener", "warns"), [("777", True), ("4242", False)])
+def test_harness_squat_check_uses_the_recipes_form_and_no_answer_on_argv(
+    smoke, tmp_path, monkeypatch, listener, warns
+):
+    import re
+
+    secret = "legacy-token-must-not-reach-argv"
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    record = tmp_path / "record.log"
+    _exe(
+        stub / "launchctl",
+        f"""#!/usr/bin/env bash
+printf 'launchctl %s\\n' "$*" >> {tmp_path / "launchctl.log"}
+if [[ "$1" == "print" ]]; then
+    printf 'state = running\\n\\tpid = 4242\\n\\tenvironment = {{\\n'
+    printf '\\t\\tKODA_STT_AUTH_TOKEN => {secret}\\n\\t}}\\n'
+    exit 0
+fi
+exit 0
+""",
+    )
+    _exe(
+        stub / "lsof",
+        "#!/usr/bin/env bash\n"
+        f'for a in "$@"; do [[ "$a" == -Fc ]] && {{ printf "p{listener}\\ncnc\\n"; exit 0; }}; done\n'
+        f'printf "p{listener}\\nn127.0.0.1:9998\\n"\n',
+    )
+    real = shutil.which("python3")
+    _exe(
+        stub / "python3",
+        f'#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> {record}\nexec {real} "$@"\n',
+    )
+    monkeypatch.setenv("PATH", f"{stub}:/usr/bin:/bin")
+    h = object.__new__(smoke.Harness)
+    h.label, h.port, h.uid = SPARE, 9998, FAKE_UID
+    assert h.squat_warns() is warns
+    # Quiet on the first pass needs the pid from stdin: one launchctl print (the
+    # harness's own); a warning re-reads it once more in the confirm pass.
+    prints = (tmp_path / "launchctl.log").read_text().splitlines()
+    assert len(prints) == (3 if warns else 1), prints
+    argv = record.read_text().splitlines()
+    assert len(argv) == 1 and "squat_check.py" in argv[0] and secret not in argv[0]
+    recipe = next(
+        ln
+        for ln in (REPO_ROOT / "justfile").read_text().splitlines()
+        if ln.strip().startswith("exec python3") and "squat_check.py" in ln
+    )
+    flags = lambda text: re.findall(r"(?<!\S)--[a-z][a-z-]*", text)  # noqa: E731
+    assert flags(argv[0]) == flags(recipe) == ["--host", "--port", "--label", "--launchctl-rc"]
