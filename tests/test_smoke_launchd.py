@@ -1008,15 +1008,16 @@ def test_compare_snapshots_listener_state_space(smoke, b, a, same):
 
 
 class _FakeHarness:
-    def __init__(self, lose_before=None):
+    def __init__(self, lose_before=None, stop="port"):
         self.lose_before = lose_before
+        self.stop = stop
         self.ensured = 0
         self.released = 0
 
     def ensure_port_ours(self):
         self.ensured += 1
         if self.lose_before == self.ensured:
-            raise _SMOKE.PortLost("port 1 is held by pid 9, not the spare job")
+            raise _stop_exc(self.stop)
 
     def release_holder(self):
         self.released += 1
@@ -1025,16 +1026,24 @@ class _FakeHarness:
 _SMOKE = None
 
 
-def _checks(ran, behaviours):
+def _stop_exc(stop):
+    if stop == "port":
+        return _SMOKE.PortLost("port 1 is held by pid 9, not the spare job")
+    return _SMOKE.LaunchdUnreadable("cannot read the launchd state of the spare")
+
+
+def _checks(ran, behaviours, stop="port"):
     def make(name, how):
         def fn():
             ran.append(name)
             if how == "lost":
-                raise _SMOKE.PortLost("cannot hold port 1 after the guard")
+                raise _stop_exc(stop)
             if how == "fail":
                 raise _SMOKE.CheckFailed("nope")
             if how == "crash":
                 raise LookupError("boom")
+            if how == "interrupt":
+                raise KeyboardInterrupt("signal 2")
             return "ok"
 
         return fn
@@ -1045,32 +1054,52 @@ def _checks(ran, behaviours):
 _NAMES = ("port collision", "socket rollback", "token file")
 
 
-# where the port is lost (inside check i, or before check i) x what the other
-# checks do -> rows: the losing check FAILs, later ones are SKIPPED and never run.
+# what stops the checks (the port lost, the spare's launchd state unreadable) x
+# where (inside check i, or in the gate before check i) x what the other checks
+# do -> rows: the stopping check FAILs, later ones are SKIPPED and never run.
+@pytest.mark.parametrize("stop", ["port", "launchd"])
 @pytest.mark.parametrize("other", ["ok", "fail", "crash"])
 @pytest.mark.parametrize(
     "where", [("in", 0), ("in", 1), ("in", 2), ("before", 1), ("before", 2), (None, None)]
 )
-def test_run_checks_port_loss_state_space(smoke, where, other):
+def test_run_checks_stop_state_space(smoke, where, other, stop):
     global _SMOKE
     _SMOKE = smoke
     kind, at = where
     behaviours = [
         (n, "lost" if (kind == "in" and i == at) else other) for i, n in enumerate(_NAMES)
     ]
-    h = _FakeHarness(lose_before=at if kind == "before" else None)
+    h = _FakeHarness(lose_before=at if kind == "before" else None, stop=stop)
     ran: list[str] = []
-    rows = smoke.run_checks(h, _checks(ran, behaviours))
+    rows: list = []
+    assert smoke.run_checks(h, _checks(ran, behaviours, stop), rows) is rows
     assert [r[0] for r in rows] == list(_NAMES)  # every check has a row
     lost_at = at if kind is not None else None
     for i, (name, status, detail) in enumerate(rows):
         if lost_at is not None and i == lost_at:
-            assert status == smoke.FAIL and "port lost" in detail
+            assert status == smoke.FAIL
+            assert ("port lost" if stop == "port" else "launchd state unreadable") in detail
         elif lost_at is not None and i > lost_at:
             assert status == smoke.SKIPPED and name not in ran
         else:
             assert status == (smoke.PASS if other == "ok" else smoke.FAIL)
     assert h.released == len(rows) - (len(_NAMES) - 1 - lost_at if lost_at is not None else 0)
+
+
+# an interrupt inside check i x what the earlier checks did -> the interrupt
+# propagates and the earlier checks' rows are already in the caller's list.
+@pytest.mark.parametrize("at", [0, 1, 2])
+@pytest.mark.parametrize("other", ["ok", "fail"])
+def test_run_checks_interrupt_keeps_finished_rows(smoke, at, other):
+    global _SMOKE
+    _SMOKE = smoke
+    behaviours = [(n, "interrupt" if i == at else other) for i, n in enumerate(_NAMES)]
+    rows: list = [("guard", smoke.PASS, "")]
+    with pytest.raises(KeyboardInterrupt):
+        smoke.run_checks(_FakeHarness(), _checks([], behaviours), rows)
+    assert [r[0] for r in rows] == ["guard", *_NAMES[:at]]
+    want = smoke.PASS if other == "ok" else smoke.FAIL
+    assert all(r[1] == want for r in rows[1:])
 
 
 def test_collision_check_fails_when_the_port_was_taken_after_the_guard(smoke, env, monkeypatch):

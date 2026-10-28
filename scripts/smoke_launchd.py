@@ -130,6 +130,16 @@ class PortLost(CheckFailed):
     """Something other than the spare job holds (or may hold) the spare port."""
 
 
+class LaunchdUnreadable(RuntimeError):
+    """``launchctl print`` gave an answer that is neither loaded nor launchctl's
+    own "could not find service": the harness cannot tell the job's state."""
+
+
+# A check that raises one of these leaves the harness unable to prove the spare
+# port and label are still its own, so no later (mutating) check may run.
+STOP_CHECKS = (PortLost, LaunchdUnreadable)
+
+
 # --- environment, paths ----------------------------------------------------
 
 
@@ -258,11 +268,14 @@ def current_uid(run=subprocess.run) -> str:
 def require_launchd_state(label: str, uid: str, run=subprocess.run) -> tuple[bool, str | None]:
     """(loaded, pid) from read-only ``launchctl print`` (squat_check's reader).
 
-    Raises RuntimeError when launchctl's answer is not "loaded" or launchctl's
-    own "could not find service": an unreadable state never reads as unloaded."""
+    Raises LaunchdUnreadable (a RuntimeError) when launchctl's answer is not
+    "loaded" or launchctl's own "could not find service": an unreadable state
+    never reads as unloaded."""
     state = squat_check.launchd_state(label, run, uid=uid)
     if state is None:
-        raise RuntimeError(f"cannot read the launchd state of {label} (launchctl print failed)")
+        raise LaunchdUnreadable(
+            f"cannot read the launchd state of {label} (launchctl print failed)"
+        )
     return state
 
 
@@ -898,20 +911,27 @@ def _print_table(results) -> None:
         print(f"{status:<8} {name:<{width}}  {detail}".rstrip())
 
 
-def run_checks(harness, checks) -> list[tuple[str, str, str]]:
-    """Run CHECKS ((name, fn) pairs) in order, one row each. Any exception is that
-    check's FAIL row and the next check still runs, except PortLost: the spare
-    port is no longer the harness's, so the remaining checks are not run (they
-    would install the spare onto a port someone else holds)."""
-    rows: list[tuple[str, str, str]] = []
+def run_checks(harness, checks, rows: list) -> list:
+    """Run CHECKS ((name, fn) pairs) in order, appending one row each to ROWS as
+    it finishes, so an interrupt (which propagates) keeps the finished rows. Any
+    exception is that check's FAIL row and the next check still runs, except a
+    STOP_CHECKS one (the spare port was lost, or the spare's launchd state cannot
+    be read): the harness can no longer prove the port and label are its own, so
+    the remaining checks, which install the spare, are not run."""
     for i, (name, fn) in enumerate(checks):
         try:
             if i:
                 harness.ensure_port_ours()
             rows.append((name, PASS, fn()))
-        except PortLost as exc:
-            rows.append((name, FAIL, f"port lost: {exc}"))
-            rows += [(n, SKIPPED, "not run: the spare port was lost") for n, _f in checks[i + 1 :]]
+        except STOP_CHECKS as exc:
+            why = (
+                "the spare port was lost"
+                if isinstance(exc, PortLost)
+                else "the spare's launchd state cannot be read"
+            )
+            prefix = "port lost" if isinstance(exc, PortLost) else "launchd state unreadable"
+            rows.append((name, FAIL, f"{prefix}: {exc}"))
+            rows += [(n, SKIPPED, f"not run: {why}") for n, _f in checks[i + 1 :]]
             break
         except Exception as exc:  # noqa: BLE001 - any crash is this check's FAIL row
             detail = str(exc) or type(exc).__name__
@@ -1059,13 +1079,14 @@ def _locked_main(args, env, results, refuse, agents_at) -> int:
     harness = Harness(args.label, args.port, args.inject)
     interrupted = False
     try:
-        results += run_checks(
+        run_checks(
             harness,
             (
                 ("port collision", harness.check_collision),
                 ("socket rollback", harness.check_rollback),
                 ("token file", harness.check_token),
             ),
+            results,
         )
     except (KeyboardInterrupt, SystemExit) as exc:
         interrupted = True
