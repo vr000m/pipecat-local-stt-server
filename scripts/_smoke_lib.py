@@ -1,36 +1,37 @@
-"""Shared helpers for the peer-cred verification scripts.
+"""Shared helpers for the smoke scripts: one definition of everything two or more
+of them must agree on, so no copy can drift. Stdlib only, so it imports under
+the venv driver and under any system python.
 
-``smoke_peercred.py`` and ``verify_peercred_crossuid.py`` both drive a cross-uid
-probe against a deliberately permissive socket to prove that *peer-cred* (not the
-filesystem) is what rejects a foreign uid. That assertion is only meaningful if
-the foreign uid can actually traverse the path to the socket — otherwise it fails
-at PATH RESOLUTION before reaching ``_process_request`` and the verdict reflects
-the filesystem boundary, not the peer-cred gate. This module holds the single
-canonical traversability check both scripts use so they cannot diverge.
+The module holds several separate concerns; each section below is used by:
 
-Pure stdlib (``os``/``stat``) so it imports under both the venv driver and any
-system-python context.
-
-It also holds what ``smoke.py`` and ``smoke_launchd.py`` must agree on: the
-outcome names and the harness's skip line (``LAUNCHD_SKIP_MARK``), the spare
-label, the installed-agent plist glob and directory, the home the installed real
-agents are read from, the launchd preconditions, the token-file fixture
-(``write_policy_token_file``), the websocket token-gate assertion
-(``assert_token_gate``), and the owned-process-group lifecycle (``run_owned``)
-both use for children whose whole group they may kill.
-
-Two homes. ``env_home()`` is ``$HOME``: where the installer puts the spare's
-plist, logs and socket. ``agents_home()`` is where both scripts look for the
-installed real agents (``smoke.py --agents`` and the harness's port guard and
-before/after snapshot): the account's home from the password database, so an
-overridden ``HOME`` can neither empty the snapshot nor hide an agent from the
-port guard. No environment variable moves it; the stubbed test suites patch
-``agents_home`` (in-process, or through ``tests/_with_agents_home.py`` for a
-subprocess) so they never read the developer's real ``~/Library/LaunchAgents``.
-
-The launchd checks are SKIPPED when ``CI`` is present in the environment with
-any value, the empty string included (Decision 8: they run only when ``CI`` is
-unset).
+* Smoke outcomes and the runner-harness contract (``smoke.py``,
+  ``smoke_launchd.py``, ``smoke_peercred.py``): the outcome names ``PASS`` /
+  ``FAIL`` / ``SKIPPED``; the harness's skip line (``LAUNCHD_SKIP_MARK``) and
+  failure channel (``LAUNCHD_FAIL_MARK``, ``launchd_fail_lines``,
+  ``launchd_failures``); the peer-cred skip lines; the launchd preconditions
+  (``launchd_skip_reason``: the launchd checks are SKIPPED when ``CI`` is
+  present with any value, the empty string included, Decision 8).
+* Agent discovery (``smoke.py --agents``, the harness's guard and snapshot): the
+  spare label, the installed-agent plist glob and directory, and the two homes.
+  ``env_home()`` is ``$HOME``: where the installer puts the spare's plist, logs
+  and socket. ``agents_home()`` is where the installed real agents are read
+  from: the account's home from the password database, so an overridden
+  ``HOME`` can neither empty the snapshot nor hide an agent from the port guard.
+  No environment variable moves it; the stubbed test suites patch
+  ``agents_home`` (in-process, or through ``tests/_with_agents_home.py`` for a
+  subprocess) so they never read the developer's real ``~/Library/LaunchAgents``.
+* Peer-cred traversal (``smoke_peercred.py``, ``verify_peercred_crossuid.py``):
+  ``assert_chain_traversable``. A cross-uid probe proves that peer-cred (not
+  the filesystem) rejects a foreign uid only if that uid can traverse the path
+  to the socket; otherwise it fails at path resolution, before the peer-cred
+  gate, and the verdict would reflect the filesystem boundary.
+* Token gate (``smoke.py``'s token-file step, the harness's token check): the
+  token-file fixture (``write_policy_token_file``), a raw websocket handshake
+  (``ws_handshake_status``) and the 401/401/101 assertion
+  (``assert_token_gate``, Decision 9).
+* Owned process groups (``smoke.py``'s steps, the harness's installer calls):
+  ``run_owned`` and ``OwnedGroup``, the one lifecycle for a child whose whole
+  process group may have to be killed (invariant at that section).
 """
 
 from __future__ import annotations
