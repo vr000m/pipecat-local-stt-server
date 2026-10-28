@@ -982,17 +982,27 @@ class Harness:
         A job without a readable pid and runs, or a server end that is not
         its, is CheckFailed (``wait_for`` retries it); an unreadable launchd
         state raises LaunchdUnreadable."""
-        loaded, pid, runs, _ep = read_job(self.label, self.uid)
-        if not (loaded and pid and runs and runs != UNKNOWN):
-            raise CheckFailed(
-                f"the spare job is not running with a readable pid and runs "
-                f"(loaded {loaded}, pid {pid}, runs {runs})"
-            )
+        pid, runs = self.running_identity()
         try:
             sock = _smoke_lib.connect_verified(endpoint, pid, runs, self._identity)
         except _smoke_lib.EndpointRefused as exc:
             raise CheckFailed(f"not the spare job: {exc}") from exc
         return _smoke_lib.ws_handshake_status(sock=sock)
+
+    def running_identity(self, consequence: str = "") -> tuple[str, str]:
+        """(pid, runs) of the spare job from ONE ``read_job``: the identity a
+        verified connection is checked against. A job that is not loaded, has
+        no pid, or has no readable runs (None or UNKNOWN) is CheckFailed, its
+        message ending in CONSEQUENCE; an unreadable launchd state raises
+        LaunchdUnreadable. The one precondition for verified_status and the
+        token check."""
+        loaded, pid, runs, _ep = read_job(self.label, self.uid)
+        if not (loaded and pid and runs and runs != UNKNOWN):
+            raise CheckFailed(
+                f"the spare job is not running with a readable pid and runs "
+                f"(loaded {loaded}, pid {pid}, runs {runs}){consequence}"
+            )
+        return pid, runs
 
     def tcp_up(self) -> bool:
         """The spare JOB answers 101 on the spare port (server end verified)."""
@@ -1177,12 +1187,7 @@ class Harness:
         # connection whose server end is the spare job (pid P, runs R from one
         # launchctl print), and a fresh print after the gate must still give
         # (P, R): _smoke_lib.connect_verified's contract.
-        loaded, pid, runs, _ep = read_job(self.label, self.uid)
-        if not (loaded and pid and runs and runs != UNKNOWN):
-            raise CheckFailed(
-                f"the spare job is not running with a readable pid and runs "
-                f"(loaded {loaded}, pid {pid}, runs {runs}); no token sent"
-            )
+        pid, runs = self.running_identity("; no token sent")
 
         def connect():
             return _smoke_lib.connect_verified(

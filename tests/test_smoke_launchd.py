@@ -2474,3 +2474,57 @@ def test_unknown_is_one_definition_and_never_an_identity(smoke, pid, runs, refus
         else:
             call()
             assert connected == [("tcp", "127.0.0.1", "1")]
+
+
+# One precondition for every verified connection to the spare (finding 6):
+# the job's read_job answer x the caller (verified_status, the token check) ->
+# both refuse exactly the same answers with the same message (the token check
+# adds only "; no token sent"), UNKNOWN runs included, and nothing connects.
+_JOBS = {
+    "running": ((True, "777", "3", None), None),
+    "unloaded": ((False, None, None, None), "loaded False, pid None, runs None"),
+    "no-pid": ((True, None, "3", None), "loaded True, pid None, runs 3"),
+    "no-runs": ((True, "777", None, None), "loaded True, pid 777, runs None"),
+    "unknown-runs": ((True, "777", UNKNOWN, None), f"loaded True, pid 777, runs {UNKNOWN}"),
+}
+
+
+@pytest.mark.parametrize("caller", ["verified_status", "check_token", "helper"])
+@pytest.mark.parametrize("job", list(_JOBS))
+def test_running_identity_is_one_precondition(smoke, env, monkeypatch, job, caller):
+    monkeypatch.setenv("HOME", str(env.home))
+    h = smoke.Harness(SPARE, _free_port())
+    answer, why = _JOBS[job]
+    monkeypatch.setattr(smoke, "read_job", lambda label, uid, run=None: answer)
+    connects = []
+    monkeypatch.setattr(
+        smoke._smoke_lib, "connect_verified", lambda *a, **k: connects.append(a) or "sock"
+    )
+    monkeypatch.setattr(smoke._smoke_lib, "ws_handshake_status", lambda **k: 101)
+    monkeypatch.setattr(smoke._smoke_lib, "assert_token_gate", lambda *a, connect: connect())
+    monkeypatch.setattr(smoke, "install", lambda e, what: "")
+    monkeypatch.setattr(smoke, "read_plist_field", lambda label, f: str(env.home.resolve()))
+    monkeypatch.setattr(smoke.Harness, "wait_for", lambda self, what, pred, **k: True)
+    monkeypatch.setattr(
+        "stt_server.auth.load_token_file", lambda p, uid=None: (str(env.home.resolve()), "t")
+    )
+    call = {
+        "verified_status": lambda: h.verified_status(("tcp", smoke.HOST, str(h.port))),
+        "check_token": h.check_token,
+        "helper": h.running_identity,
+    }[caller]
+    suffix = "; no token sent" if caller == "check_token" else ""
+    try:
+        if why is None:
+            got = call()
+            assert connects if caller != "helper" else got == ("777", "3")
+            return
+        with pytest.raises(smoke.CheckFailed) as exc:
+            call()
+        assert str(exc.value) == (
+            f"the spare job is not running with a readable pid and runs ({why}){suffix}"
+        )
+        assert connects == []
+    finally:
+        if h.token_dir is not None:
+            shutil.rmtree(h.token_dir, ignore_errors=True)
