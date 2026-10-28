@@ -168,7 +168,7 @@ SQUAT_START = 5.0  # the squat CLI's `python3 -I` start-up, outside cli_bound
 
 def install_bound() -> float:
     """One installer call: its timeout, one poll, the kill-and-reap drain."""
-    return INSTALL_TIMEOUT + _smoke_lib.GROUP_POLL + _smoke_lib.GROUP_DRAIN
+    return INSTALL_TIMEOUT + _smoke_lib.GROUP_POLL + _smoke_lib.reap_bound()
 
 
 def snapshot_bound(n_agents: int) -> float:
@@ -217,7 +217,7 @@ def teardown_budget(n_agents: int) -> float:
     kill and reap, the uninstall, the socket lock wait, the launchd check,
     the final snapshot and the margin."""
     return (
-        _smoke_lib.GROUP_DRAIN
+        _smoke_lib.reap_bound()
         + install_bound()
         + SOCKET_LOCK_WAIT
         + squat_check.LAUNCHCTL_TIMEOUT

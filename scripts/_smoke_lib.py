@@ -552,6 +552,12 @@ def write_policy_token_file(home: Path, prefix: str) -> tuple[Path, Path]:
 
 GROUP_POLL = 0.1  # how often the leader's exit, the clock and held signals are checked
 GROUP_DRAIN = 5.0  # pipe drain after the group is killed (a holder may have left it)
+READER_STOP = 1.0  # then the stopped readers' join (each notices STOP within GROUP_POLL)
+
+
+def reap_bound() -> float:
+    """OwnedGroup.reap's worst case: the drain, then the stopped readers' join."""
+    return GROUP_DRAIN + READER_STOP
 
 
 @contextlib.contextmanager
@@ -585,9 +591,24 @@ def redeliver(sig: int, handler) -> None:
         raise KeyboardInterrupt(f"signal {sig}")
 
 
-def _drain(fd: int, sink: list[bytes]) -> None:
-    with contextlib.suppress(OSError):
-        while chunk := os.read(fd, 65536):
+def _drain(pipe, sink: list[bytes], stop: threading.Event) -> None:
+    """Read PIPE (the Popen's pipe file object, which this thread's reference
+    keeps alive, so GC cannot close it) into SINK until EOF or STOP. It reads
+    only when the pipe is readable (polled every GROUP_POLL), so a read never
+    blocks and the thread notices STOP within one poll: the owner sets STOP,
+    joins the thread, and only then closes the pipe, so no read can ever land
+    on an fd number the owner closed (and the system may have reused)."""
+    import selectors
+
+    fd = pipe.fileno()
+    with contextlib.suppress(OSError, ValueError), selectors.DefaultSelector() as sel:
+        sel.register(fd, selectors.EVENT_READ)
+        while not stop.is_set():
+            if not sel.select(GROUP_POLL):
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return
             sink.append(chunk)
 
 
@@ -620,6 +641,7 @@ class OwnedGroup:
         self._out: list[bytes] = []
         self._err: list[bytes] = []
         self._readers: list[threading.Thread] = []
+        self._stop_reading = threading.Event()
         try:
             if input is not None:
                 # Small (a token); a child that exits without reading it is fine.
@@ -643,7 +665,9 @@ class OwnedGroup:
                     # Already exited: still a zombie, since only reap() reaps it.
                     self._exited = True
             for pipe, sink in ((self.proc.stdout, self._out), (self.proc.stderr, self._err)):
-                t = threading.Thread(target=_drain, args=(pipe.fileno(), sink), daemon=True)
+                t = threading.Thread(
+                    target=_drain, args=(pipe, sink, self._stop_reading), daemon=True
+                )
                 t.start()
                 self._readers.append(t)
         except BaseException:
@@ -698,7 +722,9 @@ class OwnedGroup:
 
     def reap(self, drain: float = GROUP_DRAIN) -> None:
         """Reap the leader (the last use of its pid), then give the pipe readers
-        DRAIN seconds; a holder that left the group cannot stall this."""
+        DRAIN seconds; a holder that left the group cannot stall this. Then
+        stop the readers, join them, and close the pipes (owner's path): a
+        pipe whose reader is still alive is never closed under it."""
         end = time.monotonic() + drain
         if not self.reaped:
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -709,6 +735,15 @@ class OwnedGroup:
                 self._kq = None
         for t in self._readers:
             t.join(max(0.0, end - time.monotonic()))
+        self._stop_reading.set()
+        stop_end = time.monotonic() + READER_STOP
+        for t in self._readers:
+            t.join(max(0.0, stop_end - time.monotonic()))
+        if not any(t.is_alive() for t in self._readers):
+            for pipe in (self.proc.stdout, self.proc.stderr):
+                if pipe is not None:
+                    with contextlib.suppress(OSError):
+                        pipe.close()
 
     def output(self) -> tuple[str, str]:
         dec = lambda chunks: b"".join(chunks).decode(errors="replace")  # noqa: E731

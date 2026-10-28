@@ -1489,3 +1489,71 @@ def test_launchd_step_uses_the_harness_budget(smoke, seam, monkeypatch, n_agents
         + smoke_launchd.snapshot_bound(n_agents)
     )
     assert got["timeout"] > got["grace"]
+
+
+# A daemon that escapes the step's process group (setsid) and keeps holding
+# its stdout/stderr outlives reap()'s drain. Before the fix the drain threads
+# read raw fd numbers and stayed blocked; once GC closed the Popen's pipes the
+# numbers could be reused, and a stale thread would read an unrelated fd. Now:
+# which pipe the daemon holds x whether it writes after the reap -> the readers
+# are joined and the owner closed both pipes; a fresh pipe that reuses those
+# fd numbers keeps every byte written to it (no stale reader steals it).
+_DAEMON = r"""
+import os, sys, time
+trigger, pidfile = sys.argv[1], sys.argv[2]
+if os.fork() == 0:
+    os.setsid()  # out of the step's group: kill_group cannot reach it
+    open(pidfile, "w").write(str(os.getpid()))
+    while not os.path.exists(trigger):
+        time.sleep(0.02)
+    try:
+        os.write(1, b"late-out"); os.write(2, b"late-err")
+    except OSError:
+        pass
+    time.sleep(30)
+    os._exit(0)
+"""
+
+
+@pytest.mark.parametrize("writes_late", [False, True])
+def test_reap_never_leaves_a_reader_on_a_pipe_an_escaped_daemon_holds(smoke, tmp_path, writes_late):
+    import gc
+
+    lib = smoke._smoke_lib
+    trigger, pidfile = tmp_path / "go", tmp_path / "pid"
+    group = lib.OwnedGroup([sys.executable, "-c", _DAEMON, str(trigger), str(pidfile)])
+    daemon = None
+    try:
+        deadline = time.monotonic() + 10
+        while not (group.exited() and pidfile.exists() and pidfile.read_text()):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
+        daemon = int(pidfile.read_text())
+        assert group.kill_group() is None
+        group.reap(drain=0.3)  # the daemon still holds both pipes: no EOF
+        assert group.reaped
+        assert not any(t.is_alive() for t in group._readers), "a reader outlived reap()"
+        assert group.proc.stdout.closed and group.proc.stderr.closed  # the owner closed them
+        readers = list(group._readers)
+        del group
+        gc.collect()
+        # Fresh pipes take the freed numbers; bytes written there must stay.
+        fresh = [os.pipe() for _ in range(4)]
+        try:
+            for r, w in fresh:
+                os.write(w, b"canary")
+            if writes_late:
+                trigger.write_text("")
+            time.sleep(0.5)
+            assert not any(t.is_alive() for t in readers)
+            for r, _w in fresh:
+                os.set_blocking(r, False)
+                assert os.read(r, 64) == b"canary", "a stale reader stole a reused fd's bytes"
+        finally:
+            for r, w in fresh:
+                os.close(r)
+                os.close(w)
+    finally:
+        if daemon is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(daemon, signal.SIGKILL)
