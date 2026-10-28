@@ -1121,6 +1121,7 @@ def test_runner_and_harness_share_outcome_names(smoke):
         "smoke_launchd_names", REPO_ROOT / "scripts" / "smoke_launchd.py"
     )
     mod = importlib.util.module_from_spec(harness)
+    sys.modules["smoke_launchd_names"] = mod  # dataclasses resolve their module here
     harness.loader.exec_module(mod)
     for name in ("PASS", "FAIL", "SKIPPED"):
         assert getattr(smoke, name) == getattr(mod, name) == getattr(_smoke_lib, name)

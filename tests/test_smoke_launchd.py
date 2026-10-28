@@ -353,25 +353,64 @@ def test_cli_ci_skips_with_exit_zero(env):
 # --------------------------------------------------------------------------
 
 
+def _st(smoke, pid="100", listener="100", **kw):
+    """An AgentState for a running TCP job (overridable per field)."""
+    base = dict(
+        loaded=True,
+        pid=pid,
+        runs="1",
+        endpoint=("tcp", "127.0.0.1", "9565"),
+        plist="digest",
+        listener=listener,
+    )
+    base.update(kw)
+    return smoke.AgentState(**base)
+
+
 def test_compare_snapshots_identical(smoke):
-    s = {"pipecat.stt-server": ("100", "100"), "pipecat.stt-server.parakeet": (None, None)}
+    s = {
+        "pipecat.stt-server": _st(smoke),
+        "pipecat.stt-server.parakeet": smoke.AgentState(False, None, None, None, "d", None),
+    }
     assert smoke.compare_snapshots(s, dict(s)) == []
 
 
-def test_compare_snapshots_changed_pid(smoke):
-    before = {"pipecat.stt-server": ("100", "100")}
-    assert smoke.compare_snapshots(before, {"pipecat.stt-server": ("200", "100")})
+# one field changed (or unreadable) -> a difference naming that field. ``runs``
+# moves on a restart that came back to the same pid and listener.
+@pytest.mark.parametrize(
+    ("field", "after", "same"),
+    [
+        ("pid", "200", False),
+        ("listener", "999", False),
+        ("listener", None, False),
+        ("runs", "2", False),
+        ("loaded", False, False),
+        ("endpoint", ("tcp", "127.0.0.1", "9566"), False),
+        ("endpoint", ("unix", "/s.sock"), False),
+        ("plist", "other-digest", False),
+        ("plist", None, False),
+        ("plist", "unknown", False),
+        ("listener", "unknown", False),
+        ("runs", "1", True),
+        ("pid", "100", True),
+    ],
+)
+def test_compare_snapshots_field_state_space(smoke, field, after, same):
+    import dataclasses
 
-
-def test_compare_snapshots_changed_listener(smoke):
-    before = {"pipecat.stt-server": ("100", "100")}
-    assert smoke.compare_snapshots(before, {"pipecat.stt-server": ("100", "999")})
-    assert smoke.compare_snapshots(before, {"pipecat.stt-server": ("100", None)})
+    before = {"pipecat.stt-server": _st(smoke)}
+    changed = {
+        "pipecat.stt-server": dataclasses.replace(before["pipecat.stt-server"], **{field: after})
+    }
+    diffs = smoke.compare_snapshots(before, changed)
+    assert (diffs == []) is same
+    if not same:
+        assert any(field in d for d in diffs), diffs
 
 
 def test_compare_snapshots_appear_disappear(smoke):
-    a = {"pipecat.stt-server": ("100", "100")}
-    b = {**a, "pipecat.stt-server.parakeet": ("5", "5")}
+    a = {"pipecat.stt-server": _st(smoke)}
+    b = {**a, "pipecat.stt-server.parakeet": _st(smoke, "5", "5")}
     assert smoke.compare_snapshots(a, b)
     assert smoke.compare_snapshots(b, a)
 
@@ -408,7 +447,10 @@ def _agent_plist(path: Path, port: str) -> None:
 def test_guard_refuses_port_recorded_in_installed_agent_plist(smoke, env):
     _agent_plist(env.agents / "pipecat.stt-server.custom.plist", "9123")
     _agent_plist(env.agents / f"{SPARE}.plist", "9124")  # the spare's own port is not real
-    ports = smoke.agent_ports(home=env.home)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("PATH", env.path)
+        snap = smoke.snapshot_real_agents(home=env.home)
+    ports = smoke.snapshot_ports(snap, home=env.home)
     assert ports == {9123: "pipecat.stt-server.custom"}
     with pytest.raises(smoke.GuardRefused, match="pipecat.stt-server.custom"):
         smoke.check_guard(
@@ -421,10 +463,11 @@ def test_guard_refuses_port_recorded_in_installed_agent_plist(smoke, env):
         )
 
 
-def test_agent_ports_unreadable_plist_refuses(smoke, env):
+def test_snapshot_ports_unreadable_plist_refuses(smoke, env):
     (env.agents / "pipecat.stt-server.broken.plist").write_text("not a plist")
+    snap = {"pipecat.stt-server.broken": smoke.AgentState(False, None, None, None, "d", None)}
     with pytest.raises(smoke.GuardRefused):
-        smoke.agent_ports(home=env.home)
+        smoke.snapshot_ports(snap, home=env.home)
 
 
 # --------------------------------------------------------------------------
@@ -755,23 +798,10 @@ def test_inject_fail_still_tears_down(env):
     _assert_torn_down(env)
 
 
-def _endpointless_plist(path: Path) -> None:
-    import plistlib
-
-    with open(path, "wb") as fh:
-        plistlib.dump(
-            {
-                "Label": path.stem,
-                "ProgramArguments": [sys.executable, "-m", "stt_server", "serve"],
-            },
-            fh,
-        )
-
-
 def test_unreadable_baseline_snapshot_refuses_before_any_install(env):
-    # A real agent whose listener cannot be read is UNKNOWN in the baseline, so
+    # A real agent whose plist cannot be read is UNKNOWN in the baseline, so
     # "real agents unchanged" could never PASS: refuse before the first install.
-    _endpointless_plist(env.agents / "pipecat.stt-server.custom.plist")
+    (env.agents / "pipecat.stt-server.custom.plist").mkdir()
     r = env.run(["--inject", "fail", "--port", str(_free_port())], env.spare_env())
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert "snapshot" in r.stdout and "pipecat.stt-server.custom" in r.stdout
@@ -784,15 +814,20 @@ def test_unreadable_baseline_snapshot_refuses_before_any_install(env):
     ("snap", "unknown"),
     [
         ({}, []),
-        ({"a": ("1", "1")}, []),
-        ({"a": (None, None)}, []),
-        ({"a": ("1", "unknown")}, ["a"]),
-        ({"a": (None, "unknown"), "b": ("2", "2")}, ["a"]),
-        ({"b": ("2", "unknown"), "a": ("1", "unknown")}, ["a", "b"]),
+        ({"a": ("1", "1", "d")}, []),
+        ({"a": (None, None, None)}, []),
+        ({"a": ("1", "unknown", "d")}, ["a"]),
+        ({"a": (None, None, "unknown")}, ["a"]),
+        ({"a": (None, "unknown", "d"), "b": ("2", "2", "d")}, ["a"]),
+        ({"b": ("2", "unknown", "d"), "a": ("1", "1", "unknown")}, ["a", "b"]),
     ],
 )
 def test_snapshot_unknowns_state_space(smoke, snap, unknown):
-    assert smoke.snapshot_unknowns(snap) == unknown
+    states = {
+        k: smoke.AgentState(pid is not None, pid, None, None, plist, listener)
+        for k, (pid, listener, plist) in snap.items()
+    }
+    assert smoke.snapshot_unknowns(states) == unknown
 
 
 def _run_lock(env: Env) -> Path:
@@ -1003,10 +1038,16 @@ _GHOST_PRINT = f"""gui/{FAKE_UID}/{_GHOST} = {{
 """
 
 
-def _fake_launchd(listed="", prints=None, listeners=(), list_rc=0):
+def _fake_launchd(listed="", prints=None, listeners=(), list_rc=0, calls=None):
+    """A ``run`` for the snapshot: ``launchctl list`` answers LISTED, ``print``
+    answers PRINTS[label] (exit 0; a missing label is launchctl's own "could not
+    find service"), ``lsof`` lists LISTENERS (None: lsof fails) for any target.
+    Every argv is appended to CALLS."""
     prints = prints or {}
 
     def run(argv, **_kw):
+        if calls is not None:
+            calls.append([str(a) for a in argv])
         tool = Path(str(argv[0])).name
         if tool == "id":
             return _cp(argv, 0, f"{FAKE_UID}\n")
@@ -1030,17 +1071,164 @@ def _fake_launchd(listed="", prints=None, listeners=(), list_rc=0):
 _LIST = f"PID\tStatus\tLabel\n777\t0\t{_GHOST}\n-\t0\t{SPARE}\n12\t0\tcom.apple.x\n"
 
 
+def _job_print(label, *, running=True, transport="tcp", port="9123", sock="/x/job.sock", runs="3"):
+    """A ``launchctl print`` body for a loaded job serving PORT (tcp) or SOCK."""
+    serve = (
+        ["--host", "127.0.0.1", "--port", port] if transport == "tcp" else ["--socket-path", sock]
+    )
+    args = "".join(f"\t\t{a}\n" for a in ["/venv/bin/python", "-m", "stt_server", "serve", *serve])
+    pid = "\tpid = 777\n" if running else ""
+    return (
+        f"gui/{FAKE_UID}/{label} = {{\n\tstate = {'running' if running else 'waiting'}\n"
+        f"\targuments = {{\n{args}\t}}\n\truns = {runs}\n{pid}}}\n"
+    )
+
+
+def _plist_for(path: Path, *, transport="tcp", port="9123", sock="/x/plist.sock") -> None:
+    import plistlib
+
+    serve = (
+        ["--host", "127.0.0.1", "--port", port] if transport == "tcp" else ["--socket-path", sock]
+    )
+    path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": path.stem,
+                "ProgramArguments": [sys.executable, "-m", "stt_server", "serve", *serve],
+            }
+        )
+    )
+
+
+# The snapshot's full state space: job loaded/unloaded x running or not x TCP or
+# socket x plist present/absent x the plist's endpoint equal to the job's or not.
+# The listener is read ONLY from the job's endpoint (its port, or its socket's
+# .lock), never from the plist; a job with no pid serves nothing (None, no lsof
+# call, an absent socket is not UNKNOWN); the plist is recorded as a digest and
+# its intended port still reaches the guard.
+_LABEL = "pipecat.stt-server.cell"
+
+
+@pytest.mark.parametrize("plist", ["absent", "same", "differ"])
+@pytest.mark.parametrize("transport", ["tcp", "unix"])
+@pytest.mark.parametrize("job", ["unloaded", "loaded-stopped", "running"])
+def test_snapshot_state_space(smoke, env, tmp_path, job, transport, plist):
+    job_sock = tmp_path / "job.sock"
+    plist_sock = tmp_path / "plist.sock"
+    if plist == "absent" and job == "unloaded":
+        pytest.skip("no plist and no job: not an agent")
+    if transport == "unix":
+        (tmp_path / "job.sock.lock").write_text("")  # held by 777 per the fake lsof
+    prints = {}
+    if job != "unloaded":
+        prints[_LABEL] = _job_print(
+            _LABEL, running=job == "running", transport=transport, port="9123", sock=str(job_sock)
+        )
+    if plist != "absent":
+        _plist_for(
+            env.agents / f"{_LABEL}.plist",
+            transport=transport,
+            port="9123" if plist == "same" else "9124",
+            sock=str(job_sock if plist == "same" else plist_sock),
+        )
+    listed = f"PID\tStatus\tLabel\n777\t0\t{_LABEL}\n" if job != "unloaded" else ""
+    calls: list[list[str]] = []
+    run = _fake_launchd(listed, prints, listeners=["777"], calls=calls)
+    st = smoke.snapshot_real_agents(run, home=env.home)[_LABEL]
+    lsof = [c for c in calls if Path(c[0]).name == "lsof"]
+
+    assert st.loaded == (job != "unloaded")
+    assert st.pid == ("777" if job == "running" else None)
+    assert st.runs == (None if job == "unloaded" else "3")
+    want_ep = None
+    if job != "unloaded":
+        want_ep = ("tcp", "127.0.0.1", "9123") if transport == "tcp" else ("unix", str(job_sock))
+    assert st.endpoint == want_ep
+    assert (st.plist is None) == (plist == "absent")
+    if job == "running":
+        assert st.listener == "777"
+        assert len(lsof) == 1
+        if transport == "tcp":
+            assert "-iTCP:9123" in lsof[0] and "-iTCP:9124" not in lsof[0]
+        else:
+            assert lsof[0][-1] == f"{job_sock}.lock"  # the job's lock, never the plist's
+    else:
+        assert st.listener is None and lsof == []
+    ports = smoke.snapshot_ports({_LABEL: st}, home=env.home)
+    want_ports = set()
+    if transport == "tcp" and job != "unloaded":
+        want_ports.add(9123)
+    if transport == "tcp" and plist != "absent":
+        want_ports.add(9123 if plist == "same" else 9124)
+    assert set(ports) == want_ports
+
+
+# A running job whose endpoint cannot be read is UNKNOWN (refuses the run); a
+# running socket job whose .lock does not exist has no holder (None, no lsof).
+@pytest.mark.parametrize(
+    ("transport", "lock", "listeners", "want", "lsof_calls"),
+    [
+        ("tcp", False, None, "unknown", 1),
+        ("tcp", False, [], None, 1),
+        ("unix", True, None, "unknown", 1),
+        ("unix", True, [], None, 1),
+        ("unix", False, ["777"], None, 0),
+        ("none", False, ["777"], "unknown", 0),
+    ],
+)
+def test_snapshot_running_listener_state_space(
+    smoke, env, tmp_path, transport, lock, listeners, want, lsof_calls
+):
+    sock = tmp_path / "job.sock"
+    if lock:
+        (tmp_path / "job.sock.lock").write_text("")
+    body = _job_print(_LABEL, transport="tcp" if transport == "none" else transport, sock=str(sock))
+    if transport == "none":
+        body = body.replace("\t\t--host\n\t\t127.0.0.1\n\t\t--port\n\t\t9123\n", "")
+    calls: list[list[str]] = []
+    listed = f"PID\tStatus\tLabel\n777\t0\t{_LABEL}\n"
+    run = _fake_launchd(listed, {_LABEL: body}, listeners=listeners, calls=calls)
+    snap = smoke.snapshot_real_agents(run, home=env.home)
+    assert snap[_LABEL].listener == want
+    assert len([c for c in calls if Path(c[0]).name == "lsof"]) == lsof_calls
+    assert (smoke.snapshot_unknowns(snap) == [_LABEL]) == (want == "unknown")
+
+
+# Transient mutation: a restart that came back to the same pid and listener moves
+# launchd's runs counter; a job that is loaded and booted out again before the
+# next boundary is caught there because the comparison runs before every check.
+def test_snapshot_catches_a_same_pid_restart_and_a_transient_load(smoke, env):
+    listed = f"PID\tStatus\tLabel\n777\t0\t{_LABEL}\n"
+    before = smoke.snapshot_real_agents(
+        _fake_launchd(listed, {_LABEL: _job_print(_LABEL, runs="3")}, ["777"]), home=env.home
+    )
+    restarted = smoke.snapshot_real_agents(
+        _fake_launchd(listed, {_LABEL: _job_print(_LABEL, runs="4")}, ["777"]), home=env.home
+    )
+    assert [d for d in smoke.compare_snapshots(before, restarted) if "runs" in d]
+    _plist_for(env.agents / "pipecat.stt-server.idle.plist")
+    idle = smoke.snapshot_real_agents(_fake_launchd(), home=env.home)
+    loaded = smoke.snapshot_real_agents(
+        _fake_launchd(
+            "PID\tStatus\tLabel\n9\t0\tpipecat.stt-server.idle\n",
+            {"pipecat.stt-server.idle": _job_print("pipecat.stt-server.idle", runs="1")},
+            ["777"],
+        ),
+        home=env.home,
+    )
+    assert smoke.compare_snapshots(idle, loaded)
+
+
 def test_snapshot_includes_a_loaded_agent_with_no_plist(smoke, env):
     run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT}, listeners=["777"])
     snap = smoke.snapshot_real_agents(run, home=env.home)
-    assert snap == {_GHOST: ("777", "777")}  # spare and non-pipecat labels excluded
+    assert list(snap) == [_GHOST]  # spare and non-pipecat labels excluded
+    assert (snap[_GHOST].pid, snap[_GHOST].listener, snap[_GHOST].plist) == ("777", "777", None)
 
 
 def test_plistless_agent_port_reaches_the_guard(smoke, env):
     run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT})
-    plistless = smoke.plistless_agents(FAKE_UID, run, env.home)
-    assert plistless[_GHOST]["--port"] == "9123"
-    ports = smoke.agent_ports(home=env.home, plistless=plistless)
+    ports = smoke.snapshot_ports(smoke.snapshot_real_agents(run, home=env.home), home=env.home)
     assert ports == {9123: _GHOST}
     with pytest.raises(smoke.GuardRefused, match=_GHOST):
         smoke.check_guard(
@@ -1055,8 +1243,9 @@ def test_plistless_agent_port_reaches_the_guard(smoke, env):
 
 def test_loaded_agent_with_a_plist_is_not_counted_twice(smoke, env):
     _agent_plist(env.agents / f"{_GHOST}.plist", "9123")
-    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT})
-    assert smoke.plistless_agents(FAKE_UID, run, env.home) == {}
+    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT}, listeners=["777"])
+    snap = smoke.snapshot_real_agents(run, home=env.home)
+    assert list(snap) == [_GHOST] and snap[_GHOST].plist is not None
 
 
 def test_unreadable_launchctl_list_fails_closed(smoke, env):
@@ -1064,28 +1253,16 @@ def test_unreadable_launchctl_list_fails_closed(smoke, env):
         smoke.snapshot_real_agents(_fake_launchd(list_rc=5), home=env.home)
 
 
-def test_unreadable_listener_is_unknown_in_the_snapshot(smoke, env):
-    run = _fake_launchd(_LIST, {_GHOST: _GHOST_PRINT}, listeners=None)
-    assert smoke.snapshot_real_agents(run, home=env.home) == {_GHOST: ("777", smoke.UNKNOWN)}
+def test_unreadable_job_print_fails_closed(smoke, env):
+    _agent_plist(env.agents / f"{_GHOST}.plist", "9123")
 
+    def run(argv, **kw):
+        if Path(str(argv[0])).name == "launchctl" and argv[1] == "print":
+            return _cp(argv, 5, "", "launchctl: Input/output error")
+        return _fake_launchd()(argv, **kw)
 
-# (listener before, listener after) -> unchanged? UNKNOWN on either side never is.
-@pytest.mark.parametrize(
-    ("b", "a", "same"),
-    [
-        ("100", "100", True),
-        (None, None, True),
-        ("100", "200", False),
-        ("100", None, False),
-        ("unknown", "unknown", False),
-        ("unknown", "100", False),
-        ("100", "unknown", False),
-        (None, "unknown", False),
-    ],
-)
-def test_compare_snapshots_listener_state_space(smoke, b, a, same):
-    diffs = smoke.compare_snapshots({"x": ("1", b)}, {"x": ("1", a)})
-    assert (diffs == []) is same
+    with pytest.raises(smoke.LaunchdUnreadable):
+        smoke.snapshot_real_agents(run, home=env.home)
 
 
 # --------------------------------------------------------------------------
@@ -1094,15 +1271,27 @@ def test_compare_snapshots_listener_state_space(smoke, b, a, same):
 
 
 class _FakeHarness:
+    """Gates before check i: the real-agent comparison (every check), then the
+    port check (every check but the first). LOSE_BEFORE stops the gate before
+    that check index: the agents gate for stop="agents", else the port gate."""
+
     def __init__(self, lose_before=None, stop="port"):
         self.lose_before = lose_before
         self.stop = stop
+        self.index = -1
+        self.compared = 0
         self.ensured = 0
         self.released = 0
 
+    def ensure_real_agents_unchanged(self):
+        self.index += 1
+        self.compared += 1
+        if self.stop == "agents" and self.lose_before == self.index:
+            raise _stop_exc(self.stop)
+
     def ensure_port_ours(self):
         self.ensured += 1
-        if self.lose_before == self.ensured:
+        if self.stop != "agents" and self.lose_before == self.index:
             raise _stop_exc(self.stop)
 
     def release_holder(self):
@@ -1115,7 +1304,16 @@ _SMOKE = None
 def _stop_exc(stop):
     if stop == "port":
         return _SMOKE.PortLost("port 1 is held by pid 9, not the spare job")
+    if stop == "agents":
+        return _SMOKE.RealAgentsChanged("pipecat.stt-server: runs 1 -> 2")
     return _SMOKE.LaunchdUnreadable("cannot read the launchd state of the spare")
+
+
+_STOP_PREFIX = {
+    "port": "port lost",
+    "launchd": "launchd state unreadable",
+    "agents": "real agents changed",
+}
 
 
 def _checks(ran, behaviours, stop="port"):
@@ -1140,18 +1338,23 @@ def _checks(ran, behaviours, stop="port"):
 _NAMES = ("port collision", "socket rollback", "token file")
 
 
-# what stops the checks (the port lost, the spare's launchd state unreadable) x
-# where (inside check i, or in the gate before check i) x what the other checks
-# do -> rows: the stopping check FAILs, later ones are SKIPPED and never run.
-@pytest.mark.parametrize("stop", ["port", "launchd"])
+# what stops the checks (the port lost, the spare's launchd state unreadable, a
+# real agent changed) x where (inside check i, or in the gate before check i; the
+# real-agent gate runs before every check, the port gate before all but the
+# first) x what the other checks do -> rows: the stopping check FAILs, later
+# ones are SKIPPED and never run.
+@pytest.mark.parametrize("stop", ["port", "launchd", "agents"])
 @pytest.mark.parametrize("other", ["ok", "fail", "crash"])
 @pytest.mark.parametrize(
-    "where", [("in", 0), ("in", 1), ("in", 2), ("before", 1), ("before", 2), (None, None)]
+    "where",
+    [("in", 0), ("in", 1), ("in", 2), ("before", 0), ("before", 1), ("before", 2), (None, None)],
 )
 def test_run_checks_stop_state_space(smoke, where, other, stop):
     global _SMOKE
     _SMOKE = smoke
     kind, at = where
+    if where == ("before", 0) and stop != "agents":
+        pytest.skip("no port gate runs before the first check")
     behaviours = [
         (n, "lost" if (kind == "in" and i == at) else other) for i, n in enumerate(_NAMES)
     ]
@@ -1164,12 +1367,14 @@ def test_run_checks_stop_state_space(smoke, where, other, stop):
     for i, (name, status, detail) in enumerate(rows):
         if lost_at is not None and i == lost_at:
             assert status == smoke.FAIL
-            assert ("port lost" if stop == "port" else "launchd state unreadable") in detail
+            assert _STOP_PREFIX[stop] in detail
         elif lost_at is not None and i > lost_at:
             assert status == smoke.SKIPPED and name not in ran
         else:
             assert status == (smoke.PASS if other == "ok" else smoke.FAIL)
     assert h.released == len(rows) - (len(_NAMES) - 1 - lost_at if lost_at is not None else 0)
+    # The real-agent gate ran before every check that started.
+    assert h.compared == (lost_at + 1 if lost_at is not None else len(_NAMES))
 
 
 # an interrupt inside check i x what the earlier checks did -> the interrupt
