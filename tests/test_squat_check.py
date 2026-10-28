@@ -285,6 +285,85 @@ def test_recheck_launchctl_unreadable_keeps_callers_pid(capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_recheck_launchctl_unreadable_with_persistent_squatter_is_cannot_tell(capsys):
+    # The re-read of the pid failed, so the caller's pid 100 may be stale (a
+    # restart could have made the listener 200 the job's own): exit 2, no warning.
+    w = World([[(200, "nc", HOST)], [(200, "nc", HOST)]], launchctl_rc=5)
+    assert _check(w, pid=100, label="pipecat.stt-server") == 2
+    err = capsys.readouterr().err
+    assert PREFIX not in err and len(err.strip().splitlines()) == 1
+
+
+# The re-check's launchd read x the second listener observation -> exit code.
+# (re-read answer, second listener pid) for a caller pid of 100.
+@pytest.mark.parametrize(
+    ("launchctl_rc", "pids", "second", "want"),
+    [
+        (None, (100, 100), 100, 0),  # re-read pid matches the listener
+        (None, (100, 100), 200, 3),  # re-read pid, persistent squatter
+        (None, (100, 200), 200, 0),  # restarted: the new pid is the listener
+        (5, (None,), 100, 0),  # unreadable, listener matches the caller's pid
+        (5, (None,), 200, 2),  # unreadable, would warn on a stale pid
+        (5, (None,), None, 0),  # unreadable, listener gone
+    ],
+)
+def test_recheck_pid_state_space(capsys, launchctl_rc, pids, second, want):
+    snap2 = [] if second is None else [(second, "nc", HOST)]
+    w = World([[(200, "nc", HOST)], snap2], launchd_pids=pids, launchctl_rc=launchctl_rc)
+    assert _check(w, pid=100, label="pipecat.stt-server") == want
+    assert (PREFIX in capsys.readouterr().err) == (want == 3)
+
+
+# lsof's answer (exit, stdout, stderr) -> lsof_output: the whole state space.
+# Exit 1 with no stderr or only "lsof: WARNING:" lines is "nothing matched".
+_WARN = "lsof: WARNING: can't stat() smbfs file system /Volumes/x\n"
+
+
+@pytest.mark.parametrize(
+    ("rc", "out", "err", "want"),
+    [
+        (0, "p1\n", "", "p1\n"),
+        (0, "p1\n", _WARN, "p1\n"),
+        (1, "", "", ""),
+        (1, "", "  \n", ""),
+        (1, "", _WARN, ""),
+        (1, "", _WARN + "lsof: WARNING: Output information may be incomplete.\n", ""),
+        (1, "", _WARN + "lsof: status error on /x.lock: No such file or directory\n", None),
+        (1, "", "lsof: status error on /x.lock: No such file or directory\n", None),
+        (1, "", "WARNING: not lsof's own line\n", None),
+        (2, "", "", None),
+        (2, "", _WARN, None),
+        (127, "", "lsof: not found\n", None),
+    ],
+)
+def test_lsof_output_state_space(rc, out, err, want):
+    def run(argv, **_kw):
+        return subprocess.CompletedProcess(argv, rc, out, err)
+
+    assert squat_check.lsof_output(["-Fp"], run) == want
+
+
+def test_warning_only_no_match_is_no_listener_not_cannot_tell(capsys):
+    def run(argv, **_kw):
+        return subprocess.CompletedProcess(argv, 1, "", _WARN)
+
+    assert squat_check.listener_pids(PORT, HOST, run) == []
+    assert squat_check.lsof_pids(["--", "/x.lock"], run) == []
+    assert squat_check.check(HOST, PORT, "100", True, run=run, sleep=lambda _s: None) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_every_lsof_call_suppresses_warnings():
+    w = World([[(200, "nc", HOST)], [(200, "nc", HOST)]])
+    assert _check(w, pid=100) == 3  # listener reads plus the -Fc command read
+    calls = w.lsof_calls()
+    assert any("-Fc" in c for c in calls)
+    for argv in calls:
+        assert "-w" in argv, argv
+    squat_check.lsof_pids(["--", "/x.lock"], w.run)
+    assert "-w" in w.lsof_calls()[-1]
+
+
 @pytest.mark.parametrize(
     ("rc", "stderr", "want"),
     [

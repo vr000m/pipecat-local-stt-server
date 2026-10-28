@@ -8,8 +8,9 @@ Read-only: it runs ``lsof`` (and, for the confirm pass, ``launchctl print``),
 never starts, stops or signals anything. Stdout is always empty. Each warning is
 one block on stderr, every line starting ``squat-check: warning:``.
 
-Exit status: 0 quiet, 3 warned, 2 cannot tell (``lsof`` missing or failed; a
-one-line note on stderr, no warning).
+Exit status: 0 quiet, 3 warned, 2 cannot tell (``lsof`` missing or failed, or
+the confirm pass could not re-read the launchd pid; a one-line note on stderr, no
+warning).
 
 The invariant (Decision 5): the PID listening on the agent's port must equal the
 PID launchd reports for the agent. Two warnings break it:
@@ -24,6 +25,8 @@ A finding is only reported after a 1-second re-check, so a restart in flight (th
 launchd pid or the listener changing between the two reads) never warns. The
 re-check re-reads the listeners and, when ``--label`` is given, the pid with
 ``launchctl print gui/<uid>/<label>``; without ``--label`` it reuses ``--pid``.
+When that re-read fails, a finding that persists is "cannot tell" (exit 2), never a
+warning resting on the first pass's pid.
 
 Visibility limit (Decision 6): ``lsof`` run as the user lists only the user's own
 processes' sockets. A listener owned by another uid is invisible, so this check
@@ -37,9 +40,15 @@ ignored on both sides.
 The confirm pass re-reads the job's state with ``--label``: a job that became
 unloaded within the second is quiet again (Decision 2, case a).
 
-The ``lsof`` and ``launchctl print`` readers here are also imported by
-``scripts/smoke_launchd.py`` so the harness and the recipes share one listener
-definition.
+``lsof`` runs with ``-w`` (warnings off). Its "nothing matched" answer is exit 1
+with no stderr, or with only ``lsof: WARNING:`` lines; any other exit 1 message,
+or an exit of 2 or more, is "cannot tell".
+
+Import surface: besides the CLI, ``scripts/smoke_launchd.py`` imports
+``lsof_output``, ``lsof_pids`` (its ``.lock`` holder read), ``listener_pids``
+and ``launchd_state`` (with the ``uid`` keyword), so the harness and the recipes
+share one listener and launchd-state definition. Everything else here is
+private to this module.
 
 Stdlib only: it runs under the system python3 (``python3 -I``).
 """
@@ -60,22 +69,30 @@ _LOCALHOST = frozenset({"127.0.0.1", "::1"})
 # launchctl print's answer for a label that is not loaded (exit 113).
 _NOT_LOADED_RC = 113
 _NOT_LOADED_RE = re.compile(r"could not find service", re.IGNORECASE)
+_LSOF_WARNING = "lsof: WARNING"
+
+
+def _only_warnings(stderr):
+    """True when STDERR is empty or holds only ``lsof: WARNING:`` lines."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return all(ln.startswith(_LSOF_WARNING) for ln in lines)
 
 
 def lsof_output(args, run=subprocess.run):
-    """``lsof -nP <args>`` stdout, or None when lsof can't tell.
+    """``lsof -nP -w <args>`` stdout, or None when lsof can't tell.
 
     ``args`` must carry its ``-F`` fields before any ``--`` (after ``--`` lsof
     reads every word as a file name)."""
     try:
-        res = run(["lsof", "-nP", *args], capture_output=True, text=True, timeout=10)
+        res = run(["lsof", "-nP", "-w", *args], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
-    # lsof exits 1 with no output when nothing matches; a non-zero exit with a
-    # message (a missing file, a bad option) is a failure.
-    if res.returncode not in (0, 1) or (res.returncode == 1 and (res.stderr or "").strip()):
-        return None
-    return res.stdout or ""
+    # lsof exits 1 when nothing matches, with no stderr or (should -w not cover
+    # one) only warnings; exit 1 with any other message (a missing file, a bad
+    # option) or an exit of 2 or more is a failure.
+    if res.returncode == 0 or (res.returncode == 1 and _only_warnings(res.stderr)):
+        return res.stdout or ""
+    return None
 
 
 def _lsof(port, run):
@@ -145,7 +162,7 @@ def _commands(pids, run):
     for pid in pids:
         try:
             res = run(
-                ["lsof", "-nP", "-p", pid, "-Fc"],
+                ["lsof", "-nP", "-w", "-p", pid, "-Fc"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -211,9 +228,14 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
 
     # Confirm: a restart in flight changes the pid or the listener within a second.
     sleep(1)
+    pid_current = True
     if label:
         state = launchd_state(label, run)
-        if state is not None:  # can't tell: keep the caller's observation
+        if state is None:
+            # Can't tell: the caller's pid may be stale, so it can only clear a
+            # finding (a listener that now matches it), never confirm one.
+            pid_current = False
+        else:
             if not state[0]:
                 return 0  # unloaded within the second: quiet, as in the first pass
             pid = state[1] or ""
@@ -225,6 +247,9 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
     kind = _finding(listeners, pid)
     if kind is None:
         return 0
+    if not pid_current:
+        print("squat-check: cannot re-read the launchd pid; skipping port check", file=sys.stderr)
+        return 2
 
     cmds = _commands(listeners, run)
     if kind == "b":
