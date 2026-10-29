@@ -614,10 +614,12 @@ ignoring TCP settings, a dropped token for a socket agent, a retried bootstrap).
 (token-file refusal and acceptance on a spare port without launchd, a decode
 through each real agent, `smoke_supervised.py --backend echo`, same-uid
 peer-cred). New in 0.5.1: the launchd harness (`scripts/smoke_launchd.py`) ran
-live once, on 2026-10-28, against the spare label and port 9998. The port
-collision (with the squat warning), the socket rollback, the token file and the
-teardown all passed, each answer's server end was verified against the spare
-job, and the real agents were unchanged afterwards. That run confirms that
+live three times, on 2026-10-28, against the spare label and port 9998; the
+last run, on the final code of that day's closing pass, had all five rows PASS.
+The port collision (with the squat warning), the socket rollback, the token
+file and the teardown all passed, each answer's server end was verified against
+the spare job, and the real agents were unchanged afterwards. Review fixes made
+after that run are covered by stubbed tests. Those runs confirm that
 `launchctl print` prints a `runs =` line and that `LOCAL_PEERPID` and `lsof`
 identify a launchd job's server end. Still covered only by stubbed tests (stub
 `launchctl`, `lsof` and `id`, a temp home): the `smoke.py` code that now

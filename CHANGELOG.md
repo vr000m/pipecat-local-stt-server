@@ -38,8 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worst-case budget, teardown included. The shared
   `assert_token_gate` in `scripts/_smoke_lib.py` checks that a request without
   the token gets 401 and with it is accepted, sending the token only over a
-  connection whose server end is the expected process. Run live once against the
-  spare label and port (all checks passed); the rest is covered by stubbed tests.
+  connection whose server end is the expected process. Run live three times
+  against the spare label and port, the last (on the closing-pass code) with all
+  five rows PASS; the rest is covered by stubbed tests.
 
 - **Unified `just smoke [--agents] [--launchd]`**. `scripts/smoke.py` runs the
   supervised (echo), peer-cred and token-file checks and prints one table of
