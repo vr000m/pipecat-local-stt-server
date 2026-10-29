@@ -1781,7 +1781,7 @@ def test_harness_squat_check_uses_the_recipes_form_and_no_answer_on_argv(
         f"""#!/usr/bin/env bash
 printf 'launchctl %s\\n' "$*" >> {tmp_path / "launchctl.log"}
 if [[ "$1" == "print" ]]; then
-    printf 'state = running\\n\\tpid = 4242\\n\\tenvironment = {{\\n'
+    printf 'state = running\\n\\tpid = 4242\\n\\truns = 3\\n\\tenvironment = {{\\n'
     printf '\\t\\tKODA_STT_AUTH_TOKEN => {secret}\\n\\t}}\\n'
     exit 0
 fi
