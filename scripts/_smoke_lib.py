@@ -617,6 +617,17 @@ class GroupNotStopped(RuntimeError):
     started may still be running; the caller must treat this as a failure."""
 
 
+def group_not_stopped(exc: BaseException) -> GroupNotStopped | None:
+    """The GroupNotStopped EXC is or carries: a held signal's exception
+    (e.g. KeyboardInterrupt) that ``run_owned`` raised after a group it could
+    not show stopped carries it as ``group_not_stopped`` (and as its
+    ``__cause__``); None when the group was not left running."""
+    if isinstance(exc, GroupNotStopped):
+        return exc
+    found = getattr(exc, "group_not_stopped", None)
+    return found if isinstance(found, GroupNotStopped) else None
+
+
 class OwnedGroup:
     """A child started in its own session (so it leads its own process group),
     signalled only while this process owns that group (see the invariant
@@ -780,8 +791,14 @@ def run_owned(
     Raises GroupNotStopped when the group could not be shown stopped: the
     SIGKILL failed (anything but ESRCH, or EPERM once the leader has exited,
     macOS's answer for a zombie-only group) or the leader was not reaped
-    after it. No result is returned as success then."""
+    after it. No result is returned as success then. That verdict is decided
+    BEFORE a held signal is redelivered, so the handler's exception cannot
+    hide it: when the handler raises, its exception propagates carrying the
+    GroupNotStopped (``group_not_stopped(exc)``, also its ``__cause__``);
+    otherwise GroupNotStopped is raised, also over an exception in flight."""
     held: tuple[list[int], dict] = ([], {})
+    group = None
+    kill_error = None
     try:
         with held_signals() as held:
             got, _old = held
@@ -811,11 +828,20 @@ def run_owned(
                 kill_error = group.kill_group()
                 group.reap()
     finally:
+        not_stopped = None
+        if group is not None and (kill_error is not None or not group.reaped):
+            why = kill_error or f"pid {group.pid} was still running after SIGKILL and the reap wait"
+            not_stopped = GroupNotStopped(f"{why}; its process group may still be running")
         got, old = held
         if got:
-            redeliver(got[0], old.get(got[0]))
+            try:
+                redeliver(got[0], old.get(got[0]))
+            except BaseException as sig_exc:
+                if not_stopped is not None:
+                    sig_exc.group_not_stopped = not_stopped
+                    raise sig_exc from not_stopped
+                raise
+        if not_stopped is not None:
+            raise not_stopped
     out, err = group.output()
-    if kill_error is not None or not group.reaped:
-        why = kill_error or f"pid {group.pid} was still running after SIGKILL and the reap wait"
-        raise GroupNotStopped(f"{why}; its process group may still be running")
     return subprocess.CompletedProcess(cmd, group.proc.returncode, out, err), timed_out

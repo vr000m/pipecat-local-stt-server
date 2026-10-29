@@ -2197,8 +2197,163 @@ def test_installer_group_not_stopped_is_a_failure(smoke, env, monkeypatch, where
         monkeypatch.setenv("HOME", str(env.home))
         monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
         monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
-        problems = smoke.Harness(SPARE, _free_port()).teardown()
+        h = smoke.Harness(SPARE, _free_port())
+        plist = env.agents / f"{SPARE}.plist"
+        plist.write_text("<plist/>")
+        problems = h.teardown()
         assert any("uninstall failed" in p and "EPERM" in p for p in problems), problems
+        # The uninstall itself may still be running: nothing more is removed.
+        assert "teardown changed nothing" in problems[0] and plist.exists()
+
+
+# run_owned decides "group not stopped" BEFORE it redelivers a held signal:
+# the group kill (stopped / not stopped) x the held signal (none, a handler
+# that raises, a handler that returns) -> the outcome. A raising handler's
+# exception carries the GroupNotStopped (group_not_stopped, and as __cause__);
+# otherwise GroupNotStopped is raised. The handler always gets the signal.
+@pytest.mark.parametrize("held", ["none", "raises", "returns"])
+@pytest.mark.parametrize("stopped", [True, False])
+def test_run_owned_group_not_stopped_survives_a_held_signal(smoke, monkeypatch, stopped, held):
+    import errno
+
+    lib = smoke._smoke_lib
+    real_killpg, real_group = os.killpg, lib.OwnedGroup
+    got: list[int] = []
+
+    class Group(real_group):
+        def __init__(self, *a, **k):
+            if held != "none":
+                os.kill(os.getpid(), signal.SIGINT)  # arrives while held
+            super().__init__(*a, **k)
+
+    def killpg(pgid, sig):
+        if stopped:
+            return real_killpg(pgid, sig)
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+
+    def handler(signum, _frame):
+        got.append(signum)
+        if held == "raises":
+            raise KeyboardInterrupt(f"signal {signum}")
+
+    monkeypatch.setattr(lib, "OwnedGroup", Group)
+    monkeypatch.setattr(lib.os, "killpg", killpg)
+    old = signal.signal(signal.SIGINT, handler)
+    try:
+        with (
+            pytest.raises(BaseException)
+            if (held == "raises" or not stopped)
+            else (contextlib.nullcontext()) as caught
+        ):
+            res, _ = lib.run_owned([sys.executable, "-c", "pass"], 30, interrupt_signal=None)
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert got == ([] if held == "none" else [signal.SIGINT])
+    if held == "raises":
+        exc = caught.value
+        assert isinstance(exc, KeyboardInterrupt)
+        gns = lib.group_not_stopped(exc)
+        if stopped:
+            assert gns is None
+        else:
+            assert isinstance(gns, lib.GroupNotStopped) and exc.__cause__ is gns
+    elif not stopped:
+        assert isinstance(caught.value, lib.GroupNotStopped)
+    else:
+        assert res.returncode is not None  # a result (a held signal stops it: -9)
+
+
+# After an installer that could not be shown stopped the teardown changes
+# nothing: whether the installer group stopped x whether a signal was held
+# during the install (the harness's own handler raises KeyboardInterrupt) ->
+# the run's rows and the teardown path. Not stopped (with or without the
+# signal): the install row is "installer not stopped", no uninstall runs, the
+# spare's artifacts are untouched, and the teardown row FAILs with the
+# shell-quoted cleanup commands. Stopped: the uninstall runs and removes them.
+@pytest.mark.parametrize("signalled", [False, True])
+@pytest.mark.parametrize("stopped", [True, False])
+def test_teardown_changes_nothing_after_an_installer_not_stopped(
+    smoke, env, monkeypatch, stopped, signalled
+):
+    import errno
+    import shlex
+
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setenv("PATH", env.path)
+    lib = smoke._smoke_lib
+    real_killpg = os.killpg
+    fake = env.tmp / "fake installer.sh"
+    _exe(
+        fake, "#!/bin/bash\n" + ('kill -INT "$PPID"\nsleep 0.3\n' if signalled else "") + "exit 0\n"
+    )
+    monkeypatch.setattr(smoke, "INSTALLER", fake)
+    subs = []
+    real_run_owned = lib.run_owned
+
+    def run_owned(cmd, *a, **k):
+        subs.append(cmd[-1])
+        return real_run_owned(cmd, *a, **k)
+
+    def killpg(pgid, sig):
+        if stopped or subs[-1] == "uninstall":
+            return real_killpg(pgid, sig)
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+
+    monkeypatch.setattr(lib, "run_owned", run_owned)
+    monkeypatch.setattr(lib.os, "killpg", killpg)
+    monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
+    monkeypatch.setattr(smoke, "snapshot_real_agents", lambda *a, **k: {})
+
+    class H(smoke.Harness):
+        def ensure_real_agents_unchanged(self):
+            pass
+
+        def ensure_port_ours(self):
+            pass
+
+    h = H(SPARE, _free_port())
+    plist = env.agents / f"{SPARE}.plist"
+    plist.write_text("<plist/>")  # read_stt_plist cannot parse it: logs by the naming rule
+    logs = smoke._log_paths(SPARE)
+    for p in logs:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("log\n")
+    checks = (
+        ("a", lambda: smoke.install(smoke.install_env(SPARE, h.port), "a")),
+        ("b", lambda: "ran"),
+    )
+    results: list = []
+    rc = smoke.checks_then_teardown(h, checks, results, {}, env.home)
+    rows = {n: (s, d) for n, s, d in results}
+    assert rc == 1 or stopped
+    teardown_status, teardown_detail = rows["teardown"]
+    if stopped:
+        assert subs == ["install", "uninstall"]
+        if signalled:
+            assert rows["interrupted"][0] == smoke.FAIL
+        else:
+            assert rows["a"][0] == smoke.PASS and rows["b"] == (smoke.PASS, "ran")
+        assert not plist.exists() and not any(p.exists() for p in logs)
+        return
+    assert subs == ["install"]  # no uninstall beside a possibly running installer
+    assert rows["a"][0] == smoke.FAIL and rows["a"][1].startswith("installer not stopped")
+    assert rows["b"][0] == smoke.SKIPPED
+    if signalled:
+        assert "KeyboardInterrupt" in rows["a"][1]
+    assert plist.exists() and all(p.exists() for p in logs)  # nothing removed
+    assert teardown_status == smoke.FAIL
+    assert "teardown changed nothing" in teardown_detail
+    assert str(plist) in teardown_detail
+    bootout = f"cleanup: launchctl bootout gui/{h.uid}/{SPARE}"
+    assert bootout in teardown_detail
+    rm = next(p for p in teardown_detail.split("; ") if p.startswith("cleanup: rm -f "))
+    assert shlex.split(rm[len("cleanup: ") :])[2:] == [
+        str(plist),
+        *map(str, logs),
+        str(h.sock),
+        str(smoke._lock_path(h.sock)),
+    ]
+    assert shlex.quote(str(fake)) in teardown_detail  # the pgrep check, quoted
 
 
 # Every --port syntax the server's parser accepts (argparse type=int over the

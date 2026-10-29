@@ -536,7 +536,13 @@ with a 120 s timeout: a SIGINT or SIGTERM during an install kills the
 installer's whole group before teardown starts, so teardown never runs beside a
 half-finished install. An installer group that cannot be shown stopped (its
 kill failed, or its leader was not reaped) is a failure that stops the
-remaining checks, never a result. The teardown's uninstall is not interrupted.
+remaining checks, never a result, also when a signal arrived during it. That
+installer may still bootstrap the spare or rewrite its plist, so the teardown
+then changes nothing (no uninstall, nothing removed): its row FAILs with the
+spare's launchd state, what is left behind and the cleanup commands
+(shell-quoted) to run once no installer process is left. The same holds when
+the teardown's own uninstall cannot be shown stopped. The teardown's uninstall
+is not interrupted.
 The harness runs everything (the installer included) with a scrubbed
 environment: `HOME`, `USER`, `TMPDIR`, the spare label and log-dir variables
 and the fixed `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; `BASH_ENV`, `ENV`,

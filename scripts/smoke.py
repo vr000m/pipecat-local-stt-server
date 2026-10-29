@@ -474,9 +474,11 @@ def build_and_run(agents: bool, launchd: bool) -> list[StepResult]:
         try:
             results.append(step())
         except KeyboardInterrupt as exc:
-            results.append(
-                StepResult(name, FAIL, f"interrupted ({exc})" if str(exc) else "interrupted")
-            )
+            detail = f"interrupted ({exc})" if str(exc) else "interrupted"
+            not_stopped = _smoke_lib.group_not_stopped(exc)
+            if not_stopped is not None:  # the step's group could not be shown stopped
+                detail = f"{detail}; {not_stopped}"
+            results.append(StepResult(name, FAIL, detail))
             results += [
                 StepResult(n, SKIPPED, "not run: the run was interrupted")
                 for n, _s in steps[i + 1 :]

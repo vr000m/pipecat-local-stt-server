@@ -938,7 +938,9 @@ def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.
     uninstall) a signal does not stop the installer. INSTALL_TIMEOUT kills the
     group and raises subprocess.TimeoutExpired. A group that cannot be shown
     stopped (the SIGKILL failed, or the leader was not reaped) raises
-    InstallerNotStopped, never a result."""
+    InstallerNotStopped, never a result, also when a held signal arrived
+    during the call (its exception then carries the GroupNotStopped,
+    ``_smoke_lib.group_not_stopped``; it is the cause here)."""
     cmd = [BASH, str(INSTALLER), sub]
     try:
         res, timed_out = _smoke_lib.run_owned(
@@ -950,8 +952,12 @@ def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.
             interrupt_signal=None,
             timeout_signal=None,
         )
-    except _smoke_lib.GroupNotStopped as exc:
-        raise InstallerNotStopped(f"installer {sub}: {exc}") from exc
+    except BaseException as exc:
+        not_stopped = _smoke_lib.group_not_stopped(exc)
+        if not_stopped is None:
+            raise
+        also = "" if exc is not_stopped else f" ({type(exc).__name__} {exc} arrived during it)"
+        raise InstallerNotStopped(f"installer {sub}: {not_stopped}{also}") from exc
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, INSTALL_TIMEOUT, output=res.stdout, stderr=res.stderr)
     return res
@@ -991,6 +997,9 @@ class Harness:
         self.sock_dir_made = False
         self.token_dir: Path | None = None
         self.holder = None  # the collision check's port occupier
+        # Why an installer call may still be running (InstallerNotStopped):
+        # set by run_checks; teardown then changes nothing (frozen_teardown).
+        self.installer_not_stopped: str | None = None
 
     # -- waits
 
@@ -1349,10 +1358,15 @@ class Harness:
         """Remove everything the harness created; touches only the spare label.
         Every removal that fails, and every artifact still present at the end
         (``lexists``: a dangling symlink counts), is a problem, so a teardown
-        that did not clean up can never PASS."""
+        that did not clean up can never PASS. After an installer call that
+        could not be shown stopped (``installer_not_stopped``, or the
+        uninstall's own InstallerNotStopped) nothing more is changed:
+        ``frozen_teardown``."""
         problems: list[str] = []
         label = self.label
         self.release_holder()
+        if self.installer_not_stopped:
+            return self.frozen_teardown(self.installer_not_stopped)
         logs = _log_paths(label)  # read StandardErrorPath before the plist goes
         try:
             socket_in_plist = read_plist_field(label, "socket-path")
@@ -1366,7 +1380,9 @@ class Harness:
                 problems.append(
                     f"uninstall: exit {res.returncode}: {(res.stderr or '').strip()[-200:]}"
                 )
-        except (OSError, subprocess.SubprocessError, InstallerNotStopped) as exc:
+        except InstallerNotStopped as exc:
+            return problems + self.frozen_teardown(f"uninstall failed: {exc}")
+        except (OSError, subprocess.SubprocessError) as exc:
             problems.append(f"uninstall failed: {exc}")
 
         self.remove_spare_socket(problems)
@@ -1410,6 +1426,50 @@ class Harness:
             problems.append("left behind: " + ", ".join(str(p) for p in left))
         return problems
 
+    def frozen_teardown(self, why: str) -> list[str]:
+        """The teardown when an installer call may still be running (WHY): it
+        could still bootstrap the spare or rewrite its plist, so the harness
+        neither runs the uninstall nor removes anything (no launchd change, no
+        unlink). It only reads: which spare artifacts exist now and the
+        spare's launchd state, and reports them with the exact cleanup
+        commands (each word shell-quoted) to run once no installer process is
+        left. Always problems: the teardown row FAILs."""
+        label = self.label
+        try:
+            logs = _log_paths(label)
+        except Exception as exc:  # noqa: BLE001 - the report must still print
+            logs = []
+            unread = f"; cannot read the spare's log paths: {exc}"
+        else:
+            unread = ""
+        artifacts = [_plist_path(label), *logs, self.sock, _lock_path(self.sock)]
+        try:
+            loaded, _pid = require_launchd_state(label, self.uid)
+            state = "loaded" if loaded else "not loaded"
+        except RuntimeError as exc:
+            state = f"unreadable ({exc})"
+        left = [str(p) for p in artifacts if os.path.lexists(p)]
+        if self.token_dir is not None and os.path.lexists(self.token_dir):
+            left.append(str(self.token_dir))
+        if self.sock_dir_made and os.path.lexists(self.sock.parent):
+            left.append(str(self.sock.parent))
+        cmds = [
+            shell_command("launchctl", "bootout", f"gui/{self.uid}/{label}"),
+            shell_command("rm", "-f", *artifacts),
+        ]
+        if self.token_dir is not None:
+            cmds.append(shell_command("rm", "-rf", self.token_dir))
+        if self.sock_dir_made:
+            cmds.append(shell_command("rmdir", self.sock.parent))
+        return [
+            f"{why}; an installer may still be running, so teardown changed nothing "
+            f"(no uninstall, nothing removed){unread}",
+            f"{label} is {state}; left behind now: {', '.join(left) or 'nothing'}",
+            f"once {shell_command('pgrep', '-fl', str(INSTALLER))} lists no installer, "
+            "clean up by hand",
+            *(f"cleanup: {c}" for c in cmds),
+        ]
+
 
 # --- main -------------------------------------------------------------------
 
@@ -1442,6 +1502,8 @@ def run_checks(harness, checks, rows: list) -> list:
                 harness.ensure_port_ours()
             rows.append((name, PASS, fn()))
         except STOP_CHECKS as exc:
+            if isinstance(exc, InstallerNotStopped):
+                harness.installer_not_stopped = str(exc)
             prefix, why = next(v for k, v in _STOP_REASONS.items() if isinstance(exc, k))
             rows.append((name, FAIL, f"{prefix}: {exc}"))
             rows += [(n, SKIPPED, f"not run: {why}") for n, _f in checks[i + 1 :]]

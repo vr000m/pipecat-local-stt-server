@@ -1691,3 +1691,21 @@ def test_smoke_supervised_server_stderr_never_blocks(monkeypatch, tmp_path, star
         name, ok, detail = sup.RESULTS[-1]
         assert name.startswith("S13") and ok, detail
         assert "LAST-STDERR-LINE" in detail
+
+
+# A step interrupted while its group could not be shown stopped: what the
+# KeyboardInterrupt carries -> the interrupted row names the GroupNotStopped
+# too, and the later steps are SKIPPED either way.
+@pytest.mark.parametrize("carries", [False, True])
+def test_interrupted_row_names_a_group_not_stopped(smoke, monkeypatch, carries):
+    def step(*_a):
+        exc = KeyboardInterrupt("signal 2")
+        if carries:
+            exc.group_not_stopped = smoke._smoke_lib.GroupNotStopped("cannot SIGKILL group 7")
+        raise exc
+
+    monkeypatch.setattr(smoke, "supervised_step", step)
+    rows = smoke.build_and_run(False, False)
+    assert rows[0].outcome == smoke.FAIL and rows[0].detail.startswith("interrupted (signal 2)")
+    assert ("cannot SIGKILL group 7" in rows[0].detail) is carries
+    assert {r.outcome for r in rows[1:]} == {smoke.SKIPPED}
