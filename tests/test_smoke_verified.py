@@ -10,6 +10,7 @@ process (and a real echo ``stt_server``), never launchd.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import socket
@@ -193,6 +194,62 @@ def test_ws_handshake_sends_a_token_only_over_a_given_socket(lib, token, given_s
             with pytest.raises(OSError):  # the listener never answers
                 lib.ws_handshake_status(host=host, port=port, token=token, timeout=0.5, **kw)
     finally:
+        srv.close()
+
+
+# The status-line read has ONE deadline and a byte cap: peer behaviour ->
+# outcome and how long it may take. A trickle (a byte every 50 ms, never a
+# CRLF, for 4 s) must not extend the 0.5 s deadline; a flood with no CRLF stops
+# at STATUS_LINE_MAX; a prompt status line is read as before.
+@pytest.mark.parametrize(
+    ("peer", "want", "within"),
+    [
+        ("status", 101, 2.0),
+        ("trickle", "timeout", 1.5),
+        ("flood", "cap", 1.5),
+        ("silent", "timeout", 1.5),
+    ],
+)
+def test_ws_handshake_status_line_has_one_deadline(lib, peer, want, within):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    stop = threading.Event()
+
+    def serve():
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(4096)
+            if peer == "status":
+                conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+            elif peer == "flood":
+                with contextlib.suppress(OSError):
+                    conn.sendall(b"x" * (4 * lib.STATUS_LINE_MAX))
+            end = time.monotonic() + 4.0
+            while not stop.is_set() and time.monotonic() < end:
+                if peer == "trickle":
+                    with contextlib.suppress(OSError):
+                        conn.sendall(b"x")
+                time.sleep(0.05)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        sock = socket.create_connection(srv.getsockname(), timeout=2)
+        start = time.monotonic()
+        if want == 101:
+            assert lib.ws_handshake_status(sock=sock, timeout=0.5) == 101
+        else:
+            with pytest.raises(OSError) as exc:
+                lib.ws_handshake_status(sock=sock, timeout=0.5)
+            if want == "timeout":
+                assert isinstance(exc.value, TimeoutError)
+            else:
+                assert f"first {lib.STATUS_LINE_MAX} bytes" in str(exc.value)
+        assert time.monotonic() - start < within
+    finally:
+        stop.set()
+        t.join(5)
         srv.close()
 
 

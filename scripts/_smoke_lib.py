@@ -232,7 +232,10 @@ UNKNOWN = squat_check.UNKNOWN
 SOL_LOCAL = 0  # <sys/un.h>, macOS
 LOCAL_PEERPID = 2  # <sys/un.h>, macOS: pid of the peer at connect time
 SERVER_END_SETTLE = 3.0  # how long lsof gets to see the accepted server end
-HANDSHAKE_TIMEOUT = 5.0  # each socket operation's bound: connect, and each recv
+# The bound on the connect, and (separately) on the whole request-and-status-
+# line exchange after it: one deadline, never reset by a byte that arrives.
+HANDSHAKE_TIMEOUT = 5.0
+STATUS_LINE_MAX = 4096  # bytes read for the status line before it is "no status line"
 
 
 class EndpointRefused(Exception):
@@ -421,6 +424,11 @@ def ws_handshake_status(
     wrong token is a 401 and an accepted request is a 101. A TOKEN (or a wrong
     one, which is nearly the token) is sent only over SOCK, which the caller
     got from ``connect_verified``; with an address it is a ValueError.
+
+    Bounds: the connect gets TIMEOUT; then sending the request and reading
+    the status line share ONE deadline of TIMEOUT (a peer that trickles bytes
+    without a CRLF cannot extend it), and at most STATUS_LINE_MAX bytes are
+    read. Past either, OSError (TimeoutError for the deadline).
     """
     import base64
 
@@ -436,6 +444,14 @@ def ws_handshake_status(
         if host is None or port is None:
             raise ValueError("provide host+port or unix_path")
         sock = socket.create_connection((host, port), timeout=timeout)
+    deadline = time.monotonic() + timeout
+
+    def left() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"no HTTP status line within {timeout:g}s")
+        return remaining
+
     try:
         lines = [
             "GET / HTTP/1.1",
@@ -447,10 +463,14 @@ def ws_handshake_status(
         ]
         if token:
             lines.append(f"Authorization: Bearer {token}")
+        sock.settimeout(left())
         sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
         buf = b""
         while b"\r\n" not in buf:
-            chunk = sock.recv(1024)
+            if len(buf) >= STATUS_LINE_MAX:
+                raise OSError(f"no HTTP status line in the first {STATUS_LINE_MAX} bytes")
+            sock.settimeout(left())
+            chunk = sock.recv(min(1024, STATUS_LINE_MAX - len(buf)))
             if not chunk:
                 break
             buf += chunk
