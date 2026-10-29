@@ -573,6 +573,53 @@ def _token_check() -> int:
         signal.signal(signal.SIGTERM, old_term)
 
 
+# Every name stt_server.client.TranscriptionClient.connect uses (its globals,
+# attributes and methods), as client.py has it: byte-identical to main, the
+# surface Koda pins by SHA. The swap in _verified_client is sound only while
+# connect opens its uri-branch websocket through the module-global ws_connect
+# and nothing else, so before anything is sent the decode requires connect to
+# run in that module's globals, to look ws_connect up there, and to use no
+# name outside this set (a direct websockets call or a new helper would add
+# one): otherwise it refuses, until this set is re-checked against client.py.
+_CONNECT_NAMES = frozenset(
+    {
+        "_auth_token", "_uri", "ws_connect", "P", "MAX_APPEND_BYTES", "_ws",
+        "_socket_path", "ws_unix_connect", "format_host_for_uri", "_host", "_port",
+        "_recv_json", "get", "EVT_SERVER_HELLO", "RuntimeError", "EVT_SESSION_CREATED",
+    }
+)  # fmt: skip
+
+
+def _connect_swap_problem(client_mod) -> str | None:
+    """Why the verified-socket swap cannot be trusted to carry
+    ``TranscriptionClient.connect``'s connection (see ``_CONNECT_NAMES``), or
+    None when it can."""
+    import dis
+    import types
+
+    fn = client_mod.TranscriptionClient.connect
+    code = getattr(fn, "__code__", None)
+    if code is None or getattr(fn, "__globals__", None) is not vars(client_mod):
+        return "TranscriptionClient.connect does not run in stt_server.client's globals"
+    names: set[str] = set()
+    stack = [code]
+    while stack:
+        co = stack.pop()
+        names.update(co.co_names)
+        stack += [k for k in co.co_consts if isinstance(k, types.CodeType)]
+    new = sorted(names - _CONNECT_NAMES)
+    if new:
+        return (
+            "TranscriptionClient.connect uses names the verified-socket swap was not "
+            f"checked against: {', '.join(new)}"
+        )
+    if "ws_connect" not in {
+        i.argval for i in dis.get_instructions(code) if i.opname == "LOAD_GLOBAL"
+    }:
+        return "TranscriptionClient.connect no longer looks up the module-global ws_connect"
+    return None
+
+
 def _verified_client(sock, uri: str, token: str | None):
     """A ``TranscriptionClient`` that speaks over SOCK, a connection
     ``connect_verified`` already checked, instead of opening its own.
@@ -584,25 +631,38 @@ def _verified_client(sock, uri: str, token: str | None):
     ``stt_server/client.py`` stays unchanged (it is the surface Koda pins by
     SHA). The client is built with ``uri=URI``, so the uri branch, the one that
     calls ``ws_connect``, is the one connect takes; a call for any other uri,
-    or any other transport, is refused rather than opened elsewhere."""
+    or any other transport, is refused rather than opened elsewhere. A
+    production connect the swap cannot be shown to carry
+    (``_connect_swap_problem``) is refused before anything is sent, and a
+    connect that returns without calling the swap exactly once is an error."""
     import stt_server.client as client_mod
 
     class VerifiedSocketClient(client_mod.TranscriptionClient):
         async def connect(self) -> dict:
+            problem = _connect_swap_problem(client_mod)
+            if problem:
+                raise RuntimeError(f"refusing to connect, nothing sent: {problem}")
             real = client_mod.ws_connect
+            calls = []
 
             def over_verified_sock(target, **kw):
                 if target != uri or "sock" in kw:
                     raise RuntimeError(
                         f"refusing a transport other than the verified socket: {target}"
                     )
+                calls.append(target)
                 return real(target, sock=sock, **kw)
 
             client_mod.ws_connect = over_verified_sock
             try:
-                return await super().connect()
+                hello = await super().connect()
             finally:
                 client_mod.ws_connect = real
+            if len(calls) != 1:
+                raise RuntimeError(
+                    f"connect opened the verified socket {len(calls)} times, not once"
+                )
+            return hello
 
     return VerifiedSocketClient(uri=uri, auth_token=token)
 
@@ -612,7 +672,9 @@ def _decode(args: argparse.Namespace) -> int:
 
     The token arrives on stdin. Before anything is sent, the connection's
     server end must be the launchd job (ARGS.pid, ARGS.runs) of ARGS.label
-    (``_smoke_lib.connect_verified``); a refusal exits ``DECODE_REFUSED``."""
+    (``_smoke_lib.connect_verified``), and first of all the production
+    connect must be one the verified-socket swap carries
+    (``_connect_swap_problem``); a refusal exits ``DECODE_REFUSED``."""
     import asyncio
     import wave
 
@@ -621,6 +683,12 @@ def _decode(args: argparse.Namespace) -> int:
     from stt_server.protocol import EVT_TRANSCRIPT_COMPLETED
 
     token = sys.stdin.read().strip() or None
+    import stt_server.client as client_mod
+
+    problem = _connect_swap_problem(client_mod)
+    if problem:
+        print(f"refused: {problem}", file=sys.stderr)
+        return DECODE_REFUSED
     with wave.open(args.wav) as w:
         data = w.readframes(w.getnframes())
     if args.socket_path:

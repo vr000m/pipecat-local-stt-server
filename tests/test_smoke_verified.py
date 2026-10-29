@@ -650,11 +650,13 @@ def test_verified_client_runs_the_production_connect_tail(tail):
     spec.loader.exec_module(smoke)
     frames, error = _TAILS[tail]
     names = {"hello": P.EVT_SERVER_HELLO, "created": P.EVT_SESSION_CREATED}
-    seen = []
+    seen, peers = [], []
+    ours = []
     real = client_mod.ws_connect
 
     async def go():
         async def handler(ws):
+            peers.append(ws.remote_address[:2])
             seen.append(ws.request.headers.get("Authorization"))
             for f in frames:
                 await ws.send(json.dumps({"type": names.get(f, f)}))
@@ -663,6 +665,7 @@ def test_verified_client_runs_the_production_connect_tail(tail):
         async with serve(handler, "127.0.0.1", 0) as server:
             port = server.sockets[0].getsockname()[1]
             sock = socket.create_connection(("127.0.0.1", port))
+            ours.append(sock.getsockname()[:2])
             c = smoke._verified_client(sock, f"ws://127.0.0.1:{port}/", "tok")
             try:
                 return await c.connect()
@@ -675,7 +678,139 @@ def test_verified_client_runs_the_production_connect_tail(tail):
         with pytest.raises(RuntimeError, match=error):
             asyncio.run(go())
     assert seen == ["Bearer tok"]
+    # Exactly one connection was served, and it was the pre-created (verified)
+    # socket: its peer address is that socket's own local address.
+    assert peers == ours, (peers, ours)
     assert client_mod.ws_connect is real
+
+
+# The swap fails closed before anything is sent when the production connect
+# could open its own connection: the kind of connect -> refused (with the
+# reason) or run; a refused connect sends nothing, so the server accepts no
+# connection and sees no token. "production" is client.py as it is.
+_BYPASS = {
+    # A uri branch calling websockets directly (the swap never sees it).
+    "direct-websockets": (
+        "async def connect(self):\n"
+        "    self._ws = await websockets.asyncio.client.connect(\n"
+        "        self._uri, additional_headers={'Authorization': 'Bearer ' + self._auth_token})\n"
+        "    return {}\n",
+        "client",
+        "names the verified-socket swap was not checked against",
+    ),
+    # A new helper method holding the transport call.
+    "helper-method": (
+        "async def connect(self):\n    return await self._open()\n",
+        "client",
+        "names the verified-socket swap was not checked against",
+    ),
+    # ws_connect bound in another module's globals: the swap cannot reach it.
+    "foreign-globals": (
+        "async def connect(self):\n"
+        "    self._ws = await ws_connect(self._uri, additional_headers="
+        "{'Authorization': 'Bearer ' + self._auth_token})\n"
+        "    return {}\n",
+        "foreign",
+        "does not run in stt_server.client's globals",
+    ),
+    # Only allowed names, but ws_connect read as an attribute, not a global.
+    "no-global-lookup": (
+        "async def connect(self):\n    return self._ws.ws_connect\n",
+        "client",
+        "no longer looks up the module-global ws_connect",
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", ["production", *_BYPASS])
+def test_verified_client_refuses_a_connect_the_swap_cannot_carry(monkeypatch, kind):
+    import asyncio
+
+    import websockets.asyncio.client
+    from websockets.asyncio.server import serve
+
+    import stt_server.client as client_mod
+
+    sys.path.insert(0, str(REPO_ROOT))
+    spec = importlib.util.spec_from_file_location("smoke_runner_bypass", SCRIPTS / "smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    sys.modules["smoke_runner_bypass"] = smoke
+    spec.loader.exec_module(smoke)
+    if kind != "production":
+        src, where, why = _BYPASS[kind]
+        scope = (
+            vars(client_mod)
+            if where == "client"
+            else {"ws_connect": websockets.asyncio.client.connect, "websockets": websockets}
+        )
+        ns: dict = {}
+        exec(compile(src, f"<{kind}>", "exec"), scope, ns)
+        monkeypatch.setattr(client_mod.TranscriptionClient, "connect", ns["connect"])
+        assert smoke._connect_swap_problem(client_mod) is not None
+    else:
+        assert smoke._connect_swap_problem(client_mod) is None
+    seen = []
+
+    async def go():
+        async def handler(ws):
+            seen.append(ws.request.headers.get("Authorization"))
+            await ws.send('{"type": "server.hello"}')
+            await ws.send('{"type": "session.created"}')
+            await asyncio.sleep(1)
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            sock = socket.create_connection(("127.0.0.1", port))
+            c = smoke._verified_client(sock, f"ws://127.0.0.1:{port}/", "tok")
+            try:
+                return await c.connect()
+            finally:
+                sock.close()
+                if c._ws is not None:
+                    await c._ws.close()
+
+    if kind == "production":
+        asyncio.run(go())
+        assert seen == ["Bearer tok"]
+    else:
+        with pytest.raises(RuntimeError, match=f"refusing to connect, nothing sent: .*{why}"):
+            asyncio.run(go())
+        assert seen == []  # no connection served: no token on the wire
+
+
+# The decode child checks the swap before it even connects: a swap problem
+# -> DECODE_REFUSED ("not decoded, no token sent"), and no connection opened.
+@pytest.mark.parametrize("problem", [None, "connect changed"])
+def test_decode_refuses_before_connecting_when_the_swap_cannot_carry(
+    monkeypatch, tmp_path, problem
+):
+    import argparse
+    import io
+    import wave
+
+    sys.path.insert(0, str(REPO_ROOT))
+    spec = importlib.util.spec_from_file_location("smoke_runner_decode", SCRIPTS / "smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    sys.modules["smoke_runner_decode"] = smoke
+    spec.loader.exec_module(smoke)
+    wav = tmp_path / "c.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(16000), w.writeframes(b"\0" * 320)
+    connects = []
+
+    def connect_verified(*a, **k):
+        connects.append(a)
+        raise smoke._smoke_lib.EndpointRefused("stop here")
+
+    monkeypatch.setattr(smoke, "_connect_swap_problem", lambda mod: problem)
+    monkeypatch.setattr(smoke._smoke_lib, "connect_verified", connect_verified)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("tok\n"))
+    args = argparse.Namespace(
+        wav=str(wav), keyword="x", label="l", pid="1", runs="1",
+        socket_path=None, host="127.0.0.1", port="1",
+    )  # fmt: skip
+    assert smoke._decode(args) == smoke.DECODE_REFUSED
+    assert len(connects) == (0 if problem else 1)
 
 
 # The swap admits only the verified socket: a connect for another uri (or one
