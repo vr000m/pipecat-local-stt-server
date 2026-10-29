@@ -88,6 +88,23 @@ def _stub_path_is_the_harness_path(smoke, monkeypatch):
     monkeypatch.setattr(smoke._smoke_lib, "safe_path", lambda: os.environ.get("PATH", ""))
 
 
+# The environment names the harness derives paths from (and so would unlink
+# under, in teardown): the log dir (``_log_dir``) and HOME (``env_home``: the
+# spare plist, socket and default log dir).
+_PATH_ENV = ("PIPECAT_STT_LOG_DIR", "KODA_STT_LOG_DIR")
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_harness_paths(monkeypatch, tmp_path_factory):
+    """No in-process test inherits a path from the developer's shell: the log
+    dir variables are removed and HOME is a fresh empty temp dir (a test that
+    needs its own sets HOME itself), so ``Harness.teardown`` called directly
+    can never unlink a file in a real folder."""
+    for name in _PATH_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("isolated-home")))
+
+
 def _exe(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -3380,3 +3397,16 @@ def test_rollback_check_end_to_end(smoke, monkeypatch, tmp_path, short_home, fau
             a.close()
         with contextlib.suppress(OSError):
             os.unlink(f"{sock}.lock")
+
+
+# The isolation fixture is active for every test: whatever the developer's
+# shell exported (the log dir names, HOME) -> the harness's log dir and home
+# are under the test's own temp tree, never the inherited folder.
+def test_no_test_inherits_a_harness_path_from_the_shell(smoke, tmp_path_factory):
+    for name in _PATH_ENV:
+        assert name not in os.environ, name
+    home = smoke._home().resolve()
+    assert home.is_relative_to(tmp_path_factory.getbasetemp().resolve()), home
+    assert home != Path(os.path.expanduser("~" + os.environ.get("USER", ""))).resolve()
+    assert smoke._log_dir().resolve().is_relative_to(home)
+    assert not any(home.iterdir())  # a fresh, empty home
