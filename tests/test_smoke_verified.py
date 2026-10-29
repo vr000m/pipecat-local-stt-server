@@ -289,14 +289,6 @@ def test_verified_client_handshakes_over_the_verified_socket(lib, transport):
 
         async def go():
             async with smoke._verified_client(sock, uri, None) as c:
-                # Only the transport step is the smoke client's own: connect
-                # (the headers and the server.hello / session.created tail)
-                # is the production TranscriptionClient's.
-                from stt_server.client import TranscriptionClient
-
-                cls = type(c)
-                assert cls.connect is TranscriptionClient.connect
-                assert [n for n in vars(cls) if not n.startswith("__")] == ["_open_ws"]
                 return c._ws is not None
 
         assert asyncio.run(asyncio.wait_for(go(), 30))
@@ -570,3 +562,81 @@ def test_agents_decode_contract_end_to_end(transport, cell, tmp_path):
     else:
         assert res.returncode == 1, res.stderr
         assert len(agent.requests) == 1  # the gate passed; the agent refused the token
+
+
+# smoke.py's verified-socket client runs the PRODUCTION connect (unchanged
+# stt_server/client.py, the surface Koda pins): only its transport call is
+# swapped for the verified socket. What the server sends first -> hello
+# returned or the production client's own error, the bearer header sent on
+# the verified socket, and the client module's ws_connect restored after.
+_TAILS = {
+    "ok": (["hello", "created"], None),
+    "no-hello": (["bogus", "created"], "expected server.hello, got bogus"),
+    "no-created": (["hello", "x"], "expected session.created, got x"),
+}
+
+
+@pytest.mark.parametrize("tail", list(_TAILS))
+def test_verified_client_runs_the_production_connect_tail(tail):
+    import asyncio
+    import json
+
+    from websockets.asyncio.server import serve
+
+    import stt_server.client as client_mod
+    from stt_server import protocol as P
+
+    sys.path.insert(0, str(REPO_ROOT))
+    spec = importlib.util.spec_from_file_location("smoke_runner_tail", SCRIPTS / "smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    sys.modules["smoke_runner_tail"] = smoke
+    spec.loader.exec_module(smoke)
+    frames, error = _TAILS[tail]
+    names = {"hello": P.EVT_SERVER_HELLO, "created": P.EVT_SESSION_CREATED}
+    seen = []
+    real = client_mod.ws_connect
+
+    async def go():
+        async def handler(ws):
+            seen.append(ws.request.headers.get("Authorization"))
+            for f in frames:
+                await ws.send(json.dumps({"type": names.get(f, f)}))
+            await asyncio.sleep(1)
+
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            sock = socket.create_connection(("127.0.0.1", port))
+            c = smoke._verified_client(sock, f"ws://127.0.0.1:{port}/", "tok")
+            try:
+                return await c.connect()
+            finally:
+                await c.close()
+
+    if error is None:
+        assert asyncio.run(go())["type"] == P.EVT_SERVER_HELLO
+    else:
+        with pytest.raises(RuntimeError, match=error):
+            asyncio.run(go())
+    assert seen == ["Bearer tok"]
+    assert client_mod.ws_connect is real
+
+
+# The swap admits only the verified socket: a connect for another uri (or one
+# that already names a socket) is refused, never opened.
+def test_verified_client_refuses_any_other_transport(monkeypatch):
+    import asyncio
+
+    import stt_server.client as client_mod
+
+    sys.path.insert(0, str(REPO_ROOT))
+    spec = importlib.util.spec_from_file_location("smoke_runner_swap", SCRIPTS / "smoke.py")
+    smoke = importlib.util.module_from_spec(spec)
+    sys.modules["smoke_runner_swap"] = smoke
+    spec.loader.exec_module(smoke)
+    opened = []
+    monkeypatch.setattr(client_mod, "ws_connect", lambda *a, **k: opened.append(a))
+    c = smoke._verified_client(object(), "ws://127.0.0.1:1/", None)
+    c._uri = "ws://elsewhere:2/"
+    with pytest.raises(RuntimeError, match="refusing a transport"):
+        asyncio.run(c.connect())
+    assert opened == []

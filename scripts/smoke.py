@@ -575,20 +575,34 @@ def _token_check() -> int:
 
 def _verified_client(sock, uri: str, token: str | None):
     """A ``TranscriptionClient`` that speaks over SOCK, a connection
-    ``connect_verified`` already checked, instead of opening its own. It
-    overrides ONLY the transport step (``_open_ws``): the headers (the bearer
-    token) and the handshake (``server.hello`` then ``session.created``) are
-    the production ``connect``'s own."""
-    from websockets.asyncio.client import connect as ws_connect
+    ``connect_verified`` already checked, instead of opening its own.
 
-    from stt_server import protocol as P
-    from stt_server.client import TranscriptionClient
+    It runs the production ``TranscriptionClient.connect`` itself (its
+    headers, the bearer token, and its ``server.hello`` / ``session.created``
+    handshake), replacing ONLY that method's transport call: for the call, the
+    client module's ``ws_connect`` is one that opens the websocket on SOCK.
+    ``stt_server/client.py`` stays unchanged (it is the surface Koda pins by
+    SHA). The client is built with ``uri=URI``, so the uri branch, the one that
+    calls ``ws_connect``, is the one connect takes; a call for any other uri,
+    or any other transport, is refused rather than opened elsewhere."""
+    import stt_server.client as client_mod
 
-    class VerifiedSocketClient(TranscriptionClient):
-        async def _open_ws(self, headers):
-            return await ws_connect(
-                uri, sock=sock, additional_headers=headers, max_size=P.MAX_APPEND_BYTES
-            )
+    class VerifiedSocketClient(client_mod.TranscriptionClient):
+        async def connect(self) -> dict:
+            real = client_mod.ws_connect
+
+            def over_verified_sock(target, **kw):
+                if target != uri or "sock" in kw:
+                    raise RuntimeError(
+                        f"refusing a transport other than the verified socket: {target}"
+                    )
+                return real(target, sock=sock, **kw)
+
+            client_mod.ws_connect = over_verified_sock
+            try:
+                return await super().connect()
+            finally:
+                client_mod.ws_connect = real
 
     return VerifiedSocketClient(uri=uri, auth_token=token)
 

@@ -1996,33 +1996,3 @@ async def test_client_connect_transport_unchanged(monkeypatch, kwargs, want, tok
     assert calls == [
         (want[0], want[1], {"additional_headers": headers, "max_size": P.MAX_APPEND_BYTES})
     ]
-
-
-# The handshake tail belongs to connect(), whatever opened the transport: a
-# subclass that overrides only _open_ws (smoke.py's verified-socket client)
-# gets the production headers and the production checks. first frames ->
-# hello returned, or the production error.
-@pytest.mark.parametrize(
-    ("frames", "error"),
-    [
-        (_HANDSHAKE, None),
-        ([json.dumps({"type": "bogus"}), _HANDSHAKE[1]], "expected server.hello, got bogus"),
-        ([_HANDSHAKE[0], json.dumps({"type": "x"})], "expected session.created, got x"),
-        ([b"\0", _HANDSHAKE[1]], "unexpected binary frame"),
-    ],
-)
-async def test_open_ws_override_runs_the_production_tail(frames, error):
-    seen = []
-
-    class Transport(TranscriptionClient):
-        async def _open_ws(self, headers):
-            seen.append(headers)
-            return _FakeWs(frames)
-
-    c = Transport(uri="ws://x/", auth_token="tok")
-    if error is None:
-        assert (await c.connect())["type"] == P.EVT_SERVER_HELLO
-    else:
-        with pytest.raises(RuntimeError, match=error):
-            await c.connect()
-    assert seen == [{"Authorization": "Bearer tok"}]

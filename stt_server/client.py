@@ -126,7 +126,30 @@ class TranscriptionClient:
         headers = {}
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
-        self._ws = await self._open_ws(headers or None)
+        if self._uri:
+            self._ws = await ws_connect(
+                self._uri,
+                additional_headers=headers or None,
+                max_size=P.MAX_APPEND_BYTES,
+            )
+        elif self._socket_path:
+            self._ws = await ws_unix_connect(
+                self._socket_path,
+                "ws://localhost/",
+                additional_headers=headers or None,
+                max_size=P.MAX_APPEND_BYTES,
+            )
+        else:
+            # IPv6 literals (e.g. "::1") must be bracketed in URIs; unbracketed
+            # hosts go through unchanged so "localhost" / "127.0.0.1" / DNS
+            # names keep working.
+            host = format_host_for_uri(self._host)
+            uri = f"ws://{host}:{self._port}/"
+            self._ws = await ws_connect(
+                uri,
+                additional_headers=headers or None,
+                max_size=P.MAX_APPEND_BYTES,
+            )
         hello = await self._recv_json()
         if hello.get("type") != P.EVT_SERVER_HELLO:
             raise RuntimeError(f"expected server.hello, got {hello.get('type')}")
@@ -134,36 +157,6 @@ class TranscriptionClient:
         if created.get("type") != P.EVT_SESSION_CREATED:
             raise RuntimeError(f"expected session.created, got {created.get('type')}")
         return hello
-
-    async def _open_ws(self, headers: dict | None) -> ClientConnection:
-        """The transport step of ``connect``: open the websocket (sending
-        HEADERS, the bearer token when there is one) to ``uri``, else
-        ``socket_path``, else ``host``:``port``. ``connect`` then runs the
-        handshake (``server.hello``, ``session.created``) on it. A subclass
-        that already holds a connected socket overrides only this step, so the
-        handshake it runs is the production one."""
-        if self._uri:
-            return await ws_connect(
-                self._uri,
-                additional_headers=headers,
-                max_size=P.MAX_APPEND_BYTES,
-            )
-        if self._socket_path:
-            return await ws_unix_connect(
-                self._socket_path,
-                "ws://localhost/",
-                additional_headers=headers,
-                max_size=P.MAX_APPEND_BYTES,
-            )
-        # IPv6 literals (e.g. "::1") must be bracketed in URIs; unbracketed
-        # hosts go through unchanged so "localhost" / "127.0.0.1" / DNS
-        # names keep working.
-        host = format_host_for_uri(self._host)
-        return await ws_connect(
-            f"ws://{host}:{self._port}/",
-            additional_headers=headers,
-            max_size=P.MAX_APPEND_BYTES,
-        )
 
     async def _recv_json(self) -> dict:
         assert self._ws is not None
@@ -252,7 +245,7 @@ class TranscriptionClient:
             return
 
     # --- async context manager ---
-    async def __aenter__(self) -> TranscriptionClient:
+    async def __aenter__(self) -> "TranscriptionClient":
         await self.connect()
         return self
 
