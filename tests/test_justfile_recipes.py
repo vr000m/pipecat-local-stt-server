@@ -134,6 +134,9 @@ if [[ "$1" == "print" ]]; then
         if [[ -n "{launchd_pid if launchd_pid is not None else ""}" ]]; then
             printf '\\tpid = {launchd_pid}\\n'
         fi
+        # launchctl prints the spawn counter for a loaded job; the squat
+        # confirm pass needs it on both reads to warn.
+        printf '\\truns = 1\\n'
     elif [[ -n "{print_err}" ]]; then
         printf '%s\\n' "{print_err}" >&2
     fi
@@ -2607,7 +2610,7 @@ def test_launchctl_answer_never_reaches_argv(tmp_path, recipe):
         stub_dir / "launchctl",
         f"""#!/usr/bin/env bash
 if [[ "$1" == "print" ]]; then
-    printf 'state = running\\n\\tpid = 4242\\n\\tenvironment = {{\\n'
+    printf 'state = running\\n\\tpid = 4242\\n\\truns = 1\\n\\tenvironment = {{\\n'
     printf '\\t\\tKODA_STT_AUTH_TOKEN => {LEGACY_SECRET}\\n\\t}}\\n'
     exit 0
 fi
