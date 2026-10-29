@@ -2335,6 +2335,55 @@ def test_transport_recovery_requires_the_spare_jobs_server_end(
         assert connects == [(want_ep, "777", "3")]
 
 
+# Decision 12's post-exchange identity check in transport recovery: the FRESH
+# read after the exchange x transport -> tcp_up / sock_up True only when it
+# still gives the same (pid, runs); a restart (pid or runs changed) or an
+# unload during the exchange is CheckFailed, an unreadable read is
+# LaunchdUnreadable (the harness's stop rule).
+@pytest.mark.parametrize(
+    ("after", "want"),
+    [
+        ((True, "777", "3", None), True),
+        ((True, "778", "3", None), "changed"),
+        ((True, "777", "4", None), "changed"),
+        ((False, None, None, None), "changed"),
+        ("unreadable", "unreadable"),
+    ],
+)
+@pytest.mark.parametrize("transport", ["tcp", "unix"])
+def test_transport_recovery_rereads_the_identity_after_the_exchange(
+    smoke, env, monkeypatch, transport, after, want
+):
+    monkeypatch.setenv("HOME", str(env.home))
+    h = smoke.Harness(SPARE, _free_port())
+    reads = []
+
+    def read_job(label, uid, run=None):
+        reads.append(label)
+        if len(reads) == 1:
+            return (True, "777", "3", None)
+        if after == "unreadable":
+            raise smoke.LaunchdUnreadable("launchctl print exit 5")
+        return after
+
+    exchanged = []
+    monkeypatch.setattr(smoke, "read_job", read_job)
+    monkeypatch.setattr(smoke._smoke_lib, "connect_verified", lambda *a, **k: "verified-sock")
+    monkeypatch.setattr(
+        smoke._smoke_lib, "ws_handshake_status", lambda **kw: exchanged.append(kw) or 101
+    )
+    up = h.tcp_up if transport == "tcp" else h.sock_up
+    if want is True:
+        assert up() is True
+    elif want == "changed":
+        with pytest.raises(smoke.CheckFailed, match="changed during the exchange"):
+            up()
+    else:
+        with pytest.raises(smoke.LaunchdUnreadable):
+            up()
+    assert len(exchanged) == 1 and len(reads) == 2  # the fresh read follows the exchange
+
+
 # A hostile caller environment never reaches the installer or any harness
 # subprocess: each name below (bash startup files, an exported launchctl
 # function, Python startup and loader variables, a raw token, the caller's

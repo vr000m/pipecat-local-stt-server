@@ -194,8 +194,14 @@ def _connect_verified_bound() -> float:
 
 
 def _verified_status_bound() -> float:
-    """Harness.verified_status: read_job, connect_verified, the handshake."""
-    return squat_check.LAUNCHCTL_TIMEOUT + _connect_verified_bound() + _handshake_bound()
+    """Harness.verified_status: read_job, connect_verified, the handshake,
+    the fresh read afterwards."""
+    return (
+        squat_check.LAUNCHCTL_TIMEOUT
+        + _connect_verified_bound()
+        + _handshake_bound()
+        + squat_check.LAUNCHCTL_TIMEOUT
+    )
 
 
 def squat_cli_timeout() -> float:
@@ -1016,13 +1022,21 @@ class Harness:
         the token check): what proves the SPARE answered, not any listener.
         A job without a readable pid and runs, or a server end that is not
         its, is CheckFailed (``wait_for`` retries it); an unreadable launchd
-        state raises LaunchdUnreadable."""
+        state raises LaunchdUnreadable. After the exchange a FRESH read must
+        still give (pid, runs) (step 5 of the contract): a job that restarted
+        or unloaded during it is CheckFailed, so its answer proves nothing."""
         pid, runs = self.running_identity()
         try:
             sock = _smoke_lib.connect_verified(endpoint, pid, runs, self._identity)
         except _smoke_lib.EndpointRefused as exc:
             raise CheckFailed(f"not the spare job: {exc}") from exc
-        return _smoke_lib.ws_handshake_status(sock=sock)
+        status = _smoke_lib.ws_handshake_status(sock=sock)
+        now = self._identity()
+        if now != (pid, runs):
+            raise CheckFailed(
+                f"the spare job changed during the exchange (pid {pid}, runs {runs} -> {now})"
+            )
+        return status
 
     def running_identity(self, consequence: str = "") -> tuple[str, str]:
         """(pid, runs) of the spare job from ONE ``read_job``: the identity a
