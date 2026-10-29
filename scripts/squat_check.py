@@ -44,9 +44,9 @@ When that re-read fails, a finding that persists is "cannot tell" (exit 2), neve
 warning resting on the first pass's pid. With ``--label`` the pid is read once more
 after the second listener read; a pid or ``runs`` counter that changed across that
 listener read (the job restarted while lsof ran, or started, listened and exited
-with no pid on either side), a running job whose answer has no ``runs =`` line,
-or a read that failed is also "cannot tell", so a warning always compares the
-listeners with a job that held for the whole read.
+with no pid on either side), an answer with no ``runs =`` line (running or not:
+no counter, nothing to compare), or a read that failed is also "cannot tell", so
+a warning always compares the listeners with a job that held for the whole read.
 
 Visibility limit (Decision 6): ``lsof`` run as the user lists only the user's own
 processes' sockets. A listener owned by another uid is invisible, so this check
@@ -81,10 +81,18 @@ Import surface (besides the CLI), exactly what each importer uses:
 So the harness, the runner and the recipes share one listener definition and
 ONE ``launchctl print`` reader (``read_print`` + ``parse_print``, see "the one
 ``launchctl print`` reader" below); ``launchd_state``, ``launchd_identity``
-and ``read_job`` are thin wrappers over it. This module never imports
-``_smoke_lib`` (it runs alone under ``python3 -I``).
+and ``read_job`` are thin wrappers over it.
 
-Stdlib only: it runs under the system python3 (``python3 -I``).
+One file, by design. The recipes run it as ``python3 -I scripts/squat_check.py``
+under the system python3: ``-I`` (isolated mode) puts neither the script's
+directory nor the current directory on ``sys.path`` and ignores every
+``PYTHON*`` variable, so a file planted next to it or in the caller's directory
+cannot shadow a module it imports. The same rule means it cannot import a
+sibling of its own either: a helper split into another ``scripts/`` module
+would fail to import under ``-I``. So it stays one stdlib-only file, it never
+imports ``_smoke_lib`` (the dependency runs the other way), and the code the
+CLI and the importers share (the listener rule, the one ``launchctl print``
+reader) lives here.
 """
 
 from __future__ import annotations
@@ -396,15 +404,23 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
         # above and lsof would have its new pid compared with the old one, and
         # a job that started, listened and exited in between (no pid on either
         # side) would have its own listener reported. The spawn counter `runs`
-        # moves on every start, so it must hold too; an UNKNOWN one (a running
-        # job with no `runs =` line) never compares as unchanged.
+        # moves on every start, so it must hold too, as a number read on both
+        # sides: an UNKNOWN one (a running job with no `runs =` line) and a
+        # None one (a job with no pid and no line) never compare as unchanged,
+        # since None == None would let a start-listen-exit with no pid on
+        # either side pass as a job that held (fail closed: cannot tell).
         after = read_job_print(label, run)
         if after is not None and not after.loaded:
             return 0  # unloaded during the read: quiet, as above
-        if after is None or (after.pid or "") != pid or runs == UNKNOWN or after.runs != runs:
+        if (
+            after is None
+            or (after.pid or "") != pid
+            or runs in (None, UNKNOWN)
+            or after.runs != runs
+        ):
             print(
-                "squat-check: the launchd job changed (pid or runs) during the re-check; "
-                "skipping port check",
+                "squat-check: the launchd job changed (pid or runs), or showed no runs "
+                "counter, during the re-check; skipping port check",
                 file=sys.stderr,
             )
             return 2

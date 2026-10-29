@@ -48,9 +48,11 @@ class World:
     ``snapshots`` is a list of listener lists, each row ``(pid, command, addr)``
     with ``addr`` like ``127.0.0.1`` or ``*``; the snapshot index advances each
     time the code under test calls ``sleep``. ``launchd_pids`` follows the same
-    timeline for a ``launchctl print`` (None: no ``pid =`` line). A running job
-    (a pid) prints ``runs = 1``, as launchctl does; a ``launchd_reads`` answer
-    may name its own runs as a third item (None: no ``runs =`` line).
+    timeline for a ``launchctl print`` (None: no ``pid =`` line). A loaded job
+    prints ``runs = 1``, running or not (a running job's line is confirmed live;
+    a not-running one's is assumed, and its absence is "cannot tell" in the
+    re-check); a ``launchd_reads`` answer may name its own runs as a third item
+    (None: no ``runs =`` line).
     """
 
     def __init__(
@@ -106,7 +108,7 @@ class World:
                 if answer is None:
                     return subprocess.CompletedProcess(argv, 5, "", "launchctl: boom")
                 loaded, pid = answer[:2]
-                runs = answer[2] if len(answer) > 2 else ("1" if pid is not None else None)
+                runs = answer[2] if len(answer) > 2 else "1"
                 if not loaded:
                     return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
                 return subprocess.CompletedProcess(argv, 0, _print_body(pid, runs), "")
@@ -116,8 +118,7 @@ class World:
                 msg = f'Could not find service "{argv[2].rsplit("/", 1)[-1]}" in domain\n'
                 return subprocess.CompletedProcess(argv, 113, "", msg)
             pid = self._at(self.launchd_pids)
-            runs = "1" if pid is not None else None
-            return subprocess.CompletedProcess(argv, 0, _print_body(pid, runs), "")
+            return subprocess.CompletedProcess(argv, 0, _print_body(pid, "1"), "")
         if tool == "id":
             return subprocess.CompletedProcess(argv, 0, "501\n", "")
         raise AssertionError(f"unexpected command {argv!r}")
@@ -370,14 +371,18 @@ def test_recheck_brackets_the_listener_read_with_two_pid_reads(capsys, before, a
 # -> exit. A job that started, listened and exited between two no-pid reads
 # moved `runs`, so its own (now gone) listener is "cannot tell", never "label
 # not running"; a restart back to the same pid moved it too; a running job with
-# no `runs =` line (UNKNOWN) never compares as unchanged. Caller pid 100, first
-# listener 200.
+# no `runs =` line (UNKNOWN) never compares as unchanged, nor does a job with
+# no pid and no line (None on both sides). Caller pid 100, first listener 200.
 @pytest.mark.parametrize(
     ("before", "after", "second", "want"),
     [
         ((True, None, "4"), (True, None, "4"), 300, 3),  # stable, not running: warn
         ((True, None, "4"), (True, None, "5"), 300, 2),  # ran and exited mid-read
-        ((True, None, None), (True, None, None), 300, 3),  # never ran, no line: stable
+        # No pid and no line on both sides: None == None proves nothing (a
+        # start-listen-exit would leave it so if launchd printed no line), so
+        # it fails closed, never "label not running".
+        ((True, None, None), (True, None, None), 300, 2),
+        ((True, None, "4"), (True, None, None), 300, 2),  # a line, then none
         ((True, None, None), (True, None, "1"), 300, 2),  # first spawn mid-read
         ((True, 100, "4"), (True, 100, "4"), 200, 3),  # stable pid and runs: squatter
         ((True, 100, "4"), (True, 100, "5"), 200, 2),  # restarted back to pid 100
