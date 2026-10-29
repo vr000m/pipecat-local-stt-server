@@ -157,18 +157,6 @@ def run_command(
 
 
 @contextlib.contextmanager
-def _signals_held(*, reraise: bool = False):
-    """Hold SIGINT and SIGTERM to this process for the block (main thread only),
-    so a signal cannot cut a cleanup short. A signal that arrives is dropped,
-    or with ``reraise`` raised as KeyboardInterrupt once the old handlers are
-    back, so the run still stops."""
-    with _smoke_lib.held_signals() as (got, _old):
-        yield
-    if reraise and got:
-        raise KeyboardInterrupt(f"signal {got[0]}")
-
-
-@contextlib.contextmanager
 def _term_as_interrupt():
     """Make a SIGTERM to this runner raise KeyboardInterrupt, like Ctrl-C, so the
     active step is stopped through ``run_command`` instead of being orphaned."""
@@ -561,7 +549,9 @@ def _token_check() -> int:
         print(f"token gate OK on 127.0.0.1:{port}")
         return 0
     finally:
-        with _signals_held():
+        # Held, then dropped: this child is exiting anyway, and a second
+        # SIGTERM must not cut the cleanup short (_smoke_lib's policy table).
+        with _smoke_lib.held_signals():
             if server is not None and server.poll() is None:
                 server.terminate()
                 try:

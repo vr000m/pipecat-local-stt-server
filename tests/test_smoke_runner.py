@@ -1058,23 +1058,96 @@ def test_interrupt_stops_the_run_and_still_prints_the_table(
         assert _outcome(_row(out, name)) == "SKIPPED"
 
 
-# _signals_held(reraise) x the signal that arrives in the block -> raised?
+def test_smoke_uses_the_one_hold_helper(smoke):
+    # One hold helper (_smoke_lib.held_signals) for smoke.py and run_owned.
+    assert not hasattr(smoke, "_signals_held")
+    assert "_smoke_lib.held_signals()" in Path(smoke.__file__).read_text()
+
+
+# _smoke_lib.held_signals, the whole state space: hold (main thread) or no hold
+# (another thread) x reraise x a signal arrives in the block or not x nested
+# (an inner held_signals(reraise) inside the outer one, the signal arriving in
+# the inner block) -> KeyboardInterrupt raised?, what the block's `got` holds,
+# whether the process's own handler saw it, and the handlers restored after.
+# Nested: the inner block holds the signal and restores the outer hold, so the
+# outer `got` never sees it; only the INNER reraise can raise it.
+@pytest.mark.parametrize("hold", [True, False])
 @pytest.mark.parametrize("reraise", [False, True])
 @pytest.mark.parametrize("sig", [None, signal.SIGINT, signal.SIGTERM])
-def test_signals_held_state_space(smoke, reraise, sig):
-    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+@pytest.mark.parametrize("nested", [None, False, True])  # None: flat; else the inner reraise
+def test_held_signals_state_space(smoke, hold, reraise, sig, nested):
+    lib = smoke._smoke_lib
+    seen: list[int] = []
+
+    def record(signum, _frame):
+        seen.append(signum)
+
+    before = {s: signal.signal(s, record) for s in (signal.SIGINT, signal.SIGTERM)}
+    installed = {s: signal.getsignal(s) for s in before}
+    outcome: dict = {}
+
+    def fire():
+        if sig is not None:
+            os.kill(os.getpid(), sig)
+            time.sleep(0.2)  # the main thread runs the handler in the block
 
     def body():
-        with smoke._signals_held(reraise=reraise):
-            if sig is not None:
-                os.kill(os.getpid(), sig)
-                time.sleep(0.2)  # let the handler run inside the block
+        try:
+            with lib.held_signals(reraise=reraise) as (got, _old):
+                outcome["got"] = got
+                if nested is None:
+                    fire()
+                else:
+                    with lib.held_signals(reraise=nested) as (inner, _o):
+                        outcome["inner"] = inner
+                        fire()
+                    outcome["outer_after_inner"] = signal.getsignal(signal.SIGINT)
+        except KeyboardInterrupt:
+            outcome["raised"] = True
 
-    if reraise and sig is not None:
-        with pytest.raises(KeyboardInterrupt):
+    try:
+        if hold:
             body()
+        else:
+            t = threading.Thread(target=body)
+            t.start()
+            t.join()
+            time.sleep(0.2)  # the main thread's handler runs for an unheld signal
+        after = {s: signal.getsignal(s) for s in before}
+    finally:
+        for s, h in before.items():
+            signal.signal(s, h)
+
+    raises = hold and sig is not None and (reraise if nested is None else nested)
+    assert outcome.get("raised", False) == raises
+    assert after == installed  # every handler is back
+    if not hold:  # nothing held: the process's own handler acted on it
+        assert seen == ([] if sig is None else [sig]) and outcome["got"] == []
+        return
+    assert seen == []  # held: the process's handler never ran
+    if nested is None:
+        assert outcome["got"] == ([] if sig is None else [sig])
     else:
-        body()
+        assert outcome["inner"] == ([] if sig is None else [sig])
+        assert outcome["got"] == []  # what the inner hold took never reaches the outer
+        if not nested:  # no exception: the outer hold was restored after the inner block
+            assert outcome["outer_after_inner"] not in (record, signal.SIG_DFL)
+
+
+# reraise never replaces an exception from the block: it propagates, the held
+# signal is dropped, and the handlers are back.
+@pytest.mark.parametrize("reraise", [False, True])
+def test_held_signals_block_exception_wins_over_reraise(smoke, reraise):
+    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    raised = None
+    try:
+        with smoke._smoke_lib.held_signals(reraise=reraise):
+            os.kill(os.getpid(), signal.SIGINT)
+            time.sleep(0.2)
+            raise ValueError("block")
+    except BaseException as exc:  # noqa: BLE001 - a KeyboardInterrupt here is the failure
+        raised = exc
+    assert type(raised) is ValueError
     assert {s: signal.getsignal(s) for s in before} == before
 
 

@@ -41,7 +41,29 @@ The module holds several separate concerns; each section below is used by:
   ``SAFE_PATH``, what every harness subprocess and the installer inherit.
 * Owned process groups (``smoke.py``'s steps, the harness's installer calls):
   ``run_owned`` and ``OwnedGroup``, the one lifecycle for a child whose whole
-  process group may have to be killed (invariant at that section).
+  process group may have to be killed (invariant at that section), and
+  ``held_signals``, the one helper that holds SIGINT / SIGTERM for a block.
+
+The smoke scripts' four signal policies. Each is a distinct role, so they are
+kept apart; only the hold is shared (``held_signals``):
+
+==============================  ==================================  ==============================
+policy                          where                               why
+==============================  ==================================  ==============================
+hold, then redeliver or drop    ``run_owned`` (redeliver),          nothing cuts the block short;
+(``held_signals``)              ``smoke._token_check``'s cleanup    run_owned redelivers the first
+                                (drop)                              held signal only after its
+                                                                    GroupNotStopped verdict; the
+                                                                    exiting child drops it
+SIGTERM -> KeyboardInterrupt    ``smoke._term_as_interrupt``        the runner treats SIGTERM like
+                                (``smoke.main``)                    Ctrl-C, so the active step is
+                                                                    stopped through run_owned
+SIGTERM -> SystemExit(128+n)    ``smoke._token_check``'s            the token-check child runs its
+                                ``on_term``                         finally (server, token dir)
+raise once, then ignore         ``smoke_launchd.signal_handler``,   the first signal stops the
+                                ``begin_teardown``                  checks; no later one escapes
+                                                                    main or cuts the teardown short
+==============================  ==================================  ==============================
 """
 
 from __future__ import annotations
@@ -559,11 +581,24 @@ def reap_bound() -> float:
     return GROUP_DRAIN + READER_STOP
 
 
+# held_signals is the one hold-then-act helper; the other signal policies are
+# distinct roles (the table in the module docstring).
+
+
 @contextlib.contextmanager
-def held_signals():
+def held_signals(*, reraise: bool = False):
     """Record SIGINT and SIGTERM instead of acting on them for the block (main
-    thread only; elsewhere nothing is held). Yields ``(got, old)``: the signals
-    that arrived and the handlers that were in place, restored on exit."""
+    thread only; elsewhere nothing is held and nothing is raised). Yields
+    ``(got, old)``: the signals that arrived and the handlers that were in
+    place, restored on exit (a handler Python did not install, None, is left).
+
+    Without RERAISE a held signal is the caller's: ``run_owned`` redelivers
+    ``got[0]`` to ``old`` itself (``redeliver``), after its GroupNotStopped
+    verdict; a caller that ignores ``got`` drops it. With RERAISE, once the
+    handlers are back and only when the block finished normally, a held
+    signal is raised as KeyboardInterrupt; an exception from the block wins.
+    Nested, the inner block holds what arrives in it and restores the outer
+    hold; what the inner one holds never reaches the outer ``got``."""
     got: list[int] = []
     if threading.current_thread() is not threading.main_thread():
         yield got, {}
@@ -579,6 +614,8 @@ def held_signals():
         for s, h in old.items():
             if h is not None:
                 signal.signal(s, h)
+    if reraise and got:
+        raise KeyboardInterrupt(f"signal {got[0]}")
 
 
 def redeliver(sig: int, handler) -> None:
