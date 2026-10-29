@@ -743,3 +743,20 @@ def test_cli_bound_is_the_slowest_path(capsys, n):
     assert rc == 3  # the warning path: every wait ran
     assert sum(spent) == squat_check.cli_bound(n)
     assert len(spent) == 2 + 1 + 2 + n  # two lsof, the sleep, two prints, n lookups
+
+
+# The docstring's import surface is exactly what each importer uses: importer
+# -> the ``squat_check.<name>`` attributes in its source == the names its
+# bullet lists (every double-backticked word that is an attribute of the
+# module), so the free-text contract cannot drift.
+@pytest.mark.parametrize("importer", ["smoke_launchd.py", "_smoke_lib.py"])
+def test_docstring_import_surface_is_what_each_importer_uses(importer):
+    import re
+
+    used = set(re.findall(r"squat_check\.([A-Za-z_]\w*)", (SCRIPT.parent / importer).read_text()))
+    used.discard("py")
+    doc = squat_check.__doc__
+    bullet = doc.split(f"* ``scripts/{importer}``:", 1)[1].split("\n* ", 1)[0]
+    bullet = bullet.split("\n\n", 1)[0]
+    listed = {w for w in re.findall(r"``(\w+)``", bullet) if hasattr(squat_check, w)}
+    assert listed == used, (importer, sorted(listed ^ used))
