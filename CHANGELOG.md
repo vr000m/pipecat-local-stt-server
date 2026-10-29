@@ -52,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server end is the agent's own launchd process (same pid and restart count
   before and after); a foreign or unidentifiable listener gets nothing.
   `--launchd` adds the launchd harness (macOS only, opt-in, never in CI). The
-  `--agents` decode is stub-tested only until a live `--agents` run.
+  `--agents` decode runs the production client's handshake over the verified
+  socket and is tested end to end against a fake agent, but not yet live.
 
 ### Changed
 
@@ -61,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --no-sync python` so they cannot prune the backend extras.
 - `just smoke-peercred` and `scripts/smoke_test_parakeet.py` run with
   `.venv/bin/python` instead of plain `uv run`, which pruned the backend extras.
+- `scripts/smoke_supervised.py` sends each server's stderr to a temp file
+  instead of an unread pipe, so a chatty server can no longer stall a scenario.
 
 ## [0.5.0] - 2026-10-27
 

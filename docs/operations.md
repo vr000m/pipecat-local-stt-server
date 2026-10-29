@@ -502,7 +502,9 @@ scripts/smoke.py`, never `uv run` (which prunes the backend extras).
 | `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
 | `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
 | `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101`; each request goes over a connection whose server end `lsof` shows is that server's own process |
-| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (its `--port` parsed as the server parses it; installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, read under the server's own token-file policy (a symlink, a FIFO, a file with group or other access, or a token the server would refuse makes that agent FAIL with nothing sent), else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection. After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. A job that is not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or an answer that cannot be read makes that agent FAIL, and when the check refused, no token was sent. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
+| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (its `--port` parsed as the server parses it; installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, read under the server's own token-file policy (a symlink, a FIFO, a file with group or other access, or a token the server would refuse makes that agent FAIL with nothing sent), else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection, through the production
+client's own `connect` (its headers and its `server.hello` / `session.created`
+handshake; only the transport is the verified socket). After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. A job that is not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or an answer that cannot be read makes that agent FAIL, and when the check refused, no token was sent. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents or `say` is absent |
 | `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
 
 `--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
@@ -561,6 +563,12 @@ again between two of those comparisons with its plist untouched, leaves nothing
 to compare. A real agent that restarts on its own during the run (a crash loop)
 fails the comparison too: fix it before the run.
 
+Every `launchctl print` answer here, in `smoke.py --agents` and in the
+recipes' squat check is read by one parser, in `scripts/squat_check.py`
+(`read_print` / `parse_print`): only "could not find service" is "not
+loaded", any other failure is "cannot tell", and a running job whose answer
+has no `runs =` line is unreadable everywhere (never "no restart counter").
+
 The token check sends its throwaway token (and a wrong one) only over
 connections whose server end `lsof` shows is the spare job's pid, with the same
 pid and `runs` before and after; it waits for the agent with requests that carry
@@ -608,7 +616,10 @@ identify a launchd job's server end. Still covered only by stubbed tests (stub
 `launchctl`, `lsof` and `id`, a temp home): the `smoke.py` code that now
 automates the 0.5.0 checks — the `token-file` child, the `--agents` decode and
 the `peercred` SKIPPED mapping — and the `just smoke --launchd` wiring around
-the harness. Treat those results as unverified until a live
+the harness. The tests run the `--agents` decode child (its verified
+connection, the token on stdin, the production client handshake) and the
+harness's collision and rollback bodies end to end against stubs and a fake
+agent on a real socket; that is not a live run. Treat those results as unverified until a live
 `just smoke --agents --launchd` run; a FAIL there may be a harness bug rather
 than an agent fault.
 
