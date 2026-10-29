@@ -100,8 +100,9 @@ TCP agent's port (from `lsof`) with the pid launchd reports for that agent
 stdin, never as an argument, because it carries the job's environment block and
 a plist from before 0.5.0 keeps its bearer token there, while any local user can
 read a process's arguments with `ps`). They warn on stderr, after a 1-second re-check so a restart
-in flight stays quiet (the re-check reads the launchd pid before and after its
-`lsof` read; a pid that changed in between gives no warning), when:
+in flight stays quiet (the re-check reads the launchd pid and `runs` counter before and after its
+`lsof` read; a pid or `runs` that changed in between, as when the job started,
+listened and exited between two reads with no pid, gives no warning), when:
 
 - the agent is running but a different pid holds the port (the warning names the
   port, the listener pid(s) and command(s), and the launchd pid), or

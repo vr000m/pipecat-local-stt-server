@@ -21,7 +21,8 @@ one block on stderr, every line starting ``squat-check: warning:``.
 
 Exit status: 0 quiet, 3 warned, 2 cannot tell (``lsof`` missing or failed, the
 caller's ``launchctl print`` answer unreadable, or the confirm pass could not
-re-read the launchd pid or saw it change; a one-line note on stderr, no warning).
+re-read the launchd job or saw its pid or ``runs`` change; a one-line note on
+stderr, no warning).
 
 The invariant (Decision 5): the PID listening on the agent's port must equal the
 PID launchd reports for the agent. Two warnings break it:
@@ -41,9 +42,11 @@ re-check re-reads the listeners and, when ``--label`` is given, the pid with
 from the caller's answer.
 When that re-read fails, a finding that persists is "cannot tell" (exit 2), never a
 warning resting on the first pass's pid. With ``--label`` the pid is read once more
-after the second listener read; a pid that changed across that listener read (the
-job restarted while lsof ran) or a read that failed is also "cannot tell", so a
-warning always compares the listeners with a pid that held for the whole read.
+after the second listener read; a pid or ``runs`` counter that changed across that
+listener read (the job restarted while lsof ran, or started, listened and exited
+with no pid on either side), a running job whose answer has no ``runs =`` line,
+or a read that failed is also "cannot tell", so a warning always compares the
+listeners with a job that held for the whole read.
 
 Visibility limit (Decision 6): ``lsof`` run as the user lists only the user's own
 processes' sockets. A listener owned by another uid is invisible, so this check
@@ -63,10 +66,10 @@ or an exit of 2 or more, is "cannot tell".
 
 Import surface (besides the CLI), exactly what each importer uses:
 
-* ``scripts/smoke_launchd.py``: ``read_print``, ``parse_print`` and
-  ``read_job_print`` (``read_job``, ``squat_warns``), ``endpoint_holders``,
-  ``launchd_state`` (with the ``uid`` keyword), ``listener_pids``,
-  ``lsof_pids``, ``parse_job_argv`` (``job_endpoint``), the bounds
+* ``scripts/smoke_launchd.py``: ``read_print`` and ``parse_print``
+  (``read_job``, ``squat_warns``), ``endpoint_holders``, ``launchd_state``
+  (with the ``uid`` keyword), ``listener_pids``, ``lsof_pids``,
+  ``parse_job_argv`` (``job_endpoint``), the bounds
   ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its time budget sums them) and
   ``cli_bound`` (the CLI's own worst case, which its squat-check timeout and
   budget derive from).
@@ -234,7 +237,7 @@ def _commands(pids, run):
 #
 # Every reader of a job's `launchctl print` answer goes through read_print (the
 # call) and parse_print (the rule): this module's own re-check
-# (launchd_state), the recipes' CLI form (classify_print, the loaded/pid half
+# (read_job_print), the recipes' CLI form (classify_print, the loaded/pid half
 # of parse_print), _smoke_lib.launchd_identity (smoke.py --agents) and
 # smoke_launchd.read_job / Harness.squat_warns. One rule each for:
 #
@@ -366,16 +369,17 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
     # Confirm: a restart in flight changes the pid or the listener within a second.
     sleep(CONFIRM_SLEEP)
     pid_current = True
+    runs = None
     if label:
-        state = launchd_state(label, run)
-        if state is None:
+        job = read_job_print(label, run)
+        if job is None:
             # Can't tell: the caller's pid may be stale, so it can only clear a
             # finding (a listener that now matches it), never confirm one.
             pid_current = False
         else:
-            if not state[0]:
+            if not job.loaded:
                 return 0  # unloaded within the second: quiet, as in the first pass
-            pid = state[1] or ""
+            pid, runs = job.pid or "", job.runs
     out = _lsof(port, run)
     if out is None:
         print("squat-check: cannot run lsof; skipping port check", file=sys.stderr)
@@ -389,13 +393,18 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
         return 2
     if label:
         # Bracket the listener read: a job that restarted between the pid read
-        # above and lsof would have its new pid compared with the old one.
-        after = launchd_state(label, run)
-        if after is not None and not after[0]:
+        # above and lsof would have its new pid compared with the old one, and
+        # a job that started, listened and exited in between (no pid on either
+        # side) would have its own listener reported. The spawn counter `runs`
+        # moves on every start, so it must hold too; an UNKNOWN one (a running
+        # job with no `runs =` line) never compares as unchanged.
+        after = read_job_print(label, run)
+        if after is not None and not after.loaded:
             return 0  # unloaded during the read: quiet, as above
-        if after is None or (after[1] or "") != pid:
+        if after is None or (after.pid or "") != pid or runs == UNKNOWN or after.runs != runs:
             print(
-                "squat-check: the launchd pid changed during the re-check; skipping port check",
+                "squat-check: the launchd job changed (pid or runs) during the re-check; "
+                "skipping port check",
                 file=sys.stderr,
             )
             return 2

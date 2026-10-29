@@ -36,13 +36,21 @@ def _load():
 squat_check = _load()
 
 
+def _print_body(pid, runs):
+    """A ``launchctl print`` body with optional ``pid =`` and ``runs =`` lines."""
+    body = "state = running\n" + (f"\tpid = {pid}\n" if pid is not None else "")
+    return body + (f"\truns = {runs}\n" if runs is not None else "")
+
+
 class World:
     """A scripted timeline of lsof listeners and launchd pids.
 
     ``snapshots`` is a list of listener lists, each row ``(pid, command, addr)``
     with ``addr`` like ``127.0.0.1`` or ``*``; the snapshot index advances each
     time the code under test calls ``sleep``. ``launchd_pids`` follows the same
-    timeline for a ``launchctl print`` (None: no ``pid =`` line).
+    timeline for a ``launchctl print`` (None: no ``pid =`` line). A running job
+    (a pid) prints ``runs = 1``, as launchctl does; a ``launchd_reads`` answer
+    may name its own runs as a third item (None: no ``runs =`` line).
     """
 
     def __init__(
@@ -56,8 +64,8 @@ class World:
         lsof_missing=False,
         launchd_reads=None,
     ):
-        # launchd_reads: one (loaded, pid) answer per launchctl call, in call
-        # order (None: launchctl fails), overriding the sleep timeline.
+        # launchd_reads: one (loaded, pid[, runs]) answer per launchctl call, in
+        # call order (None: launchctl fails), overriding the sleep timeline.
         self.launchd_reads = list(launchd_reads) if launchd_reads is not None else None
         self.snapshots = snapshots
         self.launchd_pids = launchd_pids
@@ -97,19 +105,19 @@ class World:
                 answer = self.launchd_reads.pop(0) if self.launchd_reads else (True, None)
                 if answer is None:
                     return subprocess.CompletedProcess(argv, 5, "", "launchctl: boom")
-                loaded, pid = answer
+                loaded, pid = answer[:2]
+                runs = answer[2] if len(answer) > 2 else ("1" if pid is not None else None)
                 if not loaded:
                     return subprocess.CompletedProcess(argv, 113, "", "Could not find service")
-                body = "state = running\n" + (f"\tpid = {pid}\n" if pid is not None else "")
-                return subprocess.CompletedProcess(argv, 0, body, "")
+                return subprocess.CompletedProcess(argv, 0, _print_body(pid, runs), "")
             if self.launchctl_rc is not None:
                 return subprocess.CompletedProcess(argv, self.launchctl_rc, "", "launchctl: boom")
             if not self._at(self.launchd_loaded):
                 msg = f'Could not find service "{argv[2].rsplit("/", 1)[-1]}" in domain\n'
                 return subprocess.CompletedProcess(argv, 113, "", msg)
             pid = self._at(self.launchd_pids)
-            body = "state = running\n" + (f"\tpid = {pid}\n" if pid is not None else "")
-            return subprocess.CompletedProcess(argv, 0, body, "")
+            runs = "1" if pid is not None else None
+            return subprocess.CompletedProcess(argv, 0, _print_body(pid, runs), "")
         if tool == "id":
             return subprocess.CompletedProcess(argv, 0, "501\n", "")
         raise AssertionError(f"unexpected command {argv!r}")
@@ -355,6 +363,38 @@ def test_recheck_brackets_the_listener_read_with_two_pid_reads(capsys, before, a
     assert (PREFIX in err) == (want == 3)
     if want == 2:
         assert len(err.strip().splitlines()) == 1
+
+
+# The bracketing reads compare the spawn counter too: (before, after) launchd
+# answers (loaded, pid, runs) around the second listener read x that listener
+# -> exit. A job that started, listened and exited between two no-pid reads
+# moved `runs`, so its own (now gone) listener is "cannot tell", never "label
+# not running"; a restart back to the same pid moved it too; a running job with
+# no `runs =` line (UNKNOWN) never compares as unchanged. Caller pid 100, first
+# listener 200.
+@pytest.mark.parametrize(
+    ("before", "after", "second", "want"),
+    [
+        ((True, None, "4"), (True, None, "4"), 300, 3),  # stable, not running: warn
+        ((True, None, "4"), (True, None, "5"), 300, 2),  # ran and exited mid-read
+        ((True, None, None), (True, None, None), 300, 3),  # never ran, no line: stable
+        ((True, None, None), (True, None, "1"), 300, 2),  # first spawn mid-read
+        ((True, 100, "4"), (True, 100, "4"), 200, 3),  # stable pid and runs: squatter
+        ((True, 100, "4"), (True, 100, "5"), 200, 2),  # restarted back to pid 100
+        ((True, 100, None), (True, 100, None), 200, 2),  # runs UNKNOWN on both sides
+        ((True, 100, "4"), (True, 100, None), 200, 2),  # runs UNKNOWN after
+        ((True, 100, "4"), (True, 100, "5"), 100, 0),  # listener matches: quiet first
+        ((True, None, "4"), (False, None, None), 300, 0),  # unloaded mid-read: quiet
+    ],
+)
+def test_recheck_brackets_the_listener_read_with_runs_too(capsys, before, after, second, want):
+    snap2 = [] if second is None else [(second, "nc", HOST)]
+    w = World([[(200, "nc", HOST)], snap2], launchd_reads=[before, after])
+    assert _check(w, pid=100, label="pipecat.stt-server") == want
+    err = capsys.readouterr().err
+    assert (PREFIX in err) == (want == 3)
+    if want == 2:
+        assert len(err.strip().splitlines()) == 1 and "pid or runs" in err
 
 
 def test_restart_between_the_pid_read_and_the_listener_read_does_not_warn(capsys):
@@ -693,7 +733,7 @@ def test_cli_bound_is_the_slowest_path(capsys, n):
     def run(cmd, **kw):
         spent.append(kw["timeout"])
         if cmd[0] == "launchctl":
-            return subprocess.CompletedProcess(cmd, 0, "\tpid = 100\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "\tpid = 100\n\truns = 1\n", "")
         if "-Fc" in cmd:
             return subprocess.CompletedProcess(cmd, 0, f"p{cmd[cmd.index('-p') + 1]}\ncx\n", "")
         rows = "".join(f"p{200 + i}\nn127.0.0.1:{PORT}\n" for i in range(n))
