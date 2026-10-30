@@ -1312,9 +1312,12 @@ class Harness:
         ``<socket>.lock`` for its whole life and takes it before it binds, so the
         harness takes that same lock itself (non-blocking, retried for WAIT
         seconds): while it holds the lock no server can be serving the socket or
-        start to. Holding it, the harness unlinks the socket (only an AF_UNIX
-        socket owned by this user), then the ``.lock`` (only while the path still
-        names the inode it holds), then lets go. A lock it cannot take (held by a
+        start to. Holding it, and only once the ``.lock`` path is shown to still
+        name the inode it holds (a path replaced by another process's lock
+        proves nothing about the socket), the harness unlinks the socket (only
+        an AF_UNIX socket owned by this user), then the ``.lock`` (checked
+        again), then lets go. Residual: a replacement in the instant between
+        that check and the unlink is not seen. A lock it cannot take (held by a
         live process), a path of the wrong type or owner, or a socket with no
         ``.lock`` (nothing can prove it unserved) is left in place and reported."""
         import fcntl
@@ -1348,19 +1351,34 @@ class Harness:
                         )
                         return
                     time.sleep(0.2)
+
+            def still_held() -> bool:
+                """The lock path still names the inode whose flock this
+                process holds (so no server can hold that path's lock)."""
+                try:
+                    now = os.lstat(lock)
+                except FileNotFoundError:
+                    return False
+                return (now.st_dev, now.st_ino) == (held.st_dev, held.st_ino)
+
+            # The proof comes BEFORE the socket is touched: a lock path that
+            # no longer names the held inode (replaced, or gone) proves
+            # nothing about who serves the socket now, so both are left.
+            if not still_held():
+                problems.append(
+                    f"{lock} was replaced or removed during teardown; {sock} and {lock} "
+                    "left in place"
+                )
+                return
             if os.path.lexists(sock):
                 st = os.lstat(sock)
                 if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid():
                     self._unlink(sock, problems)
                 else:
                     problems.append(f"{sock} is not a socket owned by this user; left in place")
-            try:
-                now = os.lstat(lock)
-            except FileNotFoundError:
-                now = None
-            if now is not None and (now.st_dev, now.st_ino) == (held.st_dev, held.st_ino):
+            if still_held():
                 self._unlink(lock, problems)
-            elif now is not None:
+            elif os.path.lexists(lock):
                 problems.append(f"{lock} was replaced during teardown; left in place")
         finally:
             os.close(fd)

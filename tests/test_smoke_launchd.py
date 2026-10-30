@@ -1873,6 +1873,70 @@ def test_remove_spare_socket_state_space(smoke, lock_state, sock_state):
         shutil.rmtree(d, ignore_errors=True)
 
 
+# The lock path changes between the harness's flock and its socket unlink:
+# none x replaced (another process put its own held lock there and bound a
+# fresh socket) x removed -> the socket is unlinked only while the lock path
+# still names the inode the harness holds; otherwise both are left, reported.
+@pytest.mark.parametrize("change", ["none", "replaced", "removed"])
+def test_remove_spare_socket_proves_the_lock_before_the_socket(smoke, monkeypatch, change):
+    import fcntl
+    import os
+    import tempfile
+
+    d = Path(tempfile.mkdtemp(prefix="sk", dir="/tmp"))  # short: AF_UNIX path limit
+    sock, lock = d / "s.sock", d / "s.sock.lock"
+    old_srv = socket.socket(socket.AF_UNIX)
+    old_srv.bind(str(sock))
+    old_srv.close()
+    lock.write_text("")
+    holders: list = []
+    live: list = []
+    real_flock = fcntl.flock
+
+    def flock(fd, op):
+        real_flock(fd, op)  # the harness now holds inode A
+        if change == "none" or holders:
+            return
+        if change == "replaced":
+            fresh = d / "new.lock"
+            fresh.write_text("")
+            b = os.open(fresh, os.O_RDWR)
+            real_flock(b, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held inode B
+            holders.append(b)
+            os.replace(fresh, lock)
+            os.unlink(sock)
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(str(sock))  # a fresh, live socket
+            srv.listen(1)
+            live.append(srv)
+        else:
+            holders.append(None)
+            os.unlink(lock)
+
+    monkeypatch.setattr(fcntl, "flock", flock)
+    try:
+        h = object.__new__(smoke.Harness)
+        h.sock = sock
+        problems: list[str] = []
+        h.remove_spare_socket(problems, wait=0.3)
+        if change == "none":
+            assert problems == [] and not os.path.lexists(sock) and not os.path.lexists(lock)
+            return
+        assert os.path.lexists(sock), "a socket was unlinked without the lock proof"
+        assert any("replaced or removed" in p for p in problems), problems
+        if change == "replaced":
+            assert os.path.lexists(lock)  # inode B, another process's, untouched
+            with socket.socket(socket.AF_UNIX) as c:
+                c.connect(str(sock))  # still the live one
+    finally:
+        for b in holders:
+            if b is not None:
+                os.close(b)
+        for srv in live:
+            srv.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # A cleanup that fails can never PASS: each failure below is a teardown problem,
 # and the residue check uses lexists, so a dangling symlink is still residue.
 @pytest.mark.parametrize("failure", ["none", "token-dir", "sock-dir", "dangling-socket"])
