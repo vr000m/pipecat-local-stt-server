@@ -1040,11 +1040,11 @@ class Harness:
         except _smoke_lib.EndpointRefused as exc:
             raise CheckFailed(f"not the spare job: {exc}") from exc
         status = _smoke_lib.ws_handshake_status(sock=sock)
-        now = self._identity()
-        if now != (pid, runs):
-            raise CheckFailed(
-                f"the spare job changed during the exchange (pid {pid}, runs {runs} -> {now})"
-            )
+        changed = _smoke_lib.confirm_identity_unchanged(
+            self._identity, pid, runs, "the spare job", "during the exchange"
+        )
+        if changed:
+            raise CheckFailed(changed)
         return status
 
     def running_identity(self, consequence: str = "") -> tuple[str, str]:
@@ -1055,7 +1055,7 @@ class Harness:
         LaunchdUnreadable. The one precondition for verified_status and the
         token check."""
         loaded, pid, runs, _ep = read_job(self.label, self.uid)
-        if not (loaded and pid and runs and runs != UNKNOWN):
+        if not (loaded and pid and squat_check.runs_readable(runs)):
             raise CheckFailed(
                 f"the spare job is not running with a readable pid and runs "
                 f"(loaded {loaded}, pid {pid}, runs {runs}){consequence}"
@@ -1265,11 +1265,11 @@ class Harness:
             raise CheckFailed(f"token not sent: {exc}") from exc
         except AssertionError as exc:
             raise CheckFailed(str(exc)) from exc
-        now = self._identity()
-        if now != (pid, runs):
-            raise CheckFailed(
-                f"the spare job changed during the token check: {(pid, runs)} -> {now}"
-            )
+        changed = _smoke_lib.confirm_identity_unchanged(
+            self._identity, pid, runs, "the spare job", "during the token check"
+        )
+        if changed:
+            raise CheckFailed(changed)
         return "no token -> 401, wrong token -> 401, token -> 101 (server end verified)"
 
     def _refuses(self) -> bool:

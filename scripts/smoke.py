@@ -369,15 +369,21 @@ def job_identity(state) -> tuple[tuple[str, str] | None, str]:
     """((pid, runs), "") of a running launchd job from STATE, the answer of ONE
     read-only ``launchctl print`` (``_smoke_lib.launchd_identity``), else
     (None, why). None (the answer cannot be read) is "cannot tell", never
-    "not loaded"."""
+    "not loaded".
+
+    A NOT LOADED job never gets here: ``agents_step`` reports it SKIPPED
+    (``NOT_LOADED_DETAIL``) before its plist is read, the one rule for that
+    state, so a not-loaded STATE is a caller's bug and raises ValueError
+    (the step's crash row, a FAIL) rather than a second, contradictory FAIL
+    verdict for it."""
     if state is None:
         return None, "cannot read its launchd state (launchctl print failed)"
     loaded, pid, runs = state
     if not loaded:
-        return None, "not loaded in launchd"
+        raise ValueError("a not-loaded job is SKIPPED by agents_step, never given to job_identity")
     if not pid:
         return None, "loaded but not running (launchd has no pid)"
-    if not runs or runs == _smoke_lib.UNKNOWN:
+    if not _smoke_lib.runs_readable(runs):
         return None, f"launchctl print shows pid {pid} but no `runs =` line"
     return (pid, runs), ""
 
@@ -456,13 +462,15 @@ def agents_step(requested: bool) -> StepResult:
             # the decode still shows the same pid and runs (a restart, even
             # one back to the same pid, or an unload during it is a FAIL).
             if outcome == PASS:
-                now = _smoke_lib.launchd_identity(label)
-                if now != (True, pid, runs):
-                    outcome, detail = (
-                        FAIL,
-                        f"the launchd job changed during the decode (pid {pid}, runs {runs} "
-                        f"-> {now})",
-                    )
+                changed = _smoke_lib.confirm_identity_unchanged(
+                    lambda: _smoke_lib.launchd_pid_runs(label),  # noqa: B023 - called here
+                    pid,
+                    runs,
+                    "the launchd job",
+                    "during the decode",
+                )
+                if changed:
+                    outcome, detail = FAIL, changed
             failed = failed or outcome != PASS
             passed = passed or outcome == PASS
             parts.append(f"{label}: {outcome}" + (f" {detail}" if detail else ""))
@@ -716,8 +724,7 @@ def _decode(args: argparse.Namespace) -> int:
         uri = f"ws://{format_host_for_uri(args.host)}:{args.port}/"
 
     def identity():
-        state = _smoke_lib.launchd_identity(args.label)
-        return (state[1], state[2]) if state and state[0] else None
+        return _smoke_lib.launchd_pid_runs(args.label)
 
     try:
         sock = _smoke_lib.connect_verified(endpoint, args.pid, args.runs, identity)

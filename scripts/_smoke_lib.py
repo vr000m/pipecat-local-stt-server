@@ -238,7 +238,8 @@ def assert_chain_traversable(sock: str) -> None:
 #   4. A second `launchctl print` (READ_IDENTITY) must still give (P, R); only
 #      then is the socket returned, for the caller to write the token on.
 #   5. The caller requires a FRESH read to give (P, R) after the exchange
-#      before it reports a PASS.
+#      before it reports a PASS: confirm_identity_unchanged, the one check
+#      (step 4's re-read is that same function), which every caller uses.
 #
 # Residuals: a same-uid process cannot hold the job's pid, so a lookalike fails
 # step 3; a root process (which can do anything) is out of scope; LOCAL_PEERPID
@@ -250,6 +251,9 @@ def assert_chain_traversable(sock: str) -> None:
 # Defined once, in squat_check (which cannot import this module);
 # smoke_launchd.UNKNOWN is this same object too.
 UNKNOWN = squat_check.UNKNOWN
+# The one "runs was read" rule (not None, not UNKNOWN, not empty), also
+# squat_check's; smoke.py uses it through here.
+runs_readable = squat_check.runs_readable
 
 SOL_LOCAL = 0  # <sys/un.h>, macOS
 LOCAL_PEERPID = 2  # <sys/un.h>, macOS: pid of the peer at connect time
@@ -334,19 +338,44 @@ def connect_verified(
     nothing sent on it (steps 2-4 of the contract above). READ_IDENTITY()
     re-reads the job and must return ``(PID, RUNS)``. Raises EndpointRefused
     otherwise."""
-    if not pid or not runs or runs == UNKNOWN:
+    if not pid or not runs_readable(runs):
         raise EndpointRefused(f"no launchd pid and runs to verify against (pid {pid}, runs {runs})")
 
     def still_same(where: str) -> str | None:
-        again = read_identity()
-        if again == (pid, runs):
-            return None
-        return f"the job changed while {where} was verified (pid {pid}, runs {runs} -> {again})"
+        return confirm_identity_unchanged(
+            read_identity, pid, runs, "the job", f"while {where} was verified"
+        )
 
     return _connect_held_by(
         endpoint, pid, still_same, f"the launchd job (pid {pid})",
         timeout=timeout, run=run, settle=settle, sleep=sleep,
     )  # fmt: skip
+
+
+def confirm_identity_unchanged(read_identity, pid, runs, who: str, when: str) -> str | None:
+    """Step 5 of the contract (and step 4's re-read inside connect_verified):
+    None when a FRESH ``READ_IDENTITY()`` (``(pid, runs)``, or None when the
+    job is not loaded) still gives ``(PID, RUNS)`` and RUNS is a readable
+    counter; else why not, naming WHO and WHEN ("the spare job", "during the
+    exchange"). A PASS that rests on a verified connection needs this None
+    after the exchange; a job that restarted (even to the same pid) or
+    unloaded during it proves nothing. READ_IDENTITY's own exception (an
+    unreadable launchd state) propagates."""
+    if not pid or not runs_readable(runs):
+        return f"{who} has no readable pid and runs to confirm (pid {pid}, runs {runs})"
+    now = read_identity()
+    if now == (pid, runs):
+        return None
+    return f"{who} changed {when} (pid {pid}, runs {runs} -> {now})"
+
+
+def launchd_pid_runs(label: str, uid=None, run=subprocess.run):
+    """(pid, runs) of LABEL's job from one ``launchd_identity`` read; None when
+    it is not loaded or the answer cannot be read: the READ_IDENTITY that
+    ``connect_verified`` and ``confirm_identity_unchanged`` take, for
+    ``smoke.py``."""
+    state = launchd_identity(label, uid, run)
+    return (state[1], state[2]) if state and state[0] else None
 
 
 def connect_verified_child(

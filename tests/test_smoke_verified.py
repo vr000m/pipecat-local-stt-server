@@ -176,6 +176,61 @@ def test_connect_verified_needs_an_identity(lib, pid, runs):
         srv.close()
 
 
+# Step 5, one helper for every caller (the decode, the harness's verified
+# status, its token check) and for step 4's re-read: the identity verified
+# against (pid, runs) x the fresh read afterwards -> None (confirmed) or why
+# not. Only a readable pair that the fresh read still gives is confirmed; a
+# restart back to the same pid, an unload or an UNKNOWN on either side is not,
+# and nothing is even read without a readable pair.
+_VERIFIED = {
+    "readable": ("4242", "7"),
+    "no-pid": (None, "7"),
+    "no-runs": ("4242", None),
+    "empty-runs": ("4242", ""),
+    "unknown-runs": ("4242", "UNKNOWN"),
+}
+_FRESH = {
+    "same": ("4242", "7"),
+    "restarted-same-pid": ("4242", "8"),
+    "new-pid": ("5151", "8"),
+    "unloaded": None,
+    "unknown-runs": ("4242", "UNKNOWN"),
+}
+
+
+@pytest.mark.parametrize("fresh", list(_FRESH))
+@pytest.mark.parametrize("verified", list(_VERIFIED))
+def test_confirm_identity_unchanged_state_space(lib, verified, fresh):
+    unknown = lambda v: lib.UNKNOWN if v == "UNKNOWN" else v  # noqa: E731 - the one sentinel
+    pid, runs = (unknown(v) for v in _VERIFIED[verified])
+    after = _FRESH[fresh] and tuple(unknown(v) for v in _FRESH[fresh])
+    reads = []
+
+    def read_identity():
+        reads.append(1)
+        return after
+
+    why = lib.confirm_identity_unchanged(read_identity, pid, runs, "the job", "during it")
+    if verified != "readable":
+        assert why and "no readable pid and runs" in why and reads == []
+        return
+    assert reads == [1]
+    if fresh == "same":
+        assert why is None
+    else:
+        assert why == f"the job changed during it (pid 4242, runs 7 -> {after})"
+
+
+# The one "runs was read" rule, owned by squat_check and re-exported here.
+@pytest.mark.parametrize(
+    ("runs", "want"), [("7", True), ("0", True), (None, False), ("", False), ("UNKNOWN", False)]
+)
+def test_runs_readable_is_one_rule(lib, runs, want):
+    runs = lib.UNKNOWN if runs == "UNKNOWN" else runs
+    assert lib.runs_readable is lib.squat_check.runs_readable
+    assert lib.runs_readable(runs) is want
+
+
 # A token (or a wrong one) is never written to an address, only to a socket
 # the caller verified: token x sock -> sent or ValueError.
 @pytest.mark.parametrize("token", [None, "s3cret"])

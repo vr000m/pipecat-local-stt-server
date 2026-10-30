@@ -543,6 +543,22 @@ def test_agents_identity_gate_state_space(
     assert reads["n"] == (2 if child == "pass" else 1)  # the PASS needs a fresh read
 
 
+# job_identity's input space: a not-loaded answer is agents_step's SKIPPED
+# rule alone, so job_identity refuses it (a caller's bug, the step's crash
+# FAIL) instead of a second, contradictory verdict; every other answer maps
+# to the identity or that agent's FAIL reason.
+@pytest.mark.parametrize("state", list(_IDENT))
+def test_job_identity_has_no_not_loaded_verdict(smoke, state):
+    answer = _IDENT[state]
+    if state == "unloaded":
+        with pytest.raises(ValueError, match="SKIPPED by agents_step"):
+            smoke.job_identity(answer)
+        return
+    ident, why = smoke.job_identity(answer)
+    assert (ident is not None) == (state == "running")
+    assert bool(why) == (state != "running")
+
+
 # --agents per-agent launchd state x {that agent alone, alongside a running
 # agent that decodes} -> that agent's outcome, the step's outcome and the
 # runner's exit code. Only a NOT LOADED job (a readable answer, loaded False)
@@ -654,16 +670,26 @@ def test_agents_token_refusal_order(smoke, agents_env, monkeypatch, capsys, answ
 # The token is resolved from the plist the way the server resolves it
 # (--auth-token-file, else PIPECAT_STT_AUTH_TOKEN, else KODA_STT_AUTH_TOKEN, a
 # blank value counting as unset) and reaches the decode child only on stdin.
+# The tokens are distinctive, so the argv check cannot match a random temp
+# directory name (one holding "pc" made this flaky).
 @pytest.mark.parametrize(
     ("file_token", "env", "want"),
     [
         (None, {}, None),
-        ("from-file", {}, "from-file"),
-        (None, {"PIPECAT_STT_AUTH_TOKEN": "pc"}, "pc"),
-        (None, {"KODA_STT_AUTH_TOKEN": "koda"}, "koda"),
-        (None, {"PIPECAT_STT_AUTH_TOKEN": "pc", "KODA_STT_AUTH_TOKEN": "koda"}, "pc"),
-        (None, {"PIPECAT_STT_AUTH_TOKEN": "  ", "KODA_STT_AUTH_TOKEN": " koda "}, "koda"),
-        ("from-file", {"PIPECAT_STT_AUTH_TOKEN": "pc"}, "from-file"),
+        ("from-file-s3cret", {}, "from-file-s3cret"),
+        (None, {"PIPECAT_STT_AUTH_TOKEN": "pc-s3cret"}, "pc-s3cret"),
+        (None, {"KODA_STT_AUTH_TOKEN": "koda-s3cret"}, "koda-s3cret"),
+        (
+            None,
+            {"PIPECAT_STT_AUTH_TOKEN": "pc-s3cret", "KODA_STT_AUTH_TOKEN": "koda-s3cret"},
+            "pc-s3cret",
+        ),
+        (
+            None,
+            {"PIPECAT_STT_AUTH_TOKEN": "  ", "KODA_STT_AUTH_TOKEN": " koda-s3cret "},
+            "koda-s3cret",
+        ),
+        ("from-file-s3cret", {"PIPECAT_STT_AUTH_TOKEN": "pc-s3cret"}, "from-file-s3cret"),
     ],
 )
 def test_agents_token_resolution_and_stdin_only(
@@ -700,7 +726,7 @@ def test_agents_token_resolution_and_stdin_only(
     assert row.outcome == "PASS", row
     (cmd, given, child_env) = seen[0]
     assert given == (want.encode() if want else None)
-    for secret in ("from-file", "pc", "koda"):
+    for secret in ("from-file-s3cret", "pc-s3cret", "koda-s3cret"):
         assert not any(secret in a for a in cmd), cmd
         assert child_env is None or secret not in " ".join(child_env.values())
     assert "--auth-token-file" not in cmd
