@@ -302,9 +302,13 @@ class RealAgentsChanged(CheckFailed):
     """A real agent's snapshot differs from the baseline (or cannot be re-read)."""
 
 
-class InstallerNotStopped(CheckFailed):
+class InstallerNotStopped(RuntimeError):
     """An installer call's process group could not be shown stopped
-    (``_smoke_lib.GroupNotStopped``): it may still be changing the spare."""
+    (``_smoke_lib.GroupNotStopped``): it may still be changing the spare.
+    Deliberately NOT a CheckFailed, so no CheckFailed handler (``wait_for``
+    retries those) can catch it; ``run_installer`` also records it on its
+    OWNER where it raises it, so a handler that did catch it still cannot
+    hide it from the teardown."""
 
 
 # A check that raises one of these leaves the harness unable to prove the spare
@@ -936,7 +940,9 @@ def install_env(label: str, port: int, *, socket_path=None, token_file=None, bas
     return env
 
 
-def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.CompletedProcess:
+def run_installer(
+    sub: str, env: dict, *, teardown: bool = False, owner=None
+) -> subprocess.CompletedProcess:
     """``install_stt_agent.sh SUB`` in its own process group, through
     ``_smoke_lib.run_owned`` (the runner's step lifecycle): when this returns or
     raises, no installer process, nor anything it started, is still running, so
@@ -951,7 +957,18 @@ def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.
     stopped (the SIGKILL failed, or the leader was not reaped) raises
     InstallerNotStopped, never a result, also when a held signal arrived
     during the call (its exception then carries the GroupNotStopped,
-    ``_smoke_lib.group_not_stopped``; it is the cause here)."""
+    ``_smoke_lib.group_not_stopped``; it is the cause here).
+
+    OWNER (the Harness) is where that verdict is recorded, here where it is
+    raised (``owner.installer_not_stopped``), so teardown freezes whatever
+    handler the exception passes through; and an OWNER with a recorded
+    verdict refuses every later installer call (InstallerNotStopped), so no
+    installer ever runs beside one that may still be running."""
+    if owner is not None and owner.installer_not_stopped:
+        raise InstallerNotStopped(
+            f"installer {sub} not run: an earlier installer call may still be running "
+            f"({owner.installer_not_stopped})"
+        )
     cmd = [BASH, str(INSTALLER), sub]
     try:
         res, timed_out = _smoke_lib.run_owned(
@@ -968,7 +985,10 @@ def run_installer(sub: str, env: dict, *, teardown: bool = False) -> subprocess.
         if not_stopped is None:
             raise
         also = "" if exc is not_stopped else f" ({type(exc).__name__} {exc} arrived during it)"
-        raise InstallerNotStopped(f"installer {sub}: {not_stopped}{also}") from exc
+        err = InstallerNotStopped(f"installer {sub}: {not_stopped}{also}")
+        if owner is not None:
+            owner.installer_not_stopped = str(err)
+        raise err from exc
     if timed_out:
         raise subprocess.TimeoutExpired(cmd, INSTALL_TIMEOUT, output=res.stdout, stderr=res.stderr)
     return res
@@ -983,9 +1003,9 @@ def leave_behind_warnings(stderr: str) -> list[str]:
     ]
 
 
-def install(env: dict, what: str) -> str:
+def install(env: dict, what: str, *, owner=None) -> str:
     """Run the installer's install; a non-zero exit or a leave-behind warning FAILs."""
-    res = run_installer("install", env)
+    res = run_installer("install", env, owner=owner)
     err = res.stderr or ""
     if res.returncode != 0:
         raise CheckFailed(f"install ({what}) exited {res.returncode}: {err.strip()[-300:]}")
@@ -1009,7 +1029,9 @@ class Harness:
         self.token_dir: Path | None = None
         self.holder = None  # the collision check's port occupier
         # Why an installer call may still be running (InstallerNotStopped):
-        # set by run_checks; teardown then changes nothing (frozen_teardown).
+        # set by run_installer where it raises it (run_checks also sets it, a
+        # backstop for a caller that passed no owner); teardown then changes
+        # nothing (frozen_teardown) and no later installer call runs.
         self.installer_not_stopped: str | None = None
 
     # -- waits
@@ -1110,7 +1132,7 @@ class Harness:
         # Only lines written after this install count: an earlier run's
         # address-in-use lines must not satisfy the assertion.
         offsets = {p: _size(p) for p in _log_paths(self.label)}  # no plist yet: naming rule
-        install(install_env(self.label, self.port), "collision")
+        install(install_env(self.label, self.port), "collision", owner=self)
         errlog = _err_log(self.label)  # now from the plist's StandardErrorPath
         offset = offsets.get(errlog, _size(errlog))
         deadline = time.monotonic() + COLLISION_TIMEOUT
@@ -1210,11 +1232,13 @@ class Harness:
         lock = _lock_path(sock)
         self.sock_dir_made = prepare_private_dir(sock.parent, _home())
 
-        install(install_env(self.label, self.port), "rollback: TCP")
+        install(install_env(self.label, self.port), "rollback: TCP", owner=self)
         self.expect_transport("tcp")
         self.wait_for("the TCP agent to answer", self.tcp_up)
 
-        install(install_env(self.label, self.port, socket_path=sock), "rollback: socket")
+        install(
+            install_env(self.label, self.port, socket_path=sock), "rollback: socket", owner=self
+        )
         self.expect_transport("socket")
         self.wait_for("the socket agent to answer", self.sock_up)
         if not lock.exists():
@@ -1225,7 +1249,7 @@ class Harness:
         # proves: install() refused any "still loaded" / "may still hold" /
         # "leaving" warning, so the installer took its unload-confirmed removal
         # path (wait_unloaded returned 0), reported it, and the socket is gone.
-        out = install(install_env(self.label, self.port), "rollback: back to TCP")
+        out = install(install_env(self.label, self.port), "rollback: back to TCP", owner=self)
         self.expect_transport("tcp")
         self.wait_for("the TCP agent to answer again", self.tcp_up)
         if OLD_SOCKET_NOTE not in out:
@@ -1254,7 +1278,7 @@ class Harness:
         except ValueError as exc:
             raise CheckFailed(f"token file policy refused the harness file: {exc}") from exc
 
-        install(install_env(self.label, self.port, token_file=token_file), "token")
+        install(install_env(self.label, self.port, token_file=token_file), "token", owner=self)
         if read_plist_field(self.label, "auth-token-file") != resolved:
             raise CheckFailed("plist does not record the resolved token file path")
         # Up = refuses a request with no token; nothing secret is sent yet.
@@ -1404,7 +1428,7 @@ class Harness:
 
         env = install_env(label, self.port)
         try:
-            res = run_installer("uninstall", env, teardown=True)
+            res = run_installer("uninstall", env, teardown=True, owner=self)
             if res.returncode != 0 or leave_behind_warnings(res.stderr):
                 problems.append(
                     f"uninstall: exit {res.returncode}: {(res.stderr or '').strip()[-200:]}"

@@ -1014,7 +1014,7 @@ def test_teardown_runs_the_uninstall_in_its_own_session(smoke, env, monkeypatch)
     monkeypatch.setenv("PATH", env.path)
     seen = []
 
-    def fake_installer(sub, e, *, teardown=False):
+    def fake_installer(sub, e, *, teardown=False, owner=None):
         seen.append((sub, teardown))
         return _cp(["bash"], 0)
 
@@ -2209,7 +2209,7 @@ def test_check_token_sends_only_over_verified_connections(
         return (True, "777", "3" if after == "same" else "4", None)
 
     monkeypatch.setattr(smoke, "read_job", read_job)
-    monkeypatch.setattr(smoke, "install", lambda e, what: "")
+    monkeypatch.setattr(smoke, "install", lambda e, what, **_kw: "")
     monkeypatch.setattr(
         smoke, "read_plist_field", lambda label, f: str(env.home.resolve()) if f else ""
     )
@@ -2285,6 +2285,50 @@ def test_installer_group_not_stopped_is_a_failure(smoke, env, monkeypatch, where
         assert any("uninstall failed" in p and "EPERM" in p for p in problems), problems
         # The uninstall itself may still be running: nothing more is removed.
         assert "teardown changed nothing" in problems[0] and plist.exists()
+
+
+# InstallerNotStopped is recorded where it is raised, whatever handler it
+# then meets: the caller (a CheckFailed-catching wait_for, a handler that
+# swallows every Exception, none) -> the exception is never a CheckFailed
+# wait_for retries, the harness's flag is set, a later install is refused
+# without running the installer, and the teardown changes nothing.
+@pytest.mark.parametrize("caller", ["wait_for", "swallow", "none"])
+def test_installer_not_stopped_is_recorded_where_raised(smoke, env, monkeypatch, caller):
+    calls = []
+
+    def run_owned(cmd, *a, **k):
+        calls.append(cmd[-1])
+        raise smoke._smoke_lib.GroupNotStopped("cannot SIGKILL process group 1: EPERM")
+
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
+    monkeypatch.setattr(smoke._smoke_lib, "run_owned", run_owned)
+    monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
+    h = smoke.Harness(SPARE, _free_port())
+    assert not issubclass(smoke.InstallerNotStopped, smoke.CheckFailed)
+
+    def install():
+        return smoke.install({}, "x", owner=h)
+
+    if caller == "wait_for":
+        with pytest.raises(smoke.InstallerNotStopped):
+            h.wait_for("an install", install, timeout=5, every=0.01)
+    elif caller == "swallow":
+        try:
+            install()
+        except Exception:  # noqa: BLE001 - the handler under test hides it
+            pass
+    else:
+        with pytest.raises(smoke.InstallerNotStopped):
+            install()
+    assert calls == ["install"]  # wait_for did not retry it
+    assert h.installer_not_stopped and "EPERM" in h.installer_not_stopped
+    with pytest.raises(smoke.InstallerNotStopped, match="not run"):
+        install()
+    assert calls == ["install"]  # refused: no installer beside the first
+    problems = h.teardown()
+    assert "teardown changed nothing" in problems[0]
+    assert calls == ["install"]  # no uninstall either
 
 
 # run_owned decides "group not stopped" BEFORE it redelivers a held signal:
@@ -2821,7 +2865,7 @@ def test_running_identity_is_one_precondition(smoke, env, monkeypatch, job, call
     )
     monkeypatch.setattr(smoke._smoke_lib, "ws_handshake_status", lambda **k: 101)
     monkeypatch.setattr(smoke._smoke_lib, "assert_token_gate", lambda *a, connect: connect())
-    monkeypatch.setattr(smoke, "install", lambda e, what: "")
+    monkeypatch.setattr(smoke, "install", lambda e, what, **_kw: "")
     monkeypatch.setattr(smoke, "read_plist_field", lambda label, f: str(env.home.resolve()))
     monkeypatch.setattr(smoke.Harness, "wait_for", lambda self, what, pred, **k: True)
     monkeypatch.setattr(
@@ -3381,7 +3425,7 @@ def test_collision_check_end_to_end(smoke, monkeypatch, tmp_path, short_home, ce
         if cell == "pid-runs-change":
             stubs.write("flap", "0")
 
-    def install(env, what):
+    def install(env, what, **_kw):
         assert what == "collision" and env["PIPECAT_STT_PORT"] == str(port)
         assert "PIPECAT_STT_AUTH_TOKEN_FILE" not in env
         log = smoke._err_log(SPARE)  # no plist: the installer's naming rule
@@ -3442,7 +3486,7 @@ def test_rollback_check_end_to_end(smoke, monkeypatch, tmp_path, short_home, fau
     agents: list[_FakeAgent] = []
     installs: list[str] = []
 
-    def install(env, what):
+    def install(env, what, **_kw):
         k = len(installs)
         installs.append(what)
         had_socket = os.path.lexists(sock)  # the old socket agent's, before it stops
