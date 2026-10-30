@@ -1445,15 +1445,24 @@ class Harness:
             if loaded:
                 hint = shell_command("launchctl", "bootout", f"gui/{self.uid}/{label}")
                 problems.append(f"{label} is still loaded; run: {hint}")
-        residue = [plist, *logs, self.sock, _lock_path(self.sock)]
-        if self.sock_dir_made:
-            residue.append(self.sock.parent)
-        if self.token_dir is not None:
-            residue.append(self.token_dir)
-        left = [p for p in residue if os.path.lexists(p)]
+        left = [p for p, _how in self.spare_artifacts(logs) if os.path.lexists(p)]
         if left:
             problems.append("left behind: " + ", ".join(str(p) for p in left))
         return problems
+
+    def spare_artifacts(self, logs: list[Path]) -> list[tuple[Path, str]]:
+        """(path, how it is removed by hand: ``rm -f``, ``rm -rf`` or
+        ``rmdir``) for everything the harness may have created, LOGS being the
+        spare's log paths: the one list ``teardown`` checks for residue and
+        ``frozen_teardown`` reports with its cleanup commands, so an artifact
+        added here is covered by both."""
+        out = [(p, "rm -f") for p in (_plist_path(self.label), *logs)]
+        out += [(self.sock, "rm -f"), (_lock_path(self.sock), "rm -f")]
+        if self.token_dir is not None:
+            out.append((self.token_dir, "rm -rf"))
+        if self.sock_dir_made:
+            out.append((self.sock.parent, "rmdir"))
+        return out
 
     def frozen_teardown(self, why: str) -> list[str]:
         """The teardown when an installer call may still be running (WHY): it
@@ -1471,25 +1480,18 @@ class Harness:
             unread = f"; cannot read the spare's log paths: {exc}"
         else:
             unread = ""
-        artifacts = [_plist_path(label), *logs, self.sock, _lock_path(self.sock)]
+        artifacts = self.spare_artifacts(logs)
         try:
             loaded, _pid = require_launchd_state(label, self.uid)
             state = "loaded" if loaded else "not loaded"
         except RuntimeError as exc:
             state = f"unreadable ({exc})"
-        left = [str(p) for p in artifacts if os.path.lexists(p)]
-        if self.token_dir is not None and os.path.lexists(self.token_dir):
-            left.append(str(self.token_dir))
-        if self.sock_dir_made and os.path.lexists(self.sock.parent):
-            left.append(str(self.sock.parent))
+        left = [str(p) for p, _how in artifacts if os.path.lexists(p)]
         cmds = [
             shell_command("launchctl", "bootout", f"gui/{self.uid}/{label}"),
-            shell_command("rm", "-f", *artifacts),
+            shell_command("rm", "-f", *(p for p, how in artifacts if how == "rm -f")),
         ]
-        if self.token_dir is not None:
-            cmds.append(shell_command("rm", "-rf", self.token_dir))
-        if self.sock_dir_made:
-            cmds.append(shell_command("rmdir", self.sock.parent))
+        cmds += [shell_command(*how.split(), p) for p, how in artifacts if how != "rm -f"]
         return [
             f"{why}; an installer may still be running, so teardown changed nothing "
             f"(no uninstall, nothing removed){unread}",

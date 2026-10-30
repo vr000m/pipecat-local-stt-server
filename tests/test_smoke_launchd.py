@@ -2437,6 +2437,38 @@ def test_teardown_changes_nothing_after_an_installer_not_stopped(
     assert shlex.quote(str(fake)) in teardown_detail  # the pgrep check, quoted
 
 
+# One artifact list (Harness.spare_artifacts) for both teardowns: an artifact
+# added to it x the teardown path (normal, frozen) -> the normal teardown
+# reports it as residue and the frozen one lists it as left with a cleanup
+# command, so neither can miss what the other covers.
+@pytest.mark.parametrize("frozen", [False, True])
+def test_both_teardowns_share_one_artifact_list(smoke, env, monkeypatch, frozen):
+    import shlex
+
+    monkeypatch.setenv("HOME", str(env.home))
+    monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: env.home)
+    monkeypatch.setattr(smoke, "require_launchd_state", lambda *a, **k: (False, None))
+    monkeypatch.setattr(
+        smoke, "run_installer", lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")
+    )
+    extra = env.tmp / "extra artifact"
+    extra.write_text("")
+    real = smoke.Harness.spare_artifacts
+    monkeypatch.setattr(
+        smoke.Harness, "spare_artifacts", lambda self, logs: [*real(self, logs), (extra, "rm -f")]
+    )
+    h = smoke.Harness(SPARE, _free_port())
+    if frozen:
+        problems = h.frozen_teardown("test")
+        assert str(extra) in problems[1]  # left behind now
+        rm = next(p for p in problems if p.startswith("cleanup: rm -f "))
+        assert str(extra) in shlex.split(rm[len("cleanup: ") :])
+    else:
+        problems = h.teardown()
+        left = next(p for p in problems if p.startswith("left behind: "))
+        assert str(extra) in left
+
+
 # Every --port syntax the server's parser accepts (argparse type=int over the
 # serve grammar: "--port N" or "--port=N", last one wins) x where it is
 # recorded (an unloaded agent's plist, a loaded job's arguments block) -> the
