@@ -149,13 +149,16 @@ the runner sets itself; it never runs in CI. Details and the individual scripts:
 The checks were verified by hand at 0.5.0 (token-file on a spare port without
 launchd, a decode through each agent). New in 0.5.1: the launchd harness
 (`scripts/smoke_launchd.py`) ran live three times (2026-10-28) against the spare
-label and port; the last, on the closing-pass code, had all five rows PASS. Still tested only with stubs: the
-`smoke.py` code that automates the 0.5.0 checks (the `token-file` child, the
-`--agents` decode, the `peercred` SKIPPED mapping; the decode and the harness's
+label and port; the last, on the closing-pass code, had all five rows PASS.
+Then the `just smoke --agents --launchd` wiring ran live on 2026-10-29 on the
+round-8 head: `supervised`, `token-file` and `launchd` PASS, `peercred`
+SKIPPED (no second uid), every `agents` row SKIPPED (the installed agents'
+jobs were not loaded; their servers run under the Pipecat Service Toolbar
+app). Later fixes are covered by stubbed tests. Still tested only with stubs:
+the `--agents` decode through a real launchd agent (it and the harness's
 collision and rollback bodies run end to end in the tests, against stub
-`launchctl`/`lsof` and a fake agent) and the `just smoke --launchd` wiring
-around the harness. Treat those results as unverified until a live
-`just smoke --agents --launchd` run.
+`launchctl`/`lsof` and a fake agent). Treat the decode as unverified until a
+live `just smoke --agents` run with a loaded agent.
 
 `<backend>` is one of `whisper` / `parakeet` / `nemotron` / `kyutai`, mapped to
 the labels and ports in the [per-backend table](docs/operations.md#per-backend-port-convention)

@@ -506,7 +506,7 @@ scripts/smoke.py`, never `uv run` (which prunes the backend extras).
 | `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101`; each request goes over a connection whose server end `lsof` shows is that server's own process |
 | `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (its `--port` parsed as the server parses it; installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, read under the server's own token-file policy (a symlink, a FIFO, a file with group or other access, or a token the server would refuse makes that agent FAIL with nothing sent), else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection, through the production
 client's own `connect` (its headers and its `server.hello` / `session.created`
-handshake; only the transport is the verified socket; a `connect` that no longer opens its connection through the swapped `ws_connect` alone refuses the decode before anything is sent). After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. An installed plist whose job is not loaded in launchd (the servers are run by another app, such as a menu bar app, not launchd) makes that agent SKIPPED: its plist and token file are not read and nothing is sent; servers run that way are not covered by `--agents`. A job that is loaded but not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or a `launchctl print` answer that cannot be read (never taken as not loaded) makes that agent FAIL, and when the check refused, no token was sent. The step is FAIL if any agent FAILED, else PASS if any agent PASSED, else SKIPPED. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode; only the first for a job that is not loaded or not decoded) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents, every installed agent's job is not loaded, or `say` is absent |
+handshake; only the transport is the verified socket; before anything is sent the decode refuses a `connect` the swap cannot be shown to carry: one that runs outside the client module's globals, uses a name outside the allowlist checked against `client.py` (which includes `ws_unix_connect` and `_socket_path` for its socket branch), or no longer looks up the module-global `ws_connect`; at run time the swapped `ws_connect` must be called exactly once, for the client's own URI, or the decode fails). After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. An installed plist whose job is not loaded in launchd (the servers are run by another app, such as a menu bar app, not launchd) makes that agent SKIPPED: its plist and token file are not read and nothing is sent; servers run that way are not covered by `--agents`. A job that is loaded but not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or a `launchctl print` answer that cannot be read (never taken as not loaded) makes that agent FAIL, and when the check refused, no token was sent. The step is FAIL if any agent FAILED, else PASS if any agent PASSED, else SKIPPED. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode; only the first for a job that is not loaded or not decoded) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents, every installed agent's job is not loaded, or `say` is absent |
 | `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
 
 `--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
@@ -519,8 +519,9 @@ Every step has a timeout (`scripts/smoke.py`): `supervised` 600 s, `peercred`
 180 s, `token-file` 90 s; in `agents`, 60 s for each `say` / `afconvert` call
 and 180 s for each decode. The `launchd` step's timeout is the harness's own
 worst case, teardown included (`smoke_launchd.run_budget`, summed from the
-bounds it waits on, for the installed agents: about 31 minutes with none, plus
-about 2 minutes per agent). A
+bounds it waits on, for every real agent its snapshot reads: installed plists
+plus loaded jobs with no plist, from `launchctl list`; about 31 minutes with
+none, plus about 2 minutes per agent). A
 timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT or SIGTERM sent to the
 runner) sends the running step SIGINT; the step then has 180 s to clean up (the
 `launchd` step: the harness's whole teardown, `smoke_launchd.teardown_budget`,
@@ -619,19 +620,22 @@ live three times, on 2026-10-28, against the spare label and port 9998; the
 last run, on the final code of that day's closing pass, had all five rows PASS.
 The port collision (with the squat warning), the socket rollback, the token
 file and the teardown all passed, each answer's server end was verified against
-the spare job, and the real agents were unchanged afterwards. Review fixes made
-after that run are covered by stubbed tests. Those runs confirm that
+the spare job, and the real agents were unchanged afterwards. Then the
+`just smoke --agents --launchd` wiring ran live on 2026-10-29 on the round-8
+head: `supervised`, `token-file` and `launchd` PASS, `peercred` SKIPPED (no
+second uid), and every `agents` row SKIPPED, since the four installed agents'
+jobs were not loaded in launchd (their servers run under the Pipecat Service
+Toolbar app). Later fixes are covered by stubbed tests. Those runs confirm that
 `launchctl print` prints a `runs =` line and that `LOCAL_PEERPID` and `lsof`
 identify a launchd job's server end. Still covered only by stubbed tests (stub
-`launchctl`, `lsof` and `id`, a temp home): the `smoke.py` code that now
-automates the 0.5.0 checks — the `token-file` child, the `--agents` decode and
-the `peercred` SKIPPED mapping — and the `just smoke --launchd` wiring around
-the harness. The tests run the `--agents` decode child (its verified
+`launchctl`, `lsof` and `id`, a temp home): the `--agents` decode through a
+real launchd agent (no agent's job was loaded in the live run, so none was
+decoded). The tests run the `--agents` decode child (its verified
 connection, the token on stdin, the production client handshake) and the
 harness's collision and rollback bodies end to end against stubs and a fake
-agent on a real socket; that is not a live run. Treat those results as unverified until a live
-`just smoke --agents --launchd` run; a FAIL there may be a harness bug rather
-than an agent fault.
+agent on a real socket; that is not a live run. Treat the decode as unverified until a live
+`just smoke --agents` run with a loaded agent; a FAIL there may be a harness
+bug rather than an agent fault.
 
 ## Supervised smoke test
 
