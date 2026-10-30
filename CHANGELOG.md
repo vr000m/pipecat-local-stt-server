@@ -51,7 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the plist; the file read under the server's own token-file policy)
   passed on stdin. The token is sent only over a connection whose
   server end is the agent's own launchd process (same pid and restart count
-  before and after); a foreign or unidentifiable listener gets nothing.
+  before and after); a foreign or unidentifiable listener gets nothing. An
+  installed agent whose job is not loaded in launchd (servers run by another
+  app) is SKIPPED, not decoded; an unreadable `launchctl print` answer FAILs.
   `--launchd` adds the launchd harness (macOS only, opt-in, never in CI). The
   `--agents` decode runs the production client's handshake over the verified
   socket and is tested end to end against a fake agent, but not yet live.
