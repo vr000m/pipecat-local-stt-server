@@ -87,6 +87,12 @@ def seam(smoke, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(smoke._smoke_lib, "agents_home", lambda: home)
     monkeypatch.delenv("CI", raising=False)
+    # The launchd step's budget reads `launchctl list` (the snapshot's label
+    # set): a stub that lists no job, so no real launchctl ever runs.
+    stub = tmp_path / "seam-bin"
+    stub.mkdir()
+    _exe(stub / "launchctl", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("PATH", f"{stub}:{os.environ.get('PATH', '/usr/bin:/bin')}")
     calls: list[tuple[list[str], dict | None]] = []
     behaviour = {"default": _cp(0), "by_script": {}}
 
@@ -1799,15 +1805,33 @@ def test_read_endpoint_token_file_uses_the_server_policy(smoke, tmp_path, kind, 
 
 
 # The launchd step's timeout and grace ARE the harness's own budget for the
-# installed agents (no copied number): agent count -> (timeout, grace) handed
-# to run_command, and the grace covers the harness's whole teardown.
-@pytest.mark.parametrize("n_agents", [0, 1, 4])
-def test_launchd_step_uses_the_harness_budget(smoke, seam, monkeypatch, n_agents):
+# real agents its snapshot reads (no copied number, the snapshot's own label
+# set): installed plists x loaded jobs with NO plist (`launchctl list`) x the
+# list being unreadable -> (timeout, grace) handed to run_command, sized from
+# every label the snapshot reads (the plists alone when the list cannot be
+# read: the harness's baseline then refuses), and the grace covers the
+# harness's whole teardown.
+@pytest.mark.parametrize("list_ok", [True, False])
+@pytest.mark.parametrize("plistless", [0, 2])
+@pytest.mark.parametrize("n_plists", [0, 1, 4])
+def test_launchd_step_uses_the_harness_budget(
+    smoke, seam, monkeypatch, tmp_path, n_plists, plistless, list_ok
+):
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
     import smoke_launchd
 
-    for i in range(n_agents):
+    for i in range(n_plists):
         _render_plist(seam.home, f"pipecat.stt-server.a{i}", port=9100 + i)
+    # A loaded plist-backed job is listed too: it must count once, not twice.
+    listed = [f"pipecat.stt-server.a{i}" for i in range(n_plists)]
+    listed += [f"pipecat.stt-server.loaded{i}" for i in range(plistless)]
+    listed += [SPARE, "com.apple.other"]  # neither is a real agent
+    lines = "".join(f"echo '123\t0\t{label}'\n" for label in listed)
+    _exe(
+        tmp_path / "seam-bin" / "launchctl",
+        "#!/bin/sh\n" + (f'[ "$1" = list ] && {{ {lines} exit 0; }}\n' if list_ok else "exit 1\n"),
+    )
+    n_agents = n_plists + (plistless if list_ok else 0)
     got = {}
 
     def fake(cmd, timeout, env=None, **kw):

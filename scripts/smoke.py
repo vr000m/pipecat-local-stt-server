@@ -240,12 +240,19 @@ def launchd_env(base: dict | None = None) -> dict:
 
 def launchd_budget() -> tuple[float, float]:
     """(timeout, grace) for the launchd step: the harness's own worst-case run
-    with its teardown, then its teardown again, for the installed agents it
-    will snapshot (``smoke_launchd.run_budget`` / ``teardown_budget``), so a
-    SIGTERM can never SIGKILL the harness mid-uninstall."""
+    with its teardown, then its teardown again, for the real agents it will
+    snapshot (``smoke_launchd.real_agent_labels``, the snapshot's own label
+    set: installed plists plus loaded jobs, plist or not; through
+    ``smoke_launchd.run_budget`` / ``teardown_budget``), so a SIGTERM can never
+    SIGKILL the harness mid-uninstall. When ``launchctl list`` cannot be read
+    here the installed plists are counted: the harness's baseline makes that
+    same read and refuses the run at once when it fails."""
     import smoke_launchd
 
-    n = len(agent_plists())
+    try:
+        n = len(smoke_launchd.real_agent_labels(home=_smoke_lib.agents_home()))
+    except RuntimeError:
+        n = len(agent_plists())
     return smoke_launchd.run_budget(n), smoke_launchd.teardown_budget(n)
 
 

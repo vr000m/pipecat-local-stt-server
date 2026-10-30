@@ -158,13 +158,15 @@ SQUAT_START = 5.0  # the squat CLI's `python3 -I` start-up, outside cli_bound
 # --- the harness's time budget ------------------------------------------------
 #
 # smoke.py's launchd step gives the harness run_budget(n) before SIGTERM and
-# then teardown_budget(n) before SIGKILL, n = the installed real-agent plists
-# (each one adds a launchctl print and an lsof to every snapshot). Both are
-# sums of the bounds the code really waits on, named here; a new wait must be
-# added to them (tests/test_smoke_launchd.py pins the runner to these
-# functions and each bound to the constant the code uses). Residual: a loaded
-# real job with NO plist is in every snapshot but not in n; it can only cut
-# short the final re-snapshot, which follows the uninstall and file removal.
+# then teardown_budget(n) before SIGKILL, n = the real agents a snapshot reads
+# (real_agent_labels: installed plists plus loaded jobs, plist or not; each
+# one adds a launchctl print and an lsof to every snapshot). Both are sums of
+# the bounds the code really waits on, named here; a new wait must be added to
+# them (tests/test_smoke_launchd.py pins the runner to these functions and
+# each bound to the constant the code uses). Residual: a job that is loaded
+# only after the runner counted n is in later snapshots but not in n; it
+# differs from the baseline, so the checks stop at the next boundary, and it
+# can only cut short the final re-snapshot.
 
 
 def install_bound() -> float:
@@ -785,12 +787,21 @@ def _plist_record(plist: Path) -> tuple[str | None, str | None]:
     return hashlib.sha256(raw).hexdigest(), port
 
 
+def real_agent_labels(run=subprocess.run, home: Path | None = None) -> set[str]:
+    """The labels a real-agent snapshot reads: every installed plist under
+    ``agents_home()`` plus every loaded job ``launchctl list`` reports (a
+    loaded job with no plist included). The one label set, for
+    ``snapshot_real_agents`` and for the run's time budget (``smoke.py``'s
+    ``launchd_budget``). Raises RuntimeError when the job list cannot be read."""
+    return {p.name[: -len(".plist")] for p in real_agent_plists(home)} | loaded_agent_labels(run)
+
+
 def snapshot_real_agents(run=subprocess.run, home: Path | None = None) -> dict[str, AgentState]:
     """label -> AgentState for each real agent (see the contract above).
     Read-only calls only."""
     uid = current_uid()
     agents = _smoke_lib.launch_agents_dir(home if home is not None else _smoke_lib.agents_home())
-    labels = {p.name[: -len(".plist")] for p in real_agent_plists(home)} | loaded_agent_labels(run)
+    labels = real_agent_labels(run, home)
     snap: dict[str, AgentState] = {}
     for label in sorted(labels):
         loaded, pid, runs, endpoint = read_job(label, uid, run)
