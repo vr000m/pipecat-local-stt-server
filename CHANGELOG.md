@@ -40,10 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the token gets 401 and with it is accepted, sending the token only over a
   connection whose server end is the expected process. Run live three times
   on 2026-10-28 against the spare label and port, the last (on the closing-pass
-  code) with all five rows PASS, then through `just smoke --agents --launchd`
-  on 2026-10-29 on the round-8 head (`launchd` PASS; every `agents` row
-  SKIPPED, no installed agent's job loaded); later fixes are covered by
-  stubbed tests.
+  code) with all five rows PASS, then twice through `just smoke --agents --launchd`
+  on 2026-10-29 (`launchd` PASS both times; every `agents` row FAIL first,
+  then SKIPPED once a not-loaded agent became SKIPPED, since no installed
+  agent's job was loaded); later fixes are covered by stubbed tests.
 
 - **Unified `just smoke [--agents] [--launchd]`**. `scripts/smoke.py` runs the
   supervised (echo), peer-cred and token-file checks and prints one table of

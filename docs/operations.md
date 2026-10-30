@@ -621,11 +621,13 @@ last run, on the final code of that day's closing pass, had all five rows PASS.
 The port collision (with the squat warning), the socket rollback, the token
 file and the teardown all passed, each answer's server end was verified against
 the spare job, and the real agents were unchanged afterwards. Then the
-`just smoke --agents --launchd` wiring ran live on 2026-10-29 on the round-8
-head: `supervised`, `token-file` and `launchd` PASS, `peercred` SKIPPED (no
-second uid), and every `agents` row SKIPPED, since the four installed agents'
-jobs were not loaded in launchd (their servers run under the Pipecat Service
-Toolbar app). Later fixes are covered by stubbed tests. Those runs confirm that
+`just smoke --agents --launchd` wiring ran live twice on 2026-10-29. On
+`8a87046`, `launchd` PASSed and every `agents` row FAILed, since the four
+installed agents' jobs were not loaded in launchd (their servers run under the
+Pipecat Service Toolbar app). After a not-loaded agent became SKIPPED, on
+`e01d7df`: `supervised`, `token-file` and `launchd` PASS, `peercred` SKIPPED (no
+second uid), and every `agents` row SKIPPED. Later fixes are covered by stubbed
+tests. Those runs confirm that
 `launchctl print` prints a `runs =` line and that `LOCAL_PEERPID` and `lsof`
 identify a launchd job's server end. Still covered only by stubbed tests (stub
 `launchctl`, `lsof` and `id`, a temp home): the `--agents` decode through a

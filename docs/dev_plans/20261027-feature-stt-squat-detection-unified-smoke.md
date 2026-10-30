@@ -1,6 +1,6 @@
 # Task: Port-squat detection, one smoke entry point and launchd verification (0.5.1)
 
-**Status**: Shipped in 0.5.1 (PR #18; the launchd harness ran live three times on 2026-10-28, then the `just smoke --agents --launchd` wiring ran live on 2026-10-29 on the round-8 head; later fixes are covered by stubbed tests; `--agents` decode through a real launchd agent is stub-tested only, as every installed agent was not loaded in that run)
+**Status**: Shipped in 0.5.1 (PR #18; the launchd harness ran live three times on 2026-10-28, then the `just smoke --agents --launchd` wiring ran live twice on 2026-10-29 (on `8a87046`, then on `e01d7df`); later fixes are covered by stubbed tests; `--agents` decode through a real launchd agent is stub-tested only, as every installed agent was not loaded in that run)
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: Medium
@@ -188,7 +188,7 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-30 @ ed2444fb9104d911a1f9aec9d42780502885b8ef -->
+<!-- reviewed: 2026-10-30 @ 44325fbf0b76436db1a818eb13a571634242def7 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -199,7 +199,7 @@ Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implemen
 - [x] Phase 2: launchd verification harness
 - [x] Phase 3: Unified smoke
 - [x] Phase 4: Release housekeeping
-- 2026-10-29 live run: the user ran `just smoke --agents --launchd` from a terminal on the round-8 head (before `2f2e2d4`, the `--agents` not-loaded SKIPPED change). `peercred` SKIPPED (no second uid), `supervised` and `token-file` PASS, the `launchd` step PASS, and every `agents` row SKIPPED: the four installed plists are not loaded in launchd (the servers run under the Pipecat Service Toolbar app). So the `just smoke` wiring ran live; the `--agents` decode through a real launchd agent did not. Later fixes are covered by stubbed tests.
+- 2026-10-29 live run: the user ran `just smoke --agents --launchd` from a terminal twice. On `8a87046` (before `2f2e2d4`, the `--agents` not-loaded SKIPPED change) `launchd` PASSed and every `agents` row FAILed as not loaded; on `e01d7df` (after it) `peercred` was SKIPPED (no second uid), `supervised` and `token-file` PASS, the `launchd` step PASS, and every `agents` row SKIPPED: the four installed plists are not loaded in launchd (the servers run under the Pipecat Service Toolbar app). So the `just smoke` wiring ran live; the `--agents` decode through a real launchd agent did not. Later fixes are covered by stubbed tests.
 
 ## Findings
 
