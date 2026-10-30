@@ -1,6 +1,6 @@
 # Task: Port-squat detection, one smoke entry point and launchd verification (0.5.1)
 
-**Status**: Implemented (all phases done; the launchd harness ran live 2026-10-28; PR #18 open)
+**Status**: Shipped in 0.5.1 (PR #18; the launchd harness ran live 2026-10-28 and again via `just smoke --launchd` 2026-10-29; `--agents` decode through a real launchd agent is stub-tested only)
 **Component**: Install & Packaging
 **Assigned to**: Varun Singh
 **Priority**: Medium
@@ -140,7 +140,7 @@ This phase wrote code and stubbed tests. The harness then ran live three times (
 
 - [x] Finalise the CHANGELOG `[0.5.1]` entry.
 - [x] Bump `pyproject.toml` to 0.5.1 and regenerate `uv.lock` with `uv lock` (never `uv sync`, which prunes the extras). Do this **before** the final `just smoke --launchd` so the same-PID check covers it.
-- [ ] Mark this plan Shipped and flip its row in `docs/dev_plans/README.md`.
+- [x] Mark this plan Shipped and flip its row in `docs/dev_plans/README.md`.
 
 ## Files to Modify
 
@@ -186,7 +186,7 @@ Plan review 2026-10-27 (5 lenses plus a contradiction pass, 43 findings, 1 Criti
 
 Conduct-format edit 2026-10-27 (user-approved): `## Phases` renamed `## Implementation Checklist`, Phase 1 split into 1a and 1b so the `uv run` fix is its own commit, per-phase `Impl files` / `Test files` / `Test command` slots added, and the `smoke` public-recipe test entry moved to Phase 3. No design decision changed.
 
-<!-- reviewed: 2026-10-29 @ b58177260244f34c14c703e0ada2581320f44ddd -->
+<!-- reviewed: 2026-10-30 @ 783a1925230ee85fe2600cd4803a1ffd8de4034a -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
