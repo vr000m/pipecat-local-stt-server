@@ -527,6 +527,10 @@ def test_agents_identity_gate_state_space(
     capsys.readouterr()
     ours = ident == "running"
     assert (len(decodes) == 1) == ours, (row, decodes)
+    if ident == "unloaded":  # an installed leftover: SKIPPED, nothing read or sent
+        assert row.outcome == "SKIPPED" and "not loaded in launchd" in row.detail, row
+        assert reads["n"] == 1
+        return
     if not ours:
         assert "no token sent" in row.detail and row.outcome == "FAIL", row
         assert reads["n"] == 1
@@ -537,6 +541,114 @@ def test_agents_identity_gate_state_space(
     assert row.outcome == want, row
     assert ("no token sent" in row.detail) == (child == "refused"), row
     assert reads["n"] == (2 if child == "pass" else 1)  # the PASS needs a fresh read
+
+
+# --agents per-agent launchd state x {that agent alone, alongside a running
+# agent that decodes} -> that agent's outcome, the step's outcome and the
+# runner's exit code. Only a NOT LOADED job (a readable answer, loaded False)
+# is SKIPPED; an unreadable answer is "cannot tell" and FAILs. Nothing is sent
+# (no decode, and the plist is not even read) for a not-loaded job, and no
+# decode starts for an unreadable one. The step: FAIL on any FAIL, else PASS on
+# any PASS, else SKIPPED; only FAIL gives exit 1.
+_AGENT_STATE = {
+    # state: (launchd_identity's first answer, that agent's outcome)
+    "decodes": ((True, "4242", "7"), "PASS"),
+    "no-pid": ((True, None, "3"), "FAIL"),
+    "no-runs": ((True, "4242", _smoke_lib_unknown()), "FAIL"),
+    "not-loaded": ((False, None, None), "SKIPPED"),
+    "unreadable": (None, "FAIL"),
+}
+_RUNNING = (True, "4242", "7")
+
+
+def _step_outcome(outcomes: list[str]) -> str:
+    if "FAIL" in outcomes:
+        return "FAIL"
+    return "PASS" if "PASS" in outcomes else "SKIPPED"
+
+
+@pytest.mark.parametrize("mix", ["one", "mixed"])
+@pytest.mark.parametrize("state", list(_AGENT_STATE))
+def test_agents_not_loaded_is_skipped_state_space(
+    smoke, agents_env, monkeypatch, capsys, state, mix
+):
+    home, _log, _ran, _tmp = agents_env
+    case, other = "pipecat.stt-server.case", "pipecat.stt-server.other"
+    _render_plist(home, case, port=9565)
+    if mix == "mixed":
+        _render_plist(home, other, port=9765)
+    first_answer, want = _AGENT_STATE[state]
+    reads: dict[str, int] = {}
+
+    def identity(label, *a, **k):
+        reads[label] = reads.get(label, 0) + 1
+        if label == case and reads[label] == 1:
+            return first_answer
+        return _RUNNING  # the fresh read after a decode: unchanged
+
+    monkeypatch.setattr(smoke._smoke_lib, "launchd_identity", identity)
+    loads: list[str] = []
+    real_load = smoke.read_stt_plist.load
+    monkeypatch.setattr(smoke.read_stt_plist, "load", lambda p: loads.append(p) or real_load(p))
+    decoded: list[str] = []
+
+    def seam_run(cmd, timeout, env=None, **kw):
+        cmd = [str(c) for c in cmd]
+        if "--_decode" in cmd:
+            decoded.append(cmd[cmd.index("--label") + 1])
+        return _cp(0)  # every other step and child: PASS
+
+    monkeypatch.setattr(smoke, "run_command", seam_run)
+    rc = smoke.main(["--agents"])
+    out = capsys.readouterr().out
+    row = _row(out, "agents")
+    per_agent = dict(re.findall(r"(pipecat\.stt-server\.\w+): (PASS|FAIL|SKIPPED)\b", row))
+    assert per_agent[case] == want, row
+    outcomes = [want] + (["PASS"] if mix == "mixed" else [])
+    if mix == "mixed":
+        assert per_agent[other] == "PASS", row
+    step = _step_outcome(outcomes)
+    assert _outcome(row.split()[1]) == step, row
+    assert rc == (1 if step == "FAIL" else 0), out
+    assert (case in decoded) == (want == "PASS"), decoded
+    if state == "not-loaded":
+        assert "not loaded in launchd" in row and "servers run by another app" in row
+        assert not any(Path(p).name == f"{case}.plist" for p in loads), loads
+        assert reads[case] == 1
+    if state == "unreadable":
+        assert "cannot read its launchd state" in row and "no token sent" in row
+
+
+# The not-loaded check comes before the plist and token-file read, but it does
+# not move a loaded (or unreadable) agent's token-file refusal: that is still
+# its FAIL, nothing sent. A not-loaded agent's bad token file is never read.
+@pytest.mark.parametrize(
+    ("answer", "want"),
+    [((True, "4242", "7"), "FAIL"), (None, "FAIL"), ((False, None, None), "SKIPPED")],
+)
+def test_agents_token_refusal_order(smoke, agents_env, monkeypatch, capsys, answer, want):
+    import plistlib
+
+    home, _log, _ran, tmp_path = agents_env
+    args = [sys.executable, "-m", "stt_server", "serve", "--host", "127.0.0.1", "--port", "9565"]
+    args += ["--auth-token-file", str(tmp_path / "missing-token")]
+    (home / "Library" / "LaunchAgents" / "pipecat.stt-server.plist").write_bytes(
+        plistlib.dumps({"Label": "pipecat.stt-server", "ProgramArguments": args})
+    )
+    monkeypatch.setattr(smoke._smoke_lib, "launchd_identity", lambda *a, **k: answer)
+    decodes: list = []
+
+    def seam_run(cmd, timeout, env=None, **kw):
+        if "--_decode" in [str(c) for c in cmd]:
+            decodes.append(cmd)
+        return _cp(0)
+
+    monkeypatch.setattr(smoke, "run_command", seam_run)
+    row = smoke.agents_step(True)
+    capsys.readouterr()
+    assert row.outcome == want, row
+    assert not decodes
+    assert ("token file is refused" in row.detail) == (want == "FAIL"), row
 
 
 # The token is resolved from the plist the way the server resolves it

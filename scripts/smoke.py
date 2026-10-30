@@ -29,8 +29,12 @@ Run it as ``just smoke [--agents] [--launchd]``. Steps, in order:
   (``LOCAL_PEERPID`` for a socket, ``lsof`` for TCP) and a second print still
   gives (P, R), then decodes over that same socket. After the decode a fresh
   print must still give (P, R) for a PASS. Otherwise the agent's row is FAIL,
-  and when the check refused, nothing was sent. Strictly read-only: it never
-  calls bootout, bootstrap, kickstart or the installer.
+  and when the check refused, nothing was sent. An installed plist whose job
+  is not loaded in launchd (servers run by another app) is SKIPPED, not
+  decoded, before its plist is read; an answer that cannot be read is FAIL,
+  never SKIPPED. The step is FAIL on any FAIL, else PASS on any PASS, else
+  SKIPPED. Strictly read-only: it never calls bootout, bootstrap, kickstart or
+  the installer.
 * ``launchd`` (``--launchd``): ``smoke_launchd.py`` on the spare label and port.
   macOS only, never in CI, and it needs both ``PIPECAT_STT_LABEL`` and
   ``KODA_STT_LABEL`` set to the spare label, which this runner does explicitly.
@@ -353,10 +357,19 @@ def read_endpoint(plist: Path) -> tuple[dict[str, str] | None, str | None, str]:
     return endpoint, read_stt_plist.env_token(data) or None, ""
 
 
-def job_identity(label: str) -> tuple[tuple[str, str] | None, str]:
-    """((pid, runs), "") of LABEL's running launchd job from ONE read-only
-    ``launchctl print`` (``_smoke_lib.launchd_identity``), else (None, why)."""
-    state = _smoke_lib.launchd_identity(label)
+# An installed plist whose job launchd does not have loaded is a leftover (the
+# servers may be run by another app, not launchd): SKIPPED, never decoded.
+NOT_LOADED_DETAIL = (
+    "installed, not loaded in launchd (not decoded; servers run by another app "
+    "are not covered by --agents)"
+)
+
+
+def job_identity(state) -> tuple[tuple[str, str] | None, str]:
+    """((pid, runs), "") of a running launchd job from STATE, the answer of ONE
+    read-only ``launchctl print`` (``_smoke_lib.launchd_identity``), else
+    (None, why). None (the answer cannot be read) is "cannot tell", never
+    "not loaded"."""
     if state is None:
         return None, "cannot read its launchd state (launchctl print failed)"
     loaded, pid, runs = state
@@ -405,17 +418,26 @@ def agents_step(requested: bool) -> StepResult:
     if shutil.which("say") is None:
         return StepResult("agents", SKIPPED, "macOS `say` is not available to generate the clip")
     parts: list[str] = []
-    failed = False
+    failed = passed = False
     with tempfile.TemporaryDirectory(prefix="stt-smoke-agents.") as tmp:
         wav, err = make_clip(tmp)
         if wav is None:
             return StepResult("agents", FAIL, err)
         for plist in plists:
             label = plist.name[: -len(".plist")]
+            # The identity read comes first: a job that is NOT LOADED (a readable
+            # answer, loaded False) is SKIPPED before its plist or token file is
+            # read. An unreadable answer (None) is "cannot tell" and goes on to
+            # the FAIL below, never SKIPPED; a loaded job's plist and token-file
+            # errors are reported exactly as before.
+            state = _smoke_lib.launchd_identity(label)
+            if state is not None and not state[0]:
+                parts.append(f"{label}: {SKIPPED} {NOT_LOADED_DETAIL}")
+                continue
             endpoint, token, bad = read_endpoint(plist)
             ident = None
             if endpoint is not None:
-                ident, why = job_identity(label)
+                ident, why = job_identity(state)
                 if ident is None:
                     bad = f"{why}; not decoded, no token sent"
             if bad:
@@ -442,8 +464,12 @@ def agents_step(requested: bool) -> StepResult:
                         f"-> {now})",
                     )
             failed = failed or outcome != PASS
+            passed = passed or outcome == PASS
             parts.append(f"{label}: {outcome}" + (f" {detail}" if detail else ""))
-    return StepResult("agents", FAIL if failed else PASS, "; ".join(parts))
+    # Any FAIL fails the step; else a PASS passes it; else every installed agent
+    # was SKIPPED (not loaded) and so is the step.
+    step = FAIL if failed else PASS if passed else SKIPPED
+    return StepResult("agents", step, "; ".join(parts))
 
 
 def build_and_run(agents: bool, launchd: bool) -> list[StepResult]:
