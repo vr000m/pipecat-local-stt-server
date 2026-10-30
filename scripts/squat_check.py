@@ -69,12 +69,14 @@ Import surface (besides the CLI), exactly what each importer uses:
 * ``scripts/smoke_launchd.py``: ``read_print`` and ``parse_print``
   (``read_job``, ``squat_warns``), ``endpoint_holders``, ``launchd_state``
   (with the ``uid`` keyword), ``listener_pids``, ``lsof_pids``,
-  ``parse_job_argv`` (``job_endpoint``), the bounds
+  ``parse_job_argv`` (``job_endpoint``), ``runs_readable``
+  (``Harness.running_identity``), the bounds
   ``LSOF_TIMEOUT`` / ``LAUNCHCTL_TIMEOUT`` (its time budget sums them) and
   ``cli_bound`` (the CLI's own worst case, which its squat-check timeout and
   budget derive from).
 * ``scripts/_smoke_lib.py``: ``UNKNOWN`` (re-exported as
-  ``_smoke_lib.UNKNOWN``), ``read_job_print`` (``launchd_identity``, which
+  ``_smoke_lib.UNKNOWN``), ``runs_readable`` (the one "runs was read" rule,
+  re-exported as ``_smoke_lib.runs_readable`` for ``smoke.py``), ``read_job_print`` (``launchd_identity``, which
   ``smoke.py`` uses) and ``lsof_output`` (``tcp_server_end_pids``, which
   ``connect_verified`` uses).
 
@@ -271,6 +273,15 @@ def _commands(pids, run):
 # same object.
 UNKNOWN = "unknown"
 
+
+def runs_readable(runs):
+    """True when RUNS is a spawn counter that was read (not None, not UNKNOWN,
+    not empty): the only kind two reads can be compared on. UNKNOWN is a plain
+    string, so ``UNKNOWN == UNKNOWN`` is True; every reader that compares runs
+    goes through this one rule instead of its own guard."""
+    return bool(runs) and runs != UNKNOWN
+
+
 _PID_RE = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
 _RUNS_RE = re.compile(r"^\s*runs = (\d+)", re.MULTILINE)
 _ARGS_RE = re.compile(r"^\s*arguments = \{\s*\n(.*?)^\s*\}", re.MULTILINE | re.DOTALL)
@@ -415,7 +426,7 @@ def check(host, port, pid, loaded, label=None, *, run=subprocess.run, sleep=time
         if (
             after is None
             or (after.pid or "") != pid
-            or runs in (None, UNKNOWN)
+            or not runs_readable(runs)
             or after.runs != runs
         ):
             print(
