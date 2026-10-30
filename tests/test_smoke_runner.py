@@ -1515,6 +1515,127 @@ def test_run_owned_input_reaches_stdin_only(smoke, payload, want):
     assert all("s3cret" not in a for a in cmd)
 
 
+# INPUT is written by a writer thread under run_owned's own timeout: payload
+# size (one byte, well past a pipe buffer) x whether the child reads its stdin
+# -> a reading child gets every byte; a child that never reads times out
+# (timed_out, its group killed) instead of blocking the caller in the write.
+@pytest.mark.parametrize("reads", [True, False])
+@pytest.mark.parametrize("size", [1, 1 << 20])
+def test_run_owned_input_never_blocks_past_the_timeout(smoke, reads, size):
+    lib = smoke._smoke_lib
+    body = (
+        "import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))"
+        if reads
+        else "import time; time.sleep(30)"
+    )
+    got: list = []
+    # Off the main thread (nothing is held there), so a blocked write would
+    # show as a worker that never finishes rather than a hung test run.
+    worker = threading.Thread(
+        target=lambda: got.append(
+            lib.run_owned(
+                [sys.executable, "-c", body],
+                30 if reads else 2,
+                input=b"x" * size,
+                timeout_signal=None,  # the kill alone: no SIGTERM-then-killpg race
+            )
+        ),
+        daemon=True,
+    )
+    started = time.monotonic()
+    worker.start()
+    worker.join(30)
+    assert got, "run_owned blocked writing stdin past its timeout"
+    res, timed_out = got[0]
+    if reads:
+        assert (res.stdout, timed_out) == (str(size), False)
+    else:
+        assert timed_out and time.monotonic() - started < 20
+
+
+# A failure in OwnedGroup's constructor AFTER the child started (a pipe
+# thread's start) x the group kill (lands / fails) x the reap (reaped / not) x
+# a held signal whose handler raises -> what propagates. The bare failure only
+# when the group is shown stopped; otherwise GroupNotStopped chained to it
+# (a raising handler's KeyboardInterrupt carries it, group_not_stopped), the
+# same verdict run_owned gives a group it ran, so run_installer can map it.
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("reaped", [True, False])
+@pytest.mark.parametrize("kill", ["lands", "fails"])
+def test_owned_group_failure_after_spawn_keeps_the_verdict(smoke, monkeypatch, kill, reaped, held):
+    import types
+
+    lib = smoke._smoke_lib
+    real_kill, real_reap = lib.OwnedGroup.kill_group, lib.OwnedGroup.reap
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    class Recorded(real_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            spawned.append(self)
+
+    class FailingThread(threading.Thread):
+        def start(self):
+            assert spawned, "the failure must come after the spawn"
+            if held:
+                os.kill(os.getpid(), signal.SIGINT)  # arrives while held
+            raise RuntimeError("cannot start a pipe thread")
+
+    def kill_group(self):
+        err = real_kill(self)  # the real SIGKILL always lands: nothing is left
+        return err if kill == "lands" else f"cannot SIGKILL process group {self.pid}: test"
+
+    def reap(self, *a, **k):
+        real_reap(self, *a, **k)
+        if not reaped:
+            self.reaped = False
+
+    def handler(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    monkeypatch.setattr(lib.subprocess, "Popen", Recorded)
+    monkeypatch.setattr(
+        lib,
+        "threading",
+        types.SimpleNamespace(
+            Thread=FailingThread,
+            Event=threading.Event,
+            current_thread=threading.current_thread,
+            main_thread=threading.main_thread,
+        ),
+    )
+    monkeypatch.setattr(lib.OwnedGroup, "kill_group", kill_group)
+    monkeypatch.setattr(lib.OwnedGroup, "reap", reap)
+    stopped = kill == "lands" and reaped
+    cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+    old = signal.signal(signal.SIGINT, handler)
+    try:
+        with pytest.raises(BaseException) as caught:
+            lib.run_owned(cmd, 30)
+    finally:
+        signal.signal(signal.SIGINT, old)
+        for p in spawned:
+            if p.returncode is None:
+                with contextlib.suppress(OSError):
+                    os.killpg(p.pid, signal.SIGKILL)
+                p.wait(10)
+    exc = caught.value
+    assert len(spawned) == 1
+    gns = lib.group_not_stopped(exc)
+    if held:
+        assert isinstance(exc, KeyboardInterrupt)
+    if stopped:
+        assert gns is None
+        if not held:
+            assert isinstance(exc, RuntimeError) and "pipe thread" in str(exc)
+    else:
+        assert isinstance(gns, lib.GroupNotStopped)
+        assert isinstance(gns.__cause__, RuntimeError)  # chained to the failure
+        assert "may still be running" in str(gns)
+        assert held or exc is gns
+
+
 # The group kill's outcome x whether the leader is still running -> run_owned
 # returns the result only when the group is provably stopped: the SIGKILL
 # landed (or the group is gone: ESRCH; or macOS's EPERM for a zombie-only

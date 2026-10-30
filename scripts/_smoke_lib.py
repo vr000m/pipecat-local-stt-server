@@ -665,11 +665,44 @@ def group_not_stopped(exc: BaseException) -> GroupNotStopped | None:
     return found if isinstance(found, GroupNotStopped) else None
 
 
+def _feed(pipe, data: bytes, stop: threading.Event) -> None:
+    """Write DATA to PIPE (the child's stdin) and close it, on its own thread,
+    so the caller's timeout loop runs while it writes. The fd is non-blocking
+    and written only when writable (polled every GROUP_POLL), so a child that
+    never reads cannot block this thread past STOP, which the owner sets on
+    the reap, after the group is killed. A child that closed its stdin or
+    exited first (EPIPE) is the child's own problem: the rest is dropped.
+    PIPE is closed on every path (the child's EOF); no other thread uses it."""
+    import selectors
+
+    try:
+        fd = pipe.fileno()
+        os.set_blocking(fd, False)
+        view = memoryview(data)
+        with selectors.DefaultSelector() as sel:
+            sel.register(fd, selectors.EVENT_WRITE)
+            while view and not stop.is_set():
+                if not sel.select(GROUP_POLL):
+                    continue
+                with contextlib.suppress(BlockingIOError):
+                    view = view[os.write(fd, view) :]
+    except (OSError, ValueError):
+        pass  # BrokenPipeError: the child is not reading any more
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            pipe.close()
+
+
 class OwnedGroup:
     """A child started in its own session (so it leads its own process group),
     signalled only while this process owns that group (see the invariant
     above). Its stdout and stderr are drained by two daemon threads; INPUT, when
-    given, is written to its stdin, which is then closed."""
+    given, is written to its stdin by a third (``_feed``), which then closes it.
+
+    A failure after the child started (the kqueue registration, a thread
+    start) kills and reaps the group before it propagates; when the group
+    cannot be shown stopped (``stop_verdict``) the constructor raises
+    GroupNotStopped, chained to that failure, never the bare failure."""
 
     def __init__(self, cmd, *, env=None, cwd=None, input: bytes | None = None):
         self.proc = subprocess.Popen(
@@ -690,12 +723,6 @@ class OwnedGroup:
         self._readers: list[threading.Thread] = []
         self._stop_reading = threading.Event()
         try:
-            if input is not None:
-                # Small (a token); a child that exits without reading it is fine.
-                with contextlib.suppress(BrokenPipeError):
-                    self.proc.stdin.write(input)
-                with contextlib.suppress(BrokenPipeError):
-                    self.proc.stdin.close()
             if not hasattr(os, "waitid"):
                 import select
 
@@ -711,16 +738,37 @@ class OwnedGroup:
                 except ProcessLookupError:
                     # Already exited: still a zombie, since only reap() reaps it.
                     self._exited = True
-            for pipe, sink in ((self.proc.stdout, self._out), (self.proc.stderr, self._err)):
-                t = threading.Thread(
-                    target=_drain, args=(pipe, sink, self._stop_reading), daemon=True
-                )
+            # The pipe threads: the two readers, then the stdin writer. reap()
+            # stops and joins every one before it closes the output pipes.
+            targets = [
+                (_drain, (self.proc.stdout, self._out, self._stop_reading)),
+                (_drain, (self.proc.stderr, self._err, self._stop_reading)),
+            ]
+            if input is not None:
+                targets.append((_feed, (self.proc.stdin, input, self._stop_reading)))
+            for target, args in targets:
+                t = threading.Thread(target=target, args=args, daemon=True)
                 t.start()
                 self._readers.append(t)
-        except BaseException:
-            self.kill_group()
+        except BaseException as exc:
+            # The group exists (Popen succeeded): kill and reap it, and when it
+            # cannot be shown stopped that verdict is what propagates.
+            kill_error = self.kill_group()
             self.reap()
+            not_stopped = self.stop_verdict(kill_error)
+            if not_stopped is not None:
+                raise not_stopped from exc
             raise
+
+    def stop_verdict(self, kill_error: str | None) -> GroupNotStopped | None:
+        """After ``kill_group()`` (its result, KILL_ERROR) and ``reap()``:
+        None when the group is shown stopped (the kill landed AND the leader
+        was reaped), else the GroupNotStopped to raise. The one rule for
+        ``run_owned`` and for a constructor that failed after the spawn."""
+        if kill_error is None and self.reaped:
+            return None
+        why = kill_error or f"pid {self.pid} was still running after SIGKILL and the reap wait"
+        return GroupNotStopped(f"{why}; its process group may still be running")
 
     def exited(self) -> bool:
         """True once the leader has exited; it is NOT reaped here."""
@@ -810,8 +858,11 @@ def run_owned(
     input: bytes | None = None,
 ) -> tuple[subprocess.CompletedProcess, bool]:
     """Run CMD in its own process group; return (completed, timed_out).
-    INPUT (bytes) is written to its stdin, which is then closed; without it
-    stdin is ``/dev/null``. A secret goes this way, never on argv.
+    INPUT (bytes) is written to its stdin by a writer thread, which then
+    closes it; without it stdin is ``/dev/null``. A secret goes this way,
+    never on argv. The write runs under the same TIMEOUT and kill as the rest
+    (a child that never reads its stdin times out; it never blocks this
+    process with the signals held), and the writer is stopped on the reap.
 
     One lifecycle for every way the run can end. SIGINT and SIGTERM to this
     process are held throughout. The leader's exit is awaited without reaping
@@ -828,7 +879,9 @@ def run_owned(
     Raises GroupNotStopped when the group could not be shown stopped: the
     SIGKILL failed (anything but ESRCH, or EPERM once the leader has exited,
     macOS's answer for a zombie-only group) or the leader was not reaped
-    after it. No result is returned as success then. That verdict is decided
+    after it; also when OwnedGroup's constructor failed after the child
+    started and its group could not be shown stopped (``stop_verdict``, one
+    rule). No result is returned as success then. That verdict is decided
     BEFORE a held signal is redelivered, so the handler's exception cannot
     hide it: when the handler raises, its exception propagates carrying the
     GroupNotStopped (``group_not_stopped(exc)``, also its ``__cause__``);
@@ -836,10 +889,17 @@ def run_owned(
     held: tuple[list[int], dict] = ([], {})
     group = None
     kill_error = None
+    not_stopped = None
     try:
         with held_signals() as held:
             got, _old = held
-            group = OwnedGroup(cmd, env=env, cwd=cwd, input=input)
+            try:
+                group = OwnedGroup(cmd, env=env, cwd=cwd, input=input)
+            except GroupNotStopped as exc:
+                # The child started and the constructor then failed: its
+                # group could not be shown stopped, the same verdict as below.
+                not_stopped = exc
+                raise
             timed_out = False
             try:
                 deadline = time.monotonic() + timeout
@@ -865,10 +925,8 @@ def run_owned(
                 kill_error = group.kill_group()
                 group.reap()
     finally:
-        not_stopped = None
-        if group is not None and (kill_error is not None or not group.reaped):
-            why = kill_error or f"pid {group.pid} was still running after SIGKILL and the reap wait"
-            not_stopped = GroupNotStopped(f"{why}; its process group may still be running")
+        if group is not None:
+            not_stopped = group.stop_verdict(kill_error)
         got, old = held
         if got:
             try:
