@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-30
+
+### Added
+
+- **Port squat detection** (issue #17). `just stt-list` and `just stt-status
+  <backend>` warn on stderr when a TCP agent's port is held by a process other
+  than the agent (listener pid vs launchd pid, confirmed after 1 second), or by
+  any process while the agent is not running. Advisory only: stdout and exit
+  codes are unchanged. A `launchctl print` failure other than "could not find
+  service" prints a "cannot read the launchd state" note instead of passing as
+  not running. `scripts/squat_check.py` does the check, reading the `launchctl
+  print` answer from stdin so a legacy plist's token never appears in `ps`;
+  `lsof` shows only your own processes' sockets. See `docs/operations.md`.
+
+- **launchd verification harness** (opt-in). `scripts/smoke_launchd.py` runs
+  the checks 0.5.0 covered only with stubs against real launchd, on a spare
+  label (`pipecat.stt-server.smoke`) and port (9998) that no real agent shares:
+  the port-collision restart loop (with a squat warning), the TCP-to-socket-and-
+  back rollback, and a token file through launchd. It refuses any other label or
+  a canonical or busy port, tears the spare agent down on every exit (removing
+  the spare socket only under its own `.lock` flock, and failing on any cleanup
+  it could not do), and compares each real agent's loaded job (pid, restart
+  count, served endpoint), plist and listener with a baseline before every check
+  and after teardown; a field it cannot read refuses the run (a real agent's
+  `--port` is parsed as the server parses it, so `+9998` is 9998). Every
+  answer that proves the spare is up goes over a connection whose server end
+  is the spare job; the harness and its installer run with a scrubbed
+  environment and fixed `PATH`; its runner timeout is the harness's own
+  worst-case budget, teardown included. The shared
+  `assert_token_gate` in `scripts/_smoke_lib.py` checks that a request without
+  the token gets 401 and with it is accepted, sending the token only over a
+  connection whose server end is the expected process. Run live three times
+  on 2026-10-28 against the spare label and port, the last (on the closing-pass
+  code) with all five rows PASS, then twice through `just smoke --agents --launchd`
+  on 2026-10-29 (`launchd` PASS both times; every `agents` row FAIL first,
+  then SKIPPED once a not-loaded agent became SKIPPED, since no installed
+  agent's job was loaded); later fixes are covered by stubbed tests.
+
+- **Unified `just smoke [--agents] [--launchd]`**. `scripts/smoke.py` runs the
+  supervised (echo), peer-cred and token-file checks and prints one table of
+  PASS, FAIL or SKIPPED with a reason; the exit status is 1 on any FAIL.
+  `--agents` decodes a clip (generated with `say`/`afconvert`) through each
+  installed agent from its plist endpoint, read-only, with the agent's token
+  (its token file, or a legacy `PIPECAT_STT_AUTH_TOKEN` / `KODA_STT_AUTH_TOKEN`
+  in the plist; the file read under the server's own token-file policy)
+  passed on stdin. The token is sent only over a connection whose
+  server end is the agent's own launchd process (same pid and restart count
+  before and after); a foreign or unidentifiable listener gets nothing. An
+  installed agent whose job is not loaded in launchd (servers run by another
+  app) is SKIPPED, not decoded; an unreadable `launchctl print` answer FAILs.
+  `--launchd` adds the launchd harness (macOS only, opt-in, never in CI). The
+  `--agents` decode runs the production client's handshake over the verified
+  socket and is tested end to end against a fake agent, but not yet live.
+
+### Changed
+
+- README and `docs/operations.md`: one `just smoke` section replaces the scattered
+  smoke instructions, and the remaining `uv run python` examples use `uv run
+  --no-sync python` so they cannot prune the backend extras.
+- `just smoke-peercred` and `scripts/smoke_test_parakeet.py` run with
+  `.venv/bin/python` instead of plain `uv run`, which pruned the backend extras.
+- `scripts/smoke_supervised.py` sends each server's stderr to a temp file
+  instead of an unread pipe, so a chatty server can no longer stall a scenario.
+
 ## [0.5.0] - 2026-10-27
 
 > **UPGRADE NOTE.** The default LaunchAgent transport changed from a Unix socket
@@ -759,6 +823,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.5.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.1
 [0.5.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.0
 [0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0
 [0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3

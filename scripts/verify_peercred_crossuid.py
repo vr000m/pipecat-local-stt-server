@@ -14,7 +14,7 @@ peer-credential gate (not the filesystem boundary) is what discriminates. The
 probe needs no venv/websockets, so `nobody` (who cannot read this repo under a
 0750 home) can still run it from /tmp via the system /usr/bin/python3.
 
-Run from the repo root:  uv run python <this file>
+Run from the repo root:  uv run --no-sync python <this file>
 The `nobody` leg uses `sudo -u nobody`; sudo will prompt for your password once
 (or run `sudo -v` first to pre-cache).
 """

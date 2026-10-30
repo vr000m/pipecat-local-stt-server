@@ -74,14 +74,20 @@ def _make_stub_dir(
     tmp_path: Path,
     *,
     print_loaded: bool = False,
+    print_error: tuple[int, str] | None = None,
     status_exit: int = 0,
     fail_actions: tuple[str, ...] = (),
     unload_polls: int = 0,
+    launchd_pid: int | None = 4242,
+    lsof_listeners: tuple[tuple[int, str, str], ...] = (),
+    lsof_exit: int = 0,
 ) -> tuple[Path, Path]:
     """Stub ``launchctl`` / ``id`` / ``uv`` that log argv to ``argv.log``.
 
-    ``print_loaded`` controls ``launchctl print``'s exit code (0 == agent
-    loaded). ``status_exit`` controls the exit code of the stubbed
+    ``print_loaded`` controls ``launchctl print``'s answer: loaded (exit 0) or
+    launchd's own not-loaded answer (exit 113, "Could not find service" on
+    stderr). ``print_error`` ``(rc, stderr)`` makes ``print`` fail any other
+    way (an answer that is neither: "cannot tell"). ``status_exit`` controls the exit code of the stubbed
     ``uv run --no-sync python -m stt_server status`` probe (non-zero == stopped socket).
     ``fail_actions`` names ``launchctl`` subcommands (e.g. ``bootout``,
     ``bootstrap``, ``kickstart``) that should exit non-zero, so recipe
@@ -90,12 +96,20 @@ def _make_stub_dir(
     ``bootout``, ``print`` still reports the job loaded for that many calls
     (``-1``: forever), then reports it gone; a ``bootstrap`` while it is still
     listed fails with exit 5, as launchd does in that window.
+    ``launchd_pid`` is the ``pid =`` that a loaded job's ``launchctl print``
+    reports (``None``: loaded but no ``pid =`` line, i.e. not running).
+    ``lsof_listeners`` is a tuple of ``(pid, command, address:port)`` rows the
+    stubbed ``lsof`` reports (default: no listener, so the squat check is quiet
+    and existing tests stay hermetic). Every ``lsof`` call is logged to
+    ``lsof.log`` (not ``argv.log``) so "no squat call" is assertable.
     """
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir()
     argv_log = tmp_path / "argv.log"
 
-    print_rc = 0 if print_loaded else 1
+    print_rc, print_err = (0, "") if print_loaded else (113, "Could not find service")
+    if print_error is not None:
+        print_rc, print_err = print_error
     fail_set = " ".join(fail_actions)
     _write_executable(
         stub_dir / "launchctl",
@@ -116,7 +130,15 @@ if [[ -e "$TEARDOWN" ]]; then
 fi
 if [[ "$1" == "print" ]]; then
     if [[ {print_rc} -eq 0 ]]; then
-        printf 'state = running\\n\\tpid = 4242\\n'
+        printf 'state = running\\n'
+        if [[ -n "{launchd_pid if launchd_pid is not None else ""}" ]]; then
+            printf '\\tpid = {launchd_pid}\\n'
+        fi
+        # launchctl prints the spawn counter for a loaded job; the squat
+        # confirm pass needs it on both reads to warn.
+        printf '\\truns = 1\\n'
+    elif [[ -n "{print_err}" ]]; then
+        printf '%s\\n' "{print_err}" >&2
     fi
     exit {print_rc}
 fi
@@ -139,6 +161,29 @@ if [[ "$1" == "-u" ]]; then
     exit 0
 fi
 exec /usr/bin/id "$@"
+""",
+    )
+
+    # lsof stub: logs argv to lsof.log; renders the configured listeners as
+    # `-F` field output (`p` always, `c`/`n` only when named in the -F arg).
+    rows = [list(r) for r in lsof_listeners]
+    _write_executable(
+        stub_dir / "lsof",
+        f"""#!{sys.executable}
+import sys
+with open({str(tmp_path / "lsof.log")!r}, "a") as fh:
+    fh.write("lsof " + " ".join(sys.argv[1:]) + "\\n")
+if {lsof_exit}:
+    sys.stderr.write("lsof: stub failure\\n")
+    sys.exit({lsof_exit})
+fields = "".join(a[2:] for a in sys.argv[1:] if a.startswith("-F"))
+for pid, cmd, addr in {rows!r}:
+    out = ["p%s" % pid]
+    if "c" in fields:
+        out.append("c" + cmd)
+    if "n" in fields:
+        out.append("n" + addr)
+    print("\\n".join(out))
 """,
     )
 
@@ -282,11 +327,48 @@ def test_just_list_exposes_public_recipes(tmp_path):
         "stt-install",
         "stt-uninstall",
         "stt-probe",
+        "smoke",
     ):
-        assert recipe in res.stdout
+        assert re.search(rf"^\s*{re.escape(recipe)}\b", res.stdout, re.M), recipe
     # Private (underscore) helpers are not advertised in --list.
     assert "_resolve" not in res.stdout
+    assert "_squat_check" not in res.stdout
     assert "_ensure-extra" not in res.stdout
+
+
+def test_smoke_recipe_passes_args_to_smoke_py(tmp_path):
+    """`just smoke ARGS` runs `.venv/bin/python scripts/smoke.py ARGS` from the
+    justfile dir. Hermetic: the justfile is copied beside a stub interpreter and
+    an empty `scripts/smoke.py`; no real smoke step runs."""
+    work = tmp_path / "work"
+    (work / ".venv" / "bin").mkdir(parents=True)
+    (work / "scripts").mkdir()
+    (work / "scripts" / "smoke.py").write_text("")
+    shutil.copy(JUSTFILE, work / "justfile")
+    argv_out = tmp_path / "py-argv.log"
+    _write_executable(
+        work / ".venv" / "bin" / "python",
+        f"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {argv_out}\npwd >> {argv_out}\n",
+    )
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = _home_with_agents(tmp_path, [])
+    env = {
+        "HOME": str(home),
+        "PATH": f"{stub_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+    }
+    env.pop("CI", None)
+    res = subprocess.run(
+        ["just", "smoke", "--agents", "--launchd"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=str(work),
+    )
+    assert res.returncode == 0, res.stderr
+    lines = argv_out.read_text().splitlines()
+    assert lines[:3] == ["scripts/smoke.py", "--agents", "--launchd"]
+    assert Path(lines[3]).resolve() == work.resolve()
 
 
 def _resolve(backend: str, tmp_path: Path) -> subprocess.CompletedProcess:
@@ -2279,3 +2361,282 @@ def test_nested_just_calls_forward_the_variables_their_callee_reads():
         f"expected nested just calls from stt-status, stt-enable and stt-install; "
         f"scan saw {sorted(callers_seen)}"
     )
+
+
+def test_no_plain_uv_run_python_in_smoke_surfaces():
+    """Plain `uv run python` re-syncs and strips the optional backend extras
+    (crash-looping LaunchAgents). The justfile and every scripts/*.py
+    must run `.venv/bin/python` (or `uv run --no-sync python`) instead; the
+    README and docs/operations.md examples follow the same rule."""
+    files = [
+        JUSTFILE,
+        *sorted((REPO_ROOT / "scripts").glob("*.py")),
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "docs" / "operations.md",
+    ]
+    plain = re.compile(r"\buv run python\b")
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{n}: {line.strip()}"
+        for path in files
+        if path.exists()
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if plain.search(line)
+    ]
+    assert not offenders, "plain `uv run python` (needs --no-sync):\n" + "\n".join(offenders)
+
+
+# --------------------------------------------------------------------------- #
+# Port-squat detection wiring (issue #17): _squat_check from stt-list/stt-status
+# --------------------------------------------------------------------------- #
+
+SQUAT_WARNING = "squat-check: warning:"
+
+
+def _lsof_log(tmp_path: Path) -> list[str]:
+    log = tmp_path / "lsof.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _squat_run(tmp_path, recipe_args, *, listeners, status_exit=0, launchd_pid=4242):
+    """One recipe run against a rendered whisper TCP plist on port 9871."""
+    stub_dir, argv_log = _make_stub_dir(
+        tmp_path,
+        print_loaded=True,
+        status_exit=status_exit,
+        launchd_pid=launchd_pid,
+        lsof_listeners=listeners,
+    )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    return _run_just(recipe_args, home=home, stub_dir=stub_dir), argv_log
+
+
+def test_lsof_stub_defaults_to_no_listener(tmp_path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    res = subprocess.run(
+        [str(stub_dir / "lsof"), "-nP", "-iTCP:9565", "-sTCP:LISTEN", "-Fpn"],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0 and res.stdout == ""
+
+
+def test_stt_list_matching_listener_is_quiet_but_checked(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-list"], listeners=((4242, "python", "127.0.0.1:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert any("9871" in ln for ln in _lsof_log(tmp_path)), "TCP agent must be checked"
+
+
+def test_stt_list_squat_warns_on_stderr_only_and_exits_zero(tmp_path):
+    (tmp_path / "clean").mkdir()
+    (tmp_path / "squat").mkdir()
+    clean, _ = _squat_run(
+        tmp_path / "clean", ["stt-list"], listeners=((4242, "python", "127.0.0.1:9871"),)
+    )
+    squat, _ = _squat_run(
+        tmp_path / "squat", ["stt-list"], listeners=((777, "nc", "127.0.0.1:9871"),)
+    )
+    assert squat.returncode == 0, squat.stderr
+    assert SQUAT_WARNING in squat.stderr
+    assert "777" in squat.stderr and "9871" in squat.stderr
+    # The advisory recipe's exit 3 must not surface as a `just` error line.
+    assert "error: recipe" not in squat.stderr
+    assert SQUAT_WARNING not in squat.stdout
+    # The machine-readable surface is untouched by a squat.
+    assert squat.stdout.encode() == clean.stdout.encode()
+
+
+def test_stt_list_wildcard_squatter_warns(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-list"], listeners=((888, "nc", "*:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING in res.stderr and "888" in res.stderr
+
+
+def test_stt_list_listener_on_another_host_is_ignored(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-list"], listeners=((888, "nc", "10.9.9.9:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+
+
+def test_stt_list_loaded_without_pid_and_listener_warns(tmp_path):
+    res, _ = _squat_run(
+        tmp_path,
+        ["stt-list"],
+        listeners=((555, "nc", "127.0.0.1:9871"),),
+        launchd_pid=None,
+    )
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING in res.stderr and "555" in res.stderr
+    assert "not running" in res.stderr
+
+
+def test_stt_list_not_loaded_job_is_quiet(tmp_path):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path, print_loaded=False, lsof_listeners=((555, "nc", "127.0.0.1:9871"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+
+
+def test_stt_list_socket_agent_makes_no_squat_call(tmp_path):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path, print_loaded=True, lsof_listeners=((555, "nc", "127.0.0.1:9871"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    _render_plist(home, "pipecat.stt-server", socket_path=sock)
+    res = _run_just(["stt-list"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert _lsof_log(tmp_path) == []
+
+
+@pytest.mark.parametrize("probe_exit", [0, 1])
+def test_stt_status_squat_keeps_probe_exit_and_stdout(tmp_path, probe_exit):
+    (tmp_path / "clean").mkdir()
+    (tmp_path / "squat").mkdir()
+    clean, _ = _squat_run(
+        tmp_path / "clean",
+        ["stt-status", "whisper"],
+        listeners=((4242, "python", "127.0.0.1:9871"),),
+        status_exit=probe_exit,
+    )
+    squat, argv_log = _squat_run(
+        tmp_path / "squat",
+        ["stt-status", "whisper"],
+        listeners=((777, "nc", "127.0.0.1:9871"),),
+        status_exit=probe_exit,
+    )
+    assert squat.returncode == probe_exit, squat.stderr
+    assert SQUAT_WARNING in squat.stderr and "777" in squat.stderr
+    assert SQUAT_WARNING not in squat.stdout
+    assert squat.stdout.encode() == clean.stdout.encode()
+    assert clean.returncode == probe_exit and SQUAT_WARNING not in clean.stderr
+    # The warning comes before the probe, and the probe still ran.
+    assert "--host 127.0.0.1 --port 9871" in _status_call(argv_log)
+
+
+def test_stt_status_no_argument_squat_via_stt_list(tmp_path):
+    res, _ = _squat_run(tmp_path, ["stt-status"], listeners=((777, "nc", "127.0.0.1:9871"),))
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING in res.stderr
+
+
+def test_stt_status_socket_plist_makes_no_squat_call(tmp_path):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path, print_loaded=True, lsof_listeners=((555, "nc", "127.0.0.1:9565"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    sock = home / "Library" / "Caches" / "pipecat-stt" / "stt.sock"
+    _render_plist(home, "pipecat.stt-server", socket_path=sock)
+    res = _run_just(["stt-status", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert _lsof_log(tmp_path) == []
+
+
+def test_stt_status_no_plist_canonical_fallback_makes_no_squat_call(tmp_path):
+    stub_dir, argv_log = _make_stub_dir(
+        tmp_path, print_loaded=True, lsof_listeners=((555, "nc", "127.0.0.1:9565"),)
+    )
+    home = _home_with_agents(tmp_path, [])
+    res = _run_just(["stt-status", "whisper"], home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stderr
+    assert _lsof_log(tmp_path) == []
+    assert "--host 127.0.0.1 --port 9565" in _status_call(argv_log)
+
+
+# The recipe's one `launchctl print` answer x its listener -> the squat verdict.
+# Not loaded is only launchd's own "could not find service" (quiet, no lsof); an
+# answer that is neither loaded nor that is "cannot tell" (a note, no warning,
+# never quiet-as-not-loaded); the recipe's exit status and stdout never change.
+_PRINT_ANSWERS = {
+    "loaded": {"print_loaded": True},
+    "not-loaded": {"print_loaded": False},
+    "denied": {"print_error": (1, "Operation not permitted")},
+    "io-error": {"print_error": (5, "Input/output error")},
+    "silent-fail": {"print_error": (1, "")},
+}
+
+
+@pytest.mark.parametrize("recipe", [["stt-list"], ["stt-status", "whisper"]])
+@pytest.mark.parametrize(
+    ("answer", "listener", "verdict"),
+    [
+        ("loaded", 4242, "quiet-checked"),
+        ("loaded", 777, "warn"),
+        ("not-loaded", 777, "quiet-unchecked"),
+        ("denied", 777, "cannot-tell"),
+        ("io-error", 777, "cannot-tell"),
+        ("silent-fail", 777, "cannot-tell"),
+    ],
+)
+def test_squat_verdict_follows_the_recipes_launchctl_answer(
+    tmp_path, recipe, answer, listener, verdict
+):
+    stub_dir, _ = _make_stub_dir(
+        tmp_path,
+        status_exit=0,
+        lsof_listeners=((listener, "nc", "127.0.0.1:9871"),),
+        **_PRINT_ANSWERS[answer],
+    )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    res = _run_just(recipe, home=home, stub_dir=stub_dir)
+    assert res.returncode == 0, res.stderr
+    assert SQUAT_WARNING not in res.stdout
+    assert (SQUAT_WARNING in res.stderr) == (verdict == "warn")
+    assert ("cannot read the launchd state" in res.stderr) == (verdict == "cannot-tell")
+    checked = any("9871" in ln for ln in _lsof_log(tmp_path))
+    assert checked == (verdict in ("quiet-checked", "warn"))
+
+
+# The launchctl print answer can carry a legacy plist's bearer token (its job
+# environment block), and every local user can read argv with `ps`. The recipes
+# hand it to squat_check.py on stdin: no process the recipes start (nested `just`
+# included) may carry it on argv, and the squat check still classifies it.
+LEGACY_SECRET = "legacy-token-must-not-reach-argv"
+
+
+@pytest.mark.parametrize("recipe", [["stt-list"], ["stt-status"], ["stt-status", "whisper"]])
+def test_launchctl_answer_never_reaches_argv(tmp_path, recipe):
+    stub_dir, _ = _make_stub_dir(tmp_path, lsof_listeners=((777, "nc", "127.0.0.1:9871"),))
+    _write_executable(
+        stub_dir / "launchctl",
+        f"""#!/usr/bin/env bash
+if [[ "$1" == "print" ]]; then
+    printf 'state = running\\n\\tpid = 4242\\n\\truns = 1\\n\\tenvironment = {{\\n'
+    printf '\\t\\tKODA_STT_AUTH_TOKEN => {LEGACY_SECRET}\\n\\t}}\\n'
+    exit 0
+fi
+exit 0
+""",
+    )
+    record = tmp_path / "argv-record.log"
+    real = {name: shutil.which(name) for name in ("just", "python3")}
+    for name, path in real.items():
+        assert path and not path.startswith(str(stub_dir)), name
+        _write_executable(
+            stub_dir / name,
+            f"""#!/usr/bin/env bash
+printf '{name} %s\\n' "$*" >> {record!s}
+exec {path} "$@"
+""",
+        )
+    home = _home_with_agents(tmp_path, [])
+    _render_plist(home, "pipecat.stt-server", backend="mlx", port=9871)
+    res = _run_just(recipe, home=home, stub_dir=stub_dir)
+    lines = record.read_text().splitlines()
+    squat = [ln for ln in lines if ln.startswith("python3 ") and "squat_check.py" in ln]
+    assert len(squat) == 1, lines
+    assert "--launchctl-rc 0" in squat[0] and "--label pipecat.stt-server" in squat[0]
+    assert all(LEGACY_SECRET not in ln for ln in lines), [ln for ln in lines if LEGACY_SECRET in ln]
+    # The answer reached squat_check.py on stdin: the pid it names (4242) is the
+    # one the warning compares the foreign listener (777) with.
+    assert SQUAT_WARNING in res.stderr and "pid 4242" in res.stderr, res.stderr
+    assert LEGACY_SECRET not in res.stdout + res.stderr

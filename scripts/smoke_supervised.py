@@ -93,15 +93,35 @@ def cmd(extra=()):
     return c + list(extra)
 
 
-def spawn(extra=()):
-    return subprocess.Popen(
-        cmd(extra),
+def server_popen(argv):
+    """Start a server: stdin and stdout are pipes the scenarios drive and read.
+    Its stderr goes to an anonymous temp file (``p.errlog``), never a pipe
+    nobody drains: a server that logs more than a pipe buffer would block on
+    write (and never reach its ready or error event). ``err_tail`` reads it."""
+    errlog = tempfile.TemporaryFile()
+    p = subprocess.Popen(
+        argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=errlog,
         text=True,
         cwd=CWD,
     )
+    p.errlog = errlog
+    return p
+
+
+def err_tail(p, n=200):
+    """The last N characters of P's stderr (``server_popen``'s temp file)."""
+    try:
+        p.errlog.seek(0)
+        return p.errlog.read().decode(errors="replace")[-n:]
+    except (AttributeError, OSError, ValueError):
+        return ""
+
+
+def spawn(extra=()):
+    return server_popen(cmd(extra))
 
 
 def read_events(p, until, timeout):
@@ -189,6 +209,8 @@ def s_happy_and_stdin_eof():
     )
     if not ready:
         p.kill()
+        p.wait()
+        print(f"  server stderr: {err_tail(p)!r}", flush=True)
         return None
     text, st = asyncio.run(transcribe())
     rec(
@@ -423,15 +445,13 @@ def s_bad_model_then_sigterm():
         "--model",
         "/nonexistent/model",
     ]
-    p = subprocess.Popen(
-        c, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=CWD
-    )
+    p = server_popen(c)
     evs, bad = read_events(p, lambda e: e.get("event") == "error", 60)
     dt = wait_exit(p, 20)
     rec(
         "S13 bad model: one error event, process exits nonzero, no leftovers",
         bool(evs) and dt is not None and p.returncode != 0 and not os.path.exists(SOCK),
-        f"ev={evs[:1]} rc={p.returncode}",
+        f"ev={evs[:1]} rc={p.returncode} stderr={err_tail(p)!r}",
     )
 
 

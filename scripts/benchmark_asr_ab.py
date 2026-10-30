@@ -18,20 +18,20 @@ those signatures, not just passing another ``Endpoint``.
 
 Usage:
     # Default: whisper on stt.sock, parakeet on parakeet.sock.
-    uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus
+    uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus
 
     # Explicit endpoints (UDS).
-    uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
+    uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
         --whisper-socket ~/Library/Caches/pipecat-stt/stt.sock \\
         --parakeet-socket ~/Library/Caches/pipecat-stt/parakeet.sock
 
     # Loopback TCP instead of a socket (per ASR).
-    uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
+    uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
         --whisper-uri ws://127.0.0.1:9565/ \\
         --parakeet-uri ws://127.0.0.1:9765/
 
     # Write the per-utterance + aggregate report as JSON.
-    uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
+    uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \\
         --json-out benchmarks/results/asr_ab_20260518.json
 
 Corpus layout

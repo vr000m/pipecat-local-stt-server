@@ -1937,3 +1937,62 @@ async def test_uds_multi_connection_same_uid_all_handshake(monkeypatch):
             await asyncio.gather(*(_one_session(i) for i in range(n)))
         finally:
             await srv.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# connect = transport (_open_ws) + the production handshake tail
+# ---------------------------------------------------------------------------
+
+
+class _FakeWs:
+    """A connection whose recv() answers FRAMES in order."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    async def recv(self):
+        return self.frames.pop(0)
+
+
+_HANDSHAKE = [
+    json.dumps({"type": P.EVT_SERVER_HELLO, "v": 1}),
+    json.dumps({"type": P.EVT_SESSION_CREATED}),
+]
+
+
+# Unchanged behaviour for every existing caller (Koda and onoats pin this
+# client by SHA): kwargs x token -> the exact websockets call connect() makes
+# and its return value.
+@pytest.mark.parametrize("token", [None, "tok"])
+@pytest.mark.parametrize(
+    ("kwargs", "want"),
+    [
+        ({"uri": "ws://h:1/"}, ("connect", ("ws://h:1/",))),
+        ({"uri": "ws://h:1/", "socket_path": "/s"}, ("connect", ("ws://h:1/",))),
+        ({"socket_path": "/x/s.sock"}, ("unix", ("/x/s.sock", "ws://localhost/"))),
+        ({"host": "127.0.0.1", "port": 9}, ("connect", ("ws://127.0.0.1:9/",))),
+        ({"host": "::1", "port": 9}, ("connect", ("ws://[::1]:9/",))),
+        ({"host": "localhost", "port": 9}, ("connect", ("ws://localhost:9/",))),
+    ],
+)
+async def test_client_connect_transport_unchanged(monkeypatch, kwargs, want, token):
+    import stt_server.client as C
+
+    calls = []
+
+    def fake(kind):
+        async def connect(*args, **kw):
+            calls.append((kind, args, kw))
+            return _FakeWs(_HANDSHAKE)
+
+        return connect
+
+    monkeypatch.setattr(C, "ws_connect", fake("connect"))
+    monkeypatch.setattr(C, "ws_unix_connect", fake("unix"))
+    c = TranscriptionClient(auth_token=token, **kwargs)
+    hello = await c.connect()
+    assert hello == {"type": P.EVT_SERVER_HELLO, "v": 1}
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    assert calls == [
+        (want[0], want[1], {"additional_headers": headers, "max_size": P.MAX_APPEND_BYTES})
+    ]

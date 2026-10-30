@@ -44,14 +44,18 @@ takes no value (``--supervised``, ``--help``) never consumes the next element. A
 VALUE is consumed in the step after its flag, so a value that looks like a flag
 (``--log-level --socket-path``) is never read as one. tests/test_justfile_recipes.py
 checks this against the real parser. The justfile (stt-list, stt-status,
-stt-enable) and scripts/install_stt_agent.sh all call this, so they cannot
-disagree about what an installed plist says. Stdlib only: it must run under the
+stt-enable), scripts/install_stt_agent.sh and scripts/smoke.py all call this, and
+scripts/smoke_launchd.py imports it (``load``, ``loads``, ``read_flags``,
+``read_field``, ``read_argv_flags``, ``parse_port``, ``read_bytes``),
+so they cannot disagree about what an installed plist says. Stdlib only: it must run under the
 system python3 when the project venv is absent.
 """
 
 from __future__ import annotations
 
+import os
 import plistlib
+import stat
 import sys
 
 _FLAGS = ("--host", "--port", "--socket-path", "--auth-token-file")
@@ -69,16 +73,45 @@ class MalformedPlist(Exception):
     """The plist exists but cannot be read as an agent definition."""
 
 
+def read_bytes(path: str) -> bytes | None:
+    """PATH's bytes; None when absent; ``MalformedPlist`` when it is not a
+    readable regular file. Opened ``O_NONBLOCK`` and checked with ``fstat``
+    before any read, so a FIFO (or a device) at PATH is refused at once and
+    can never block the caller."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # unreadable: malformed
+        raise MalformedPlist(type(exc).__name__) from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MalformedPlist("not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 65536):
+            chunks.append(chunk)
+    except OSError as exc:
+        raise MalformedPlist(type(exc).__name__) from exc
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
 def _load(path: str) -> dict:
     """Return the plist dict; ``{}`` when absent; raise ``MalformedPlist`` otherwise."""
+    raw = read_bytes(path)
+    return {} if raw is None else loads(raw)
+
+
+def loads(raw: bytes) -> dict:
+    """The plist in RAW (bytes already read) as a dict; ``MalformedPlist`` when
+    malformed. The same checks as ``load``, so a caller that hashes the bytes
+    can parse exactly those bytes."""
     try:
-        with open(path, "rb") as fh:
-            data = plistlib.load(fh)
-    except FileNotFoundError:
-        return {}
+        data = plistlib.loads(raw)
     # Anything else is malformed: plistlib raises InvalidFileException, ValueError,
-    # xml.parsers.expat.ExpatError (truncated XML), TypeError, ... and open() an
-    # OSError for an unreadable file or a directory. The sweep must not trace back.
+    # xml.parsers.expat.ExpatError (truncated XML), TypeError, ... (an unreadable
+    # file or a directory is caught in _load). The sweep must not trace back.
     # Only the exception's type is reported: a parse message can quote plist
     # content, and an old plist may carry a token in EnvironmentVariables.
     except Exception as exc:
@@ -96,11 +129,26 @@ def _load(path: str) -> dict:
     return data
 
 
+def load(path: str) -> dict:
+    """The plist at PATH as a dict: ``{}`` when absent, ``MalformedPlist`` when
+    malformed (the three states above). ``scripts/smoke_launchd.py`` reads every
+    plist through this and ``read_field`` in-process."""
+    return _load(path)
+
+
 def read_flags(plist: dict) -> dict[str, str]:
+    """The serve flags in a loaded plist's ``ProgramArguments``."""
     args = plist.get("ProgramArguments")
-    found: dict[str, str] = {}
     if not isinstance(args, list):
-        return found
+        return {}
+    return read_argv_flags(args)
+
+
+def read_argv_flags(args: list) -> dict[str, str]:
+    """The serve flags (``--host``, ``--port``, ``--socket-path``,
+    ``--auth-token-file``) in an argv list, with the serve grammar above. The
+    launchd harness reads a running job's ``arguments`` block through this."""
+    found: dict[str, str] = {}
     expect = ""
     for el in (str(a) for a in args):
         if expect:
@@ -117,12 +165,40 @@ def read_flags(plist: dict) -> dict[str, str]:
     return found
 
 
+def parse_port(value: str) -> int | None:
+    """The port the server takes from a ``--port VALUE``: its parser has
+    ``type=int``, so this is Python's ``int()`` (``+9998``, `` 9998 ``,
+    ``9_998``, ``09998`` and non-ASCII digits all parse). None when ``int()``
+    refuses VALUE (an empty one included): the server would not start, and a
+    caller guarding ports must treat that as unknown, never as "no port"."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def read_field(plist: dict, name: str) -> str:
     """The value of field ``name`` (one of ``FIELDS``) in a loaded plist, or ``""``."""
     if name == INTERPRETER:
         args = plist.get("ProgramArguments")
         return str(args[0]) if isinstance(args, list) and args else ""
     return read_flags(plist).get(f"--{name}", "")
+
+
+def env_token(plist: dict) -> str:
+    """The legacy bearer token in a loaded plist's ``EnvironmentVariables``, the
+    way the server resolves it when it has no ``--auth-token-file``
+    (``stt_server.__main__._resolve_auth_token``): the first of
+    ``PIPECAT_STT_AUTH_TOKEN``, ``KODA_STT_AUTH_TOKEN`` that is set and not
+    blank, stripped; '' when neither is. Never printed by the CLI."""
+    env = plist.get("EnvironmentVariables")
+    if not isinstance(env, dict):
+        return ""
+    for name in _ENV_TOKENS:
+        val = env.get(name)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
 
 def has_auth(plist: dict) -> bool:

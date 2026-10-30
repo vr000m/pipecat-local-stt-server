@@ -87,6 +87,53 @@ agent).
   (for example `pipecat-stt-server-parakeet.err`; the default whisper agent logs
   to `pipecat-stt.err`) and free the port or reinstall on another one.
 
+### Port squat detection
+
+Decision for [issue #17](https://github.com/vr000m/pipecat-local-stt-server/issues/17):
+the trust boundary stays as described above. Loopback TCP is open to every local
+user, the token file is opt-in, and token-by-default is deferred until the TTS
+server moves. What this adds is a warning, not a gate.
+
+`just stt-list` and `just stt-status <backend>` compare the pid listening on a
+TCP agent's port (from `lsof`) with the pid launchd reports for that agent
+(`launchctl print`; the recipes hand that answer to `scripts/squat_check.py` on
+stdin, never as an argument, because it carries the job's environment block and
+a plist from before 0.5.0 keeps its bearer token there, while any local user can
+read a process's arguments with `ps`). They warn on stderr, after a 1-second re-check so a restart
+in flight stays quiet (the re-check reads the launchd pid and `runs` counter before and after its
+`lsof` read; a pid or `runs` that changed in between, as when the job started,
+listened and exited between two reads with no pid, or an answer with no `runs =`
+line, gives no warning but a "cannot tell" note), when:
+
+- the agent is running but a different pid holds the port (the warning names the
+  port, the listener pid(s) and command(s), and the launchd pid), or
+- the agent is not running and something holds the port
+  (`port N held by pid X; label not running`).
+
+A listener counts when its address could block the agent's bind: either side is
+a wildcard (`*`, `::`, `0.0.0.0`), the addresses are equal, or the agent's host is
+`localhost` and the listener is on `127.0.0.1` or `::1` (IPv6 brackets ignored).
+
+Stdout and exit codes do not change. Socket agents are not checked, and neither
+is the canonical-port fallback used when no plist is installed. Only launchd's
+own "could not find service" answer counts as not running; when `launchctl
+print` fails any other way the check prints one `squat-check: cannot read the
+launchd state` note and no warning, so an unreadable state is never taken as
+"not loaded" (which would silence the check).
+
+**Limit:** `lsof` run as you lists only your own processes' sockets, so a
+squatter running as another user is invisible. No warning means no visible
+squatter, not that the port is free.
+
+If you see the warning:
+
+```bash
+launchctl print gui/$(id -u)/<label>      # the pid launchd thinks it runs
+lsof -nP -iTCP:<port> -sTCP:LISTEN        # who actually holds the port
+```
+
+Kill the squatter, or reinstall the agent on another port.
+
 ### Token file (replaces env tokens)
 
 `render_stt_plist.py` and `install_stt_agent.sh` now **refuse**
@@ -331,16 +378,16 @@ a pure V1 client — no protocol surface added — and a one-off operator tool
 ```bash
 # 0.5.0 default agents are loopback TCP, so pass the URIs. --whisper-uri /
 # --parakeet-uri override the socket flags.
-uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
     --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765
 
 # Socket agents: with no endpoint flags the script defaults to
 # ~/Library/Caches/pipecat-stt/stt.sock and .../parakeet.sock
 # (override with --whisper-socket / --parakeet-socket).
-uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus
+uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus
 
 # Write a full JSON report alongside the console summary.
-uv run python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
+uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
     --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765 \
     --json-out benchmarks/results/asr_ab.json
 ```
@@ -396,13 +443,13 @@ than trust the socket path or port. The `status` subcommand wraps that round-tri
 
 ```bash
 # Text output (exit 0 on success, 1 on not-reachable/timeout/error)
-uv run python -m stt_server status --socket-path ~/Library/Caches/pipecat-stt/stt.sock
+uv run --no-sync python -m stt_server status --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 
 # Raw JSON for scripting / monitoring
-uv run python -m stt_server status --socket-path ... --json
+uv run --no-sync python -m stt_server status --socket-path ... --json
 
 # Loopback TCP agent (whisper's canonical port; add --auth-token-file if set)
-uv run python -m stt_server status --host 127.0.0.1 --port 9565
+uv run --no-sync python -m stt_server status --host 127.0.0.1 --port 9565
 
 # Same, through the recipe (any endpoint; an explicit endpoint is required)
 just stt-probe --host 127.0.0.1 --port 9565
@@ -444,6 +491,153 @@ Use this as a preflight before starting a client, in CI smoke tests, or
 from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 `--port`/`--auth-token-file` endpoint flags work for both `serve` and
 `status` subcommands.
+
+## Smoke tests (`just smoke`)
+
+`just smoke [--agents] [--launchd]` runs the local checks in one command and
+prints one table of PASS, FAIL or SKIPPED with a reason per step; the exit status
+is 1 if any step FAILED (SKIPPED never fails). It runs `.venv/bin/python
+scripts/smoke.py`, never `uv run` (which prunes the backend extras).
+
+| Step | What it runs |
+| --- | --- |
+| `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
+| `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
+| `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101`; each request goes over a connection whose server end `lsof` shows is that server's own process |
+| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (its `--port` parsed as the server parses it; installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, read under the server's own token-file policy (a symlink, a FIFO, a file with group or other access, or a token the server would refuse makes that agent FAIL with nothing sent), else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection, through the production
+client's own `connect` (its headers and its `server.hello` / `session.created`
+handshake; only the transport is the verified socket; before anything is sent the decode refuses a `connect` the swap cannot be shown to carry: one that runs outside the client module's globals, uses a name outside the allowlist checked against `client.py` (which includes `ws_unix_connect` and `_socket_path` for its socket branch), or no longer looks up the module-global `ws_connect`; at run time the swapped `ws_connect` must be called exactly once, for the client's own URI, or the decode fails). After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. An installed plist whose job is not loaded in launchd (the servers are run by another app, such as a menu bar app, not launchd) makes that agent SKIPPED: its plist and token file are not read and nothing is sent; servers run that way are not covered by `--agents`. A job that is loaded but not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or a `launchctl print` answer that cannot be read (never taken as not loaded) makes that agent FAIL, and when the check refused, no token was sent. The step is FAIL if any agent FAILED, else PASS if any agent PASSED, else SKIPPED. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode; only the first for a job that is not loaded or not decoded) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents, every installed agent's job is not loaded, or `say` is absent |
+| `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
+
+`--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
+The harness refuses to run unless both `PIPECAT_STT_LABEL` and `KODA_STT_LABEL`
+name the spare label; the runner sets both itself, so do the same when calling
+`scripts/smoke_launchd.py` directly. The individual scripts below still run on
+their own, but `just smoke` is the entry point.
+
+Every step has a timeout (`scripts/smoke.py`): `supervised` 600 s, `peercred`
+180 s, `token-file` 90 s; in `agents`, 60 s for each `say` / `afconvert` call
+and 180 s for each decode. The `launchd` step's timeout is the harness's own
+worst case, teardown included (`smoke_launchd.run_budget`, summed from the
+bounds it waits on, for every real agent its snapshot reads: installed plists
+plus loaded jobs with no plist, from `launchctl list`; about 31 minutes with
+none, plus about 2 minutes per agent). A
+timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT or SIGTERM sent to the
+runner) sends the running step SIGINT; the step then has 180 s to clean up (the
+`launchd` step: the harness's whole teardown, `smoke_launchd.teardown_budget`,
+about 3 minutes plus 25 s per agent). Once the step has exited, or that grace ran out, its
+whole process group is killed, before the step's own process is reaped, so the
+kill can only reach that step's group. A further signal to the runner during
+that grace is held until the step has stopped and then stops the run: no later
+step starts, the interrupted step is FAIL, the rest are SKIPPED, and the table
+still prints. A step that crashes is a FAIL row and the run goes on to the next
+step.
+
+Inside the launchd harness each installer call runs in its own process group,
+with a 120 s timeout: a SIGINT or SIGTERM during an install kills the
+installer's whole group before teardown starts, so teardown never runs beside a
+half-finished install. An installer group that cannot be shown stopped (its
+kill failed, or its leader was not reaped) is a failure that stops the
+remaining checks, never a result, also when a signal arrived during it. That
+installer may still bootstrap the spare or rewrite its plist, so the teardown
+then changes nothing (no uninstall, nothing removed): its row FAILs with the
+spare's launchd state, what is left behind and the cleanup commands
+(shell-quoted) to run once no installer process is left. The same holds when
+the teardown's own uninstall cannot be shown stopped. The teardown's uninstall
+is not interrupted.
+The harness runs everything (the installer included) with a scrubbed
+environment: `HOME`, `USER`, `TMPDIR`, the spare label and log-dir variables
+and the fixed `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; `BASH_ENV`, `ENV`,
+exported shell functions, `PYTHON*`, `DYLD_*` and `LD_*` never reach it, and
+bash is `/bin/bash`. An agent
+gets 60 s to answer after each install, and the collision check polls its log
+for 30 s.
+
+The harness's proof that it left the real agents alone is a snapshot of each
+one (every installed `pipecat.stt-server*` plist and every loaded such job):
+from one `launchctl print` of the job, its loaded state, pid, `runs` counter
+(which moves on a restart even when the pid is reused) and the endpoint the job
+is serving; a digest of its plist (the plist is only the intended endpoint and
+can change without a reload) and the port recorded in those same bytes (parsed
+as the server parses `--port`, so `+9998` or `09998` is 9998; a value the
+server would refuse is unreadable and refuses the run); and the
+pid holding the job's endpoint (a socket job's `<socket>.lock`). A job with no
+pid serves nothing; anything it cannot read on a running job refuses the run
+before the first install, a running job whose `launchctl print` has no `runs =`
+line included (the live run is what confirms launchctl prints one). The
+baseline is taken before the guard (which refuses every port a real job serves
+or a real plist recorded, both taken from the baseline) and compared before every check and after teardown; a difference stops
+the remaining checks. A real agent that was not loaded, then loaded and unloaded
+again between two of those comparisons with its plist untouched, leaves nothing
+to compare. A real agent that restarts on its own during the run (a crash loop)
+fails the comparison too: fix it before the run.
+
+Every `launchctl print` answer here, in `smoke.py --agents` and in the
+recipes' squat check is read by one parser, in `scripts/squat_check.py`
+(`read_print` / `parse_print`): only "could not find service" is "not
+loaded", any other failure is "cannot tell", and a running job whose answer
+has no `runs =` line is unreadable everywhere (never "no restart counter").
+
+The token check sends its throwaway token (and a wrong one) only over
+connections whose server end `lsof` shows is the spare job's pid, with the same
+pid and `runs` before and after; it waits for the agent with requests that carry
+no token. The collision check's "agent up" and every rollback transport are
+proved the same way: their no-token request goes over a connection whose server
+end is the spare job, so a listener that is not the spare cannot pass them.
+
+Teardown removes the spare socket and its `.lock` only while it holds that
+`.lock`'s `flock` itself, so no live server can own them; anything it cannot prove
+is its own and unheld is left and reported. A removal that fails, or anything
+still there afterwards, makes the `teardown` row FAIL. On a FAIL the harness
+prints one `FAIL: launchd check failed: <check>: <detail>` line per failed row,
+and `just smoke` shows those in its `launchd` row.
+
+Only one `smoke_launchd.py` run at a time: it takes an exclusive lock on
+`~/Library/Caches/pipecat-stt-smoke-launchd.lock` (in the account home, not
+`$HOME`) before touching anything, and a second run is refused. The lock is
+released when the run exits; the file stays.
+
+The launchd harness uses spare port 9998 by default; when that port is busy, run
+it on another spare port with `scripts/smoke_launchd.py --port <port>` (the guard
+still refuses a canonical port, a port recorded by an installed or loaded agent,
+and a port that is already listening). Its socket-rollback check always uses
+the fixed spare socket `$HOME/Library/Caches/pipecat-stt-smoke-launchd/spare.sock`
+(`PIPECAT_STT_SOCKET` is not read), so it can never be a real agent's socket.
+
+Before it installs anything the harness refuses leftover spare state, and
+prints the cleanup commands (shell-quoted, safe to paste): a loaded spare job, a
+spare plist under `$HOME` or under the account home's `~/Library/LaunchAgents`
+(the label is one launchd job per user, whatever `HOME` says), the spare socket
+or its `.lock`, and spare logs. An installer `warning:` line fails the install
+or the teardown unless it is one of three known harmless ones (socket mode
+ignoring TCP settings, a dropped token for a socket agent, a retried bootstrap).
+
+**What has been verified live.** The checks themselves were run by hand at 0.5.0
+(token-file refusal and acceptance on a spare port without launchd, a decode
+through each real agent, `smoke_supervised.py --backend echo`, same-uid
+peer-cred). New in 0.5.1: the launchd harness (`scripts/smoke_launchd.py`) ran
+live three times, on 2026-10-28, against the spare label and port 9998; the
+last run, on the final code of that day's closing pass, had all five rows PASS.
+The port collision (with the squat warning), the socket rollback, the token
+file and the teardown all passed, each answer's server end was verified against
+the spare job, and the real agents were unchanged afterwards. Then the
+`just smoke --agents --launchd` wiring ran live twice on 2026-10-29. On
+`8a87046`, `launchd` PASSed and every `agents` row FAILed, since the four
+installed agents' jobs were not loaded in launchd (their servers run under the
+Pipecat Service Toolbar app). After a not-loaded agent became SKIPPED, on
+`e01d7df`: `supervised`, `token-file` and `launchd` PASS, `peercred` SKIPPED (no
+second uid), and every `agents` row SKIPPED. Later fixes are covered by stubbed
+tests. Those runs confirm that
+`launchctl print` prints a `runs =` line and that `LOCAL_PEERPID` and `lsof`
+identify a launchd job's server end. Still covered only by stubbed tests (stub
+`launchctl`, `lsof` and `id`, a temp home): the `--agents` decode through a
+real launchd agent (no agent's job was loaded in the live run, so none was
+decoded). The tests run the `--agents` decode child (its verified
+connection, the token on stdin, the production client handshake) and the
+harness's collision and rollback bodies end to end against stubs and a fake
+agent on a real socket; that is not a live run. Treat the decode as unverified until a live
+`just smoke --agents` run with a loaded agent; a FAIL there may be a harness
+bug rather than an agent fault.
 
 ## Supervised smoke test
 
@@ -565,7 +759,7 @@ catches a width/signature regression — keep it.
 
 Two local checks exercise what single-uid CI cannot:
 
-- `just smoke-peercred` (`scripts/smoke_peercred.py`) — opens N concurrent
+- `just smoke-peercred` (also part of `just smoke`; `scripts/smoke_peercred.py`) — opens N concurrent
   same-uid sessions (regression guard) and, when a second local uid is reachable
   via passwordless `sudo`, drives a foreign-uid connection that must be rejected
   `403`. The cross-uid leg skips cleanly when no second uid is available.
@@ -573,7 +767,7 @@ Two local checks exercise what single-uid CI cannot:
   `websockets`) that drives a probe as **both** the owning uid (expect `101`) and
   `nobody` (expect `403`) against one permissive socket. Same socket + perms,
   only the uid differs, so a `101`-vs-`403` split proves peer-cred — not the
-  filesystem — is the discriminator. Run with `sudo -v && uv run python
+  filesystem — is the discriminator. Run with `sudo -v && uv run --no-sync python
   scripts/verify_peercred_crossuid.py`. It binds under `/tmp` (world-traversable)
   and asserts every ancestor is traversable, so a filesystem-boundary failure is
   reported as inconclusive rather than masquerading as a peer-cred result.

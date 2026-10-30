@@ -83,6 +83,24 @@ _plist_field plist field strict='':
     [[ -n {{quote(strict)}} ]] && mode=(--strict)
     exec python3 -I "{{justfile_directory()}}/scripts/read_stt_plist.py" "${mode[@]+"${mode[@]}"}" --field {{quote(field)}} {{quote(plist)}}
 
+# Warn (stderr only) when a TCP agent's port is held by a process that is not the
+# agent: scripts/squat_check.py compares the lsof listener pid with the launchd pid.
+# `print_rc` is the exit status of the caller's one `launchctl print
+# gui/<uid>/<label>`; its output (stdout and stderr) arrives on STDIN, never as an
+# argument: it carries the job's environment block, where a pre-0.5.0 plist keeps
+# its bearer token, and argv is readable by every local user through `ps`.
+# squat_check.py reads the loaded state and pid from that answer with the same
+# rule as its own re-check (only launchctl's "could not find service" is not
+# loaded; any other failure is "cannot tell", exit 2, never quiet). `label` is
+# for the 1-second re-check. Advisory: callers append `|| true`, so it never
+# changes an exit status or stdout. System python3 so a pruned venv cannot break it.
+# no-exit-message: just would otherwise add an "error: recipe `_squat_check` failed
+# with exit code 3" line after every warning (and after "cannot tell", exit 2).
+[no-exit-message]
+_squat_check host port label print_rc:
+    #!/usr/bin/env bash
+    exec python3 -I "{{justfile_directory()}}/scripts/squat_check.py" --host {{quote(host)}} --port {{quote(port)}} --label {{quote(label)}} --launchctl-rc {{quote(print_rc)}}
+
 # List every pipecat.stt-server* agent with state, pid, and live backend.
 stt-list:
     #!/usr/bin/env bash
@@ -94,9 +112,14 @@ stt-list:
       found=1
       label=$(basename "$plist" .plist)
       target="gui/$uid/$label"
-      # launchctl print exits non-zero when the agent is not loaded; reuse the
-      # same fields the script greps (state|last exit|pid).
-      if info=$(launchctl print "$target" 2>/dev/null); then
+      # One read-only launchctl print per agent (stdout and stderr): its pid and
+      # state are shown here, and its answer goes to _squat_check as-is (on
+      # stdin), which classifies it (an unreadable answer is "cannot tell" there, not "not
+      # loaded"). The display below shows any non-zero answer as stopped.
+      pid=
+      info=$(launchctl print "$target" 2>&1)
+      print_rc=$?
+      if [[ "$print_rc" -eq 0 ]]; then
         pid=$(grep -m1 -E '^[[:space:]]*pid = ' <<<"$info" | grep -oE '[0-9]+' | head -1)
         state=$(grep -m1 -E '^[[:space:]]*state = ' <<<"$info" | sed -E 's/.*state = //')
         printf 'running  %-32s pid=%-7s state=%s\n' "$label" "${pid:-?}" "${state:-?}"
@@ -127,6 +150,8 @@ stt-list:
       elif [[ -n "$host" && -n "$port" ]]; then
         printf '         endpoint: %s:%s\n' "$host" "$port"
         probe=(--host "$host" --port "$port")
+        # The answer goes on stdin (printf is a builtin: no argv), never as an argument.
+        printf '%s\n' "$info" | just _squat_check "$host" "$port" "$label" "$print_rc" || true
       else
         printf '         endpoint: (no serve endpoint found in plist)\n'
         probe=()
@@ -201,6 +226,13 @@ stt-status target='':
       else
         echo "stt-status: $plist has no serve endpoint (--socket-path or --host/--port)" >&2
         exit 1
+      fi
+      if [[ -z "$p_sock" ]]; then
+        # TCP plist: check the port's holder before the probe's exec. Same
+        # one read-only launchctl print as stt-list; _squat_check classifies it.
+        info=$(launchctl print "gui/$(id -u)/$label" 2>&1)
+        print_rc=$?
+        printf '%s\n' "$info" | just _squat_check "$p_host" "$p_port" "$label" "$print_rc" || true
       fi
     else
       probe=(--host "$host" --port "$port")
@@ -313,7 +345,19 @@ stt-enable backend:
 smoke-peercred:
     #!/usr/bin/env bash
     set -uo pipefail
-    exec uv run python "{{justfile_directory()}}/scripts/smoke_peercred.py"
+    exec .venv/bin/python "{{justfile_directory()}}/scripts/smoke_peercred.py"
+
+# Uses .venv/bin/python, never `uv run` (which prunes the backend extras).
+# `--agents` also decodes a generated clip through each installed agent
+# (read-only); `--launchd` also runs the launchd harness on the spare label
+# (macOS only, opt-in, never in CI). Exit 1 on any FAIL.
+# One-command smoke: supervised (echo), peer-cred, token-file, one PASS/FAIL/SKIPPED table.
+[positional-arguments]
+smoke *args:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cd "{{justfile_directory()}}"
+    exec .venv/bin/python scripts/smoke.py "$@"
 
 # The interpreter an agent installed now would run: PIPECAT_STT_PYTHON when it is
 # set and non-empty, else the backend's venv python (kyutai: kyutai_venv). The one

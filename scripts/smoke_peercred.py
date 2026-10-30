@@ -27,8 +27,8 @@ single-uid CI run structurally cannot exercise:
 
 Usage::
 
-    uv run python scripts/smoke_peercred.py
-    uv run python scripts/smoke_peercred.py --connections 8
+    .venv/bin/python scripts/smoke_peercred.py
+    .venv/bin/python scripts/smoke_peercred.py --connections 8
 
 Run via ``just smoke-peercred``. The server runs IN-PROCESS (not as a
 subprocess) so the test-only helper replacement and ``unix_socket_mode=0o666``
@@ -56,7 +56,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import websockets.exceptions  # noqa: E402
 
-from _smoke_lib import assert_chain_traversable  # noqa: E402
+from _smoke_lib import (  # noqa: E402
+    PEERCRED_NO_UID_MARK,
+    PEERCRED_PLATFORM_MARK,
+    assert_chain_traversable,
+)
 from stt_server import _peercred  # noqa: E402
 from stt_server.backend import EchoBackend  # noqa: E402
 from stt_server.client import TranscriptionClient  # noqa: E402
@@ -230,7 +234,7 @@ async def _run_cross_uid(sock: str) -> bool:
     second = _find_second_uid()
     if second is None:
         print("\n=== cross-uid rejection ===")
-        print("  skipped: needs a second local uid reachable via passwordless sudo")
+        print(f"  {PEERCRED_NO_UID_MARK} reachable via passwordless sudo")
         return False
 
     username, uid = second
@@ -333,7 +337,7 @@ async def _running_server():
 
 async def _run(args: argparse.Namespace) -> int:
     if sys.platform not in ("darwin", "linux"):
-        print(f"skipped: peer-cred smoke needs macOS/Linux, not {sys.platform}")
+        print(f"{PEERCRED_PLATFORM_MARK} macOS/Linux, not {sys.platform}")
         return 0
 
     async with _running_server() as sock:
