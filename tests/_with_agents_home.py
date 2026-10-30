@@ -58,8 +58,8 @@ else:
     real_install = mod.install
     fired = []
 
-    def install(env, what):
-        out = real_install(env, what)
+    def install(env, what, **kw):
+        out = real_install(env, what, **kw)
         if not fired:
             fired.append(what)
             if inject == "fail":
