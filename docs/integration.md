@@ -76,9 +76,10 @@ Two requirements follow from how the server works:
   `ErrorFrame` rather than silently mis-transcribing a mismatched rate.
 
 To switch Whisper ↔ Parakeet, change *which server* the service connects to
-(its `socket_path`/`host`+`port`), not the service code. `server.hello` carries
-the backend identity, so the example logs which ASR it connected to and can
-optionally hard-assert it (see `_log_backend`).
+(its `socket_path`/`host`+`port`), not the service code. The
+[backend guide](backends.md) lists the available ASRs and models.
+`server.hello` carries the backend identity, so the example logs which ASR it
+connected to and can optionally hard-assert it (see `_log_backend`).
 
 
 ## Reference consumer (Koda)

@@ -1,4 +1,4 @@
-"""Executable form of the README's "Adding a new backend" recipe.
+"""Executable form of the backend recipe in ``docs/contributing.md``.
 
 Defines a trivial ``FakeBackend`` that satisfies the ``TranscriptionBackend``
 structural protocol, plugs it into ``TranscriptionServer``, connects a real

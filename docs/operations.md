@@ -1,6 +1,8 @@
 # Operations and deployment
 
-> Multi-backend operation, LaunchAgent install, health checks, and backend tuning for [pipecat-local-stt-server](../README.md). The day-to-day `just` operator recipes live in the [README](../README.md#managing-agents-with-just).
+> Multi-backend deployment, LaunchAgent management, health checks, smoke tests,
+> and transport security for [pipecat-local-stt-server](../README.md). Backend
+> selection and model tuning live in [Backends and models](backends.md).
 
 ## Multi-backend operation
 
@@ -25,13 +27,10 @@ opt-in: set `PIPECAT_STT_SOCKET` when running `just stt-install` (see
 [Socket agents](#socket-agents-opt-in)). Point the bot at the agent with
 `STT_WS_HOST`/`STT_WS_PORT`.
 
-Why these numbers: the sibling TTS server uses 8665-9365 (its kokoro agent is
-8765, so do not copy a TTS port into an STT example), and the macOS menu bar app
-owns 9465-9665 (Apple Speech 9465 is the app's own and is not an agent).
-Whisper 9565 and kyutai 9665 are the menu bar app's existing numbers; Parakeet
-9765 and Nemotron 9865 were confirmed by the menu bar app side on 2026-10-26.
-The menu bar app does not yet adopt an occupied port, so an agent and the
-app contend for the same port if both are running.
+The sibling TTS server uses ports 8665-9365; do not copy one of those ports into
+an STT example. The macOS menu bar app uses the same STT port convention. It
+does not yet adopt an occupied port, so an agent and the app contend if both try
+to own the same endpoint.
 
 For a TCP agent, `just stt-install` / `just stt-uninstall` always use the
 canonical host and port from this table (the recipe strips an ambient
@@ -344,14 +343,17 @@ just stt-status ~/Library/Caches/pipecat-stt/stt.sock   # a path is probed as --
 just stt-probe --host 127.0.0.1 --port 9565   # status probe of any endpoint
 ```
 
-Warm the ~1.5 GB Hugging Face model cache for Parakeet FIRST: a cold first
-launch downloads it under `KeepAlive` + `ThrottleInterval=10` and launchd may
-throttle-loop the agent before the download finishes:
+Warm the model cache before installing a production backend. A cold first
+launch downloads under `KeepAlive` + `ThrottleInterval=10`, so launchd can
+throttle-loop the agent before a large download finishes:
 
 ```bash
 uv sync --extra parakeet
 .venv/bin/python -m stt_server prefetch --backend parakeet
 ```
+
+See [Prefetching and cache checks](backends.md#prefetching-and-cache-checks) for
+cache validation, local model paths, progress events, and pinned revisions.
 
 `scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
 `PIPECAT_STT_BACKEND` / `PIPECAT_STT_HOST` / `PIPECAT_STT_PORT` /
@@ -401,35 +403,12 @@ financials, so the script refuses a `--corpus` under those roots unless
 `--allow-pii-corpus` is passed. Use a synthetic or consented-recording corpus
 and keep it outside the repo.
 
-### Prefetch progress semantics
+### Model cache warm-up
 
-`python -m stt_server prefetch --json` emits `progress{repo, downloaded_bytes,
-total_bytes, files_done, files_total}` events. They describe only the files this
-run still has to download (the same meaning as `tts_server prefetch`), so a
-supervisor can show `downloaded_bytes / total_bytes` directly:
-
-- `total_bytes` / `files_total`: files not already in the Hugging Face cache when
-  the fetch started (a fully cached repo reports `0` / `0`).
-- `downloaded_bytes`: bytes on disk for those files, including partial
-  `.incomplete` blobs left by an interrupted earlier run.
-- `files_done`: how many of those files have finished.
-- The last `progress` before `done` always has `downloaded_bytes == total_bytes`
-  and `files_done == files_total`.
-
-For the four default models, `prefetch` fetches the commit pinned in
-`PINNED_REVISIONS` (`stt_server/backends/__init__.py`), so the `start`/`check`
-events carry that SHA as `revision`; any other `--model` reports `revision: null`
-and follows the repo's `main`. The server loads the same commit, so a fetched
-snapshot is the one it serves.
-
-The `kyutai` backend reads its weight filenames from the repo's `config.json`,
-so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open. Each
-name must be a plain filename (no `/`, `..` or glob characters), or prefetch and
-the loader refuse it.
-
-A `prefetch` that fails with nothing network-related going wrong (an incomplete
-snapshot, a corrupt or incomplete `config.json`, a local model directory that is
-missing files) reports `code: ModelInvalidError`, not `ModelDownloadError`.
+`prefetch --json` exposes byte/file progress, and `prefetch --check` inspects
+the cache without using the network. The event schema, pinned-revision rules,
+local-path validation, and backend-specific constraints are canonical in
+[Prefetching and cache checks](backends.md#prefetching-and-cache-checks).
 
 ## Checking server health
 
@@ -612,32 +591,12 @@ or its `.lock`, and spare logs. An installer `warning:` line fails the install
 or the teardown unless it is one of three known harmless ones (socket mode
 ignoring TCP settings, a dropped token for a socket agent, a retried bootstrap).
 
-**What has been verified live.** The checks themselves were run by hand at 0.5.0
-(token-file refusal and acceptance on a spare port without launchd, a decode
-through each real agent, `smoke_supervised.py --backend echo`, same-uid
-peer-cred). New in 0.5.1: the launchd harness (`scripts/smoke_launchd.py`) ran
-live three times, on 2026-10-28, against the spare label and port 9998; the
-last run, on the final code of that day's closing pass, had all five rows PASS.
-The port collision (with the squat warning), the socket rollback, the token
-file and the teardown all passed, each answer's server end was verified against
-the spare job, and the real agents were unchanged afterwards. Then the
-`just smoke --agents --launchd` wiring ran live twice on 2026-10-29. On
-`8a87046`, `launchd` PASSed and every `agents` row FAILed, since the four
-installed agents' jobs were not loaded in launchd (their servers run under the
-Pipecat Service Toolbar app). After a not-loaded agent became SKIPPED, on
-`e01d7df`: `supervised`, `token-file` and `launchd` PASS, `peercred` SKIPPED (no
-second uid), and every `agents` row SKIPPED. Later fixes are covered by stubbed
-tests. Those runs confirm that
-`launchctl print` prints a `runs =` line and that `LOCAL_PEERPID` and `lsof`
-identify a launchd job's server end. Still covered only by stubbed tests (stub
-`launchctl`, `lsof` and `id`, a temp home): the `--agents` decode through a
-real launchd agent (no agent's job was loaded in the live run, so none was
-decoded). The tests run the `--agents` decode child (its verified
-connection, the token on stdin, the production client handshake) and the
-harness's collision and rollback bodies end to end against stubs and a fake
-agent on a real socket; that is not a live run. Treat the decode as unverified until a live
-`just smoke --agents` run with a loaded agent; a FAIL there may be a harness
-bug rather than an agent fault.
+**Current coverage boundary.** The harness, collision, rollback, token-file,
+and teardown paths have live coverage. The `--agents` child is fully exercised
+against stubbed `launchctl`/`lsof` and a fake agent, but still needs a live run
+with a loaded LaunchAgent. A service managed by another app is SKIPPED rather
+than treated as a launchd-backed agent. Historical run evidence lives in the
+[0.5.1 development plan](dev_plans/20261027-feature-stt-squat-detection-unified-smoke.md).
 
 ## Supervised smoke test
 
@@ -772,56 +731,7 @@ Two local checks exercise what single-uid CI cannot:
   and asserts every ancestor is traversable, so a filesystem-boundary failure is
   reported as inconclusive rather than masquerading as a peer-cred result.
 
-## Whisper hallucination suppression (MLX backend)
+## Backend-specific tuning
 
-The MLX Whisper backend forwards four decode-time knobs to
-`mlx_whisper.transcribe()` to suppress the cascading-repetition failure
-mode (hundreds of `subscription subscription…` lines emitted as a single
-segment). Defaults match OpenAI's reference Whisper EXCEPT
-`condition_on_previous_text`, which we disable: feeding the previous
-chunk's emitted text back as a decoder prompt creates a self-amplifying
-loop on hallucinated tokens. Bool parser accepts `1`/`true`/`yes`/`on`
-(case-insensitive); anything else — including `False`, `0`, empty, or
-unset — is `False`.
-
-Each variable below is canonical (`PIPECAT_STT_*`); its legacy `KODA_STT_*`
-alias is still honoured (canonical wins if both are set). For these numeric
-(and the boolean) knobs precedence is *presence-based*: a present-but-empty
-canonical value wins and resolves to the default rather than falling through
-to a set legacy alias — so blanking the canonical reliably overrides the
-alias. (String knobs like the LaunchAgent label instead skip an empty
-canonical and fall through to the alias.)
-
-| Variable (canonical) | Default | Description |
-|---|---|---|
-| `PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT` | `False` | Condition each chunk's decode on the previous chunk's text. Load-bearing — leave `False`. |
-| `PIPECAT_STT_WHISPER_COMPRESSION_RATIO_THRESHOLD` | `2.4` | Flags zlib-compressible (repetitive) output as a failed segment, forces re-decode. |
-| `PIPECAT_STT_WHISPER_LOGPROB_THRESHOLD` | `-1.0` | Flags low-confidence segments. |
-| `PIPECAT_STT_WHISPER_NO_SPEECH_THRESHOLD` | `0.6` | Drops silence segments before they get a chance to hallucinate. |
-
-After decode, `_decode_sync` runs a degenerate-output filter
-(`stt_server.text_quality.is_degenerate`) on each segment. Segments where
-the dominant case-folded unigram exceeds the ratio threshold AND the
-segment has at least the minimum token count are replaced with an empty
-string (and a `mlx_whisper.degenerate_dropped` warning is logged).
-Defaults are calibrated against the existing transcript corpus —
-p99 = 0.36, p99.5 = 0.40 — so backchannels ("yeah yeah yeah") and other
-legitimate high-repetition paragraphs are not flagged.
-
-| Variable (canonical) | Default | Description |
-|---|---|---|
-| `PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO` | `0.40` | Drop a segment whose dominant unigram exceeds this share of all tokens. Pinned above the corpus p99.5; raise toward `0.45` first if the monitoring audit shows >1% of segments dropped. |
-| `PIPECAT_STT_WHISPER_DEGENERATE_MIN_TOKENS` | `10` | Minimum token count before the ratio check fires — short utterances with one repeated word are not flagged. |
-
-`PIPECAT_STT_WHISPER_DEGENERATE_*` are the canonical names. The earlier
-`KODA_TEXT_QUALITY_DEGENERATE_TOKEN_RATIO` /
-`KODA_TEXT_QUALITY_DEGENERATE_MIN_TOKENS` names, and the original
-`KODA_STT_WHISPER_DEGENERATE_TOKEN_RATIO` /
-`KODA_STT_WHISPER_DEGENERATE_MIN_TOKENS` names from the initial ship, are
-all still honoured as deprecated backward-compat aliases (canonical wins if
-several are set). New deployments should prefer the `PIPECAT_STT_*` names.
-
-These decode-time defences were calibrated against the original transcription
-corpus; a consumer's cleanup stage can pair them with a short-circuit on
-degenerate input and a symmetric output guard against same-length degenerate
-rewrites.
+Backend defaults, model revisions, and the canonical Whisper hallucination
+suppression variables live in [Backends and models](backends.md).

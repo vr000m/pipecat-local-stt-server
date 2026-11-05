@@ -112,12 +112,53 @@ path: the pending step is cancelled and waited for, bounded by the drain timeout
 and anything that ignores the cancel is handed to the server with `adopt()` so it
 keeps the lock until it ends.
 
+## Supervised process contract
+
+`serve --supervised` is for a parent process such as a menu bar app. Logging
+continues on stderr; stdout becomes a machine-readable JSON Lines channel:
+
+- After the listener is bound and the model warm-up succeeds, the server emits
+  one `{"event":"ready","backend","model","host","port","socket_path","rate","pid"}`
+  event. With `--port 0`, `port` contains the assigned port.
+- A fatal startup error emits
+  `{"event":"error","code","message","exc_type"}` and exits with status 1.
+- stdin EOF stops the server like SIGTERM. During non-cancellable model loading,
+  the CLI performs safe synchronous cleanup and exits promptly.
+
+```bash
+( sleep 5 ) | uv run --no-sync python -m stt_server serve --backend echo \
+  --host 127.0.0.1 --port 0 --supervised
+```
+
+Consumers should skip any stdout line that does not parse as JSON. Native code
+can write directly to file descriptor 1 and bypass Python's redirect.
+
+### Stable process error codes
+
+The `error` event from `serve --supervised` and `prefetch --json` uses stable
+strings. The event shape matches the sibling TTS server, but each repository
+owns its code list.
+
+| Code | When |
+|---|---|
+| `EADDRINUSE` | A port is busy, or a live server owns the Unix socket. |
+| `EACCES` | Access is denied, including an unopenable socket lock. |
+| `ModuleNotFoundError` | The selected backend's optional extra is not installed. |
+| `ModelDownloadError` | A network library error, or a network error during model fetch. |
+| `ModelInvalidError` | A cached or local STT model is incomplete or unreadable. |
+| `ConfigError` | An endpoint, model, backend, socket directory, or other CLI input is rejected. |
+| `BackendStartError` | Any other backend startup failure. |
+
+`pipecat-local-tts-server` does not define `ModelInvalidError` and may add
+different codes. A shared supervisor should treat unknown values as
+`BackendStartError`.
+
 ## What a supervisor can rely on
 
 - stdout carries only JSON lines. `ready` is printed once, after the listener is
   bound and the model is warm, and never after a stop has won.
 - A fatal error prints one `error` event with a stable `code` and exits 1.
-  See [Error codes](../README.md#error-codes-per-repo).
+  See [Stable process error codes](#stable-process-error-codes).
 - stdin EOF and SIGTERM both stop the server. The server exits when its parent
   dies, because the parent holds the other end of the stdin pipe.
 - A second `serve` for a socket a live server owns exits with `EADDRINUSE` before
@@ -134,4 +175,4 @@ survives a failed start or a hard exit) and `idle()` (reports when no decode
 thread is left, so the lock is kept until then). `DecodeGuardMixin` in
 `stt_server/backends/_thread_util.py` holds the shared decode lock and in-flight
 drain. The checklist for adding one is in the
-[README](../README.md#adding-a-backend).
+[contributor guide](contributing.md).
