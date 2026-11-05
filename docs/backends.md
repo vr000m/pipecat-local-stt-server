@@ -14,8 +14,8 @@ endpoints and point the client at the one you want.
 |---|---|---|---|
 | `echo` | base package | none | Test and smoke-check backend; returns deterministic output. |
 | `mlx` | `uv sync --extra mlx` | `mlx-community/whisper-large-v3-turbo` | MLX Whisper on Apple silicon. |
-| `parakeet` | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | Writes utterance audio to a private per-process `0700` temporary directory and removes it on close. |
-| `nemotron` | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | Requires `mlx-audio>=0.4.4`; uses the same private temporary-WAV boundary as Parakeet. |
+| `parakeet` | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | Writes raw utterance audio (PII) to a private per-process `0700` temporary directory and removes it on close. |
+| `nemotron` | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | Requires `mlx-audio>=0.4.4`; writes raw utterance audio (PII) with the same private temporary-WAV boundary as Parakeet. |
 | `kyutai` | `uv sync --extra kyutai` | `kyutai/stt-1b-en_fr-mlx` | English and French; CC-BY-4.0; Python 3.12; runs from its own `.venv-kyutai` because its MLX pins conflict with the other extras. |
 
 Missing extras fail with an actionable `uv sync --extra <name> --inexact`
@@ -62,7 +62,10 @@ The four production defaults are pinned to Hugging Face commits in
 `stt_server.backends.PINNED_REVISIONS`. Both `serve` and `prefetch` use those
 pins, so a model repository changing its `main` branch cannot silently change a
 default deployment. A non-default repository ID follows that repository's
-`main`; a local path follows the files on disk.
+`main`. MLX Whisper, Parakeet, and Nemotron local paths follow the files on
+disk. Kyutai accepts Hub repository IDs only: `prefetch` rejects a local path,
+while `serve` passes an explicit value to the Hub as a repository ID and fails
+during model load if it is a path.
 
 To move a default pin, update `PINNED_REVISIONS`, run live decode tests against
 the new revision, and prefetch it before restarting agents. On cancellation,
@@ -139,6 +142,8 @@ from reinforcing itself across chunks.
 Canonical `PIPECAT_STT_*` variables win over deprecated `KODA_STT_*` aliases.
 For numeric and boolean knobs, a present but empty canonical value resolves to
 the default instead of falling through to the alias.
+The boolean parser accepts `1`/`true`/`yes`/`on` case-insensitively. Every other
+value, including `False`, `0`, empty, or unset, resolves to `False`.
 
 | Variable | Default | Purpose |
 |---|---:|---|

@@ -200,7 +200,7 @@ contributor guidance.
 - No detailed guide depends on a README heading for canonical semantics.
 - Relative links, anchors, full tests, and `git diff --check` pass.
 
-<!-- reviewed: 2026-11-04 @ 6f9d5f318263957863555f4a0dc3686b556ea7bd -->
+<!-- reviewed: 2026-11-05 @ 6f9d5f318263957863555f4a0dc3686b556ea7bd -->
 
 ## Progress
 
@@ -217,24 +217,31 @@ contributor guidance.
   socket-enabled suite passed 2,537 tests with 23 expected skips.
 - Both README echo quick starts returned `protocol_version: 0.1` and
   `backend: echo` through `status`, over UDS and loopback TCP respectively.
+- Deep review found six distinct relocation gaps: nested-link coverage, Kyutai
+  local-path scope, boolean parsing, temporary-audio PII wording, legacy README
+  anchors, and the flat CLI compatibility form.
 
 ## Issues & Solutions
 
 - The sandboxed full suite denied two loopback binds with `EPERM`. A rerun with
   local socket permissions passed the complete suite; no product change was
   required.
+- Restored every omitted contract and added focused regression assertions.
+  The link check now includes nested Markdown while ownership checks remain
+  scoped to canonical top-level guides.
 
 ## Final Results
 
 ### Summary
 
-Replaced the long README with a 149-line landing page and made focused guides
+Replaced the long README with a 168-line landing page and made focused guides
 canonical for backend/model reference, contributor mechanics, supervision, and
 operations.
 
 ### Outcomes
 
-- Reduced the README from 446 lines and 3,691 words to 149 lines and 710 words.
+- Reduced the README from 446 lines and 3,691 words to 168 lines and 758 words,
+  including hidden compatibility anchors for former README deep links.
 - Added regression coverage for relative links, heading anchors, canonical
   topic ownership, size limits, and relocated behavioural tokens.
 - Removed dated smoke-run chronology from evergreen guidance while preserving

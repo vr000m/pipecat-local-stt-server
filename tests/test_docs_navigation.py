@@ -9,7 +9,8 @@ from urllib.parse import unquote, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "README.md"
-DOCS = sorted((REPO_ROOT / "docs").glob("*.md"))
+GUIDES = sorted((REPO_ROOT / "docs").glob("*.md"))
+DOCS = sorted((REPO_ROOT / "docs").rglob("*.md"))
 MARKDOWN = [README, *DOCS]
 
 _LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\((<[^>]+>|[^\s)]+)")
@@ -76,10 +77,24 @@ def test_readme_is_a_compact_safe_landing_page() -> None:
     assert "--host 127.0.0.1 --port 9900" in text
     assert "Loopback TCP has no peer-uid check" in text
     assert "--auth-token-file /absolute/path/to/token" in text
+    assert "python -m stt_server <serve flags>" in text
+
+    for anchor in (
+        "v1-scope",
+        "running-the-server",
+        "managing-agents-with-just",
+        "smoke-tests",
+        "choosing-a-backend-and-model",
+        "prefetching-models",
+        "supervised-mode",
+        "error-codes-per-repo",
+        "adding-a-backend",
+    ):
+        assert f'<a id="{anchor}"></a>' in text
 
 
 def test_detailed_guides_do_not_depend_on_readme_anchors() -> None:
-    offenders = [path.name for path in DOCS if re.search(r"(?:\.\./)?README\.md#", _text(path))]
+    offenders = [path.name for path in GUIDES if re.search(r"(?:\.\./)?README\.md#", _text(path))]
     assert offenders == []
 
 
@@ -91,7 +106,7 @@ def test_detailed_topics_have_one_canonical_owner() -> None:
         "## Implementation checklist": "contributing.md",
     }
     for heading, owner in expected.items():
-        actual = [path.name for path in DOCS if heading in _text(path)]
+        actual = [path.name for path in GUIDES if heading in _text(path)]
         assert actual == [owner], f"{heading!r} owners: {actual}"
 
 
@@ -109,8 +124,11 @@ def test_relocated_contract_tokens_are_preserved() -> None:
         "ModelInvalidError",
         "PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
         "PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO",
+        "`1`/`true`/`yes`/`on`",
+        "Kyutai accepts Hub repository IDs only",
     ):
         assert token in backends
+    assert backends.count("raw utterance audio (PII)") == 2
 
     for code in (
         "EADDRINUSE",

@@ -6,6 +6,8 @@ pluggable ASR backends for the Pipecat ecosystem.
 The PyPI package is `pipecat-local-stt-server`; the import and CLI module remain
 `stt_server`. BSD-2-Clause.
 
+<a id="v1-scope"></a>
+
 ## What it supports
 
 - one WebSocket connection per transcription session
@@ -21,11 +23,17 @@ The PyPI package is `pipecat-local-stt-server`; the import and CLI module remain
 The protocol is intentionally smaller than OpenAI Realtime transcription. See
 the [wire protocol](docs/protocol.md) for the event set and deviations.
 
+<a id="running-the-server"></a>
+
 ## Quick start
 
 Install the base environment, then run commands through `uv run --no-sync`.
 Bare `python -m stt_server` uses the system interpreter and usually misses the
 project dependencies.
+
+The legacy flat CLI form, `python -m stt_server <serve flags>`, remains
+supported and routes to `serve`; new commands should use the explicit
+`python -m stt_server serve <flags>` form shown below.
 
 ```bash
 uv sync
@@ -62,6 +70,9 @@ uv run --no-sync python -m stt_server status \
   --host 127.0.0.1 --port 9900
 ```
 
+<a id="choosing-a-backend-and-model"></a>
+<a id="prefetching-models"></a>
+
 ## Backends
 
 Production backends require their optional extra before first use:
@@ -87,6 +98,9 @@ Warm a model before starting an always-on server:
 uv run --no-sync python -m stt_server prefetch --backend parakeet
 uv run --no-sync python -m stt_server prefetch --backend parakeet --check
 ```
+
+<a id="managing-agents-with-just"></a>
+<a id="smoke-tests"></a>
 
 ## Persistent macOS agents
 
@@ -126,12 +140,17 @@ See [Client and integration](docs/integration.md) for the complete event loop,
 loopback TCP configuration, the runnable Pipecat `SegmentedSTTService` example,
 and a reference consumer.
 
+<a id="supervised-mode"></a>
+<a id="error-codes-per-repo"></a>
+
 ## Supervised processes
 
 `serve --supervised` emits JSON Lines lifecycle events, reports stable error
 codes, and treats stdin EOF like SIGTERM. See the
 [supervised process contract](docs/architecture.md#supervised-process-contract)
 for ready/error events and stop-during-startup guarantees.
+
+<a id="adding-a-backend"></a>
 
 ## Documentation
 
