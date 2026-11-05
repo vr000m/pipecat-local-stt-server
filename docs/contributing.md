@@ -49,9 +49,9 @@ selection, and `prefetch`.
 Run formatting and linting before the complete test suite:
 
 ```bash
-uv run ruff format
-uv run ruff check
-uv run python -m pytest -q
+uv run --no-sync ruff format
+uv run --no-sync ruff check
+uv run --no-sync python -m pytest -q
 ```
 
 For a production model, also run a live decode and a `prefetch --check` against

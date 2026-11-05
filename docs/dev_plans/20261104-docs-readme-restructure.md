@@ -106,6 +106,10 @@ contributor guidance.
   duplication, and evergreen smoke-test coverage language.
 - `docs/dev_plans/README.md` — plan index row.
 - `docs/dev_plans/20261104-docs-readme-restructure.md` — progress and results.
+- `stt_server/supervise.py` — source-level pointer to the canonical error-code
+  documentation.
+- `tests/test_backend_protocol.py` — executable-recipe pointer to the canonical
+  contributor guide.
 
 ### New Files to Create
 
@@ -179,7 +183,7 @@ contributor guidance.
 
 - [x] Full test suite passes: 2,537 passed, 23 skipped.
 - [x] Documentation link validation passes.
-- [x] README size target passes: 149 lines, 710 words.
+- [x] README size target passes: 168 lines, 758 words.
 - [x] Echo-backend UDS and TCP quick-start smoke checks pass.
 
 ### Edge Cases Tested
@@ -200,7 +204,7 @@ contributor guidance.
 - No detailed guide depends on a README heading for canonical semantics.
 - Relative links, anchors, full tests, and `git diff --check` pass.
 
-<!-- reviewed: 2026-11-05 @ 6f9d5f318263957863555f4a0dc3686b556ea7bd -->
+<!-- reviewed: 2026-11-05 @ dd9702814e64e2fc91250bcf6abb8c7cbffee1f1 -->
 
 ## Progress
 
@@ -217,9 +221,10 @@ contributor guidance.
   socket-enabled suite passed 2,537 tests with 23 expected skips.
 - Both README echo quick starts returned `protocol_version: 0.1` and
   `backend: echo` through `status`, over UDS and loopback TCP respectively.
-- Deep review found six distinct relocation gaps: nested-link coverage, Kyutai
-  local-path scope, boolean parsing, temporary-audio PII wording, legacy README
-  anchors, and the flat CLI compatibility form.
+- Deep review found and resolved relocation gaps in nested-link coverage,
+  model-path scope, boolean parsing, temporary-audio PII wording, legacy
+  anchors, CLI compatibility, verification commands, error classification,
+  and source-level ownership pointers.
 
 ## Issues & Solutions
 

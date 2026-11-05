@@ -144,7 +144,7 @@ owns its code list.
 | `EADDRINUSE` | A port is busy, or a live server owns the Unix socket. |
 | `EACCES` | Access is denied, including an unopenable socket lock. |
 | `ModuleNotFoundError` | The selected backend's optional extra is not installed. |
-| `ModelDownloadError` | Network or model-fetch work failed. |
+| `ModelDownloadError` | A network library error, or a network error during model fetch. |
 | `ModelInvalidError` | A cached or local STT model is incomplete or unreadable. |
 | `ConfigError` | An endpoint, model, backend, socket directory, or other CLI input is rejected. |
 | `BackendStartError` | Any other backend startup failure. |

@@ -57,7 +57,7 @@ __all__ = [
 logger = logging.getLogger("stt_server")
 
 # Stable ``code`` values for ``{"event": "error"}`` lines (part of the contract;
-# listed in README "Error codes (per repo)").
+# listed in docs/architecture.md "Stable process error codes").
 CODE_MODULE_NOT_FOUND = "ModuleNotFoundError"
 CODE_ADDR_IN_USE = "EADDRINUSE"
 CODE_ACCESS_DENIED = "EACCES"
