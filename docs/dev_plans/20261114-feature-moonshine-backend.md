@@ -121,6 +121,93 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT-licensed s
 - `moonshine-voice==0.1.6` (MIT; macOS wheel needs macOS 15 or later, arm64). Transitive: `numpy`, `sounddevice` (PortAudio), `requests`, `tqdm`, `filelock`, `platformdirs`, `google-crc32c`.
 - Runtime state outside the repo: model cache at `~/Library/Caches/moonshine_voice` (override `MOONSHINE_VOICE_CACHE`), which the LaunchAgent environment must be able to read and write.
 
+### Detailed Design
+
+#### Module and class layout (`stt_server/backends/moonshine.py`)
+
+| Unit | Responsibility | Phase |
+|---|---|---|
+| `resolve_language(lang) -> (code, note)` | Pure. `None`/blank/`auto` becomes `en`; lowercase; strip region; unsupported becomes `en` plus an error note. The caller logs `note`. | 1 |
+| `resolve_arch(code, requested) -> ModelArch \| None` | Pure. Applies the licence guard: streaming archs for every language, non-streaming only for `en`. `None` means "not servable", and the caller falls back to `en`. | 1 |
+| `MoonshineBackend(DecodeGuardMixin)` | Registry entry point. Owns the bounded transcriber cache, the lock pair and in-flight counter, and `start`/`open_stream`/`abort`/`idle`/`close`. | 1 |
+| `_TranscriberCache` | `OrderedDict[(code, arch), Transcriber]`, LRU, capacity 3. Loads under the thread lock inside `download_phase()`. It never evicts a transcriber with an open stream. | 1 |
+| `_MoonshineStream` | Phase 1: buffers PCM16LE, converts at `end()`, calls `transcribe_without_streaming`. Phase 3: a thin handle that enqueues to the worker. | 1, 3 |
+| `_Worker` | One daemon thread per backend. FIFO queue of `FEED`, `END` and `CANCEL` operations. It is the only caller of `add_audio`/`stop` and the only thread whose callbacks append line text. | 3 |
+| `prefetch_fetchers(model)` | Module-level hook for `prefetch.py`: a check callable (snapshot directory present and complete) and a fetch callable (`get_model_for_language`). | 1 |
+
+#### Language and model resolution
+
+```mermaid
+flowchart TD
+    A["client language (None, blank, auto, or code)"] --> B{"None, blank or auto?"}
+    B -->|yes| E["code = en"]
+    B -->|no| C["lowercase, strip region (en-US to en, zh-CN to zh)"]
+    C --> D{"code in catalog?"}
+    D -->|no| F["logger.error + code = en"]
+    D -->|yes| G["code"]
+    E --> H["resolve_arch(code, --model)"]
+    F --> H
+    G --> H
+    H --> I{"MIT-servable arch?"}
+    I -->|"no (ko, uk)"| F2["logger.error + code = en, default arch"]
+    I -->|yes| J["transcriber cache lookup (code, arch)"]
+    F2 --> J
+    J -->|miss| K["download_phase: get_model_for_language, then Transcriber()"]
+    J -->|hit| L["use cached transcriber"]
+    K --> L
+```
+
+#### Session stream state (Phase 3)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Open: first append (open_stream, language bound)
+    Open --> Open: append (feed, byte counter += n)
+    Open --> Ending: commit (end enqueued)
+    Ending --> Done: events() drained, completed sent
+    Open --> Cancelled: clear, cancel, close, overflow
+    Ending --> Cancelled: cancel, close timeout
+    Cancelled --> Idle: stream freed, held text dropped
+    Done --> Idle: stream freed
+```
+
+A non-streaming backend never leaves `Idle` until commit, which is today's behaviour.
+
+#### Threading model
+
+- Phase 1: one daemon thread per decode through `_run_guarded_decode`, exactly like `nemotron.py`. The whole utterance is decoded under the thread lock.
+- Phase 3: one persistent worker per backend, because `add_audio` is called about 10 times a second per stream and a thread per call would be wasteful. A single FIFO queue serialises everything, so two sessions streaming at once interleave at `add_audio` granularity. The cost is head-of-line latency: one session's pass (up to about 475 ms on medium) delays the other's. This matches the "serialise decodes" decision and is the safe default until the differing-output result is explained.
+- The event loop only enqueues. `END` carries a future that the worker completes through `loop.call_soon_threadsafe`, so `end()` awaits without blocking.
+- `idle()` returns a future that completes when the queue is empty and the worker is not inside a call. `close()` drains for a bounded time (3 s, the existing `_drain_inflight` default), then `abort()` stops the worker with a sentinel.
+
+#### Failure modes
+
+| Failure | Where it surfaces | Result |
+|---|---|---|
+| Model download fails (offline, DNS) | first decode, inside `download_phase()` | exception from `end()`/`events()`, then `transcript.failed` (the server marks it as a download error as for the other backends) |
+| Model load fails (corrupt cache) | first decode | same path; `mark_model_invalid` semantics match the HF backends where applicable |
+| Decode raises | worker or decode thread | future carries the exception, then `transcript.failed` with a generic message; details only in the server log |
+| Worker thread dies (Phase 3) | next enqueue | the dead worker is replaced lazily; operations queued behind the failure fail with the stored exception |
+| RTF above 1 (queue grows) | none on the wire | bounded by the existing 300 s uncommitted cap; log a warning when queued audio exceeds 10 s |
+| Client disconnect or `cancel` mid-stream | `_teardown_session`, `_on_cancel` | `CANCEL` enqueued, held text dropped, stream freed |
+| SIGTERM mid-decode | `close()` | bounded drain, then `abort()` |
+| Unsupported or non-MIT language | `resolve_language`/`resolve_arch` | `logger.error`, falls back to `en`; the decode proceeds |
+
+#### Configuration surface
+
+| Setting | Source | Default | Note |
+|---|---|---|---|
+| Architecture | `--model` (arch name) | catalog default for the language | `tiny-streaming` is the low-memory choice (about 290 MB RSS against about 1 GB for medium) |
+| Model cache directory | `MOONSHINE_VOICE_CACHE` (library) | platformdirs user cache | the LaunchAgent environment must be able to write it |
+| Transcriber cache size | constant (3) in v1 | 3 | worst case about 3 GB RSS with medium models |
+| Streaming update interval | library default (0.5 s) | 0.5 | the spike used 0.3; revisit in the Phase 3 benchmark |
+| Languages to prefetch | open | `en` | `prefetch` has no language argument today. Resolve in Phase 1: either an env var or a flag. The existing `env.py` conventions decide which one, and I have not checked them. |
+
+#### Audio path
+
+PCM16LE from the wire becomes a `float32` array in `[-1, 1]` (`numpy.frombuffer(..., "<i2") / 32768`), then `.tolist()` for `add_audio` and `transcribe_without_streaming`, which build a ctypes array from a Python sequence. The wire is pinned at 16 kHz mono (`protocol.py`), so the sample-rate argument is always 16000 and the library does no resampling. The spike passed Python lists of floats; the cost of converting a long utterance is not measured and goes in the Phase 1 benchmark.
+
 ### Integration Seams
 
 | Seam | Writer (task) | Caller (task) | Contract |
