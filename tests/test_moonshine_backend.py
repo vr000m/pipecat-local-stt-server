@@ -1191,3 +1191,255 @@ def test_prefetch_specs_reject_a_malformed_spec(mod, spec):
 def test_prefetch_specs_never_download(mod, fake):
     mod.prefetch_specs("@en,es,de")
     assert fake.downloads == [] and fake.loads == []
+
+
+# ---------------------------------------------------------------------------
+# Package version pin: one value in pyproject, the constant and the installer probe
+# ---------------------------------------------------------------------------
+
+
+def _justfile_moonshine_probe() -> str:
+    import re
+
+    text = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+    m = re.search(r'^\s*moonshine\)\s*extra="moonshine";\s*probe="([^"]*)"', text, re.M)
+    assert m, "justfile _ensure-extra has no moonshine probe"
+    return m.group(1)
+
+
+def test_version_pin_is_identical_in_pyproject_constant_and_installer_probe():
+    """A pin bump must move all three together: the extra, the backend's runtime check
+    and the installer's ``_ensure-extra`` probe (else a stale venv passes the probe)."""
+    import re
+    import tomllib
+
+    from stt_server.backends.moonshine import MOONSHINE_VOICE_VERSION
+
+    root = Path(__file__).resolve().parent.parent
+    extra = tomllib.loads((root / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]["moonshine"]
+    pins = [r.replace(" ", "").split("==", 1)[1] for r in extra if r.startswith("moonshine-voice")]
+    assert pins == [MOONSHINE_VOICE_VERSION]
+    assert re.findall(r"'(\d+\.\d+\.\d+)'", _justfile_moonshine_probe()) == [
+        MOONSHINE_VOICE_VERSION
+    ]
+
+
+@pytest.mark.parametrize(("version", "ok"), [("0.1.6", True), ("0.0.62", False), (None, False)])
+def test_installer_probe_requires_the_pinned_version(tmp_path, version, ok):
+    """The probe string, run as ``_ensure-extra`` runs it, against a stub package: an
+    importable but older wheel must fail the probe so the installer re-syncs."""
+    from stt_server.backends.moonshine import MOONSHINE_VOICE_VERSION
+
+    assert MOONSHINE_VOICE_VERSION == "0.1.6", "update the parametrisation with the pin"
+    pkg = tmp_path / "moonshine_voice"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("" if version is None else f"__version__ = {version!r}\n")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["PYTHONPATH"] = str(tmp_path)
+    r = subprocess.run(
+        [sys.executable, "-c", _justfile_moonshine_probe()], env=env, capture_output=True
+    )
+    assert (r.returncode == 0) is ok, r.stderr
+
+
+@pytest.mark.parametrize("version", ["0.0.62", "0.2.0", None])
+async def test_start_refuses_a_package_version_other_than_the_pin(mod, fake, version):
+    """A stale wheel imports fine but lacks the private API (``_stt_catalog``): fail
+    with the remedy, not an ``AttributeError``."""
+    pkg = sys.modules["moonshine_voice"]
+    if version is None:
+        del pkg.__version__
+    else:
+        pkg.__version__ = version
+    with pytest.raises(ImportError) as excinfo:
+        await _backend(mod).start()
+    msg = str(excinfo.value)
+    assert mod.MOONSHINE_VOICE_VERSION in msg and str(version) in msg
+    assert "uv sync --extra moonshine --inexact" in msg
+    with pytest.raises(ImportError):
+        mod.prefetch_specs(None)[0].check(None)
+    assert fake.downloads == []
+
+
+# ---------------------------------------------------------------------------
+# Decode: the PCM -> list conversion happens under the decode lock
+# ---------------------------------------------------------------------------
+
+
+async def test_pcm_conversion_runs_under_the_decode_thread_lock(mod, fake, monkeypatch):
+    backend = _backend(mod)
+    await backend.start()
+    seen: list[bool] = []
+    real = np.frombuffer
+
+    def spy(*args, **kwargs):
+        seen.append(backend._thread_lock.locked())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(np, "frombuffer", spy)
+    _, events = await _drive(backend)
+    assert events[-1].kind == "completed" and events[-1].text == "hello from moonshine"
+    assert seen == [True], "each queued decode would otherwise build its float list unlocked"
+    await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Cache integrity contract (prefetch): reader ``_file_state``, writer repair
+# ---------------------------------------------------------------------------
+
+_NAME = "decoder.onnx"
+_ARCH = ModelArch.MEDIUM_STREAMING
+
+
+def _info(fake, *, checksum: bool = True) -> dict:
+    (info,) = [f for f in fake.group("en", _ARCH)["files"] if f["name"] == _NAME]
+    return info if checksum else {k: v for k, v in info.items() if k != "checksum"}
+
+
+def _place(fake, path: Path, state: str) -> None:
+    good = fake.file_bytes("en", _ARCH, _NAME)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if state == "missing":
+        path.unlink(missing_ok=True)
+    elif state == "size_bad":
+        path.write_bytes(good[:-1])
+    elif state == "crc_bad":
+        path.write_bytes(bytes(b ^ 0x01 for b in good))
+    else:  # "crc_ok" / "uncomputable"
+        path.write_bytes(good)
+
+
+def _uncomputable(monkeypatch) -> None:
+    # What ``crc32c_file`` returns when ``google-crc32c`` cannot be imported.
+    monkeypatch.setattr(sys.modules["moonshine_voice.download_file"], "crc32c_file", lambda p: None)
+
+
+# Reader: (file state, manifest has a CRC32C) -> result ("raise:<code>" or the state).
+_READER_CELLS = [
+    ("missing", True, "missing"),
+    ("size_bad", True, "incomplete"),
+    ("crc_ok", True, "ok"),
+    ("crc_bad", True, "raise:ModelInvalidError"),
+    ("uncomputable", True, "raise:ModuleNotFoundError"),
+    ("crc_bad", False, "ok"),  # no CRC32C in the manifest: size is all there is
+    ("uncomputable", False, "ok"),
+]
+
+
+@pytest.mark.parametrize(("state", "checksum", "expected"), _READER_CELLS)
+def test_file_state_over_the_whole_state_space(mod, fake, monkeypatch, state, checksum, expected):
+    from stt_server.supervise import classify_startup_error
+
+    path = fake.group_dir("en", _ARCH) / _NAME
+    _place(fake, path, state)
+    if state == "uncomputable":
+        _uncomputable(monkeypatch)
+    info = _info(fake, checksum=checksum)
+    if expected.startswith("raise:"):
+        with pytest.raises(Exception) as excinfo:
+            mod._file_state(path, info)
+        assert classify_startup_error(excinfo.value)[0] == expected.split(":", 1)[1]
+        assert str(path) in str(excinfo.value)
+    else:
+        assert mod._file_state(path, info) == expected
+
+
+# Writer: the file's state when the repair takes the lock (after another prefetch may
+# have removed or replaced it) -> what the repair leaves behind.
+_REPAIR_CELLS = [
+    ("missing", "missing"),  # another prefetch already removed it: no FileNotFoundError
+    ("size_bad", "kept"),  # not ours to judge: the library replaces a size mismatch itself
+    ("crc_ok", "kept"),  # another prefetch already re-downloaded it: never delete it
+    ("crc_bad", "removed"),
+    ("uncomputable", "raise"),  # fail closed, delete nothing
+]
+
+
+@pytest.mark.parametrize(("state", "expected"), _REPAIR_CELLS)
+def test_repair_rechecks_under_the_lock_over_the_whole_state_space(
+    mod, fake, monkeypatch, state, expected
+):
+    path = fake.group_dir("en", _ARCH) / _NAME
+    _place(fake, path, state)
+    before = path.read_bytes() if path.exists() else None
+    if state == "uncomputable":
+        _uncomputable(monkeypatch)
+    if expected == "raise":
+        with pytest.raises(ModuleNotFoundError):
+            mod._remove_if_still_corrupt(path, _info(fake))
+    else:
+        mod._remove_if_still_corrupt(path, _info(fake))
+    if expected in ("missing", "removed"):
+        assert not path.exists()
+    else:
+        assert path.read_bytes() == before
+
+
+def test_repair_holds_the_librarys_per_file_download_lock(mod, fake, monkeypatch):
+    """The recheck and the delete run under ``<file>.lock``, the lock
+    ``moonshine_voice.download_file.download_file`` holds while it writes and renames."""
+    filelock = pytest.importorskip("filelock")
+    if not hasattr(filelock, "Timeout"):
+        pytest.skip("real filelock not installed (single-process stand-in)")
+    path = fake.group_dir("en", _ARCH) / _NAME
+    _place(fake, path, "crc_bad")
+    held: list[bool] = []
+    real = mod._crc_mismatch
+
+    def probe(p, info):
+        try:
+            filelock.FileLock(str(p) + ".lock", timeout=0).acquire()
+        except filelock.Timeout:
+            held.append(True)
+        else:
+            held.append(False)
+        return real(p, info)
+
+    monkeypatch.setattr(mod, "_crc_mismatch", probe)
+    mod._remove_if_still_corrupt(path, _info(fake))
+    assert held == [True] and not path.exists()
+
+
+@pytest.mark.parametrize("other", ["removed", "replaced"])
+def test_fetch_survives_a_concurrent_repair_of_the_same_file(mod, fake, monkeypatch, other):
+    """Two prefetches see the same corrupt file; the other one wins the lock first and
+    either just removed it or already re-downloaded it. This one must neither crash
+    (``FileNotFoundError``) nor delete the good replacement."""
+    root = Path(fake.write_model("en", _ARCH, corrupt=True))
+    good = fake.file_bytes("en", _ARCH, _NAME)
+    real = mod._remove_if_still_corrupt
+
+    def racing(path, info):
+        if path.name == _NAME:
+            if other == "removed":
+                path.unlink()
+            else:
+                path.write_bytes(good)
+        return real(path, info)
+
+    monkeypatch.setattr(mod, "_remove_if_still_corrupt", racing)
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    assert spec.fetch(spec, None) == str(root)
+    assert (root / _NAME).read_bytes() == good
+    assert spec.check(spec) == (str(root), fake.total_size("en", _ARCH))
+
+
+def test_fetch_fails_clearly_when_the_library_serves_another_directory(mod, fake, monkeypatch):
+    """Prefetch verifies the manifest-derived root; the server loads from the path
+    ``get_model_for_language`` returns. They must be the same directory."""
+    dl = sys.modules["moonshine_voice.download"]
+    real = dl.get_model_for_language
+    elsewhere = fake.cache_root / "elsewhere"
+
+    def moved(*args, **kwargs):
+        _path, arch = real(*args, **kwargs)
+        return str(elsewhere), arch
+
+    monkeypatch.setattr(dl, "get_model_for_language", moved)
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    with pytest.raises(RuntimeError) as excinfo:
+        spec.fetch(spec, None)
+    msg = str(excinfo.value)
+    assert str(elsewhere) in msg and str(fake.group_dir("en", _ARCH)) in msg

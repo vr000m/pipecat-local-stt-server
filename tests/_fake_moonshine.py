@@ -488,8 +488,33 @@ def install(monkeypatch, cache_root: Path) -> FakeMoonshine:
         "moonshine_voice.transcriber": trmod,
     }.items():
         monkeypatch.setitem(sys.modules, name, mod)
+    # ``filelock`` (a hard dependency of moonshine-voice: its per-file download lock, which
+    # prefetch's repair shares) is real wherever it is installed; a client-only test env
+    # has none, so a single-process stand-in takes its place there.
+    try:
+        import filelock  # noqa: F401
+    except ImportError:
+        shim = types.ModuleType("filelock")
+        shim.FileLock = _ThreadFileLock  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "filelock", shim)
     monkeypatch.delitem(sys.modules, "stt_server.backends.moonshine", raising=False)
     return st
+
+
+class _ThreadFileLock:
+    """In-process stand-in for ``filelock.FileLock`` (one lock per path)."""
+
+    _locks: dict[str, threading.Lock] = {}
+
+    def __init__(self, path: Any, **_kw: Any) -> None:
+        self._lock = self._locks.setdefault(str(path), threading.Lock())
+
+    def __enter__(self) -> _ThreadFileLock:
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._lock.release()
 
 
 # --- audio helpers ---------------------------------------------------------------------------

@@ -412,7 +412,9 @@ _ensure-extra backend python='' plist='':
       parakeet) extra="parakeet"; probe="import parakeet_mlx" ;;
       nemotron) extra="nemotron"; probe="from mlx_audio.stt import load" ;;
       kyutai)   extra="kyutai";   probe="import moshi_mlx" ;;
-      moonshine) extra="moonshine"; probe="import moonshine_voice" ;;
+      # moonshine also needs the exact pin (backend.start() refuses any other
+      # version: an older wheel imports but lacks the API and the model URLs).
+      moonshine) extra="moonshine"; probe="import moonshine_voice as m; raise SystemExit(getattr(m, '__version__', None) != '0.1.6')" ;;
       *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai, moonshine)" >&2; exit 1 ;;
     esac
     if [[ -n "${PIPECAT_STT_SKIP_DEP_SYNC:-}" ]]; then

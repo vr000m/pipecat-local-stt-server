@@ -195,6 +195,16 @@ def _import_package():
             f"the 'moonshine' extra is not installed or failed to import "
             f"({missing}) — run: uv sync --extra moonshine --inexact"
         ) from exc
+    # The private API used here (``_stt_catalog``, the manifest) and the model
+    # URLs are fixed by the exact pin; an older wheel imports but lacks them. The
+    # justfile ``_ensure-extra`` probe applies the same check.
+    installed = getattr(moonshine_voice, "__version__", None)
+    if installed != MOONSHINE_VOICE_VERSION:
+        raise ImportError(
+            f"moonshine-voice {installed} is installed, this server needs exactly "
+            f"{MOONSHINE_VOICE_VERSION} — run: uv sync --extra moonshine --inexact",
+            name="moonshine_voice",
+        )
     return moonshine_voice, download
 
 
@@ -260,10 +270,6 @@ class _MoonshineStream:
             if not pcm:
                 return ""
             import numpy as np
-
-            # PCM16LE -> float32 in [-1, 1]; the library takes a Python sequence
-            # of floats, hence ``.tolist()``.
-            samples = (np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0).tolist()
             from moonshine_voice.transcriber import Error, LineCompleted  # type: ignore
 
             texts: list[str] = []
@@ -280,6 +286,10 @@ class _MoonshineStream:
             # and, with two transcribers, differing output). Language
             # resolution and the lazy model load happen inside the lock too.
             with self._thread_lock:
+                # PCM16LE -> float32 in [-1, 1]; the library takes a Python sequence
+                # of floats, hence ``.tolist()`` (~16x the PCM size), built under
+                # the lock so queued decodes do not each hold one.
+                samples = (np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0).tolist()
                 transcriber = self._backend._transcriber_for(self._language)
                 # One-shot stream, not ``transcribe_without_streaming``: repeated
                 # offline calls on one Transcriber add a spurious leading "Mm"
@@ -432,13 +442,22 @@ def _model_manifest(download: Any, code: str, arch: Any) -> tuple[Path, list[dic
 
 def _crc_mismatch(path: Path, info: dict) -> bool:
     """True when the manifest has a CRC32C for the file and the file's differs
-    (``False`` when there is none or the accelerator is unavailable, as the
-    library does)."""
+    (``False`` when the manifest has none).
+
+    Fails closed: ``crc32c_file`` returns ``None`` without ``google-crc32c`` (a
+    hard dependency of ``moonshine-voice``) and the library then skips the check,
+    so an uncomputable CRC32C raises ``ModuleNotFoundError`` instead of passing."""
     if info.get("checksum_type") == "crc32c" and info.get("checksum"):
         from moonshine_voice.download_file import crc32c_file  # type: ignore
 
         actual = crc32c_file(path)
-        return actual is not None and actual != info["checksum"]
+        if actual is None:
+            raise ModuleNotFoundError(
+                f"cannot verify the CRC32C of {path}: google-crc32c is not importable "
+                "— run: uv sync --extra moonshine --inexact",
+                name="google_crc32c",
+            )
+        return actual != info["checksum"]
     return False
 
 
@@ -457,6 +476,26 @@ def _file_state(path: Path, info: dict) -> str:
         mark_model_invalid(exc)
         raise exc
     return "ok"
+
+
+def _remove_if_still_corrupt(path: Path, info: dict) -> None:
+    """Delete a same-size, bad-CRC32C cached file, rechecked under ``<file>.lock``.
+
+    That is the lock ``moonshine_voice.download_file.download_file`` holds while
+    it writes and renames the file, so a concurrent prefetch's repair or download
+    is serialised with this one: a file it already removed is left alone, and a
+    replacement it already downloaded is never deleted.
+    """
+    from filelock import FileLock  # a hard dependency of moonshine-voice
+
+    with FileLock(path.with_suffix(path.suffix + ".lock")):  # the library's lock path
+        try:
+            same_size = path.stat().st_size == info.get("size")
+        except FileNotFoundError:
+            return
+        if same_size and _crc_mismatch(path, info):
+            logger.warning("moonshine: %s failed its CRC32C check; re-downloading it once", path)
+            path.unlink(missing_ok=True)
 
 
 def _check_model(
@@ -493,8 +532,7 @@ def _fetch_model(
     for info in files:
         path = root / info["name"]
         if have(info) and _crc_mismatch(path, info):
-            logger.warning("moonshine: %s failed its CRC32C check; re-downloading it once", path)
-            path.unlink()
+            _remove_if_still_corrupt(path, info)
     pending = [info for info in files if not have(info)]
     total = sum(int(i.get("size") or 0) for i in pending)
     done = threading.Event()
@@ -528,7 +566,7 @@ def _fetch_model(
         # alphanumeric spelling model; it is not part of the snapshot contract
         # and not required for a decode.
         try:
-            download.get_model_for_language(language, arch)
+            served_path, _ = download.get_model_for_language(language, arch)
         except ValueError as exc:
             # The library verifies size/CRC32C after a fresh download.
             if "mismatch" in str(exc):
@@ -538,6 +576,13 @@ def _fetch_model(
         done.set()
         if reporter is not None:
             reporter.join(timeout=1)
+    # The server loads from the path ``get_model_for_language`` returns; the
+    # checks here verify the manifest-derived root. They must be one directory.
+    if Path(served_path) != root:
+        raise RuntimeError(
+            f"moonshine {language}: the library's model directory {served_path} is not "
+            f"the manifest directory {root} that prefetch verifies"
+        )
     for info in files:
         # Re-verify on disk ourselves (the library's cache fast path is size-only).
         if _file_state(root / info["name"], info) != "ok":
