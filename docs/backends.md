@@ -54,7 +54,9 @@ environment. It buffers audio until `end()`, then decodes once and emits one
 `delta` equal to `completed`; the wire protocol is unchanged. The first install
 is `just stt-install moonshine` (port 9965). The `moonshine-voice==0.1.6` macOS
 wheel is `macosx_15_0_arm64` only: macOS 14 or earlier, and Intel Macs, have no
-matching wheel, so `uv sync --extra moonshine` fails there.
+matching wheel, so `uv sync --extra moonshine` fails there. The server
+requires exactly `moonshine-voice==0.1.6` at start; any other installed
+version fails with an `ImportError` that names the fix.
 
 `--model` is a spec, `[<arch>][@<lang>[,<lang>...]]`, default
 `medium-streaming@en`. Examples: `medium-streaming@en`, `tiny-streaming@en,es`,
@@ -84,7 +86,9 @@ Cache and pin: `prefetch --backend moonshine` (and `--check`) uses the
 package's own manifest and verifies each file's CRC32C; it does not use
 `HF_HOME`. CRC32C detects corruption, not deliberate tampering: the manifest
 and the files both come from `download.moonshine.ai`, so trusting that CDN is
-your call. The files live under the package's cache directory. There is no
+your call. If a CRC32C cannot be computed (`google-crc32c` not importable),
+`--check` and the repair fail instead of passing. The files live under the
+package's cache directory. There is no
 Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 `pyproject.toml` fixes the model URLs, so moving it moves the models. Models
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with

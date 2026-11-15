@@ -15,13 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the served set is fixed at startup. Only MIT models are served (streaming
   archs for any language, non-streaming for `en`). A client `auto` or blank
   language means `en` if served, else the first listed. `prefetch` downloads
-  and CRC-checks models through the package's own manifest (not the Hugging
-  Face cache). `just stt-install moonshine` installs a LaunchAgent on port
-  9965. The plist renderer now accepts `@` and `,` in the model value. See
-  `docs/backends.md`.
+  and CRC32C-checks models through the package's own manifest (not the Hugging
+  Face cache). It fails when a CRC32C cannot be computed, and repairs a
+  corrupt same-size cached file once, under the library's per-file lock. The
+  server and the installer's import probe require exactly
+  `moonshine-voice==0.1.6`; another version fails with a
+  `uv sync --extra moonshine --inexact` hint. `just stt-install moonshine`
+  installs a LaunchAgent on port 9965. The plist renderer now accepts `@` and
+  `,` in the model value. See `docs/backends.md`.
 - `scripts/benchmark_moonshine_latency.py`: paced single-endpoint benchmark of
   the moonshine backend (one-shot commit-to-completed and library `stop()`
-  flush at 3, 5 and 10 s; JSON key `one_shot_p50_s`).
+  flush at 3, 5 and 10 s; JSON key `one_shot_p50_s`). The auth token comes
+  from `--auth-token-file` or `STT_WS_TOKEN`; there is no `--auth-token`
+  argument. A failed `stop()` flush fails the run.
 - `prefetch` specs (`SnapshotSpec`) take optional `check` and `fetch`
   callables, so a backend whose models do not come from the Hugging Face Hub
   can still use `prefetch` and `--check`.
