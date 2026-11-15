@@ -917,3 +917,86 @@ def test_abort_while_decode_thread_runs_is_safe(monkeypatch, backend_name):
             backend.abort()
 
     asyncio.run(body())
+
+
+# --- moonshine: download / model-invalid tagging and abort() ---------------------------------
+
+
+@pytest.fixture
+def fake_moonshine(monkeypatch, tmp_path):
+    from _fake_moonshine import install
+
+    return install(monkeypatch, tmp_path / "moonshine-cache")
+
+
+async def _moonshine_decode(backend):
+    stream = await backend.open_stream(language="en")
+    await stream.feed(b"\x01\x00" * 1600)
+    await stream.end()
+    return [ev.text async for ev in stream.events()]
+
+
+def test_moonshine_model_fetch_connection_error_is_download_error(fake_moonshine):
+    """Only the fetch-and-load call is the download phase; a bare network error there
+    is classified as ``ModelDownloadError``."""
+    import asyncio
+
+    from stt_server.backends.moonshine import MoonshineBackend
+
+    fake_moonshine.raise_on_download = ConnectionResetError("model host hung up")
+
+    async def body():
+        backend = MoonshineBackend(model="medium-streaming@en")
+        await backend.start()
+        try:
+            await _moonshine_decode(backend)
+        finally:
+            backend.abort()
+
+    with pytest.raises(ConnectionResetError) as exc:
+        asyncio.run(body())
+    assert supervise.classify_startup_error(exc.value)[0] == "ModelDownloadError"
+
+
+def test_moonshine_corrupt_snapshot_is_model_invalid_not_a_download_error(fake_moonshine):
+    from stt_server import prefetch as PF
+
+    fake_moonshine.corrupt_downloads = True
+    (spec,) = PF.specs_for("moonshine", None)
+    with pytest.raises(Exception) as exc:
+        PF.fetch_spec(spec, None)
+    assert supervise.classify_startup_error(exc.value)[0] == "ModelInvalidError"
+
+
+def test_moonshine_abort_while_decode_thread_runs_is_safe(fake_moonshine):
+    """``abort()`` may run while a decode daemon thread is still going: idempotent,
+    non-blocking, the thread then finishes, and the backend decodes again afterwards."""
+    import asyncio
+
+    from stt_server.backends.moonshine import MoonshineBackend
+
+    release = threading.Event()
+    fake_moonshine.gate = release
+
+    async def body():
+        backend = MoonshineBackend(model="medium-streaming@en")
+        await backend.start()
+        try:
+            task = asyncio.ensure_future(_moonshine_decode(backend))
+            deadline = time.monotonic() + 5
+            while not fake_moonshine.transcribe_calls and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert fake_moonshine.transcribe_calls, "decode never reached the model call"
+            backend.abort()  # the decode thread is mid-call
+            backend.abort()  # idempotent
+            release.set()
+            await asyncio.wait_for(asyncio.wait({task}), timeout=5)
+            assert task.done()
+            # a later start()/decode still works
+            await backend.start()
+            assert await asyncio.wait_for(_moonshine_decode(backend), timeout=5)
+        finally:
+            release.set()
+            backend.abort()
+
+    asyncio.run(body())

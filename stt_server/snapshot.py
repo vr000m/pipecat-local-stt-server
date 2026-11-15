@@ -25,7 +25,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SnapshotSpec:
-    """One Hugging Face snapshot a backend needs before it can decode offline."""
+    """One model snapshot a backend needs before it can decode offline (a Hugging
+    Face snapshot unless ``check``/``fetch`` are set)."""
 
     repo_id: str
     revision: str | None = None  # None = the repo's main branch, as the loaders use
@@ -52,6 +53,29 @@ class SnapshotSpec:
     #: characters or ``|``): they are used as ``allow_patterns`` and matched
     #: with ``fnmatch``.
     resolve: Callable[[dict], tuple[str, ...]] | None = None
+    #: For backends whose weights do not come from the Hugging Face Hub
+    #: (``moonshine``: the package's own CDN and manifest). When set, ``prefetch``
+    #: calls it instead of the Hub probe: it is given this spec and returns
+    #: ``(path, size_bytes)`` of a complete snapshot, or ``None`` when files are
+    #: missing or incomplete. A snapshot that is present but corrupt raises an
+    #: exception tagged with :func:`mark_model_invalid`. ``allow_patterns``,
+    #: ``required``, ``resolve`` are ignored when it is set.
+    check: Callable[["SnapshotSpec"], tuple[str, int] | None] | None = None
+    #: Counterpart of ``check`` for a fetch. Given this spec and an optional
+    #: ``progress(downloaded_bytes, total_bytes, files_done, files_total)``
+    #: callback (``None`` when no JSON progress was requested), it downloads
+    #: what is missing and returns the snapshot's path. It reports progress with
+    #: the same meaning as the Hub path (only not-yet-cached files count) and a
+    #: final 100% event; a corrupt result raises an exception tagged with
+    #: :func:`mark_model_invalid`. ``prefetch`` emits ``start`` and ``done`` and
+    #: runs the call inside :func:`download_phase`.
+    fetch: (
+        Callable[
+            ["SnapshotSpec", Callable[[int, int, int, int], None] | None],
+            str,
+        ]
+        | None
+    ) = None
 
 
 DOWNLOAD_PHASE_ATTR = "_stt_download_phase"

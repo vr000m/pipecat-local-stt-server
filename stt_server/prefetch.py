@@ -1,6 +1,6 @@
 """``python -m stt_server prefetch`` — fetch a backend's weights without serving.
 
-The ``mlx``, ``parakeet`` and ``nemotron`` backends download their checkpoint
+The ``mlx``, ``parakeet``, ``nemotron`` and ``moonshine`` backends download their checkpoint
 on the first decode, so a fresh server answers its first request only after a
 silent multi-GB download. ``prefetch`` does that download up front, with
 optional JSON-lines progress for a supervising app, and ``--check`` answers
@@ -240,6 +240,18 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         "path": None,
         "size_bytes": 0,
     }
+    if spec.local_path is None and spec.check is not None:
+        # Non-Hub snapshot (``moonshine``): the backend's own completeness probe.
+        try:
+            found = spec.check(spec)
+        except ImportError:
+            raise
+        except Exception as exc:
+            exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            raise
+        if found is not None:
+            row.update(cached=True, path=found[0], size_bytes=found[1])
+        return row
     if spec.local_path is not None:
         path = spec.local_path
         if not Path(path).is_dir():
@@ -279,6 +291,33 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
             mark_model_invalid(exc)
             raise exc
         spec = _validated(spec, path, what=f"{path}: local model")
+        result = {
+            "event": "done",
+            "repo": spec.repo_id,
+            "path": path,
+            "size_bytes": _snapshot_size(path),
+        }
+        if emit is not None:
+            emit(result)
+        return result
+    if spec.fetch is not None:
+        # Non-Hub snapshot (``moonshine``): the backend downloads and verifies
+        # it; the events keep the Hub path's fields.
+        def relay(got: int, total: int, n_done: int, n_total: int) -> None:
+            assert emit is not None
+            emit(
+                {
+                    "event": "progress",
+                    "repo": spec.repo_id,
+                    "downloaded_bytes": got,
+                    "total_bytes": total,
+                    "files_done": n_done,
+                    "files_total": n_total,
+                }
+            )
+
+        with download_phase():
+            path = spec.fetch(spec, relay if emit is not None else None)
         result = {
             "event": "done",
             "repo": spec.repo_id,
@@ -387,7 +426,7 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
             )
         except Exception as exc:  # noqa: BLE001 - CLI boundary: report, exit 1
             code, message = supervise.classify_startup_error(exc)
-            if code == supervise.CODE_MODULE_NOT_FOUND:
+            if code == supervise.CODE_MODULE_NOT_FOUND and "huggingface_hub" in message:
                 message = (
                     f"{message} (prefetch needs huggingface_hub, which every model extra installs)"
                 )

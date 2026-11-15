@@ -1141,6 +1141,36 @@ def test_make_backend_parakeet_arm_does_not_import_parakeet_mlx():
     assert "OK" in r.stdout
 
 
+@pytest.fixture
+def fake_moonshine_voice(monkeypatch, tmp_path):
+    from _fake_moonshine import install
+
+    return install(monkeypatch, tmp_path / "moonshine-cache")
+
+
+def test_make_backend_moonshine_constructs_moonshine_backend(fake_moonshine_voice):
+    from stt_server.__main__ import _make_backend
+    from stt_server.backends.moonshine import MoonshineBackend
+
+    backend = _make_backend("moonshine", "small-streaming@en,es")
+    assert isinstance(backend, MoonshineBackend)
+    assert backend.model == "small-streaming@en,es"
+
+
+def test_argparse_backend_choices_include_moonshine():
+    r = _run_module("serve", "--help")
+    assert r.returncode == 0, r.stderr
+    assert "moonshine" in r.stdout
+
+
+def test_resolve_model_moonshine_default_and_override(fake_moonshine_voice):
+    from stt_server.__main__ import _resolve_model
+    from stt_server.backends import DEFAULT_MOONSHINE_MODEL
+
+    assert _resolve_model("moonshine", None) == DEFAULT_MOONSHINE_MODEL == "medium-streaming@en"
+    assert _resolve_model("moonshine", "tiny-streaming@en,es") == "tiny-streaming@en,es"
+
+
 def test_make_backend_nemotron_constructs_nemotron_backend(fake_mlx_audio):
     from stt_server.__main__ import _make_backend
     from stt_server.backends.nemotron import NemotronBackend

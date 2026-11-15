@@ -715,3 +715,213 @@ def test_prefetch_unknown_or_unsupported_backend_input_is_config_error(
         argv.append("--check")
     code, events, _ = _run(monkeypatch, capsys, *argv)
     assert code == 1 and events[-1]["code"] == "ConfigError"
+
+
+# ---------------------------------------------------------------------------
+# moonshine: ``SnapshotSpec`` check/fetch callables over a fake
+# ``moonshine_voice.download`` (no wheel, no network)
+# ---------------------------------------------------------------------------
+
+_MS_DEFAULT_REPO = "moonshine-voice/medium-streaming-en"
+
+
+@pytest.fixture
+def fake_moonshine(monkeypatch, tmp_path):
+    from _fake_moonshine import install
+
+    return install(monkeypatch, tmp_path / "moonshine-cache")
+
+
+def _ms(monkeypatch, capsys, *argv: str):
+    return _run(monkeypatch, capsys, "--backend", "moonshine", *argv)
+
+
+def test_hf_specs_keep_no_callables():
+    """The shared contract: Hugging Face specs leave ``check``/``fetch`` unset."""
+    from stt_server.snapshot import SnapshotSpec
+
+    assert SnapshotSpec("a/b").check is None and SnapshotSpec("a/b").fetch is None
+    for backend in ("mlx", "parakeet", "nemotron", "kyutai"):
+        for spec in PF.specs_for(backend, None):
+            assert spec.check is None and spec.fetch is None
+
+
+def test_moonshine_uncached_then_cached(fake_moonshine, monkeypatch, capsys):
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0
+    assert [e["event"] for e in events] == ["check", "summary"]
+    assert events[0]["repo"] == _MS_DEFAULT_REPO
+    assert events[0]["revision"] == fake_moonshine.version
+    assert events[-1]["cached"] is False
+    assert fake_moonshine.downloads == [], "--check never goes online"
+
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 0 and events[-1]["event"] == "complete" and events[-1]["cached"] is True
+    assert fake_moonshine.downloads == [("en", "medium-streaming")]
+
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0
+    assert events[0]["cached"] is True and events[-1]["cached"] is True
+    assert events[-1]["size_bytes"] == fake_moonshine.total_size("en", "medium-streaming")
+    assert fake_moonshine.downloads == [("en", "medium-streaming")], "--check did not refetch"
+
+
+def test_moonshine_fetches_the_whole_served_set(fake_moonshine, monkeypatch, capsys):
+    code, events, _ = _ms(monkeypatch, capsys, "--model", "small-streaming@en,es", "--json")
+    assert code == 0
+    starts = [e["repo"] for e in events if e["event"] == "start"]
+    assert starts == ["moonshine-voice/small-streaming-en", "moonshine-voice/small-streaming-es"]
+    assert sorted(fake_moonshine.downloads) == [
+        ("en", "small-streaming"),
+        ("es", "small-streaming"),
+    ]
+
+
+@pytest.mark.parametrize("damage", ["missing-file", "truncated-file"])
+def test_moonshine_incomplete_snapshot_is_not_cached(fake_moonshine, monkeypatch, capsys, damage):
+    root = Path(fake_moonshine.write_model("en", "medium-streaming"))
+    victim = sorted(root.iterdir())[0]
+    if damage == "missing-file":
+        victim.unlink()
+    else:
+        victim.write_bytes(victim.read_bytes()[:-3])
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0
+    assert events[0]["cached"] is False and events[-1]["cached"] is False
+    assert fake_moonshine.downloads == []
+
+
+def test_moonshine_check_with_a_populated_cache_but_one_language_missing(
+    fake_moonshine, monkeypatch, capsys
+):
+    fake_moonshine.write_model("en", "small-streaming")
+    code, events, _ = _ms(
+        monkeypatch, capsys, "--model", "small-streaming@en,es", "--check", "--json"
+    )
+    assert code == 0
+    cached = {e["repo"]: e["cached"] for e in events if e["event"] == "check"}
+    assert cached == {
+        "moonshine-voice/small-streaming-en": True,
+        "moonshine-voice/small-streaming-es": False,
+    }
+    assert events[-1]["cached"] is False
+
+
+def test_moonshine_fetch_event_order_and_fields(fake_moonshine, monkeypatch, capsys):
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 0
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "start" and kinds[-2:] == ["done", "complete"]
+    assert set(kinds[1:-2]) <= {"progress"}
+    start, done, complete = events[0], events[-2], events[-1]
+    assert start["repo"] == _MS_DEFAULT_REPO
+    assert start["revision"] == fake_moonshine.version and start["kind"] == "model"
+    assert done["repo"] == _MS_DEFAULT_REPO
+    assert done["size_bytes"] == fake_moonshine.total_size("en", "medium-streaming")
+    assert Path(done["path"]).is_dir()
+    assert complete["backend"] == "moonshine" and complete["cached"] is True
+    assert complete["size_bytes"] == done["size_bytes"]
+    for e in events[1:-2]:
+        assert {"repo", "downloaded_bytes", "total_bytes", "files_done", "files_total"} <= set(e)
+
+
+def test_moonshine_fetch_failure_reports_the_repo(fake_moonshine, monkeypatch, capsys):
+    fake_moonshine.raise_on_download = RuntimeError("cdn returned 503")
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["repo"] == _MS_DEFAULT_REPO
+    assert events[-1]["event"] != "complete" and "complete" not in [e["event"] for e in events]
+
+
+def test_moonshine_connection_error_is_a_download_error(fake_moonshine, monkeypatch, capsys):
+    fake_moonshine.raise_on_download = ConnectionResetError("peer reset")
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1 and events[-1]["code"] == "ModelDownloadError"
+    assert events[-1]["repo"] == _MS_DEFAULT_REPO
+
+
+def test_moonshine_failed_fetch_leaves_the_set_not_cached(fake_moonshine, monkeypatch, capsys):
+    fake_moonshine.raise_on_download = RuntimeError("cdn returned 503")
+    _ms(monkeypatch, capsys, "--json")
+    fake_moonshine.raise_on_download = None
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is False
+
+
+def test_moonshine_corrupt_snapshot_after_fetch_is_model_invalid(
+    fake_moonshine, monkeypatch, capsys
+):
+    """Same size, wrong bytes: the library's size-only acceptance would pass it, so the
+    check must compute CRC32C itself and report ``ModelInvalidError``."""
+    fake_moonshine.corrupt_downloads = True
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModelInvalidError"
+    assert events[-1]["repo"] == _MS_DEFAULT_REPO
+
+
+def test_moonshine_corrupt_cached_snapshot_is_never_reported_cached(
+    fake_moonshine, monkeypatch, capsys
+):
+    fake_moonshine.write_model("en", "medium-streaming", corrupt=True)
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    # either a clean "not cached" summary or a model-invalid error, never ``cached: true``
+    assert events[-1].get("cached") is not True
+    if events[-1]["event"] == "error":
+        assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+    else:
+        assert code == 0 and events[-1]["cached"] is False
+
+
+def test_moonshine_missing_extra_is_a_clean_error_without_the_hub_hint(monkeypatch, capsys):
+    import builtins
+
+    real = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name == "moonshine_voice" or name.startswith("moonshine_voice."):
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return real(name, *a, **k)
+
+    for m in [m for m in sys.modules if m.split(".")[0] == "moonshine_voice"]:
+        monkeypatch.delitem(sys.modules, m)
+    monkeypatch.delitem(sys.modules, "stt_server.backends.moonshine", raising=False)
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModuleNotFoundError"
+    assert "huggingface_hub" not in events[-1]["message"], "the hint is conditional"
+    assert "moonshine" in events[-1]["message"]
+
+
+def test_missing_huggingface_hub_hint_is_kept_for_hf_backends(monkeypatch, capsys):
+    def no_hub(spec, *, local_files_only):
+        raise ModuleNotFoundError("No module named 'huggingface_hub'", name="huggingface_hub")
+
+    monkeypatch.setattr(PF, "_snapshot_download", no_hub)
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
+    assert code == 1 and "huggingface_hub" in events[-1]["message"]
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_moonshine_local_model_path_is_refused(
+    fake_moonshine, tmp_path, monkeypatch, capsys, check
+):
+    model = tmp_path / "some-dir"
+    model.mkdir()
+    argv = ["--model", str(model), "--json"] + (["--check"] if check else [])
+    code, events, _ = _ms(monkeypatch, capsys, *argv)
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ConfigError"
+    assert fake_moonshine.downloads == []
+
+
+@pytest.mark.parametrize("model", ["@ko", "@uk", "base@es", "bogus-arch", "@xx"])
+@pytest.mark.parametrize("check", [True, False])
+def test_moonshine_invalid_spec_is_a_config_error(
+    fake_moonshine, monkeypatch, capsys, model, check
+):
+    argv = ["--model", model, "--json"] + (["--check"] if check else [])
+    code, events, _ = _ms(monkeypatch, capsys, *argv)
+    assert code == 1 and events[-1]["code"] == "ConfigError"
+    assert fake_moonshine.downloads == []

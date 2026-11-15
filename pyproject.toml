@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "Varun Singh", email = "varun@varunsingh.net" }]
-keywords = ["stt", "transcription", "whisper", "parakeet", "mlx", "websocket", "pipecat", "asr", "speech-to-text"]
+keywords = ["stt", "transcription", "whisper", "parakeet", "mlx", "websocket", "pipecat", "asr", "speech-to-text", "moonshine"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -48,6 +48,10 @@ nemotron = ["websockets>=16,<17", "mlx-audio>=0.4.4", "numpy>=1.26"]
 # Python 3.12 only in practice: moshi_mlx pins sentencepiece==0.2.0, which has no
 # cp313 wheel (a source build needs cmake + pkg-config).
 kyutai = ["websockets>=16,<17", "moshi_mlx==0.3.0", "numpy>=1.26"]
+# Full server install with the Moonshine Voice backend (via moonshine-voice:
+# ONNX Runtime on CPU, no MLX). The exact pin IS the model pin: it fixes the
+# model download URLs (models come from download.moonshine.ai, not the HF Hub).
+moonshine = ["websockets>=16,<17", "moonshine-voice==0.1.6", "numpy>=1.26"]
 
 [tool.uv]
 # kyutai's moshi_mlx pins (mlx<0.27, huggingface-hub<0.29) can't share an
