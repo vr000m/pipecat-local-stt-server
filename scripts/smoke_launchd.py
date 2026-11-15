@@ -616,7 +616,7 @@ def acquire_run_lock(path: Path) -> int:
 
 
 def canonical_ports(run=subprocess.run) -> set[int]:
-    """The four canonical ports, read from ``install_stt_agent.sh port <backend>``."""
+    """The canonical ports, read from ``install_stt_agent.sh port <backend>``."""
     ports: set[int] = set()
     for backend in CANONICAL_BACKENDS:
         try:

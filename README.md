@@ -86,8 +86,9 @@ Production backends require their optional extra before first use:
 | Moonshine | `uv sync --extra moonshine` | `medium-streaming@en` (CPU) |
 
 Kyutai needs Python 3.12 and a separate `.venv-kyutai` because its MLX pins
-conflict with the other extras. The defaults are pinned to immutable Hugging
-Face revisions. Custom repositories and local model paths are supported where
+conflict with the other extras. The Hugging Face defaults are pinned to
+immutable revisions; Moonshine is pinned by its package version. Custom
+repositories and local model paths are supported where
 the backend allows them.
 
 See [Backends and models](docs/backends.md) for model selection, pinning,

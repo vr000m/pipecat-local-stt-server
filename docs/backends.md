@@ -52,7 +52,9 @@ dedicated environment or use `just stt-install kyutai`.
 Moonshine Voice (`moonshine-voice`) runs on CPU and shares the default
 environment. It buffers audio until `end()`, then decodes once and emits one
 `delta` equal to `completed`; the wire protocol is unchanged. The first install
-is `just stt-install moonshine` (port 9965).
+is `just stt-install moonshine` (port 9965). The `moonshine-voice==0.1.6` macOS
+wheel is `macosx_15_0_arm64` only: macOS 14 or earlier, and Intel Macs, have no
+matching wheel, so `uv sync --extra moonshine` fails there.
 
 `--model` is a spec, `[<arch>][@<lang>[,<lang>...]]`, default
 `medium-streaming@en`. Examples: `medium-streaming@en`, `tiny-streaming@en,es`,

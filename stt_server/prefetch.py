@@ -29,6 +29,8 @@ JSON events (one object per stdout line; the same schema as
 Progress is measured from the Hugging Face cache on disk (bytes landing in the
 repo's ``blobs/``), so it works with every ``huggingface_hub`` version the
 backends pin; Kyutai's ``moshi_mlx`` requires ``huggingface-hub<0.29``.
+``moonshine`` (not on the Hub) reports the same events from its own cache
+directory, through the ``SnapshotSpec`` ``check``/``fetch`` callables.
 
 Lean at import: ``huggingface_hub`` is imported only inside the seams.
 """
@@ -229,7 +231,10 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
 
     ``ImportError`` and a config error (a malformed Hub repo id or revision,
     ``errors.is_config_error``) propagate, so ``--check`` and a fetch classify
-    bad input the same way; any other probe failure is a cache miss."""
+    bad input the same way; any other probe failure is a cache miss. The one
+    exception is a spec with a ``check`` callable (``moonshine``): the backend
+    decides what a miss is (``None``), and every exception it raises propagates
+    (a corrupt snapshot is tagged ``mark_model_invalid``)."""
     row: dict[str, Any] = {
         "event": "check",
         "repo": spec.repo_id,
