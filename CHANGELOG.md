@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Face cache). `just stt-install moonshine` installs a LaunchAgent on port
   9965. The plist renderer now accepts `@` and `,` in the model value. See
   `docs/backends.md`.
+- `scripts/benchmark_moonshine_latency.py`: paced single-endpoint benchmark of
+  the moonshine backend (one-shot commit-to-completed and library `stop()`
+  flush at 3, 5 and 10 s; JSON key `one_shot_p50_s`).
+- `prefetch` specs (`SnapshotSpec`) take optional `check` and `fetch`
+  callables, so a backend whose models do not come from the Hugging Face Hub
+  can still use `prefetch` and `--check`.
+- The Linux client CI job runs `tests/test_moonshine_backend.py`.
 
 ## [0.5.1] - 2026-10-30
 

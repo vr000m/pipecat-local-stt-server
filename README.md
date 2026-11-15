@@ -17,7 +17,7 @@ The PyPI package is `pipecat-local-stt-server`; the import and CLI module remain
 - pipeline-provided VAD (`turn_detection: null`); no server-side VAD
 - Unix sockets with same-uid peer checks, or loopback-only TCP with optional
   bearer-token authentication
-- MLX Whisper, Parakeet, Nemotron, and Kyutai backends
+- MLX Whisper, Parakeet, Nemotron, Kyutai, and Moonshine backends
 - supervised lifecycle events for launchd, menu bar apps, and other parents
 
 The protocol is intentionally smaller than OpenAI Realtime transcription. See
