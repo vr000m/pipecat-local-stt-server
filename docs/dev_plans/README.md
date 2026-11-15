@@ -15,7 +15,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [Port-squat detection, one smoke entry point and launchd verification (0.5.1)](20261027-feature-stt-squat-detection-unified-smoke.md) | Install & Packaging | ✅ Shipped in 0.5.1 (PR #18); harness ran live, `--agents` decode stub-tested only |
 | [Shorten the README and make focused guides canonical](20261104-docs-readme-restructure.md) | Documentation | ✅ Complete (2026-11-04) |
 | [Moonshine Voice STT backend (multilingual, commit-oriented)](20261114-feature-moonshine-backend.md) | ASR Backends | 🟡 In progress — phases 1 and 2 done; review gates and PR remain |
-| [Moonshine streaming mode](20261114-feature-moonshine-streaming-mode.md) | ASR Backends | ⏸️ Deferred, unimplemented — go/no-go rule not met (5 s one-shot 245 ms, threshold 300 ms) |
+| [Moonshine streaming mode](20261114-feature-moonshine-streaming-mode.md) | ASR Backends | ⏸️ Deferred, unimplemented — go/no-go rule not met: it needs a 5 s one-shot p50 above 300 ms AND a flush below half of it; the one-shot measured 245 ms, so the flush condition is moot |
 
 ## Conventions
 

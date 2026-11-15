@@ -66,9 +66,10 @@ Licence guard: only MIT models are served, which means streaming archs for any
 language and non-streaming archs for `en` only. A non-streaming non-`en` arch
 is refused. Models are never shipped or bundled by this project; they come from
 the package's own CDN (`download.moonshine.ai`), not the Hugging Face Hub. The
-library prints a notice on stderr whenever it downloads a model for a non-`en`
-language, naming its non-commercial Moonshine Community License for some
-models. Whether a model's licence suits your use is your call.
+`moonshine-voice` package (not this project) prints a notice on stderr whenever
+it downloads a model for a non-`en` language, naming its non-commercial
+Moonshine Community License for some models. Whether a model's licence suits
+your use is your call.
 
 Language: Moonshine has no language identification, so a client `auto`, blank
 or missing `language` silently means `en` if served, else the first listed
@@ -81,11 +82,21 @@ joined with a space, so their output reads with spaces (known limitation).
 
 Cache and pin: `prefetch --backend moonshine` (and `--check`) uses the
 package's own manifest and verifies each file's CRC32C; it does not use
-`HF_HOME`. The files live under the package's cache directory. There is no
+`HF_HOME`. CRC32C detects corruption, not deliberate tampering: the manifest
+and the files both come from `download.moonshine.ai`, so trusting that CDN is
+your call. The files live under the package's cache directory. There is no
 Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 `pyproject.toml` fixes the model URLs, so moving it moves the models. Models
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with
 `prefetch` before installing an agent. Local model paths are not supported.
+
+Latency: `scripts/benchmark_moonshine_latency.py` measures, against a running
+moonshine server, the p50 from `commit` to `transcription.completed` for 3, 5
+and 10 s utterances fed in real time (JSON key `one_shot_p50_s` with
+`--json-out`), plus the library `stop()` flush after a streamed feed. Run it with
+`uv run --inexact python scripts/benchmark_moonshine_latency.py --uri
+ws://127.0.0.1:9965/` (or `--socket <path>`; token from `--auth-token-file` or
+`STT_WS_TOKEN`).
 
 ## Models and revisions
 
