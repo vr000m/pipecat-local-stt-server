@@ -1,6 +1,6 @@
 # Task: Moonshine streaming mode (decode overlapped with incoming audio)
 
-**Status**: Not Started
+**Status**: Deferred (unimplemented)
 **Component**: ASR Backends
 **Assigned to**: Varun Singh
 **Priority**: Low
@@ -15,7 +15,7 @@ Let a streaming-capable backend start decoding at the first `audio.append` of a 
 ## Context
 
 - Split out of `20261114-feature-moonshine-backend.md` (decision 1, grilled 2026-11-14) because it changes `stt_server/server.py` session handling that every backend runs through. That plan ships the commit-oriented backend first and owns the paced benchmark.
-- **Do not start until the go/no-go in that plan's last Phase 2 step says go**: for a 5 s utterance on the default model, one-shot commit-to-completed p50 above 300 ms and `stop()` flush p50 below half of the one-shot p50 (thresholds confirmed by the user). **Gate evaluated 2026-11-15: the 5 s one-shot p50 was 245 ms on a quiet machine, so the rule is not met; by the rule this plan is closed unimplemented, pending the user's confirmation.** If the benchmark says no-go, close this plan unimplemented.
+- **Do not start until the go/no-go in that plan's last Phase 2 step says go**: for a 5 s utterance on the default model, one-shot commit-to-completed p50 above 300 ms and `stop()` flush p50 below half of the one-shot p50 (thresholds confirmed by the user). **Gate evaluated 2026-11-15: the 5 s one-shot p50 was 245 ms on a quiet machine, so the rule is not met. The user confirmed (2026-11-15): leave it unimplemented and mark it deferred. Revisit only if a real client needs partial transcripts or moonshine's one-shot latency proves worse in use.** If the benchmark says no-go, close this plan unimplemented.
 - Facts from the Phase 0 spike (see the sibling plan's `## Findings`): listener callbacks fire synchronously on the thread that called `add_audio`/`stop`; `add_audio` blocks while the model runs (medium: p95 170 ms, max 475 ms), so it can never run on the event loop; in-progress line text is rewritten constantly (46 of 63 changes on medium), and only `LineCompleted` text is final; concurrent decodes gave no speedup and, with two transcribers, differing output (cause unproven). Unpaced streaming costs RTF 0.27 against 0.075 offline on medium, so the gate can pass while streaming delivers no gain; the paced `stop()` flush measurement is the real test.
 - Wire ordering constraint: the item id is minted at commit, and OpenAI-style ordering is `committed`, `delta`, `completed`. A streaming backend therefore holds its line texts until `events()` is read after `end()`; nothing reaches the client earlier. This buys lower commit latency, not earlier text.
 
