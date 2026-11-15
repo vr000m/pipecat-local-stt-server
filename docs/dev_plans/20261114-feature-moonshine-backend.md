@@ -337,6 +337,29 @@ Context lifecycle:
 - ja/zh verification (finding 7, 2026-11-14, `moonshine-voice==0.1.6`, macOS `say` clips Kyoko/Tingting at 16 kHz, one-shot path through the real backend; audio not kept in the repo). Catalog: `ja` offers small-streaming, tiny-streaming, base, tiny; `zh` offers tiny-streaming and base; the backend's default arch resolves to `small-streaming` (ja, 121.8 MB, `quantized_26_08_23`) and `tiny-streaming` (zh, 32.3 MB, `quantized_26_08_24`). Single-sentence clips give one `LineCompleted` line; multi-sentence clips give 2 to 3 lines with no spaces inside a line (ja, zh text carries no word spaces; zh uses ASCII commas). The backend joins lines with `" "`, so `completed` reads `おはようございます 今日の会議は午後3時からです 資料は...`: a space joiner is right for `en` and other space-delimited languages, wrong for `ja` and `zh`. The library prints its non-commercial "Moonshine Community License" notice when loading both models. Not applied: join with `""` for `ja`/`zh` (needs the resolved language code from `_transcriber_for`).
 - Decision (user, 2026-11-14): `ja`/`zh` are out of scope for verification and the joiner fix. Nothing in the implementation precludes them: a developer downloads the model and serves it with `--model <arch>@ja`. We never ship or bundle models; licence suitability for a given model (the library's non-commercial Community notice) is the developer's call, so Phase 2 docs state that plainly and make no `ja`/`zh` support claim beyond "downloadable and servable". Known limitation to document: lines are joined with a space, so `ja`/`zh` text reads with spaces. The licence guard (non-streaming non-`en` refused) stays as decided earlier.
 
+### Phase 2 benchmarks (2026-11-15, Apple silicon laptop, `moonshine-voice==0.1.6`, default `medium-streaming@en`)
+- Full suite after the Phase 2 wiring: 2823 passed, 23 skipped.
+- Paced single-endpoint benchmark (`scripts/benchmark_moonshine_latency.py`, p50 of 9 warm runs, cut from `two_cities.wav`). Two runs, same machine, minutes apart:
+
+  | utterance | one-shot commit-to-completed, run 1 | run 2 | `stop()` flush, run 1 | run 2 |
+  |---|---|---|---|---|
+  | 3 s | 144 ms | 144 ms | 67 ms | 66 ms |
+  | 5 s | 264 ms | 2130 ms | 75 ms | 74 ms |
+  | 10 s | 991 ms | 821 ms | 215 ms | 88 ms |
+
+  The two runs disagree by 8x at 5 s. The machine was not quiet (load average about 6.9 at the time of the second run, with one browser content process at 99% CPU), and moonshine decodes on CPU through ONNX Runtime, so contention shows up directly in latency. These numbers do not settle the go/no-go (see below).
+- Cross-backend comparison (one-off driver, not committed; 20 synthetic `say` utterances of 2 to 7 s with known text, four voices, audio sent unpaced; WER is indicative only because text-to-speech audio flatters it; whisper and parakeet loaded alongside moonshine; nemotron served by another app's server on port 9865):
+
+  | backend | WER mean | latency p50 | RTF p50 |
+  |---|---|---|---|
+  | nemotron | 0.004 | 336 ms | 0.073 |
+  | parakeet | 0.026 | 166 ms | 0.035 |
+  | whisper | 0.026 | 1173 ms | 0.266 |
+  | moonshine | 0.070 | 458 ms | 0.100 |
+
+  Moonshine is the least accurate and mid-field on speed here (CPU decode against MLX for the others).
+- Go/no-go: **not recorded.** The thresholds (5 s one-shot p50 above 300 ms and `stop()` flush p50 below half of it) are still proposals awaiting the user, and the 5 s measurement straddles them across runs (264 ms, 458 ms on the synthetic corpus, 2130 ms). The flush ratio condition held in every paced run (0.03 to 0.28). Rerun on a quiet machine before deciding.
+
 ### Review Waivers
 
 (none)
