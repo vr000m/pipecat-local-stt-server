@@ -362,6 +362,26 @@ def test_resolve_arch_licence_guard_over_the_whole_catalog(mod, catalog):
                     mod.resolve_arch(code, name, catalog)
 
 
+def test_live_wheel_manifest_directory_matches_the_cached_model():
+    """The manifest-derived directory is where the real wheel cached the default model
+    (pinned against 0.1.6; skipped without the wheel or the cached model, nothing is
+    downloaded)."""
+    pytest.importorskip("moonshine_voice")
+    from moonshine_voice import download
+
+    import stt_server.backends.moonshine as m
+
+    arch = m.resolve_arch("en", "medium-streaming", download._stt_catalog())
+    root, files = m._model_manifest(download, "en", arch)
+    assert root.parts[-2:] == ("medium-streaming-en", "quantized_26_11_02")
+    assert files, "the manifest lists the model files"
+    if not all((root / f["name"]).is_file() for f in files):
+        pytest.skip("default moonshine model is not cached; not downloading it for a test")
+    # the cached files the library itself wrote sit exactly where the manifest says
+    for f in files:
+        assert (root / f["name"]).stat().st_size == f["size"]
+
+
 def test_resolve_arch_real_catalog_matches_the_guard():
     """Against the live catalog (only when the real wheel is installed)."""
     pytest.importorskip("moonshine_voice")
@@ -410,11 +430,18 @@ def test_resolve_language_outside_served_set_falls_back_with_a_note(mod, lang):
 def test_resolve_language_fallback_is_first_listed_when_en_not_served(mod):
     code, note = mod.resolve_language("xx", ["es", "de"])
     assert code == "es" and note
-    # ``auto`` means ``en``; ``en`` is not served here, so that falls back too
-    code, note = mod.resolve_language("auto", ["de", "es"])
+    # an explicit ``en`` that is not served is an error note and falls back too
+    code, note = mod.resolve_language("en", ["de", "es"])
     assert code == "de" and note
-    code, note = mod.resolve_language(None, ["ja"])
-    assert code == "ja" and note
+
+
+@pytest.mark.parametrize("lang", [None, "", "  ", "auto", "AUTO", " auto "])
+def test_resolve_language_default_maps_to_the_fallback_without_a_note(mod, lang):
+    """``None``/blank/``auto`` is the normal default, not an error: no note, whatever is served."""
+    assert mod.resolve_language(lang, ["en"]) == ("en", None)
+    assert mod.resolve_language(lang, ["es", "en"]) == ("en", None)
+    assert mod.resolve_language(lang, ["de", "es"]) == ("de", None)
+    assert mod.resolve_language(lang, ["ja"]) == ("ja", None)
 
 
 def test_resolve_language_prefers_en_over_first_listed(mod):
@@ -608,7 +635,23 @@ async def test_error_event_fails_the_decode_and_never_completes(mod, fake):
             events = [e async for e in stream.events()]
     assert events == [], "a failed flush must not produce completed"
     assert "flush failed" not in str(exc.value), "no library/transcript text in the message"
+    # the library's own error is kept as the cause, so the server log shows why
+    assert isinstance(exc.value.__cause__, RuntimeError)
+    assert str(exc.value.__cause__) == "flush failed"
     assert backend._wait_inflight_drained(1.0) is True
+
+
+async def test_error_event_exception_is_chained_as_the_cause(mod, fake):
+    cause = ValueError("model said no")
+    fake.error_on_stop = cause  # type: ignore[assignment]  # the real Error.error is an Exception
+    backend = _backend(mod)
+    await backend.start()
+    stream = await backend.open_stream(language="en")
+    await stream.feed(pcm(SAMPLE_RATE_HZ))
+    with pytest.raises(RuntimeError) as exc:
+        await stream.end()
+    assert exc.value.__cause__ is cause
+    assert "model said no" not in str(exc.value)
 
 
 async def test_error_event_after_lines_still_fails_not_truncated_completed(mod, fake):
@@ -986,6 +1029,19 @@ async def test_en_aliases_decode_as_en_without_an_error(mod, fake, caplog, langu
     with caplog.at_level(logging.ERROR):
         await _drive(backend, language=language)
     assert fake.downloads == [("en", "small-streaming")]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize("language", [None, "", "auto", "AUTO"])
+async def test_default_language_falls_back_silently_when_en_is_not_served(
+    mod, fake, caplog, language
+):
+    backend = _backend(mod, "small-streaming@es,de")
+    await backend.start()
+    with caplog.at_level(logging.ERROR):
+        _s, events = await _drive(backend, language=language)
+    assert events[-1].kind == "completed"
+    assert fake.downloads == [("es", "small-streaming")]
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 

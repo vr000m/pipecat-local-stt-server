@@ -413,6 +413,7 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
     ctx = supervise.json_channel() if json_mode else contextlib.nullcontext()
     with ctx:
         emit = supervise.emit if json_mode else None
+        specs: list[SnapshotSpec] = []
         try:
             specs = (
                 local_specs_for(backend, model)
@@ -426,7 +427,10 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
             )
         except Exception as exc:  # noqa: BLE001 - CLI boundary: report, exit 1
             code, message = supervise.classify_startup_error(exc)
-            if code == supervise.CODE_MODULE_NOT_FOUND and "huggingface_hub" in message:
+            # The hint is for Hub snapshots only; a spec with ``check``/``fetch``
+            # callables (``moonshine``) never touches ``huggingface_hub``.
+            non_hub = any(sp.check is not None or sp.fetch is not None for sp in specs)
+            if code == supervise.CODE_MODULE_NOT_FOUND and not non_hub:
                 message = (
                     f"{message} (prefetch needs huggingface_hub, which every model extra installs)"
                 )

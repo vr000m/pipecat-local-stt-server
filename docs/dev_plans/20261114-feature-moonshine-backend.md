@@ -33,7 +33,7 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 - **Model spec.** `--model` / `PIPECAT_STT_MODEL` is `[<arch>][@<lang>[,<lang>...]]`. Default `DEFAULT_MOONSHINE_MODEL = "medium-streaming@en"`. An omitted arch resolves each language to the first MIT-allowed catalog entry. Examples: `small-streaming` (en, small), `@en,es` (en and es at catalog defaults), `tiny-streaming@en,es,de`. The constructor stores the spec verbatim, with no import and no validation, so `backend.model` is exactly what the operator passed. `start()` imports the package, parses the spec, validates it against the live catalog and the licence guard, raises `ConfigError` on an unknown arch, unknown language or non-MIT combination, and logs the resolved language-to-arch map once at INFO.
 - **Licence guard.** Serve only MIT models: streaming archs for any language, non-streaming archs only for `en` (matches the upstream LICENSE enumeration above). `ko` and `uk` therefore cannot be served.
 - **Served-language set.** Fixed at startup from the spec. The transcriber cache is exactly that set (no eviction; memory is the sum of the listed models, documented). The downloader is never called for a language outside the set.
-- **Language contract**, following the existing pattern (no server-side validation; each backend decides): `None`, blank or `"auto"` becomes `en`. Otherwise lowercase and strip the region (`en-US` becomes `en`, `zh-CN` and `zh_CN` become `zh`). A language outside the served set, or unsupported by the catalog, calls `logger.error` and falls back to `en` if `en` is served, else the first listed language; it does not raise. Moonshine has no language identification, which departs from the uniform "auto means detect" contract; this is documented, and the client gets no signal on the wire.
+- **Language contract**, following the existing pattern (no server-side validation; each backend decides): `None`, blank or `"auto"` becomes the fallback language (`en` if served, else the first listed) without logging an error. Otherwise lowercase and strip the region (`en-US` becomes `en`, `zh-CN` and `zh_CN` become `zh`). An explicit language outside the served set, or unsupported by the catalog, calls `logger.error` and falls back to `en` if `en` is served, else the first listed language; it does not raise. Moonshine has no language identification, which departs from the uniform "auto means detect" contract; this is documented, and the client gets no signal on the wire.
 - **Wire shape unchanged.** One `delta` whose text equals `completed` (empty decode: `completed` only), the same as `nemotron`. No new events, no `PROTOCOL_VERSION` change, no change to `server.py` session handling.
 - Decodes are serialised across sessions, with the same SIGTERM-mid-decode drain, `abort()` and `idle()` behaviour as the other backends.
 - **Prefetch.** `prefetch_specs` stays the only prefetch contract. `SnapshotSpec` gains optional `check` and `fetch` callables; moonshine returns one spec per served (language, arch) with a synthetic `repo_id` (`moonshine-voice/<arch>-<lang>`), the `moonshine-voice` package version as `revision`, and callables that derive completeness from the package's own manifest (size and CRC32C per file). A size or CRC mismatch is wrapped with `mark_model_invalid`. The optional alphanumeric spelling model that `get_model_for_language` also fetches (best effort, failures swallowed) is outside the snapshot contract and is not required for a decode. Download happens under `download_phase()`; the "needs `huggingface_hub`" hint becomes conditional.
@@ -134,7 +134,7 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 |---|---|
 | `parse_model_spec(spec) -> (arch \| None, langs)` | Pure. Parses `[<arch>][@<lang>[,<lang>...]]`; no catalog access. Empty language list means `en`. |
 | `resolve_arch(code, requested, catalog) -> ModelArch` | Pure over a catalog mapping. Applies the licence guard (streaming archs for any language, non-streaming only for `en`); an omitted arch takes the first MIT-allowed entry. Raises `ConfigError` for an unknown arch or a non-MIT combination (called from `start()`). |
-| `resolve_language(lang, served) -> (code, note)` | Pure. `None`/blank/`auto` becomes `en`; lowercase; strip region (`-` or `_`); outside the served set returns the fallback (`en` if served, else the first listed) plus an error note. The caller logs the note with `logger.error`. |
+| `resolve_language(lang, served) -> (code, note)` | Pure. `None`/blank/`auto` becomes the fallback (`en` if served, else the first listed) with no note; lowercase; strip region (`-` or `_`); outside the served set returns the fallback (`en` if served, else the first listed) plus an error note. The caller logs the note with `logger.error`. |
 | `MoonshineBackend(DecodeGuardMixin)` | Registry entry point. Stores the spec verbatim; `start()` imports the package, validates, builds the served map, logs it. Owns the lock pair, in-flight counter, transcriber cache, `open_stream`, `abort`, `idle`, `close`. |
 | `_MoonshineStream` | Buffers PCM16LE; at `end()` converts and runs the one-shot-stream decode on a guarded daemon thread under the thread lock; `events()` yields one `delta` (if non-empty) and `completed`. |
 | `prefetch_specs(model)` | Module-level. One `SnapshotSpec` per served (language, arch) with `check`/`fetch` callables built from the package manifest. |
@@ -149,12 +149,12 @@ flowchart TD
     V -->|no| CE["ConfigError"]
     V -->|yes| M["served map: lang to arch (logged once)"]
     A["client language per session"] --> B{"None, blank or auto?"}
-    B -->|yes| E["code = en"]
+    B -->|yes| E["code = fallback (en, else first listed), no error"]
     B -->|no| C["lowercase, strip region"]
     C --> D{"in served set?"}
     D -->|no| F["logger.error, fallback en (or first listed)"]
     D -->|yes| G["code"]
-    E --> D
+    E --> J
     F --> J["cache lookup (code, arch)"]
     G --> J
     J -->|miss| K["download_phase: get_model_for_language, then Transcriber()"]
@@ -170,7 +170,7 @@ One daemon thread per decode through `_run_guarded_decode`, exactly like `nemotr
 | Failure | Where it surfaces | Result |
 |---|---|---|
 | Model download fails (offline, DNS) | first decode, inside `download_phase()` | exception from `end()`/`events()`, then `transcript.failed`; `requests` errors already classify as download errors (`stt_server/supervise.py`) |
-| Cached file is corrupt (size match, bad CRC32C) | prefetch check, or first load | wrapped with `mark_model_invalid` so the supervisor classifies it as an invalid model, not a start failure |
+| Cached file is corrupt (size match, bad CRC32C) | `prefetch` only (`--check` reports it; a fetch deletes the bad file and re-downloads once) | still bad after the re-download: `ModelInvalidError` (`mark_model_invalid`) naming the file path. The serve path stays size-only (no CRC at load), so an unprefetched corrupt cache is not detected there |
 | Decode raises | decode thread | future carries the exception, then `transcript.failed` with a generic message; details only in the server log |
 | Bad `--model` spec | `start()` | `ConfigError`, exit 1 with a clear message |
 | Language outside the served set or unsupported | `resolve_language` | `logger.error`, falls back; the decode proceeds; nothing is downloaded |
@@ -333,6 +333,8 @@ Context lifecycle:
   6. No live-wheel test pins the manifest-derived directory (the fake mirrors the implementation); add an `importorskip` test. A manual check showed `medium-streaming-en/quantized_26_11_02` matches.
   7. Space-joining of line texts is unverified for `ja`/`zh`; inspect raw text before Phase 2 documents them as supported.
   8. Benchmark names the one-shot wire measurement "offline" (`run_offline_wire`, `measure_offline_wire`, `offline_p50_s`); rename to `one_shot` so the go/no-go record is not confused with the rejected offline call.
+- Triage (user-approved, applied after the conduct run): 1 chained the library `Error.error` as the cause; 2 and 3 prefetch self-repairs a size-matching CRC32C-bad file (delete, re-download once, then `ModelInvalidError` naming the path), serve stays size-only, failure-table row narrowed; 4 the `huggingface_hub` hint is keyed on the spec type (`check`/`fetch` set means non-Hub); 5 `None`/blank/`auto` map to the fallback silently, `logger.error` only for explicit unserved languages; 6 live-wheel test pins the manifest directory; 8 renamed to `one_shot` (also in the streaming-mode plan's gate wording); 7 see the ja/zh verification entry below.
+- ja/zh verification (finding 7, 2026-11-14, `moonshine-voice==0.1.6`, macOS `say` clips Kyoko/Tingting at 16 kHz, one-shot path through the real backend; audio not kept in the repo). Catalog: `ja` offers small-streaming, tiny-streaming, base, tiny; `zh` offers tiny-streaming and base; the backend's default arch resolves to `small-streaming` (ja, 121.8 MB, `quantized_26_08_23`) and `tiny-streaming` (zh, 32.3 MB, `quantized_26_08_24`). Single-sentence clips give one `LineCompleted` line; multi-sentence clips give 2 to 3 lines with no spaces inside a line (ja, zh text carries no word spaces; zh uses ASCII commas). The backend joins lines with `" "`, so `completed` reads `おはようございます 今日の会議は午後3時からです 資料は...`: a space joiner is right for `en` and other space-delimited languages, wrong for `ja` and `zh`. The library prints its non-commercial "Moonshine Community License" notice when loading both models. Not applied: join with `""` for `ja`/`zh` (needs the resolved language code from `_transcriber_for`).
 
 ### Review Waivers
 

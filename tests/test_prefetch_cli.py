@@ -860,6 +860,48 @@ def test_moonshine_corrupt_snapshot_after_fetch_is_model_invalid(
     assert events[-1]["repo"] == _MS_DEFAULT_REPO
 
 
+def test_moonshine_prefetch_repairs_a_size_matching_corrupt_file_once(
+    fake_moonshine, monkeypatch, capsys
+):
+    """Same size, bad CRC32C: the library would accept it, so prefetch deletes the bad file
+    and downloads it again (once); the snapshot then verifies and reads as cached."""
+    root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
+    good = fake_moonshine.file_bytes("en", "medium-streaming", "decoder.onnx")
+    assert (root / "decoder.onnx").read_bytes() != good
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 0 and events[-1]["event"] == "complete"
+    assert fake_moonshine.downloads == [("en", "medium-streaming")], "exactly one re-download"
+    assert (root / "decoder.onnx").read_bytes() == good
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is True
+    assert fake_moonshine.downloads == [("en", "medium-streaming")]
+
+
+def test_moonshine_prefetch_still_corrupt_after_one_redownload_names_the_path(
+    fake_moonshine, monkeypatch, capsys
+):
+    root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
+    fake_moonshine.corrupt_downloads = True  # the CDN copy is bad too
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModelInvalidError"
+    assert events[-1]["repo"] == _MS_DEFAULT_REPO
+    assert str(root) in events[-1]["message"], "the corrupt file's path is named"
+    assert fake_moonshine.downloads == [("en", "medium-streaming")], "one re-download, no loop"
+
+
+def test_moonshine_check_reports_corruption_with_the_path_and_deletes_nothing(
+    fake_moonshine, monkeypatch, capsys
+):
+    root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
+    before = {p.name: p.read_bytes() for p in root.iterdir()}
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+    assert str(root) in events[-1]["message"]
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == before
+    assert fake_moonshine.downloads == []
+
+
 def test_moonshine_corrupt_cached_snapshot_is_never_reported_cached(
     fake_moonshine, monkeypatch, capsys
 ):
@@ -892,6 +934,42 @@ def test_moonshine_missing_extra_is_a_clean_error_without_the_hub_hint(monkeypat
     assert events[-1]["event"] == "error" and events[-1]["code"] == "ModuleNotFoundError"
     assert "huggingface_hub" not in events[-1]["message"], "the hint is conditional"
     assert "moonshine" in events[-1]["message"]
+
+
+def test_moonshine_missing_transitive_dependency_has_no_hub_hint(
+    fake_moonshine, monkeypatch, capsys
+):
+    """The hint is keyed on the spec type (``check``/``fetch`` set), not on message text: a
+    moonshine spec never gets it, whichever module is missing."""
+    import stt_server.backends.moonshine as MS
+
+    def missing(*_a, **_k):
+        raise ModuleNotFoundError("No module named 'filelock'", name="filelock")
+
+    monkeypatch.setattr(MS, "_import_package", missing)
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 1 and events[-1]["code"] == "ModuleNotFoundError"
+    assert "filelock" in events[-1]["message"]
+    assert "huggingface_hub" not in events[-1]["message"]
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_hf_missing_transitive_dependency_keeps_the_hub_hint(monkeypatch, capsys, check):
+    """Unchanged since before the moonshine backend: any missing module on the Hugging Face
+    path (here ``filelock``, which ``huggingface_hub`` needs) gets the hint."""
+
+    def no_filelock(spec, *, local_files_only):
+        raise ModuleNotFoundError("No module named 'filelock'", name="filelock")
+
+    monkeypatch.setattr(PF, "_snapshot_download", no_filelock)
+    argv = ("--backend", "kyutai", "--json") + (("--check",) if check else ())
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+    assert code == 1 and events[-1]["code"] == "ModuleNotFoundError"
+    assert "filelock" in events[-1]["message"]
+    assert (
+        "prefetch needs huggingface_hub, which every model extra installs"
+        in (events[-1]["message"])
+    )
 
 
 def test_missing_huggingface_hub_hint_is_kept_for_hf_backends(monkeypatch, capsys):

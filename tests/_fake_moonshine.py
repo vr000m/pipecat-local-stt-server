@@ -410,7 +410,11 @@ def install(monkeypatch, cache_root: Path) -> FakeMoonshine:
             data = st.file_bytes(language, arch, f["name"])
             if st.corrupt_downloads:
                 data = bytes(b ^ 0x01 for b in data)
-            (target / f["name"]).write_bytes(data)
+            dest = target / f["name"]
+            # The real library's cache fast path is size-only (CRC32C is checked only
+            # after a fresh download): a same-size corrupt file is kept as it is.
+            if not (dest.is_file() and dest.stat().st_size == len(data)):
+                dest.write_bytes(data)
             done += f["size"]
             if on_progress is not None:
                 on_progress(done / total, f["name"])

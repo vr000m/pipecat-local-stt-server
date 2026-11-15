@@ -19,11 +19,12 @@ the non-MIT models: legacy non-streaming non-English ones).
 
 Language contract: the server does no validation; each backend decides.
 Moonshine has no language identification, so ``None``/blank/``"auto"`` means
-``en`` (a documented departure from the uniform "auto means detect" contract).
-Otherwise the value is lowercased and its region stripped (``en-US`` -> ``en``,
-``zh_CN`` -> ``zh``). A language outside the served set is logged with
-``logger.error`` and falls back to ``en`` if served, else the first listed
-language; it never raises and nothing is downloaded for it.
+the fallback language, silently: ``en`` if served, else the first listed (a
+documented departure from the uniform "auto means detect" contract). Otherwise
+the value is lowercased and its region stripped (``en-US`` -> ``en``,
+``zh_CN`` -> ``zh``). An explicit language outside the served set (or an
+invalid value) is logged with ``logger.error`` and falls back the same way; it
+never raises and nothing is downloaded for it.
 
 Pin policy: HF SHAs do not apply. The pin is the exact ``moonshine-voice``
 version, which fixes the model URLs; per-model directory names come from the
@@ -50,7 +51,7 @@ from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.moonshine")
 
-#: Language used for ``None``/blank/``"auto"`` and the preferred fallback.
+#: Preferred fallback language (used for ``None``/blank/``"auto"`` when served).
 DEFAULT_MOONSHINE_LANGUAGE = "en"
 
 #: The ``moonshine-voice`` version pinned in ``pyproject.toml`` (the model pin).
@@ -141,29 +142,29 @@ def resolve_arch(code: str, requested: str | None, catalog: dict) -> Any:
 def resolve_language(lang: Any, served: Any) -> tuple[str, str | None]:
     """Map a client ``language`` onto a served code: ``(code, note)``.
 
-    ``None``/blank/``"auto"`` -> ``en``; otherwise lowercase and strip the
-    region (``-`` or ``_`` suffix). A code outside ``served`` (or a non-string
-    value) returns the fallback (``en`` if served, else the first listed) plus
-    an error ``note`` for the caller to ``logger.error``; ``note`` is ``None``
-    when the language is served. Never raises.
+    ``None``/blank/``"auto"`` -> the fallback (``en`` if served, else the first
+    listed) with no note: it is the normal default, not an error. Otherwise
+    lowercase and strip the region (``-`` or ``_`` suffix). A code outside
+    ``served`` (or a non-string value) returns the same fallback plus an error
+    ``note`` for the caller to ``logger.error``; ``note`` is ``None`` when the
+    language is served or defaulted. Never raises.
     """
     served_list = list(served)
-    if lang is None:
-        code = DEFAULT_MOONSHINE_LANGUAGE
-    elif isinstance(lang, str):
-        text = lang.strip().lower()
-        if not text or text == "auto":
-            code = DEFAULT_MOONSHINE_LANGUAGE
-        else:
-            code = text.replace("_", "-").split("-", 1)[0]
-    else:
-        code = ""
-    if code in served_list:
-        return code, None
     if DEFAULT_MOONSHINE_LANGUAGE in served_list or not served_list:
         fallback = DEFAULT_MOONSHINE_LANGUAGE
     else:
         fallback = served_list[0]
+    if lang is None:
+        return fallback, None
+    if isinstance(lang, str):
+        text = lang.strip().lower()
+        if not text or text == "auto":
+            return fallback, None
+        code = text.replace("_", "-").split("-", 1)[0]
+    else:
+        code = ""
+    if code in served_list:
+        return code, None
     shown = repr(lang if isinstance(lang, str) else type(lang).__name__)[:48]
     note = (
         f"language {shown} is not served (served: {', '.join(served_list) or 'none'}); "
@@ -297,7 +298,12 @@ class _MoonshineStream:
             if errors:
                 # Never emit a truncated ``completed`` after a failed flush; the
                 # message carries no transcript text or audio.
-                raise RuntimeError("moonshine stream decode reported an error")
+                # The library's own ``Error.error`` is kept as the cause so the
+                # server log shows why; the message itself stays generic.
+                cause = getattr(errors[0], "error", None)
+                if cause is not None and not isinstance(cause, BaseException):
+                    cause = RuntimeError(str(cause))
+                raise RuntimeError("moonshine stream decode reported an error") from cause
             return " ".join(t for t in texts if t)
         finally:
             self._backend._mark_inflight_end()
@@ -424,6 +430,18 @@ def _model_manifest(download: Any, code: str, arch: Any) -> tuple[Path, list[dic
     return root, list(group.get("files", []))
 
 
+def _crc_mismatch(path: Path, info: dict) -> bool:
+    """True when the manifest has a CRC32C for the file and the file's differs
+    (``False`` when there is none or the accelerator is unavailable, as the
+    library does)."""
+    if info.get("checksum_type") == "crc32c" and info.get("checksum"):
+        from moonshine_voice.download_file import crc32c_file  # type: ignore
+
+        actual = crc32c_file(path)
+        return actual is not None and actual != info["checksum"]
+    return False
+
+
 def _file_state(path: Path, info: dict) -> str:
     """``"missing"``, ``"incomplete"`` (absent/size mismatch) or ``"ok"``; raises on a
     CRC32C mismatch (size alone is not trusted: the library accepts a size match)."""
@@ -434,16 +452,10 @@ def _file_state(path: Path, info: dict) -> str:
     expected = info.get("size")
     if isinstance(expected, int) and expected >= 0 and size != expected:
         return "incomplete"
-    if info.get("checksum_type") == "crc32c" and info.get("checksum"):
-        from moonshine_voice.download_file import crc32c_file  # type: ignore
-
-        actual = crc32c_file(path)
-        # ``None``: the accelerator is unavailable, verification is skipped (as
-        # the library does).
-        if actual is not None and actual != info["checksum"]:
-            exc = ValueError(f"CRC32C mismatch for {path.name}: cached file is corrupt")
-            mark_model_invalid(exc)
-            raise exc
+    if _crc_mismatch(path, info):
+        exc = ValueError(f"CRC32C mismatch for {path}: cached file is corrupt")
+        mark_model_invalid(exc)
+        raise exc
     return "ok"
 
 
@@ -474,6 +486,15 @@ def _fetch_model(
         except OSError:
             return False
 
+    # Self-repair, once: the library's cache fast path accepts a size match, so a
+    # same-size file with a bad CRC32C would never be re-downloaded. Delete it so
+    # the download below fetches it again; if it is still bad afterwards, the
+    # final verification raises ``ModelInvalidError`` naming the path.
+    for info in files:
+        path = root / info["name"]
+        if have(info) and _crc_mismatch(path, info):
+            logger.warning("moonshine: %s failed its CRC32C check; re-downloading it once", path)
+            path.unlink()
     pending = [info for info in files if not have(info)]
     total = sum(int(i.get("size") or 0) for i in pending)
     done = threading.Event()

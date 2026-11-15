@@ -192,7 +192,7 @@ def test_format_report_has_a_row_per_length_with_milliseconds():
         assert any(line.split()[:2] == [length, "s"] for line in text.splitlines())
     assert "250 ms" in text and "400 ms" in text and "900 ms" in text
     assert "100 ms" in text and "150 ms" in text and "300 ms" in text
-    assert "0.40" in text, "flush/offline ratio: 0.100/0.250 = 0.40"
+    assert "0.40" in text, "flush/one-shot ratio: 0.100/0.250 = 0.40"
 
 
 def test_format_report_without_flush_numbers_says_na():

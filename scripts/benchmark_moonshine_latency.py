@@ -122,7 +122,7 @@ def summarise(samples_by_length: dict[int, Sequence[float]]) -> dict[int, float]
 
 
 def format_report(
-    offline_s: dict[int, float],
+    one_shot_s: dict[int, float],
     flush_s: dict[int, float] | None,
     *,
     backend: str = "moonshine",
@@ -133,12 +133,12 @@ def format_report(
         f"{backend} latency, p50 of {runs - 1} warm runs (1 cold run discarded), 16 kHz PCM16",
         f"{'utterance':>10}  {'one-shot commit->completed':>27}  {'stop() flush':>14}  {'flush/one-shot':>14}",
     ]
-    for length in sorted(offline_s):
-        off = offline_s[length]
+    for length in sorted(one_shot_s):
+        one = one_shot_s[length]
         flush = (flush_s or {}).get(length)
-        ratio = f"{flush / off:.2f}" if flush is not None and off > 0 else "n/a"
+        ratio = f"{flush / one:.2f}" if flush is not None and one > 0 else "n/a"
         flush_txt = f"{flush * 1000:.0f} ms" if flush is not None else "n/a"
-        lines.append(f"{length:>8} s  {off * 1000:>24.0f} ms  {flush_txt:>14}  {ratio:>14}")
+        lines.append(f"{length:>8} s  {one * 1000:>24.0f} ms  {flush_txt:>14}  {ratio:>14}")
     return "\n".join(lines)
 
 
@@ -168,7 +168,7 @@ async def paced_send(
                 await asyncio.sleep(delay)
 
 
-async def measure_offline_wire(
+async def measure_one_shot_wire(
     make_client: Callable[[], object], pcm: bytes, *, pace: bool
 ) -> float:
     """Seconds from ``commit`` to ``transcription.completed`` for one utterance.
@@ -193,7 +193,7 @@ async def measure_offline_wire(
         await client.close()
 
 
-async def run_offline_wire(
+async def run_one_shot_wire(
     make_client: Callable[[], object],
     pcm_by_length: dict[int, bytes],
     *,
@@ -202,7 +202,9 @@ async def run_offline_wire(
 ) -> dict[int, list[float]]:
     out: dict[int, list[float]] = {}
     for length, pcm in pcm_by_length.items():
-        out[length] = [await measure_offline_wire(make_client, pcm, pace=pace) for _ in range(runs)]
+        out[length] = [
+            await measure_one_shot_wire(make_client, pcm, pace=pace) for _ in range(runs)
+        ]
     return out
 
 
@@ -314,8 +316,10 @@ def main(argv: list[str] | None = None) -> int:
             socket_path=args.socket, uri=args.uri, auth_token=args.auth_token
         )
 
-    offline_runs = asyncio.run(run_offline_wire(make_client, utterances, runs=args.runs, pace=pace))
-    offline = summarise(offline_runs)
+    one_shot_runs = asyncio.run(
+        run_one_shot_wire(make_client, utterances, runs=args.runs, pace=pace)
+    )
+    one_shot = summarise(one_shot_runs)
     flush = None
     if not args.skip_flush:
         transcriber = _load_streaming_transcriber(args.arch)
@@ -323,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
             flush = summarise(run_stop_flush(transcriber, utterances, runs=args.runs, pace=pace))
         finally:
             transcriber.close()
-    print(format_report(offline, flush, runs=args.runs))
+    print(format_report(one_shot, flush, runs=args.runs))
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(
@@ -331,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "runs": args.runs,
                     "paced": pace,
-                    "offline_p50_s": offline,
+                    "one_shot_p50_s": one_shot,
                     "stop_flush_p50_s": flush,
                 },
                 indent=2,
