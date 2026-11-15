@@ -40,7 +40,7 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 - **Pin policy.** HF SHAs do not apply. The pin is the exact `moonshine-voice` version, which fixes the model URLs. Snapshot directory names differ per model (en streaming uses `quantized_26_11_02`; non-English streaming uses `quantized_26_08_24` or `quantized_26_08_23`; non-streaming uses an undated `quantized`), so the plan reads them from the package manifest and never from a constant. An undated directory does not pin content, and CDN retention is outside the pin; both are documented.
 - Model loading is lazy on first decode (like `nemotron`). A model that was not prefetched downloads on first use inside `download_phase()`, as the other backends do; only a language outside the served set is refused.
 - **Latency benchmark** (feeds the go/no-go for the streaming plan): a new paced, single-endpoint script measures one-shot-stream commit-to-completed latency and the library-level `stop()` flush time for 3, 5 and 10 s utterances at 16 kHz PCM16, using the real conversion path.
-- **Port.** `9965` is provisional. Confirming it with the menu bar app owner is the first Phase 2 step, and Phase 2 does not merge without it; otherwise only Phase 1 ships.
+- **Port.** `9965` confirmed by the user on 2026-11-14 (unassigned in `/etc/services`, nothing listening, continues the 9565/9665/9765/9865 series).
 
 ## Review Focus
 
@@ -82,13 +82,13 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 **Test command:** `uv run --inexact python -m pytest -q`
 **Goal:** `just stt-install moonshine` works like the other backends, every list that names backends stays in step, and the docs structure tests keep passing.
 
-- **First step (gate): confirm port 9965 with the menu bar app owner.** If it is not confirmed, stop Phase 2.
+- **Port 9965 confirmed (2026-11-14).** No gate remains; use it in the installer, smoke list and docs.
 - `justfile`: `_resolve` arms, `_agent-python` arms, `_ensure-extra` arms. Moonshine shares the default venv unless Phase 1's `uv lock` shows a conflict.
 - `scripts/install_stt_agent.sh`: default-model arm (`medium-streaming@en`), port map (`9965`), the `backends with one:` error text, case validation, header docs.
 - `scripts/render_stt_plist.py`: `_BACKEND_RE` and its hint string. Verify that `@` and `,` pass the renderer's and the installer's character checks for the model value (the spec grammar depends on it).
 - `scripts/smoke_launchd.py`: `CANONICAL_BACKENDS`, in the same commit and the same order as the installer port arm (`tests/test_smoke_launchd.py` asserts they match).
 - Tests that enumerate backends: `tests/test_justfile_recipes.py` (`BACKENDS` tuple, port and label map, the assertions that tie `_resolve`, the installer and the `docs/operations.md` port table), `tests/test_render_stt_plist.py` parametrisations, `tests/test_smoke_launchd.py`, `tests/test_docs_port_caveats.py` (reads `uv.lock`).
-- Docs: `docs/backends.md` (new section: model spec grammar, licence guard and the stderr notice, language contract and the "auto becomes en" deviation, served set and memory, model download and cache location, package pin and CDN caveat), `docs/operations.md` (port table, `stt-install`), `docs/migration.md` (port list), `docs/contributing.md` (the `SnapshotSpec` check/fetch extension), README backend list (respect the 180-line and 1200-word limits and the single-owner heading rule in `tests/test_docs_navigation.py`), CHANGELOG, `docs/dev_plans/README.md`.
+- Docs: `docs/backends.md` (new section; `ja`/`zh` are downloadable and servable but carry no verified-support claim, lines are joined with a space, and model licence suitability is the developer's call (we ship no models); model spec grammar, licence guard and the stderr notice, language contract and the "auto becomes en" deviation, served set and memory, model download and cache location, package pin and CDN caveat), `docs/operations.md` (port table, `stt-install`), `docs/migration.md` (port list), `docs/contributing.md` (the `SnapshotSpec` check/fetch extension), README backend list (respect the 180-line and 1200-word limits and the single-owner heading rule in `tests/test_docs_navigation.py`), CHANGELOG, `docs/dev_plans/README.md`.
 - CI: add `tests/test_moonshine_backend.py` to the Linux client job's explicit test list (it uses a fake module, so it needs no wheel).
 - Manual verification through an installed agent: one decode after prefetch and one with an empty model cache, both through `just stt-install moonshine` (the LaunchAgent environment sets only `PATH` and `HOME`).
 - **Last step: record the go/no-go for the streaming plan.** Enter the Phase 1 benchmark numbers in `## Findings`. Start `20261114-feature-moonshine-streaming-mode.md` only if, for the 5 s utterance on the default model, one-shot commit-to-completed p50 exceeds 300 ms and the `stop()` flush p50 is below half of the one-shot p50. (Both thresholds are proposals; the user confirms them before the record is written.)
@@ -115,7 +115,7 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 - Decision 3 (grilled): `prefetch_specs` remains the single prefetch contract; `SnapshotSpec` gains optional `check`/`fetch` callables; no second module hook.
 - Decision 4 (grilled): the served-language set is fixed at startup and carried in the model spec `[<arch>][@<langs>]`, so no new flag, environment variable or plist plumbing is needed. An unlisted language logs an error and falls back; the downloader is never called for it; the cache equals the served set.
 - Decision 5 (grilled): `DEFAULT_MOONSHINE_MODEL = "medium-streaming@en"`; the constructor stores the spec verbatim and imports nothing; `start()` validates against the live catalog and the licence guard (`ConfigError`) and logs the resolved map. Rationale: the registry and missing-extra tests require an import-free constructor.
-- Decision 6 (grilled): port `9965` is provisional until confirmed with the menu bar app owner, as the first Phase 2 step.
+- Decision 6 (grilled): port `9965`, confirmed by the user on 2026-11-14 (free and unassigned).
 - Decision 7: the wire contract stays append-only `delta` plus `completed`. The spike showed in-progress text is rewritten constantly (46 of 63 changes on medium), so exposing it would need a replace-semantics event that nothing else in the protocol has. Revisit only in the streaming plan.
 - Decision 8: serialise decodes. Concurrent runs showed no speedup and, with two transcribers, differing output; the cause is unproven and Phase 1 adds a check.
 - Decision 9: the pin is the `moonshine-voice` version, not HF SHAs; directory names come from the package manifest.
@@ -279,7 +279,7 @@ Context lifecycle:
 - The Phase 1 benchmark numbers (one-shot p50 and `stop()` flush p50 for 3, 5 and 10 s at 16 kHz) and the go/no-go for the streaming plan are recorded in `## Findings`.
 - Code reviewed and approved; the full suite passes; docs updated (backends, operations, migration, contributing, README, CHANGELOG).
 
-<!-- reviewed: 2026-11-15 @ 7152a9544daf806622b5acb5a7420bc9dc98bf57 -->
+<!-- reviewed: 2026-11-14 @ 6fa3f48efbfcd633d203960222c6d70566684bd7 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
