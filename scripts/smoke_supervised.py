@@ -314,9 +314,13 @@ def s_prefetch():
         r.returncode == 0 and bool(lines) and lines[-1].get("event") == "complete",
         f"rc={r.returncode} n={len(lines)} last={lines[-1] if lines else r.stdout[:100]}",
     )
-    if BACKEND in ("echo", "kyutai", "moonshine"):
-        # echo takes no model; kyutai and moonshine take no local path (registry
-        # ``local_model_paths=False``): a ConfigError, not a missing path
+    from stt_server.backends import BACKENDS
+
+    entry = BACKENDS.get(BACKEND)
+    if BACKEND == "echo" or (entry is not None and not entry.local_model_paths):
+        # echo takes no model; a backend whose registry entry has
+        # ``local_model_paths=False`` refuses a local path with a ConfigError,
+        # not a missing path
         return
     r = subprocess.run(
         [
