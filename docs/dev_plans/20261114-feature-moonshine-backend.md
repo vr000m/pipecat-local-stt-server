@@ -1,6 +1,6 @@
 # Task: Moonshine Voice STT backend (multilingual, commit-oriented)
 
-**Status**: Not Started
+**Status**: In Progress
 **Component**: ASR Backends
 **Assigned to**: Varun Singh
 **Priority**: Medium
@@ -279,15 +279,14 @@ Context lifecycle:
 - The Phase 1 benchmark numbers (one-shot p50 and `stop()` flush p50 for 3, 5 and 10 s at 16 kHz) and the go/no-go for the streaming plan are recorded in `## Findings`.
 - Code reviewed and approved; the full suite passes; docs updated (backends, operations, migration, contributing, README, CHANGELOG).
 
-<!-- reviewed: 2026-11-14 @ 6fa3f48efbfcd633d203960222c6d70566684bd7 -->
-
+<!-- reviewed: 2026-11-15 @ 792a76dab350115b0fd43d218c5ad8d57f500f48 -->
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
 ## Progress
 
 - [x] Phase 0: Spike (moonshine-voice behaviour, threading, languages)
 - [x] Phase 1: Commit-oriented moonshine backend, prefetch and benchmark
-- [ ] Phase 2: Install, operations and docs wiring, then the go/no-go record
+- [x] Phase 2: Install, operations and docs wiring, then the go/no-go record
 
 ## Findings
 
@@ -358,7 +357,21 @@ Context lifecycle:
   | moonshine | 0.070 | 458 ms | 0.100 |
 
   Moonshine is the least accurate and mid-field on speed here (CPU decode against MLX for the others).
-- Go/no-go: **not recorded.** The thresholds (5 s one-shot p50 above 300 ms and `stop()` flush p50 below half of it) are still proposals awaiting the user, and the 5 s measurement straddles them across runs (264 ms, 458 ms on the synthetic corpus, 2130 ms). The flush ratio condition held in every paced run (0.03 to 0.28). Rerun on a quiet machine before deciding.
+- Go/no-go: see the quiet-machine rerun below; the noisy runs above are kept for the record.
+
+### Phase 2 quiet-machine rerun and empty-cache check (2026-11-15)
+- Paced benchmark rerun at 12:01 with the 1-minute load average at 1.92 (the earlier runs had about 6.9 and a browser process at 99% CPU). p50 of 9 warm runs, `medium-streaming@en`, same script and corpus as above:
+
+  | utterance | one-shot commit-to-completed | `stop()` flush | flush / one-shot |
+  |---|---|---|---|
+  | 3 s | 149 ms | 72 ms | 0.48 |
+  | 5 s | 245 ms | 80 ms | 0.33 |
+  | 10 s | 653 ms | 94 ms | 0.14 |
+
+  The 1-minute load average read 8.61 after the run. Moonshine decodes on CPU, so the run's own ONNX threads are the likely cause; this was not measured separately (only start and end were logged). The five-minute average at the start was still 3.29, so "quiet" means no competing process, not an idle history.
+- Cross-backend spread (one-off driver above): per-utterance real-time factor varied 1.3x (nemotron) to 2.8x (whisper), moonshine 1.9x, so in that run the load did not single moonshine out; the other backends use MLX, so a quiet-machine comparison could still shift moonshine relative to them. The four-way was not rerun: the whisper and parakeet agents were removed after the first comparison.
+- Empty-cache decode through an installed agent: uninstalled the agent, moved `~/Library/Caches/moonshine_voice` to `moonshine_voice.bak-20261115` (583 MB, includes the ja/zh spike models; left in place for the user to remove), ran `just stt-install moonshine`, then decoded a 3 s clip over `ws://127.0.0.1:9965/`. The agent listens before any model exists; the first decode downloads the `medium-streaming-en` and `spelling-en` models (269 MB) and succeeds, 12 s end to end including the download. The warm decode that followed took 158 ms. The populated-cache case is covered by the benchmark runs above.
+- Go/no-go rule (Phase 2 last step): start the streaming-mode plan only if the 5 s one-shot p50 exceeds 300 ms and the flush p50 is below half of it. Measured 245 ms, so the first condition is **not met** (the flush condition, 80 ms against 122 ms, holds but does not matter without the first). By the rule the streaming plan is not started: a one-shot decode of a 5 s utterance already finishes in under a third of a second after the commit. Disposition of `20261114-feature-moonshine-streaming-mode.md` (close as unimplemented) is pending the user's confirmation.
 
 ### Review Waivers
 
