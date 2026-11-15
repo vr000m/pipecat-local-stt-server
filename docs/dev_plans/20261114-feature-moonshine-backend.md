@@ -1,4 +1,4 @@
-# Task: Moonshine Voice STT backend (multilingual, streaming-capable)
+# Task: Moonshine Voice STT backend (multilingual, commit-oriented)
 
 **Status**: Not Started
 **Component**: ASR Backends
@@ -10,231 +10,209 @@
 
 ## Objective
 
-Add a `moonshine` backend built on the `moonshine-voice` package (MIT-licensed streaming models, ONNX on CPU, 8 languages), first as a commit-oriented backend with no server change, then, if a benchmark justifies it, as a streaming backend that overlaps decode with the incoming audio. The wire protocol stays as it is: no new event types and no protocol version bump.
+Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming models, ONNX on CPU, 8 languages) as a commit-oriented backend, with no change to the server's session handling and no change to the wire protocol. A streaming mode that overlaps decode with incoming audio is a separate plan (`20261114-feature-moonshine-streaming-mode.md`), started only if this plan's benchmark justifies it.
 
 ## Context
 
-- Today every backend is commit-oriented. `_run_decode` (`stt_server/server.py:1700-1770`) opens a stream, feeds the whole buffered utterance once, calls `end()`, then reads `events()`. `docs/protocol.md` says deltas "collapse to a single final-sized `delta` + `completed`". No backend emits partials.
-- The wire protocol follows the OpenAI Realtime transcription shape: `committed`, then `delta` (append-only), then `completed`. Nothing in the repo defines interim or replaceable text. The Pipecat example service only reads `completed` (`stt_server/examples/pipecat_stt_service.py:130`).
-- `moonshine-voice` 0.1.6 (MIT, PyPI) is not mlx-audio's v1 Moonshine port. It ships a native ONNX Runtime library (CPU only; CoreML is not shipped) with a `Transcriber`/`Stream` API. The macOS wheel is `macosx_15_0_arm64`, and Linux and Windows wheels exist. It declares `numpy, sounddevice, requests, tqdm, filelock, platformdirs, google-crc32c`, with no MLX and no `huggingface-hub`. Models download from `download.moonshine.ai` into a platformdirs cache, not from the HF Hub.
-- Model catalog (read from the installed package): `en` {medium-streaming (default), small-streaming, base, tiny-streaming, tiny}, `es` {small-streaming (default), tiny-streaming, base}, `de` {small-streaming, tiny-streaming}, `ja` {small-streaming, tiny-streaming, base, tiny}, `ar`/`zh`/`vi` {tiny-streaming, base}, `tl` {tiny-streaming}, `ko` {tiny}, `uk` {base}. According to the upstream docs table (not verified in code), the non-streaming non-English models, plus `ko` and `uk`, are under the non-commercial Moonshine Community License; everything else is MIT.
-- Phase 0 spike (scratchpad venv, Apple Silicon, two_cities.wav 44 s). Raw numbers are in `## Findings`:
+- Every backend today is commit-oriented. `_run_decode` (`stt_server/server.py`) opens a stream, feeds the whole buffered utterance once, calls `end()`, then reads `events()`. Every current backend yields at most one `delta` equal to `completed` (`stt_server/backends/nemotron.py:182-184`, `docs/protocol.md:31`). The wire follows the OpenAI Realtime transcription shape (`committed`, `delta`, `completed`); nothing in the repo defines interim or replaceable text.
+- `moonshine-voice` 0.1.6 (MIT, PyPI) is not mlx-audio's v1 Moonshine port. It ships a native ONNX Runtime library (CPU only; CoreML is not shipped) behind a `Transcriber`/`Stream` API. The macOS wheel is `macosx_15_0_arm64`; Linux and Windows wheels also exist (not checked here). It declares `numpy, sounddevice, requests, tqdm, filelock, platformdirs, google-crc32c`: no MLX and no `huggingface-hub`. Models download from `download.moonshine.ai` into a platformdirs cache, not from the HF Hub.
+- Model catalog (read from the installed package): `en` {medium-streaming (default), small-streaming, base, tiny-streaming, tiny}, `es` {small-streaming (default), tiny-streaming, base}, `de` {small-streaming, tiny-streaming}, `ja` {small-streaming, tiny-streaming, base, tiny}, `ar`/`zh`/`vi` {tiny-streaming, base}, `tl` {tiny-streaming}, `ko` {tiny}, `uk` {base}.
+- Licence, verified against the upstream project LICENSE (2026-11-14): the non-MIT list is exhaustive and consists only of the legacy non-streaming non-English models (Arabic, Japanese, Korean, Mandarin, Ukrainian, Vietnamese Base and Tiny; Spanish Base); "any speech-to-text model not named in that list is MIT, including every streaming model". The Community Licence also carries registration terms for commercial use. The package prints a non-commercial notice to stderr for every non-`en` model, MIT ones included, which is misleading but harmless.
+- Phase 0 spike (scratchpad venv, Apple Silicon, two_cities.wav, 44 s, 48 kHz input to every call, so the 16 kHz path is unmeasured). Raw numbers are in `## Findings`:
   - Listener callbacks fire synchronously on the thread that called `add_audio`/`stop`.
-  - `add_audio` blocks while the model runs: tiny p95 55 ms and max 80 ms; medium p95 170 ms and max 475 ms. It must never run on the event loop.
-  - Text-in-progress revises heavily: 46 of 63 text changes were non-prefix rewrites (medium). A completed line (`LineCompleted`) is final.
-  - Offline `transcribe_without_streaming` runs at RTF 0.075 on medium (3.35 s for 44 s) and 0.02 on tiny.
-  - Medium en: 267 MB on disk, about 1.0 GB RSS after load, 1.95 GB peak with two transcribers loaded.
-  - Two threads on one transcriber, or on two transcribers, gave about 2x wall time (no parallel speedup). With two transcribers the outputs differed (`identical outputs=False`). The cause is unproven (adaptive timing versus a race), so decodes are serialised.
-  - Language ids are bare lowercase codes (`en`, `zh`). `en-US`, `EN`, `zh-CN` and `auto` raise `ValueError`.
+  - `add_audio` blocks while the model runs (medium: p95 170 ms, max 475 ms), which matters for the streaming plan, not this one.
+  - Offline `transcribe_without_streaming` runs at RTF 0.075 on medium (3.35 s for 44 s) and 0.02 on tiny; it also works with the streaming models.
+  - Medium en: 267 MB on disk, about 1.0 GB RSS after load.
+  - Concurrent decodes gave no speedup. With two transcribers the outputs differed. The cause is unproven (the compared transcriber had already served six streams, which confounds reuse with concurrency), so decodes are serialised and Phase 1 adds a check.
+  - Language ids are bare lowercase codes (`en`, `zh`); `en-US`, `EN`, `zh-CN` and `auto` raise `ValueError`.
+- Review run `20261114T215650Z` raised 50 findings; the six decisions that came out of it are recorded under `### Architecture Decisions` and in `## Findings`.
 
 ## Requirements
 
-- New `--backend moonshine` with extra `moonshine`; `uv sync --extra moonshine --inexact` installs it. The default model is the catalog default for the language (en: medium-streaming).
-- `--model` takes a Moonshine architecture name (`tiny-streaming`, `small-streaming`, `medium-streaming`, `base-streaming`, `tiny`, `base`). A language is served by the requested arch if the catalog has it, otherwise by the best allowed arch for that language.
-- Licence guard: serve only MIT models. Streaming archs are allowed for every language; non-streaming archs only for `en`. `ko` and `uk` (Community licence only) are treated as unsupported.
-- Language contract, following the existing per-backend pattern (no server-side validation; the backend decides): `None`, blank or `"auto"` becomes `"en"`. Otherwise lowercase and strip the region (`en-US` becomes `en`, `zh-CN` becomes `zh`). An unsupported language logs an error (`logger.error`) and falls back to `"en"`; it does not raise.
-- No new wire events and no `PROTOCOL_VERSION` change. Deltas stay append-only: one `delta` per completed line, then a final `completed` carrying the full transcript. The empty-decode contract is the same as the other backends (`delta` only on non-empty text, `completed` always).
-- Decodes serialised across sessions, with the same SIGTERM-mid-decode drain, `abort()` and `idle()` behaviour as the other backends.
-- Model download happens under `download_phase()`. `prefetch --backend moonshine` fetches and verifies without a decode. The server never downloads silently at an unexpected time.
-- Model loading is lazy on first decode. Loaded transcribers are cached per (language, arch) with a bounded cache (default 3), because medium en holds about 1 GB.
+- New `--backend moonshine` with extra `moonshine`; `uv sync --extra moonshine --inexact` installs it.
+- **Model spec.** `--model` / `PIPECAT_STT_MODEL` is `[<arch>][@<lang>[,<lang>...]]`. Default `DEFAULT_MOONSHINE_MODEL = "medium-streaming@en"`. An omitted arch resolves each language to the first MIT-allowed catalog entry. Examples: `small-streaming` (en, small), `@en,es` (en and es at catalog defaults), `tiny-streaming@en,es,de`. The constructor stores the spec verbatim, with no import and no validation, so `backend.model` is exactly what the operator passed. `start()` imports the package, parses the spec, validates it against the live catalog and the licence guard, raises `ConfigError` on an unknown arch, unknown language or non-MIT combination, and logs the resolved language-to-arch map once at INFO.
+- **Licence guard.** Serve only MIT models: streaming archs for any language, non-streaming archs only for `en` (matches the upstream LICENSE enumeration above). `ko` and `uk` therefore cannot be served.
+- **Served-language set.** Fixed at startup from the spec. The transcriber cache is exactly that set (no eviction; memory is the sum of the listed models, documented). The downloader is never called for a language outside the set.
+- **Language contract**, following the existing pattern (no server-side validation; each backend decides): `None`, blank or `"auto"` becomes `en`. Otherwise lowercase and strip the region (`en-US` becomes `en`, `zh-CN` and `zh_CN` become `zh`). A language outside the served set, or unsupported by the catalog, calls `logger.error` and falls back to `en` if `en` is served, else the first listed language; it does not raise. Moonshine has no language identification, which departs from the uniform "auto means detect" contract; this is documented, and the client gets no signal on the wire.
+- **Wire shape unchanged.** One `delta` whose text equals `completed` (empty decode: `completed` only), the same as `nemotron`. No new events, no `PROTOCOL_VERSION` change, no change to `server.py` session handling.
+- Decodes are serialised across sessions, with the same SIGTERM-mid-decode drain, `abort()` and `idle()` behaviour as the other backends.
+- **Prefetch.** `prefetch_specs` stays the only prefetch contract. `SnapshotSpec` gains optional `check` and `fetch` callables; moonshine returns one spec per served (language, arch) with a synthetic `repo_id` (`moonshine-voice/<arch>-<lang>`), the `moonshine-voice` package version as `revision`, and callables that derive completeness from the package's own manifest (size and CRC32C per file). A size or CRC mismatch is wrapped with `mark_model_invalid`. The optional alphanumeric spelling model that `get_model_for_language` also fetches (best effort, failures swallowed) is outside the snapshot contract and is not required for a decode. Download happens under `download_phase()`; the "needs `huggingface_hub`" hint becomes conditional.
+- **Pin policy.** HF SHAs do not apply. The pin is the exact `moonshine-voice` version, which fixes the model URLs. Snapshot directory names differ per model (en streaming uses `quantized_26_11_02`; non-English streaming uses `quantized_26_08_24` or `quantized_26_08_23`; non-streaming uses an undated `quantized`), so the plan reads them from the package manifest and never from a constant. An undated directory does not pin content, and CDN retention is outside the pin; both are documented.
+- Model loading is lazy on first decode (like `nemotron`). A model that was not prefetched downloads on first use inside `download_phase()`, as the other backends do; only a language outside the served set is refused.
+- **Latency benchmark** (feeds the go/no-go for the streaming plan): a new paced, single-endpoint script measures offline commit-to-completed latency and the library-level `stop()` flush time for 3, 5 and 10 s utterances at 16 kHz PCM16, using the real conversion path.
+- **Port.** `9965` is provisional. Confirming it with the menu bar app owner is the first Phase 2 step, and Phase 2 does not merge without it; otherwise only Phase 1 ships.
 
 ## Review Focus
 
-- Wire ordering: deltas must not reach the client before `input_audio_buffer.committed`. The item id is minted at commit, so a streaming backend holds its deltas until `events()` is read after `end()`.
-- Phase 3 touches `server.py` session state for every backend. The non-streaming path must stay byte-for-byte unchanged (open at commit, feed once).
-- Threading: `add_audio` blocks for up to hundreds of milliseconds, so every `moonshine-voice` call runs on a backend worker thread and never on the event loop. `idle()`, `abort()` and `close()` must hold with that thread alive. Callbacks run on the worker thread and must only enqueue.
-- `clear`, `cancel`, `close`, overflow and teardown while a stream is open (Phase 3).
-- The prefetch path outside the HF Hub (`prefetch.py` is HF-snapshot only today).
-- Licence guard and the language normalisation table.
-- Pin policy: HF SHAs do not apply; the pin is the exact `moonshine-voice` version, which fixes the model URLs and the `quantized_26_11_02` snapshot directory. This is an assumption to confirm in Phase 1.
+- Phase 1 must not touch `server.py` session handling or `protocol.py`. Every backend runs through them, and `tests/test_stt_server.py` assertions stay unchanged (moonshine rows are additions only).
+- `prefetch.py` and `snapshot.py` changes are shared by every backend: the HF path must behave as before (`tests/test_prefetch_cli.py`, `tests/test_backend_registry.py`, `tests/test_supervised_cli.py`).
+- The constructor must stay import-free and non-validating (`tests/test_backend_missing_extra.py`, `tests/test_backend_registry.py`).
+- Licence guard and language table: pure functions, table-tested against a fake catalog.
+- Prefetch integrity: size-only acceptance of an existing file in the library (`download_file.py`) means the check must compute CRC32C itself.
+- Backend enumerations in Phase 2 (`justfile`, installer, plist renderer, `scripts/smoke_launchd.py`, docs port table) must land in one commit so `tests/test_justfile_recipes.py` and `tests/test_smoke_launchd.py` stay green.
 
 ## Implementation Checklist
 
-### Phase 1: Commit-oriented moonshine backend (no server change)
+### Phase 1: Commit-oriented moonshine backend, prefetch and benchmark
 
-**Impl files:** `stt_server/backends/moonshine.py, stt_server/backends/__init__.py, stt_server/prefetch.py, pyproject.toml, uv.lock`
-**Test files:** `tests/test_moonshine_backend.py, tests/test_backend_missing_extra.py, tests/test_backend_registry.py, tests/test_prefetch_cli.py`
-**Test command:** `uv run --inexact pytest tests/test_moonshine_backend.py tests/test_backend_missing_extra.py tests/test_backend_registry.py tests/test_prefetch_cli.py -q`
+**Impl files:** `stt_server/backends/moonshine.py, stt_server/backends/__init__.py, stt_server/prefetch.py, stt_server/snapshot.py, pyproject.toml, uv.lock, scripts/benchmark_moonshine_latency.py`
+**Test files:** `tests/test_moonshine_backend.py, tests/test_backend_missing_extra.py, tests/test_backend_registry.py, tests/test_prefetch_cli.py, tests/test_decode_guard.py, tests/test_supervised_cli.py, tests/test_stt_server.py, tests/test_benchmark_moonshine_latency.py`
+**Test command:** `uv run --inexact pytest -q`
 **Validation cmd:** `uv sync --extra moonshine --inexact && uv run --inexact python -m stt_server prefetch --backend moonshine`
-**Goal:** A client sees the same event shape as every other backend (`delta` then `completed`) and the same error semantics, from a backend that needs no server change.
+**Goal:** A client sees the same event shape and error semantics as every other backend (one `delta` equal to `completed`), from a backend that needs no change to session handling, and the shared prefetch path keeps its existing contract.
 
-- `MoonshineBackend` in `stt_server/backends/moonshine.py`, mirroring `nemotron.py` structure: `DecodeGuardMixin` lock pair, lazy import with an actionable `ModuleNotFoundError` naming `uv sync --extra moonshine --inexact`, `abort()`, `close()` drain, `backend_name = "moonshine"`.
-- Stream: buffer PCM16LE, convert to float32 (`/32768`) at `end()`, then `Transcriber.transcribe_without_streaming(audio, 16000)`; join line texts with a space. No temp WAV is needed (the API takes float arrays), so the private temp dir is dropped.
-- Language normalisation and licence guard (see Requirements) in one pure function with a table test.
-- Transcriber cache keyed by (language, arch), bounded, loaded under the thread lock inside `download_phase()`.
-- Registry: `DEFAULT_MOONSHINE_MODEL`, a `BACKENDS["moonshine"]` entry with `local_model_paths=False` (the package resolves its own cache), and a documented rule for what `PINNED_REVISIONS` means for this backend (no entry; the package pin is the pin).
-- `prefetch.py`: add an optional non-HF hook so `prefetch_specs` is not the only contract. A backend module may define `prefetch_fetchers(model)` returning check and fetch callables, and `specs_for`/`run_prefetch` handle both kinds. The moonshine hook calls `moonshine_voice.download.get_model_for_language` and verifies the snapshot directory.
-- `pyproject.toml`: extra `moonshine = ["websockets>=16,<17", "moonshine-voice==0.1.6", "numpy>=1.26"]`; keywords. Run `uv lock` and check whether a `conflicts` pair is needed (expected: none, since there is no MLX and no `huggingface-hub` pin).
-- Benchmark for the Phase 3 gate: run `scripts/benchmark_asr_ab.py` (or a small variant) for commit-to-completed latency on 3, 5 and 10 s utterances with the default model, and record it in `## Findings`.
+- `MoonshineBackend` in `stt_server/backends/moonshine.py`, mirroring `nemotron.py`: `DecodeGuardMixin` (from `stt_server/backends/_thread_util.py`) lock pair, lazy import with an actionable `ModuleNotFoundError` naming `uv sync --extra moonshine --inexact`, `abort()`, `close()` drain, `idle()`, `backend_name = "moonshine"`.
+- Stream: buffer PCM16LE, convert to float32 (`/32768`, then `.tolist()`) at `end()`, then `Transcriber.transcribe_without_streaming(audio, 16000)`; join line texts with a space into one string; one `delta` equal to `completed`. No temp WAV, so no private temp dir. Inspect the raw line text first: the plan assumes space-joining is right, and `ja`/`zh` may not want it.
+- Pure functions `parse_model_spec`, `resolve_language` and `resolve_arch` (see Detailed Design), table-tested against a fake catalog.
+- Transcriber cache keyed by (language, arch), populated lazily under the thread lock inside `download_phase()`, fixed to the served set.
+- Registry: `DEFAULT_MOONSHINE_MODEL = "medium-streaming@en"`; `BACKENDS["moonshine"]` with `local_model_paths=False`; no `PINNED_REVISIONS` entry, with a registry docstring rule saying the package pin is the pin.
+- `snapshot.py`: `SnapshotSpec` gains optional `check` and `fetch` callables (default `None`, so HF specs are unchanged). `prefetch.py`: `check_spec` and `fetch_spec` branch once on them; the `huggingface_hub` hint is conditional; the event fields (`repo`, `revision`, `kind`, progress) keep their documented meaning.
+- `tests/test_backend_registry.py` is relaxed from "`repo_id == default_model`" to "exactly one spec, non-empty `repo_id`" for the default spec, with the model-identity assertion (`_make_backend(name, "x/y").model == "x/y"`) kept.
+- `pyproject.toml`: extra `moonshine = ["websockets>=16,<17", "moonshine-voice==0.1.6", "numpy>=1.26"]` and keywords. Run `uv lock` and check whether a `conflicts` pair is needed (expected: none).
+- Verification steps (record results in `## Findings`, adjust the plan if one fails):
+  - Read the per-model directory and file list from the package manifest for the default spec; assert the exact `moonshine-voice==0.1.6` pin and the manifest-derived directory in a test.
+  - Decode one clip three times on one transcriber and once on a fresh one, offline and streamed, and compare the texts; record the one-transcriber concurrent result the spike printed (identical outputs).
+  - Run the licence-guard table against the live catalog when the package is installed (skipped otherwise).
+- Benchmark: `scripts/benchmark_moonshine_latency.py` is a single-endpoint, real-time-paced script (not an extension of `scripts/benchmark_asr_ab.py`, which probes two endpoints and sends audio unpaced). Utterances of 3, 5 and 10 s cut from the package's `two_cities.wav` and resampled to 16 kHz PCM16; 10 runs each, the first (cold) run discarded; reports p50 for offline commit-to-completed over the wire and for the library-level `stop()` flush after a paced streamed feed.
 
-### Phase 2: Install, operations and docs wiring
+### Phase 2: Install, operations and docs wiring, then the go/no-go record
 
-**Impl files:** `justfile, scripts/install_stt_agent.sh, scripts/render_stt_plist.py, docs/backends.md, docs/operations.md, docs/protocol.md, README.md, CHANGELOG.md, docs/dev_plans/README.md, .github/workflows/test.yml`
-**Test files:** `tests/test_justfile_recipes.py, tests/test_render_stt_plist.py, tests/test_docs_navigation.py, tests/test_install_migration.py`
-**Test command:** `uv run --inexact pytest tests/test_justfile_recipes.py tests/test_render_stt_plist.py tests/test_docs_navigation.py tests/test_install_migration.py -q`
-**Goal:** `just stt-install moonshine` works like the other backends, and the docs structure tests keep passing.
+**Impl files:** `justfile, scripts/install_stt_agent.sh, scripts/render_stt_plist.py, scripts/smoke_launchd.py, docs/backends.md, docs/operations.md, docs/migration.md, docs/contributing.md, README.md, CHANGELOG.md, docs/dev_plans/README.md, .github/workflows/test.yml`
+**Test files:** `tests/test_justfile_recipes.py, tests/test_render_stt_plist.py, tests/test_smoke_launchd.py, tests/test_docs_navigation.py, tests/test_docs_port_caveats.py, tests/test_install_migration.py`
+**Test command:** `uv run --inexact pytest -q`
+**Goal:** `just stt-install moonshine` works like the other backends, every list that names backends stays in step, and the docs structure tests keep passing.
 
-- `justfile`: `_resolve` arms (lines ~60-63), `_agent-python` arms (~374-377), `_ensure-extra` arms (~410-413). Moonshine shares the default venv (no `kyutai_venv`-style separation) unless Phase 1's `uv lock` shows a conflict.
-- `scripts/install_stt_agent.sh`: default-model arms (~136-141), port map (~160-162; take the next free port after the existing 9565/9665/9765/9865, expected 9965, to be checked against `scripts/squat_check.py`), error text (~191), case validation (~618-620), header docs (~20, 43-47).
-- `scripts/render_stt_plist.py`: `_BACKEND_RE` (~52) and the hint string (~167).
-- Tests that enumerate backends: `tests/test_justfile_recipes.py` (`BACKENDS` tuple ~53, port and label map ~58-59, assertions ~524-540 including the `docs/operations.md` port table), `tests/test_render_stt_plist.py` parametrisations (~271, ~307).
-- Docs: `docs/backends.md` (new backend section, licence guard, language table, model download, 1 GB memory note), `docs/operations.md` (port table row, `stt-install`), README backend list (respect the 180-line and 1200-word limits and the single-owner heading rule in `tests/test_docs_navigation.py`), CHANGELOG, `docs/dev_plans/README.md` row, and the `docs/protocol.md` delta wording.
-- CI: decide whether the Linux client job's explicit test list should include `tests/test_moonshine_backend.py` (it uses a fake module, so it needs no wheel); verify that `import moonshine_voice` does not require PortAudio before relying on the real package anywhere in CI.
-
-### Phase 3: Streaming mode (gated on the Phase 1 benchmark)
-
-**Impl files:** `stt_server/backend.py, stt_server/server.py, stt_server/backends/moonshine.py, docs/protocol.md, docs/architecture.md, docs/backends.md`
-**Test files:** `tests/test_stt_server.py, tests/test_streaming_session.py, tests/test_moonshine_backend.py, tests/test_backend_protocol.py`
-**Test command:** `uv run --inexact pytest tests/test_stt_server.py tests/test_streaming_session.py tests/test_moonshine_backend.py tests/test_backend_protocol.py -q`
-**Goal:** Decode overlaps with the incoming audio so commit-to-completed latency is the tail flush, not a whole-utterance decode, with no change to wire event shapes or ordering and no change for non-streaming backends.
-
-- Gate: proceed only if the Phase 1 benchmark shows offline commit-to-completed p50 above 300 ms for a 5 s utterance on the default model (a proposed threshold; the spike extrapolates to about 380 ms, but it measured a 44 s clip and not the tail flush). If it does not, stop here and record the result in `## Findings`.
-- `backend.py`: an optional class attribute `streams_during_append: bool = False` (documented in the optional-hook block, with a runtime-checkable protocol like `abort`/`idle`).
-- `server.py`: for a streaming backend, open the stream at the first append of a turn (language bound then; a later `session.update` language change applies to the next turn) and `feed()` each chunk to it. The server-side byte buffer is replaced by a byte counter, so `BUFFER_OVERFLOW` and `MAX_UNCOMMITTED_SECONDS` still hold. `_on_commit` reuses the open stream and then runs `end()` and `events()` as today. `_on_clear`, `_on_cancel`, `_on_close` and `_teardown_session` cancel the open stream. A commit with no open stream, and every non-streaming backend, keep the current path unchanged.
-- `moonshine.py`: a single worker thread per backend consumes a queue of feed, end and cancel operations and calls `Stream.add_audio`/`stop`; the listener appends `LineCompleted` text to the stream's own list (a thread-safe queue). `feed()` only enqueues and never blocks the loop. `end()` enqueues `stop()` and awaits it. `events()` yields one `delta` per completed line and then `completed` (full text), after `end()`. A worker error surfaces from `end()`/`events()` and becomes `transcript.failed` through the existing `except` arm. `idle()` reports the worker queue and thread as drained.
-- Uncompleted-line text is never sent (it revises); only `LineCompleted` text is.
+- **First step (gate): confirm port 9965 with the menu bar app owner.** If it is not confirmed, stop Phase 2.
+- `justfile`: `_resolve` arms, `_agent-python` arms, `_ensure-extra` arms. Moonshine shares the default venv unless Phase 1's `uv lock` shows a conflict.
+- `scripts/install_stt_agent.sh`: default-model arm (`medium-streaming@en`), port map (`9965`), the `backends with one:` error text, case validation, header docs.
+- `scripts/render_stt_plist.py`: `_BACKEND_RE` and its hint string. Verify that `@` and `,` pass the renderer's and the installer's character checks for the model value (the spec grammar depends on it).
+- `scripts/smoke_launchd.py`: `CANONICAL_BACKENDS`, in the same commit and the same order as the installer port arm (`tests/test_smoke_launchd.py` asserts they match).
+- Tests that enumerate backends: `tests/test_justfile_recipes.py` (`BACKENDS` tuple, port and label map, the assertions that tie `_resolve`, the installer and the `docs/operations.md` port table), `tests/test_render_stt_plist.py` parametrisations, `tests/test_smoke_launchd.py`, `tests/test_docs_port_caveats.py` (reads `uv.lock`).
+- Docs: `docs/backends.md` (new section: model spec grammar, licence guard and the stderr notice, language contract and the "auto becomes en" deviation, served set and memory, model download and cache location, package pin and CDN caveat), `docs/operations.md` (port table, `stt-install`), `docs/migration.md` (port list), `docs/contributing.md` (the `SnapshotSpec` check/fetch extension), README backend list (respect the 180-line and 1200-word limits and the single-owner heading rule in `tests/test_docs_navigation.py`), CHANGELOG, `docs/dev_plans/README.md`.
+- CI: add `tests/test_moonshine_backend.py` to the Linux client job's explicit test list (it uses a fake module, so it needs no wheel).
+- Manual verification through an installed agent: one decode after prefetch and one with an empty model cache, both through `just stt-install moonshine` (the LaunchAgent environment sets only `PATH` and `HOME`).
+- **Last step: record the go/no-go for the streaming plan.** Enter the Phase 1 benchmark numbers in `## Findings`. Start `20261114-feature-moonshine-streaming-mode.md` only if, for the 5 s utterance on the default model, offline commit-to-completed p50 exceeds 300 ms and the `stop()` flush p50 is below half of the offline p50. (Both thresholds are proposals; the user confirms them before the record is written.)
 
 ## Technical Specifications
 
 ### Files to Modify
-- `stt_server/backends/__init__.py` - `DEFAULT_MOONSHINE_MODEL`, `BACKENDS` entry (module `stt_server.backends.moonshine`, class `MoonshineBackend`, `local_model_paths=False`), registry docstring.
-- `stt_server/prefetch.py` - non-HF fetcher hook alongside `SnapshotSpec` (`specs_for` at 113, `local_specs_for` at 122, `check_spec` at 227, `fetch_spec` at 271, `run_prefetch` at 368).
-- `stt_server/backend.py` - Phase 3 optional attribute and docs; the module docstring "True streaming partials are deferred" stays true on the wire.
-- `stt_server/server.py` - Phase 3 only: `_SessionState` (368-376), `_handle_binary_audio` (1480, overflow check 1510, `extend` 1518), `_on_commit` (1632-1672), `_on_clear` (1674-1697), `_run_decode` (1700-1770), `_on_close` (1805-1840), `_on_cancel` (1842-1870), `_teardown_session` (1872+); update the language comment at 1709-1715.
-- `pyproject.toml`, `uv.lock` - new extra; `justfile`, `scripts/install_stt_agent.sh`, `scripts/render_stt_plist.py` - enumerations listed in Phase 2.
-- Tests listed per phase; docs listed per phase.
+- `stt_server/backends/__init__.py` - `DEFAULT_MOONSHINE_MODEL`, `BACKENDS` entry (module `stt_server.backends.moonshine`, class `MoonshineBackend`, `local_model_paths=False`), registry docstring (the pin rule).
+- `stt_server/snapshot.py` - `SnapshotSpec` optional `check` and `fetch` callables (the class is defined here, not in `prefetch.py`; `download_phase` and `mark_model_invalid` live here too).
+- `stt_server/prefetch.py` - branch once in `check_spec` and `fetch_spec`; conditional `huggingface_hub` hint.
+- `pyproject.toml`, `uv.lock` - new extra.
+- `justfile`, `scripts/install_stt_agent.sh`, `scripts/render_stt_plist.py`, `scripts/smoke_launchd.py` - the enumerations listed in Phase 2.
+- Docs and tests as listed per phase.
 
 ### New Files to Create
 - `stt_server/backends/moonshine.py` - the backend.
-- `tests/test_moonshine_backend.py` - fake `moonshine_voice` injected with `monkeypatch.setitem(sys.modules, ...)`, following `tests/test_nemotron_backend.py:128-145`: protocol satisfaction, delta and completed shape, empty decode, failure propagation, cancel, decode serialisation, language table, licence guard, cache bound, `idle`/`abort`/`close` drain.
-- `tests/test_streaming_session.py` - Phase 3 server tests with a fake streaming backend: ordering (`committed` before any `delta`), clear, cancel, close and overflow with an open stream, non-streaming parity.
+- `scripts/benchmark_moonshine_latency.py` and `tests/test_benchmark_moonshine_latency.py` - the paced latency benchmark.
+- `tests/test_moonshine_backend.py` - fake `moonshine_voice` injected with `monkeypatch.setitem(sys.modules, ...)`, following `tests/test_nemotron_backend.py:128-145`. Cases: protocol satisfaction; one `delta` equal to `completed` at backend and wire level; empty and whitespace decode; failure propagation; cancel; decode serialisation; `idle`/`abort`/`close` drain; spec grammar table (valid and invalid); licence guard table; language table (`auto`, `""`, `None`, `AUTO`, padded, `EN`, `en-US`, `zh-CN`, `zh_CN`, `zh-Hans-CN`, `xx`, `ko`, `uk`, a non-string value, a language outside the served set); `logger.error` asserted at the call site; the downloader is never called for an unlisted language; constructor imports nothing; cache equals the served set.
+- Prefetch tests (in `tests/test_prefetch_cli.py`, with a fake `moonshine_voice.download`): uncached then cached; incomplete snapshot; fetch event order; fetch failure; connection error; missing extra; corrupt snapshot reported as model-invalid; local path refused.
 
 ### Architecture Decisions
-- Decision 1: no new wire events. The wire contract is append-only `delta` plus `completed`, and the spike showed in-progress text is rewritten constantly (46 of 63 changes). Exposing it would need a replace-semantics event, which nothing else in the protocol has. Revisit as a follow-up if a client needs interim text.
-- Decision 2: deltas are held until after `committed`. The item id is minted at commit, and OpenAI-style ordering is committed, deltas, completed. Streaming therefore buys lower commit latency (compute overlapped with speech), not earlier text on the wire.
-- Decision 3: commit-oriented first, streaming second and gated. `transcribe_without_streaming` also works with the streaming models (spike E), and it needs no server change; Phase 3 is the only change that touches shared server state.
-- Decision 4: serialise decodes. Concurrent runs showed no speedup and, with two transcribers, differing output; the cause is unproven.
-- Decision 5: the pin is the `moonshine-voice` version. Not HF SHAs.
-- Decision 6: `"auto"` or `None` maps to `"en"`, and an unsupported language logs an error and falls back to `"en"` (user decision, 2026-11-14). Moonshine has no language identification, which departs from the uniform "auto means detect" contract; document it. The client gets no signal on the wire.
+- Decision 1 (grilled): the streaming mode is split into a follow-up plan. It changes `server.py` session handling that every backend runs through, so it gets its own plan, review and PR. This plan owns the paced benchmark and the go/no-go record.
+- Decision 2 (grilled): Phase 1 emits one `delta` equal to `completed`, like every other backend. Per-line deltas, their separator and the "joined deltas equal `completed`" invariant move to the streaming plan.
+- Decision 3 (grilled): `prefetch_specs` remains the single prefetch contract; `SnapshotSpec` gains optional `check`/`fetch` callables; no second module hook.
+- Decision 4 (grilled): the served-language set is fixed at startup and carried in the model spec `[<arch>][@<langs>]`, so no new flag, environment variable or plist plumbing is needed. An unlisted language logs an error and falls back; the downloader is never called for it; the cache equals the served set.
+- Decision 5 (grilled): `DEFAULT_MOONSHINE_MODEL = "medium-streaming@en"`; the constructor stores the spec verbatim and imports nothing; `start()` validates against the live catalog and the licence guard (`ConfigError`) and logs the resolved map. Rationale: the registry and missing-extra tests require an import-free constructor.
+- Decision 6 (grilled): port `9965` is provisional until confirmed with the menu bar app owner, as the first Phase 2 step.
+- Decision 7: the wire contract stays append-only `delta` plus `completed`. The spike showed in-progress text is rewritten constantly (46 of 63 changes on medium), so exposing it would need a replace-semantics event that nothing else in the protocol has. Revisit only in the streaming plan.
+- Decision 8: serialise decodes. Concurrent runs showed no speedup and, with two transcribers, differing output; the cause is unproven and Phase 1 adds a check.
+- Decision 9: the pin is the `moonshine-voice` version, not HF SHAs; directory names come from the package manifest.
+- Decision 10 (user decision, 2026-11-14): `auto` or `None` maps to `en`, and an unsupported language logs an error and falls back to `en` (or the first served language). Moonshine has no language identification, so this departs from the uniform "auto means detect" contract; documented in `docs/backends.md`.
 
 ### Dependencies
-- `moonshine-voice==0.1.6` (MIT; macOS wheel needs macOS 15 or later, arm64). Transitive: `numpy`, `sounddevice` (PortAudio), `requests`, `tqdm`, `filelock`, `platformdirs`, `google-crc32c`.
-- Runtime state outside the repo: model cache at `~/Library/Caches/moonshine_voice` (override `MOONSHINE_VOICE_CACHE`), which the LaunchAgent environment must be able to read and write.
+- `moonshine-voice==0.1.6` (MIT; the macOS wheel needs macOS 15 or later on arm64). Transitive: `numpy`, `sounddevice` (imported lazily, so PortAudio is not needed at import time on this wheel), `requests`, `tqdm`, `filelock`, `platformdirs`, `google-crc32c`.
+- Runtime state outside the repo: model cache at `~/Library/Caches/moonshine_voice` (override `MOONSHINE_VOICE_CACHE`), which the LaunchAgent must be able to read and write. The plist environment sets only `PATH` and `HOME`.
 
 ### Detailed Design
 
 #### Module and class layout (`stt_server/backends/moonshine.py`)
 
-| Unit | Responsibility | Phase |
-|---|---|---|
-| `resolve_language(lang) -> (code, note)` | Pure. `None`/blank/`auto` becomes `en`; lowercase; strip region; unsupported becomes `en` plus an error note. The caller logs `note`. | 1 |
-| `resolve_arch(code, requested) -> ModelArch \| None` | Pure. Applies the licence guard: streaming archs for every language, non-streaming only for `en`. `None` means "not servable", and the caller falls back to `en`. | 1 |
-| `MoonshineBackend(DecodeGuardMixin)` | Registry entry point. Owns the bounded transcriber cache, the lock pair and in-flight counter, and `start`/`open_stream`/`abort`/`idle`/`close`. | 1 |
-| `_TranscriberCache` | `OrderedDict[(code, arch), Transcriber]`, LRU, capacity 3. Loads under the thread lock inside `download_phase()`. It never evicts a transcriber with an open stream. | 1 |
-| `_MoonshineStream` | Phase 1: buffers PCM16LE, converts at `end()`, calls `transcribe_without_streaming`. Phase 3: a thin handle that enqueues to the worker. | 1, 3 |
-| `_Worker` | One daemon thread per backend. FIFO queue of `FEED`, `END` and `CANCEL` operations. It is the only caller of `add_audio`/`stop` and the only thread whose callbacks append line text. | 3 |
-| `prefetch_fetchers(model)` | Module-level hook for `prefetch.py`: a check callable (snapshot directory present and complete) and a fetch callable (`get_model_for_language`). | 1 |
+| Unit | Responsibility |
+|---|---|
+| `parse_model_spec(spec) -> (arch \| None, langs)` | Pure. Parses `[<arch>][@<lang>[,<lang>...]]`; no catalog access. Empty language list means `en`. |
+| `resolve_arch(code, requested, catalog) -> ModelArch` | Pure over a catalog mapping. Applies the licence guard (streaming archs for any language, non-streaming only for `en`); an omitted arch takes the first MIT-allowed entry. Raises `ConfigError` for an unknown arch or a non-MIT combination (called from `start()`). |
+| `resolve_language(lang, served) -> (code, note)` | Pure. `None`/blank/`auto` becomes `en`; lowercase; strip region (`-` or `_`); outside the served set returns the fallback (`en` if served, else the first listed) plus an error note. The caller logs the note with `logger.error`. |
+| `MoonshineBackend(DecodeGuardMixin)` | Registry entry point. Stores the spec verbatim; `start()` imports the package, validates, builds the served map, logs it. Owns the lock pair, in-flight counter, transcriber cache, `open_stream`, `abort`, `idle`, `close`. |
+| `_MoonshineStream` | Buffers PCM16LE; at `end()` converts and runs the offline decode on a guarded daemon thread under the thread lock; `events()` yields one `delta` (if non-empty) and `completed`. |
+| `prefetch_specs(model)` | Module-level. One `SnapshotSpec` per served (language, arch) with `check`/`fetch` callables built from the package manifest. |
 
 #### Language and model resolution
 
 ```mermaid
 flowchart TD
-    A["client language (None, blank, auto, or code)"] --> B{"None, blank or auto?"}
+    S["--model spec"] --> P["parse_model_spec (constructor stores it verbatim)"]
+    P --> ST["start(): import package, read catalog"]
+    ST --> V{"arch known, language known, MIT-allowed?"}
+    V -->|no| CE["ConfigError"]
+    V -->|yes| M["served map: lang to arch (logged once)"]
+    A["client language per session"] --> B{"None, blank or auto?"}
     B -->|yes| E["code = en"]
-    B -->|no| C["lowercase, strip region (en-US to en, zh-CN to zh)"]
-    C --> D{"code in catalog?"}
-    D -->|no| F["logger.error + code = en"]
+    B -->|no| C["lowercase, strip region"]
+    C --> D{"in served set?"}
+    D -->|no| F["logger.error, fallback en (or first listed)"]
     D -->|yes| G["code"]
-    E --> H["resolve_arch(code, --model)"]
-    F --> H
-    G --> H
-    H --> I{"MIT-servable arch?"}
-    I -->|"no (ko, uk)"| F2["logger.error + code = en, default arch"]
-    I -->|yes| J["transcriber cache lookup (code, arch)"]
-    F2 --> J
+    E --> D
+    F --> J["cache lookup (code, arch)"]
+    G --> J
     J -->|miss| K["download_phase: get_model_for_language, then Transcriber()"]
     J -->|hit| L["use cached transcriber"]
     K --> L
 ```
 
-#### Session stream state (Phase 3)
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Open: first append (open_stream, language bound)
-    Open --> Open: append (feed, byte counter += n)
-    Open --> Ending: commit (end enqueued)
-    Ending --> Done: events() drained, completed sent
-    Open --> Cancelled: clear, cancel, close, overflow
-    Ending --> Cancelled: cancel, close timeout
-    Cancelled --> Idle: stream freed, held text dropped
-    Done --> Idle: stream freed
-```
-
-A non-streaming backend never leaves `Idle` until commit, which is today's behaviour.
-
 #### Threading model
-
-- Phase 1: one daemon thread per decode through `_run_guarded_decode`, exactly like `nemotron.py`. The whole utterance is decoded under the thread lock.
-- Phase 3: one persistent worker per backend, because `add_audio` is called about 10 times a second per stream and a thread per call would be wasteful. A single FIFO queue serialises everything, so two sessions streaming at once interleave at `add_audio` granularity. The cost is head-of-line latency: one session's pass (up to about 475 ms on medium) delays the other's. This matches the "serialise decodes" decision and is the safe default until the differing-output result is explained.
-- The event loop only enqueues. `END` carries a future that the worker completes through `loop.call_soon_threadsafe`, so `end()` awaits without blocking.
-- `idle()` returns a future that completes when the queue is empty and the worker is not inside a call. `close()` drains for a bounded time (3 s, the existing `_drain_inflight` default), then `abort()` stops the worker with a sentinel.
+One daemon thread per decode through `_run_guarded_decode`, exactly like `nemotron.py`; the whole utterance is decoded under the thread lock, so decodes across sessions serialise. `idle()` and the `close()` drain use the mixin unchanged (`_drain_inflight`, 3 s).
 
 #### Failure modes
 
 | Failure | Where it surfaces | Result |
 |---|---|---|
-| Model download fails (offline, DNS) | first decode, inside `download_phase()` | exception from `end()`/`events()`, then `transcript.failed` (the server marks it as a download error as for the other backends) |
-| Model load fails (corrupt cache) | first decode | same path; `mark_model_invalid` semantics match the HF backends where applicable |
-| Decode raises | worker or decode thread | future carries the exception, then `transcript.failed` with a generic message; details only in the server log |
-| Worker thread dies (Phase 3) | next enqueue | the dead worker is replaced lazily; operations queued behind the failure fail with the stored exception |
-| RTF above 1 (queue grows) | none on the wire | bounded by the existing 300 s uncommitted cap; log a warning when queued audio exceeds 10 s |
-| Client disconnect or `cancel` mid-stream | `_teardown_session`, `_on_cancel` | `CANCEL` enqueued, held text dropped, stream freed |
+| Model download fails (offline, DNS) | first decode, inside `download_phase()` | exception from `end()`/`events()`, then `transcript.failed`; `requests` errors already classify as download errors (`stt_server/supervise.py`) |
+| Cached file is corrupt (size match, bad CRC32C) | prefetch check, or first load | wrapped with `mark_model_invalid` so the supervisor classifies it as an invalid model, not a start failure |
+| Decode raises | decode thread | future carries the exception, then `transcript.failed` with a generic message; details only in the server log |
+| Bad `--model` spec | `start()` | `ConfigError`, exit 1 with a clear message |
+| Language outside the served set or unsupported | `resolve_language` | `logger.error`, falls back; the decode proceeds; nothing is downloaded |
+| Client disconnect or `cancel` mid-decode | existing server paths | `cancel()` marks the stream; the daemon thread finishes and its result is dropped |
 | SIGTERM mid-decode | `close()` | bounded drain, then `abort()` |
-| Unsupported or non-MIT language | `resolve_language`/`resolve_arch` | `logger.error`, falls back to `en`; the decode proceeds |
 
 #### Configuration surface
 
 | Setting | Source | Default | Note |
 |---|---|---|---|
-| Architecture | `--model` (arch name) | catalog default for the language | `tiny-streaming` is the low-memory choice (about 290 MB RSS against about 1 GB for medium) |
-| Model cache directory | `MOONSHINE_VOICE_CACHE` (library) | platformdirs user cache | the LaunchAgent environment must be able to write it |
-| Transcriber cache size | constant (3) in v1 | 3 | worst case about 3 GB RSS with medium models |
-| Streaming update interval | library default (0.5 s) | 0.5 | the spike used 0.3; revisit in the Phase 3 benchmark |
-| Languages to prefetch | open | `en` | `prefetch` has no language argument today. Resolve in Phase 1: either an env var or a flag. The existing `env.py` conventions decide which one, and I have not checked them. |
+| Model spec (arch and served languages) | `--model` / `PIPECAT_STT_MODEL` | `medium-streaming@en` | `tiny-streaming` is the low-memory choice (about 290 MB RSS against about 1 GB for medium) |
+| Model cache directory | `MOONSHINE_VOICE_CACHE` (library) | platformdirs user cache | the LaunchAgent must be able to write it |
+| Transcriber cache | the served set | n/a | memory is the sum of the listed models |
 
 #### Audio path
-
-PCM16LE from the wire becomes a `float32` array in `[-1, 1]` (`numpy.frombuffer(..., "<i2") / 32768`), then `.tolist()` for `add_audio` and `transcribe_without_streaming`, which build a ctypes array from a Python sequence. The wire is pinned at 16 kHz mono (`protocol.py`), so the sample-rate argument is always 16000 and the library does no resampling. The spike passed Python lists of floats; the cost of converting a long utterance is not measured and goes in the Phase 1 benchmark.
+PCM16LE from the wire becomes a float32 sequence in `[-1, 1]` (`numpy.frombuffer(..., "<i2") / 32768`, then `.tolist()`), because `transcribe_without_streaming` builds a ctypes array from a Python sequence. The wire is pinned at 16 kHz mono (`protocol.py`), so the sample-rate argument is always 16000. The spike's numbers all used 48 kHz input; the Phase 1 benchmark measures the 16 kHz path and the list-conversion cost.
 
 ### Integration Seams
 
 | Seam | Writer (task) | Caller (task) | Contract |
 |------|---------------|---------------|----------|
-| Backend streaming flag | `backend.py` / `moonshine.py` (Phase 3) | `server.py` (Phase 3) | `streams_during_append=True` means the server opens the stream at first append, feeds each chunk, and later calls `end()` then `events()`; `events()` yields nothing before `end()` returns |
-| Worker thread and event loop | `moonshine.py` | `server.py` `_run_decode` | callbacks only enqueue; the loop never blocks on `add_audio`; `idle()` reflects the worker |
-| Non-HF prefetch | `moonshine.py` `prefetch_fetchers` | `prefetch.py` | check and fetch callables; same exit codes and messages as the HF path |
-| Backend enumerations | Phase 1 registry | Phase 2 justfile, installer, plist renderer, docs table | every list that names backends gains `moonshine`; `tests/test_justfile_recipes.py:524-540` asserts the sets are equal |
+| `SnapshotSpec` callables | `moonshine.py` `prefetch_specs` (Phase 1) | `prefetch.py` `check_spec`/`fetch_spec` (Phase 1) | `check` returns the same complete/missing/invalid result the HF path does; `fetch` emits the same event fields; HF specs (callables `None`) behave exactly as before |
+| Constructor vs `start()` | `MoonshineBackend` (Phase 1) | registry and missing-extra tests | constructor never imports the package or validates; `start()` raises `ConfigError` or `ModuleNotFoundError` |
+| Backend enumerations | Phase 1 registry | Phase 2 justfile, installer, plist renderer, smoke harness, docs port table | every list that names backends gains `moonshine`; `tests/test_justfile_recipes.py` and `tests/test_smoke_launchd.py` assert the sets are equal |
+| Benchmark to go/no-go | Phase 1 benchmark | Phase 2 last step | the recorded p50 numbers are the only input to the streaming-plan decision |
 
 ## Architecture & Call Flow
 
-Component graph (final design; the dotted edge exists only in Phase 3):
+Component graph:
 
 ```mermaid
 graph LR
     Client["Pipecat bot / client"] -->|"WS: audio.append, commit"| Server["TranscriptionServer (server.py)"]
     Server -->|"open_stream, feed, end, events"| Backend["MoonshineBackend + stream"]
-    Server -.->|"Phase 3: feed per append"| Backend
-    Backend -->|"queue to worker thread"| Worker["worker thread"]
-    Worker -->|"add_audio, stop"| Runtime["moonshine-voice (libmoonshine, ONNX CPU)"]
-    Runtime -->|"line events on worker thread"| Worker
-    Worker -->|"completed-line text"| Backend
+    Backend -->|"daemon thread per decode"| Runtime["moonshine-voice (libmoonshine, ONNX CPU)"]
     Server -->|"committed, delta, completed"| Client
-    Runtime -.->|"first use only"| CDN["download.moonshine.ai to platformdirs cache"]
+    Prefetch["prefetch CLI / installer"] -->|"check, fetch via SnapshotSpec callables"| Cache["model cache (platformdirs)"]
+    Runtime -->|"load model"| Cache
+    Cache -.->|"first use or prefetch only"| CDN["download.moonshine.ai"]
+    Agent["LaunchAgent (PATH, HOME only)"] -->|"runs serve"| Server
 ```
 
-Trigger order for one turn in Phase 3 streaming mode (Phase 1 differs only in that nothing is fed before commit):
+Trigger order for one turn (commit-oriented, this plan):
 
 ```mermaid
 sequenceDiagram
@@ -242,42 +220,39 @@ sequenceDiagram
     participant S as Server
     participant B as MoonshineStream
     participant R as moonshine-voice
-    C->>S: append (chunk 1)
-    S->>B: open_stream(language), feed(chunk)
-    B->>R: add_audio (worker thread)
-    R-->>B: LineCompleted (queued, held)
-    C->>S: append (chunk N)
-    S->>B: feed(chunk)
+    C->>S: append (chunks)
+    Note over S: audio buffered in state.buffer
     C->>S: commit
     S-->>C: input_audio_buffer.committed
-    S->>B: end()
-    B->>R: stop() flush (worker thread)
-    R-->>B: LineCompleted (tail)
+    S->>B: open_stream(language), feed(whole utterance), end()
+    B->>R: transcribe_without_streaming (decode thread, under thread lock)
+    R-->>B: lines
     S->>B: events()
-    B-->>S: delta (one per completed line)
-    S-->>C: transcription.delta (per line)
-    S-->>C: transcription.completed (full text)
+    B-->>S: delta (full text), completed
+    S-->>C: transcription.delta, transcription.completed
 ```
 
 Context lifecycle:
 
 | Step | Trigger | Enters context | Cleared/persisted | Turn boundary |
 |------|---------|----------------|-------------------|---------------|
-| 1 | First append (Phase 3) or commit (Phase 1) | `open_stream(language)`; transcriber from the cache, or a lazy load on first use | stream lives to commit, clear or cancel; the transcriber stays cached | stream open |
-| 2 | Each append (Phase 3) | PCM16 chunk, converted to float32 on the worker thread | only the byte count is kept in the server | none |
-| 3 | `commit` | `end()` flushes via `stop()`; held line texts become deltas | stream freed, `completed` sent | `completed` sent |
-| 4 | `clear`, `cancel`, `close` | stream cancelled; the worker discards queued work | stream freed, held text dropped | session reset |
-| 5 | First use of a (language, arch) | download and ONNX load under `download_phase()` | cached, bounded to 3 | none |
+| 1 | `start()` | package import, catalog, served map | served map lives for the process | server ready |
+| 2 | Prefetch or first decode of a served language | model download and ONNX load under `download_phase()` | transcriber cached for the process; files persist in the model cache | none |
+| 3 | `commit` | whole utterance, language fallback applied | buffer cleared at commit (server) | `committed` sent |
+| 4 | `end()` | float32 conversion, offline decode under the thread lock | stream freed after `events()` | `completed` sent |
+| 5 | `cancel` or `close` | stream marked cancelled; bounded drain | result dropped; backend `abort()` | session closed |
 
 ## Testing Notes
 
 ### Test Approach
 - [ ] Unit tests for the backend with a fake `moonshine_voice` module (no wheel needed in CI)
-- [ ] Table tests for language normalisation and the licence guard
-- [ ] Server tests for streaming-mode ordering and lifecycle with a fake streaming backend (Phase 3)
-- [ ] Backend-enumeration tests still pass (`test_justfile_recipes`, `test_render_stt_plist`, `test_backend_registry`)
-- [ ] Manual: real decode of `moonshine_voice/assets/two_cities.wav` through the running server on this Mac for en medium-streaming and one non-English model (es small-streaming)
-- [ ] Use `uv run --inexact` (or `--no-sync`) everywhere: plain `uv run` prunes the installed backend extras and crash-loops LaunchAgents. Confirm the flag behaves as expected on the first run.
+- [ ] Table tests for spec grammar, licence guard and language normalisation
+- [ ] Prefetch tests through `SnapshotSpec` callables with a fake `moonshine_voice.download`
+- [ ] Contract tests extended with moonshine rows: `tests/test_decode_guard.py`, `tests/test_supervised_cli.py` (download and model-invalid tagging, `abort()`), `tests/test_stt_server.py` (`_make_backend`, argparse, lazy import: rows added, no existing assertion changed)
+- [ ] Backend-enumeration tests pass (`test_justfile_recipes`, `test_render_stt_plist`, `test_smoke_launchd`, `test_backend_registry`)
+- [ ] Manual: real decode of `moonshine_voice/assets/two_cities.wav` through the running server for en medium-streaming; one non-English model with an operator-supplied clip of a known phrase (the repo has no non-English audio); one decode through an installed LaunchAgent, with the model cache populated and empty
+- [ ] Run the suite with `uv run --inexact` (or `--no-sync`): plain `uv run` prunes the installed backend extras and crash-loops LaunchAgents. `--inexact` is accepted by uv 0.13.8; whether it keeps the extras is confirmed on the first run.
+- [ ] Run the full suite in the background, not the foreground
 
 ### Test Results
 - [ ] All existing tests pass
@@ -286,21 +261,22 @@ Context lifecycle:
 
 ### Edge Cases Tested
 - [ ] Empty or near-silence audio (empty decode contract)
-- [ ] Unsupported or odd language codes: `auto`, `""`, `None`, `EN`, `en-US`, `zh-CN`, `xx`, `ko`, `uk`
-- [ ] Cancel and close mid-decode; SIGTERM drain with the worker thread alive
+- [ ] Odd language values (see `tests/test_moonshine_backend.py` list above)
+- [ ] Cancel and close mid-decode; SIGTERM drain with a decode thread alive
 - [ ] Two sessions committing at once (serialised)
-- [ ] Clear, cancel, close and overflow with an open stream (Phase 3)
-- [ ] First decode when the model is not cached (download failure path)
+- [ ] First decode when the model is not cached (download failure path); corrupt cache
+- [ ] Raw line text for `ja` and `zh` (space-joining check)
 
 ## Acceptance Criteria
 
-- `uv sync --extra moonshine --inexact` followed by `python -m stt_server --backend moonshine` serves a real utterance over the wire as `committed`, `delta`, `completed` (en and es checked live).
-- Non-English languages work with the default MIT streaming models. `ko`, `uk` and non-streaming non-English archs are refused by the licence guard, with an error logged and a fallback to `en`.
-- `prefetch --backend moonshine` fetches the model and exits non-zero on a missing or corrupt snapshot, like the HF backends.
-- `just stt-install moonshine` installs and probes a LaunchAgent; the backend-enumeration tests pass.
-- No change to `PROTOCOL_VERSION` or event shapes. Behaviour for the existing backends is unchanged: `tests/test_stt_server.py` passes unmodified.
-- Phase 3 (if it runs): commit-to-completed latency measured before and after on the same utterances and recorded; the ordering and lifecycle tests pass.
-- Code reviewed and approved; tests passing; docs updated (backends, operations, README, CHANGELOG, protocol wording).
+- `uv sync --extra moonshine --inexact` followed by `python -m stt_server --backend moonshine` serves a real English utterance over the wire as `committed`, one `delta` equal to `completed`, then `completed`.
+- A non-English language from the supported set loads and returns non-empty text for an operator-supplied clip. If no clip is available, the criterion is limited to "loads and decodes without error".
+- `ko`, `uk` and non-streaming non-English archs are refused with `ConfigError` at `start()`. A client language outside the served set logs an error and falls back; no download is attempted for it.
+- `prefetch --backend moonshine` fetches the served set and exits non-zero on a missing or corrupt snapshot, like the HF backends.
+- `just stt-install moonshine` installs and probes a LaunchAgent on the confirmed port, and the backend-enumeration tests pass.
+- No change to `PROTOCOL_VERSION`, `protocol.py` or `server.py` session handling. No existing assertion in `tests/test_stt_server.py` changes.
+- The Phase 1 benchmark numbers (offline p50 and `stop()` flush p50 for 3, 5 and 10 s at 16 kHz) and the go/no-go for the streaming plan are recorded in `## Findings`.
+- Code reviewed and approved; the full suite passes; docs updated (backends, operations, migration, contributing, README, CHANGELOG).
 
 <!-- reviewed: YYYY-MM-DD @ <hash> -->
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
@@ -308,13 +284,12 @@ Context lifecycle:
 ## Progress
 
 - [x] Phase 0: Spike (moonshine-voice behaviour, threading, languages)
-- [ ] Phase 1: Commit-oriented moonshine backend (no server change)
-- [ ] Phase 2: Install, operations and docs wiring
-- [ ] Phase 3: Streaming mode (gated on the Phase 1 benchmark)
+- [ ] Phase 1: Commit-oriented moonshine backend, prefetch and benchmark
+- [ ] Phase 2: Install, operations and docs wiring, then the go/no-go record
 
 ## Findings
 
-### Phase 0 spike (2026-11-14, Apple Silicon Mac, `moonshine-voice` 0.1.6, throwaway venv in the session scratchpad; two_cities.wav is 44.4 s at 48 kHz)
+### Phase 0 spike (2026-11-14, Apple Silicon Mac, `moonshine-voice` 0.1.6, throwaway venv in the session scratchpad; two_cities.wav is 44.4 s at 48 kHz, passed at 48 kHz to every call)
 
 | | tiny-streaming (en) | medium-streaming (en, default) |
 |---|---|---|
@@ -325,13 +300,24 @@ Context lifecycle:
 | Offline `transcribe_without_streaming` | 0.99 s | 3.35 s |
 | First non-empty partial | 1.9 s of audio | 1.9 s of audio |
 | Non-prefix text revisions | 43 of 59 changes | 46 of 63 changes |
-| 2 threads, 1 transcriber, wall time | 9.2 s (single 4.7 s) | 28.1 s (single 12.7 s) |
-| 2 threads, 2 transcribers, outputs identical | yes | no |
+| 2 threads, 1 transcriber: wall time, outputs identical | 9.2 s (single 4.7 s), yes | 28.1 s (single 12.7 s), yes |
+| 2 threads, 2 transcribers: wall time, outputs identical | 8.0 s, yes | 24.9 s, no |
 
 - Callbacks fire on the calling thread (`MainThread` in the spike). A second stream on the same transcriber works after the first one's `stop()`.
 - Catalog and language errors were read from `moonshine_voice.download._stt_catalog()` and `find_model_info`.
-- Not measured: tail-flush latency after `stop()`, non-English models, Linux behaviour, and a long soak under concurrency. The cause of the differing outputs with two concurrent transcribers is not known.
+- Not measured: tail-flush latency after `stop()`, non-English models, Linux behaviour, a soak under concurrency, and the 16 kHz path. The cause of the differing outputs with two concurrent transcribers is not known; the compared transcriber had already served six streams.
 - The spike left about 310 MB in `~/Library/Caches/moonshine_voice`. The script and venv are in the session scratchpad and are not part of the repo.
+
+### Review 2026-11-14 (run `20261114T215650Z`)
+- Five lenses completed (none fell back to opus); the Contradiction Pass errored with a network error and was not retried, so the envelope is pass A's: raw 52, merged 2, unique 48, 3 Contradiction findings found by the lenses. Full JSON: `.review-plan/latest-claude.json`. The lenses read the plan from disk instead of having it embedded in the prompt.
+- Finding #1 (licence guard, Critical) resolved as a fact: the upstream LICENSE enumerates the non-MIT models exhaustively and every streaming model is MIT, so the guard in Requirements matches it. The stderr notice for non-`en` models is documented.
+- Decisions 1-6 were grilled and accepted; Decision 1 was clarified by the user as "split only if it impacts other models", which holds because the streaming mode changes `server.py` session handling that every backend uses.
+- Findings that apply only to the streaming mode moved to `20261114-feature-moonshine-streaming-mode.md`: #4, 5, 6, 10, 11, 14, 18, 28, 29 and Minor 38, 47, 48, plus the streaming halves of #20, 21 and 27.
+- Mechanical findings applied in this plan: #2, 12, 13, 15 (citations to `snapshot.py`), 19 (full-suite gate), 24, 25, 26, 34, 35, 36, 37, 39, 40, 41, 42-46, 49, 50.
+
+### Review Waivers
+
+(none)
 
 ## Issues & Solutions
 
