@@ -9,6 +9,8 @@ the report table. No audio file is read and no real speech is synthesised.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 
 import numpy as np
@@ -22,10 +24,13 @@ from scripts.benchmark_moonshine_latency import (
     discard_cold,
     format_report,
     frame_bytes,
+    main,
+    measure_stop_flush,
     p50,
     paced_send,
     pcm16_to_float_list,
     resample_pcm16,
+    resolve_auth_token,
     summarise,
 )
 
@@ -209,3 +214,73 @@ def test_format_report_rows_are_sorted_by_length():
 def test_format_report_names_the_backend_and_runs():
     text = format_report({3: 0.2}, None, backend="moonshine", runs=10)
     assert "moonshine" in text and "9" in text and "cold" in text
+
+
+# --- library stop() flush ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def transcriber(monkeypatch, tmp_path):
+    from _fake_moonshine import ModelArch, install
+
+    fake = install(monkeypatch, tmp_path / "cache")
+    return fake, sys.modules["moonshine_voice"].Transcriber("m", ModelArch.MEDIUM_STREAMING)
+
+
+def test_measure_stop_flush_times_a_clean_flush(transcriber):
+    fake, t = transcriber
+    elapsed = measure_stop_flush(t, _tone(0.3), pace=False)
+    assert isinstance(elapsed, float) and elapsed >= 0
+    assert fake.created_streams[-1].closed
+
+
+@pytest.mark.parametrize("after_lines", [False, True])
+def test_measure_stop_flush_fails_the_run_on_an_error_event(transcriber, after_lines):
+    """``Stream.stop()`` (moonshine-voice 0.1.6) swallows a failed final transcription and
+    emits an ``Error`` event instead: that run must fail, never feed the p50 as a fast flush."""
+    fake, t = transcriber
+    fake.error_on_stop = "flush failed"
+    fake.error_after_lines = after_lines
+    with pytest.raises(RuntimeError, match="stop\\(\\) flush reported an error"):
+        measure_stop_flush(t, _tone(0.3), pace=False)
+    assert fake.created_streams[-1].closed
+
+
+# --- auth token: never from argv ------------------------------------------------------------------
+
+
+def test_plaintext_auth_token_flag_is_refused(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--uri", "ws://127.0.0.1:9965/", "--auth-token", "secret"])
+    assert excinfo.value.code == 2
+    assert "secret" not in capsys.readouterr().out
+
+
+def _token_file(tmp_path, text: str) -> str:
+    path = tmp_path / "token"
+    path.write_text(text)
+    os.chmod(path, 0o600)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    ("file_text", "env", "expected"),
+    [
+        (None, None, None),
+        (None, "env-token", "env-token"),
+        ("file-token\n", None, "file-token"),
+        ("file-token\n", "env-token", "file-token"),  # the file wins
+    ],
+)
+def test_resolve_auth_token_is_the_status_probe_policy(
+    tmp_path, monkeypatch, file_text, env, expected
+):
+    """``--auth-token-file`` else ``STT_WS_TOKEN`` (what a client such as the bot sees),
+    never the server-side ``PIPECAT_STT_AUTH_TOKEN``."""
+    monkeypatch.setenv("PIPECAT_STT_AUTH_TOKEN", "server-side-secret")
+    if env is None:
+        monkeypatch.delenv("STT_WS_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("STT_WS_TOKEN", env)
+    token_file = None if file_text is None else _token_file(tmp_path, file_text)
+    assert resolve_auth_token(token_file) == expected

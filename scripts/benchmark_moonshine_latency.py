@@ -212,12 +212,19 @@ def measure_stop_flush(transcriber, pcm: bytes, *, pace: bool) -> float:
     """Seconds spent in ``stream.stop()`` after a (paced) streamed feed of ``pcm``.
 
     ``transcriber`` is a ``moonshine_voice.Transcriber`` on a streaming model.
+    ``stop()`` swallows a failed final transcription and emits an ``Error`` event
+    instead, so a listener records those (as the backend's decode does) and the
+    run raises ``RuntimeError`` rather than reporting a failed flush as a fast one.
     """
+    from moonshine_voice.transcriber import Error  # type: ignore
+
+    errors: list[object] = []
     stream = transcriber.create_stream(update_interval=0.3)
     step = frame_bytes()
-    stream.start()
-    start = time.perf_counter()
     try:
+        stream.add_listener(lambda ev: errors.append(ev) if isinstance(ev, Error) else None)
+        stream.start()
+        start = time.perf_counter()
         for i, off in enumerate(range(0, len(pcm), step)):
             stream.add_audio(pcm16_to_float_list(pcm[off : off + step]), P.AUDIO_SAMPLE_RATE_HZ)
             if pace:
@@ -226,9 +233,15 @@ def measure_stop_flush(transcriber, pcm: bytes, *, pace: bool) -> float:
                     time.sleep(delay)
         t0 = time.perf_counter()
         stream.stop()
-        return time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
     finally:
         stream.close()
+    if errors:
+        cause = getattr(errors[0], "error", None)
+        if cause is not None and not isinstance(cause, BaseException):
+            cause = RuntimeError(str(cause))
+        raise RuntimeError("library stop() flush reported an error") from cause
+    return elapsed
 
 
 def run_stop_flush(
@@ -272,6 +285,14 @@ def build_utterances(
     return {n: cut_utterance(pcm16k, n) for n in lengths}
 
 
+def resolve_auth_token(token_file: str | None) -> str | None:
+    """The bearer token the way ``stt_server status`` resolves it (the client probe
+    policy): ``--auth-token-file``, else ``STT_WS_TOKEN``. Never taken from argv."""
+    from stt_server.__main__ import _resolve_auth_token
+
+    return _resolve_auth_token(token_file, client=True)
+
+
 def _load_streaming_transcriber(arch_name: str):
     from moonshine_voice import Transcriber  # type: ignore
     from moonshine_voice.download import get_model_for_language  # type: ignore
@@ -286,11 +307,17 @@ def main(argv: list[str] | None = None) -> int:
     from stt_server.client import TranscriptionClient
 
     default_arch = DEFAULT_MOONSHINE_MODEL.partition("@")[0]
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    # allow_abbrev=False: the old ``--auth-token <token>`` must fail, not be read as
+    # ``--auth-token-file`` naming a file called ``<token>``.
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--uri", help="ws:// URI of a running moonshine server.")
     target.add_argument("--socket", help="UDS path of a running moonshine server.")
-    parser.add_argument("--auth-token", default=None)
+    parser.add_argument(
+        "--auth-token-file",
+        default=None,
+        help="file holding the bearer token (default: the STT_WS_TOKEN environment variable)",
+    )
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help="runs per length (>= 2)")
     parser.add_argument(
         "--lengths", default=",".join(map(str, DEFAULT_LENGTHS_S)), help="seconds, comma-separated"
@@ -310,11 +337,10 @@ def main(argv: list[str] | None = None) -> int:
     pcm, rate = read_wav_mono_pcm16(args.wav) if args.wav else load_two_cities()
     utterances = build_utterances(pcm, rate, lengths)
     pace = not args.no_pace
+    auth_token = resolve_auth_token(args.auth_token_file)
 
     def make_client():
-        return TranscriptionClient(
-            socket_path=args.socket, uri=args.uri, auth_token=args.auth_token
-        )
+        return TranscriptionClient(socket_path=args.socket, uri=args.uri, auth_token=auth_token)
 
     one_shot_runs = asyncio.run(
         run_one_shot_wire(make_client, utterances, runs=args.runs, pace=pace)
