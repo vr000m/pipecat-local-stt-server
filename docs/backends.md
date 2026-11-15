@@ -90,6 +90,17 @@ Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with
 `prefetch` before installing an agent. Local model paths are not supported.
 
+Removing models: the server never deletes a model. A file that fails its
+CRC32C check is the one exception: `prefetch` removes it and downloads it once
+more. A model you no longer serve stays in the cache, including after a
+`--model` change to another architecture. `prefetch --backend moonshine --model
+<spec> --check --json` reports each model's directory (`path`) and size
+(`size_bytes`) without using the network, so a deployment tool can remove that
+directory. The optional `spelling-<lang>` model sits beside it, outside the
+check. The cache is shared with any other program that uses `moonshine-voice`
+(on macOS, `~/Library/Caches/moonshine_voice`), so removing models is the
+operator's or the supervising tool's job.
+
 Latency: `scripts/benchmark_moonshine_latency.py` measures, against a running
 moonshine server, the p50 from `commit` to `transcription.completed` for 3, 5
 and 10 s utterances fed in real time (JSON key `one_shot_p50_s` with

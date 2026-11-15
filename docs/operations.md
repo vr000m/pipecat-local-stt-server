@@ -411,6 +411,9 @@ and keep it outside the repo.
 the cache without using the network. The event schema, pinned-revision rules,
 local-path validation, and backend-specific constraints are canonical in
 [Prefetching and cache checks](backends.md#prefetching-and-cache-checks).
+The server never deletes cached models. For Moonshine, `prefetch --check --json`
+reports each model's directory and size; see
+[Removing models](backends.md#moonshine) before cleaning the cache.
 
 ## Checking server health
 
