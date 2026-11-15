@@ -17,6 +17,7 @@ endpoints and point the client at the one you want.
 | `parakeet` | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | Writes raw utterance audio (PII) to a private per-process `0700` temporary directory and removes it on close. |
 | `nemotron` | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | Requires `mlx-audio>=0.4.4`; writes raw utterance audio (PII) with the same private temporary-WAV boundary as Parakeet. |
 | `kyutai` | `uv sync --extra kyutai` | `kyutai/stt-1b-en_fr-mlx` | English and French; CC-BY-4.0; Python 3.12; runs from its own `.venv-kyutai` because its MLX pins conflict with the other extras. |
+| `moonshine` | `uv sync --extra moonshine` | `medium-streaming@en` | Moonshine Voice on CPU (ONNX Runtime, no MLX); commit-oriented. `--model` is a spec, not a repo id; see [Moonshine](#moonshine). |
 
 Missing extras fail with an actionable `uv sync --extra <name> --inexact`
 message. `just stt-install kyutai` creates the separate Python 3.12 environment
@@ -46,6 +47,44 @@ Kyutai decodes in memory through `moshi_mlx`. Its extra pins an older MLX stack
 and must not be installed alongside the other MLX extras. Run it through its
 dedicated environment or use `just stt-install kyutai`.
 
+### Moonshine
+
+Moonshine Voice (`moonshine-voice`) runs on CPU and shares the default
+environment. It buffers audio until `end()`, then decodes once and emits one
+`delta` equal to `completed`; the wire protocol is unchanged. The first install
+is `just stt-install moonshine` (port 9965).
+
+`--model` is a spec, `[<arch>][@<lang>[,<lang>...]]`, default
+`medium-streaming@en`. Examples: `medium-streaming@en`, `tiny-streaming@en,es`,
+`@en,es` (first MIT model for each language). The served set is fixed at
+startup; memory is the sum of the listed models, and nothing is downloaded for
+a language outside it. Spec errors fail at start with a `ConfigError`.
+
+Licence guard: only MIT models are served, which means streaming archs for any
+language and non-streaming archs for `en` only. A non-streaming non-`en` arch
+is refused. Models are never shipped or bundled by this project; they come from
+the package's own CDN (`download.moonshine.ai`), not the Hugging Face Hub. The
+library prints a notice on stderr whenever it downloads a model for a non-`en`
+language, naming its non-commercial Moonshine Community License for some
+models. Whether a model's licence suits your use is your call.
+
+Language: Moonshine has no language identification, so a client `auto`, blank
+or missing `language` silently means `en` if served, else the first listed
+language. This departs from the uniform "auto means detect" contract of the
+other backends. A region suffix is stripped (`en-US` is `en`). An unserved
+language is logged as an error and falls back the same way; it never fails the
+request. `ja` and `zh` models are downloadable and servable with
+`--model <arch>@ja`, but carry no verified-support claim, and line texts are
+joined with a space, so their output reads with spaces (known limitation).
+
+Cache and pin: `prefetch --backend moonshine` (and `--check`) uses the
+package's own manifest and verifies each file's CRC32C; it does not use
+`HF_HOME`. The files live under the package's cache directory. There is no
+Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
+`pyproject.toml` fixes the model URLs, so moving it moves the models. Models
+download from a CDN, so a CDN outage blocks a cold start; warm the cache with
+`prefetch` before installing an agent. Local model paths are not supported.
+
 ## Models and revisions
 
 `--model` is passed to the selected backend. When it is unset, the backend uses
@@ -58,7 +97,7 @@ uv run --no-sync python -m stt_server serve --backend mlx \
   --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 ```
 
-The four production defaults are pinned to Hugging Face commits in
+The four Hugging Face defaults (not Moonshine) are pinned to commits in
 `stt_server.backends.PINNED_REVISIONS`. Both `serve` and `prefetch` use those
 pins, so a model repository changing its `main` branch cannot silently change a
 default deployment. A non-default repository ID follows that repository's

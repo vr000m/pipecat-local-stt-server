@@ -83,6 +83,7 @@ Production backends require their optional extra before first use:
 | Parakeet | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` |
 | Nemotron | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` |
 | Kyutai | `just stt-install kyutai` | `kyutai/stt-1b-en_fr-mlx` |
+| Moonshine | `uv sync --extra moonshine` | `medium-streaming@en` (CPU) |
 
 Kyutai needs Python 3.12 and a separate `.venv-kyutai` because its MLX pins
 conflict with the other extras. The defaults are pinned to immutable Hugging

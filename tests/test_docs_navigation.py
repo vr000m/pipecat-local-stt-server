@@ -121,6 +121,7 @@ def test_relocated_contract_tokens_are_preserved() -> None:
         "mlx-community/parakeet-tdt-0.6b-v3",
         "mlx-community/nemotron-3.5-asr-streaming-0.6b",
         "kyutai/stt-1b-en_fr-mlx",
+        "medium-streaming@en",
         "ModelInvalidError",
         "PIPECAT_STT_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
         "PIPECAT_STT_WHISPER_DEGENERATE_TOKEN_RATIO",

@@ -14,7 +14,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [STT LaunchAgents on loopback TCP ports (0.5.0)](20261025-feature-stt-agents-loopback-tcp.md) | Install & Packaging | ✅ Shipped in 0.5.0 (PR #16); token-file auth was checked live on a spare port, the port-collision loop, socket rollback and login persistence were not (follow-up: 0.5.1 plan below) |
 | [Port-squat detection, one smoke entry point and launchd verification (0.5.1)](20261027-feature-stt-squat-detection-unified-smoke.md) | Install & Packaging | ✅ Shipped in 0.5.1 (PR #18); harness ran live, `--agents` decode stub-tested only |
 | [Shorten the README and make focused guides canonical](20261104-docs-readme-restructure.md) | Documentation | ✅ Complete (2026-11-04) |
-| [Moonshine Voice STT backend (multilingual, commit-oriented)](20261114-feature-moonshine-backend.md) | ASR Backends | ⬜ Not started — spike done; reviewed (50 findings, decisions grilled), marker written; ready for `/conduct` |
+| [Moonshine Voice STT backend (multilingual, commit-oriented)](20261114-feature-moonshine-backend.md) | ASR Backends | 🟡 In progress — phase 1 (backend, prefetch, benchmark) done; phase 2 (install and docs wiring) under way |
 | [Moonshine streaming mode](20261114-feature-moonshine-streaming-mode.md) | ASR Backends | ⬜ Not started — blocked on the go/no-go in the Moonshine backend plan |
 
 ## Conventions

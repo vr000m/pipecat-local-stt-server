@@ -7,7 +7,7 @@
 ## Multi-backend operation
 
 Each server process loads exactly **one** backend, pinned at launch via
-`--backend {echo,mlx,parakeet,nemotron,kyutai}`. To run more than one ASR — for example to
+`--backend {echo,mlx,parakeet,nemotron,kyutai,moonshine}`. To run more than one ASR — for example to
 A/B-benchmark Parakeet against Whisper — start a second server process on its
 own endpoint: a **separate port** (the default for agents) or, for a socket
 agent, a separate socket. The V1 wire protocol is unchanged; the only difference
@@ -21,6 +21,7 @@ between two ASRs from the bot's perspective is which endpoint it connects to.
 | parakeet | `pipecat.stt-server.parakeet` | 9765 |
 | nemotron | `pipecat.stt-server.nemotron` | 9865 |
 | kyutai | `pipecat.stt-server.kyutai` | 9665 |
+| moonshine | `pipecat.stt-server.moonshine` | 9965 |
 
 Agents bind loopback TCP (`127.0.0.1:<port>`) by default. A Unix socket is
 opt-in: set `PIPECAT_STT_SOCKET` when running `just stt-install` (see
@@ -42,7 +43,7 @@ PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh install`. The installer
 defaults the port to the backend's canonical one when `PIPECAT_STT_PORT` is
 unset; the `echo` backend has no canonical port and requires one. The installer
 holds the one backend-to-port map: `scripts/install_stt_agent.sh port <backend>`
-(installer backend names: `mlx`, `parakeet`, `nemotron`, `kyutai`) prints it
+(installer backend names: `mlx`, `parakeet`, `nemotron`, `kyutai`, `moonshine`) prints it
 without touching launchd or any file, the justfile asks it rather than keeping a
 copy, and a test checks this table against it.
 `just stt-status <backend>` probes the endpoint in the installed plist (socket
@@ -336,6 +337,7 @@ just stt-install whisper      # 127.0.0.1:9565
 just stt-install parakeet     # 127.0.0.1:9765 — warm the model cache first (below)
 just stt-install nemotron     # 127.0.0.1:9865
 just stt-install kyutai       # 127.0.0.1:9665, own .venv-kyutai
+just stt-install moonshine    # 127.0.0.1:9965, CPU; prefetch first (backends.md#moonshine)
 just stt-list                 # agents, state, pid, live endpoint and backend
 just stt-status               # no argument: same as stt-list
 just stt-status parakeet      # probe the installed plist's endpoint (canonical port 9765 if no plist)

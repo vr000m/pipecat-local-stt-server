@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Moonshine Voice backend** (`--backend moonshine`, extra `moonshine`).
+  CPU ASR (ONNX Runtime, no MLX), commit-oriented, default model
+  `medium-streaming@en`. `--model` is a spec, `[<arch>][@<lang>[,<lang>...]]`,
+  and the served set is fixed at startup. Only MIT models are served (streaming
+  archs for any language, non-streaming for `en`). A client `auto` or blank
+  language means `en` if served, else the first listed. `prefetch` downloads
+  and CRC-checks models through the package's own manifest (not the Hugging
+  Face cache). `just stt-install moonshine` installs a LaunchAgent on port
+  9965. The plist renderer now accepts `@` and `,` in the model value. See
+  `docs/backends.md`.
+
 ## [0.5.1] - 2026-10-30
 
 ### Added
