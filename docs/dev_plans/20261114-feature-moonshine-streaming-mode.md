@@ -44,7 +44,7 @@ Let a streaming-capable backend start decoding at the first `audio.append` of a 
 
 **Impl files:** `stt_server/backend.py, stt_server/server.py, stt_server/__init__.py, stt_server/backends/moonshine.py, docs/protocol.md, docs/architecture.md, docs/backends.md`
 **Test files:** `tests/test_streaming_session.py, tests/test_moonshine_backend.py, tests/test_backend_protocol.py`
-**Test command:** `uv run --inexact pytest -q`
+**Test command:** `uv run --inexact python -m pytest -q`
 **Goal:** Decode overlaps with the incoming audio without any change to wire event shapes or ordering, and without any change for non-streaming backends.
 
 - Commit 1: the `backend.py` hook (documented in the optional-hook block), `server.py` support, status counter handling and the export, tested with a fake streaming backend. Commit 2: flip `streams_during_append` on in `moonshine.py`, so reverting that commit alone restores the commit-oriented behaviour.

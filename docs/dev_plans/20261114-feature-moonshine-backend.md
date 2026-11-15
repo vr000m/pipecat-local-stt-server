@@ -57,7 +57,7 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 
 **Impl files:** `stt_server/backends/moonshine.py, stt_server/backends/__init__.py, stt_server/prefetch.py, stt_server/snapshot.py, pyproject.toml, uv.lock, scripts/benchmark_moonshine_latency.py`
 **Test files:** `tests/test_moonshine_backend.py, tests/test_backend_missing_extra.py, tests/test_backend_registry.py, tests/test_prefetch_cli.py, tests/test_decode_guard.py, tests/test_supervised_cli.py, tests/test_stt_server.py, tests/test_benchmark_moonshine_latency.py`
-**Test command:** `uv run --inexact pytest -q`
+**Test command:** `uv run --inexact python -m pytest -q`
 **Validation cmd:** `uv sync --extra moonshine --inexact && uv run --inexact python -m stt_server prefetch --backend moonshine`
 **Goal:** A client sees the same event shape and error semantics as every other backend (one `delta` equal to `completed`), from a backend that needs no change to session handling, and the shared prefetch path keeps its existing contract.
 
@@ -79,7 +79,7 @@ Add a `moonshine` backend built on the `moonshine-voice` package (MIT streaming 
 
 **Impl files:** `justfile, scripts/install_stt_agent.sh, scripts/render_stt_plist.py, scripts/smoke_launchd.py, docs/backends.md, docs/operations.md, docs/migration.md, docs/contributing.md, README.md, CHANGELOG.md, docs/dev_plans/README.md, .github/workflows/test.yml`
 **Test files:** `tests/test_justfile_recipes.py, tests/test_render_stt_plist.py, tests/test_smoke_launchd.py, tests/test_docs_navigation.py, tests/test_docs_port_caveats.py, tests/test_install_migration.py`
-**Test command:** `uv run --inexact pytest -q`
+**Test command:** `uv run --inexact python -m pytest -q`
 **Goal:** `just stt-install moonshine` works like the other backends, every list that names backends stays in step, and the docs structure tests keep passing.
 
 - **First step (gate): confirm port 9965 with the menu bar app owner.** If it is not confirmed, stop Phase 2.
@@ -251,7 +251,7 @@ Context lifecycle:
 - [ ] Contract tests extended with moonshine rows: `tests/test_decode_guard.py`, `tests/test_supervised_cli.py` (download and model-invalid tagging, `abort()`), `tests/test_stt_server.py` (`_make_backend`, argparse, lazy import: rows added, no existing assertion changed)
 - [ ] Backend-enumeration tests pass (`test_justfile_recipes`, `test_render_stt_plist`, `test_smoke_launchd`, `test_backend_registry`)
 - [ ] Manual: real decode of `moonshine_voice/assets/two_cities.wav` through the running server for en medium-streaming; one non-English model with an operator-supplied clip of a known phrase (the repo has no non-English audio); one decode through an installed LaunchAgent, with the model cache populated and empty
-- [ ] Run the suite with `uv run --inexact` (or `--no-sync`): plain `uv run` prunes the installed backend extras and crash-loops LaunchAgents. `--inexact` is accepted by uv 0.13.8; whether it keeps the extras is confirmed on the first run.
+- [ ] Run the suite with `uv run --inexact` (or `--no-sync`): plain `uv run` prunes the installed backend extras and crash-loops LaunchAgents. `--inexact` is accepted by uv 0.13.8; whether it keeps the extras is confirmed on the first run. Invoke pytest as `python -m pytest`: `uv run --inexact pytest` failed with "Failed to spawn: pytest" in this checkout (2026-11-14), while `uv run --inexact python -m pytest` ran `tests/test_docs_navigation.py` (5 passed).
 - [ ] Run the full suite in the background, not the foreground
 
 ### Test Results
