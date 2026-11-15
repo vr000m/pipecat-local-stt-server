@@ -46,7 +46,7 @@ AUDIT_WRAPPER = Path(__file__).resolve().parent / "_audit_library_reads.py"
 FAKE_UID = str(os.getuid())
 SPARE = "pipecat.stt-server.smoke"
 AGENTS_HOME_WRAPPER = Path(__file__).resolve().parent / "_with_agents_home.py"
-CANONICAL = (9565, 9665, 9765, 9865)
+CANONICAL = (9565, 9665, 9765, 9865, 9965)
 
 # The one "could not read" sentinel (_smoke_lib.UNKNOWN), for the parametrize
 # tables below; the harness's UNKNOWN is this same object.

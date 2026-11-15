@@ -60,7 +60,8 @@ _resolve backend:
       parakeet) label="pipecat.stt-server.parakeet"; bk="parakeet" ;;
       nemotron) label="pipecat.stt-server.nemotron"; bk="nemotron" ;;
       kyutai)   label="pipecat.stt-server.kyutai";   bk="kyutai" ;;
-      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
+      moonshine) label="pipecat.stt-server.moonshine"; bk="moonshine" ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai, moonshine)" >&2; exit 1 ;;
     esac
     # The real installer (not the overridable `script`, which tests point at a
     # delegation stub): its `port` subcommand prints the canonical port and calls
@@ -374,7 +375,8 @@ _agent-python backend:
       parakeet) py={{quote(venv / "bin" / "python")}} ;;
       nemotron) py={{quote(venv / "bin" / "python")}} ;;
       kyutai)   py={{quote(kyutai_venv / "bin" / "python")}} ;;
-      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
+      moonshine) py={{quote(venv / "bin" / "python")}} ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai, moonshine)" >&2; exit 1 ;;
     esac
     printf '%s\n' "${PIPECAT_STT_PYTHON:-$py}"
 
@@ -410,7 +412,8 @@ _ensure-extra backend python='' plist='':
       parakeet) extra="parakeet"; probe="import parakeet_mlx" ;;
       nemotron) extra="nemotron"; probe="from mlx_audio.stt import load" ;;
       kyutai)   extra="kyutai";   probe="import moshi_mlx" ;;
-      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai)" >&2; exit 1 ;;
+      moonshine) extra="moonshine"; probe="import moonshine_voice" ;;
+      *) echo "error: unknown backend '$backend' (valid: whisper, parakeet, nemotron, kyutai, moonshine)" >&2; exit 1 ;;
     esac
     if [[ -n "${PIPECAT_STT_SKIP_DEP_SYNC:-}" ]]; then
       echo "_ensure-extra: PIPECAT_STT_SKIP_DEP_SYNC set — skipping '$extra' extra check"

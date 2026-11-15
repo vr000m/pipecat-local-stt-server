@@ -48,8 +48,9 @@ except ImportError:
 DEFAULT_LABEL = "pipecat.stt-server"
 
 _ABSPATH_RE = re.compile(r"^/[A-Za-z0-9._/+\- @]+$")
-_MODEL_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
-_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron|kyutai)$")
+# `@` and `,` carry the moonshine spec grammar `[<arch>][@<lang>[,<lang>...]]`.
+_MODEL_RE = re.compile(r"^[A-Za-z0-9._/@,\-]+$")
+_BACKEND_RE = re.compile(r"^(echo|mlx|parakeet|nemotron|kyutai|moonshine)$")
 _LABEL_RE = re.compile(r"^[A-Za-z0-9._\-]+$")
 _PORT_RE = re.compile(r"^[0-9]{1,5}$")
 
@@ -164,13 +165,16 @@ def main() -> None:
             )
             sys.exit(2)
     backend = _require(
-        "BACKEND", os.environ.get("BACKEND"), _BACKEND_RE, "echo|mlx|parakeet|nemotron|kyutai"
+        "BACKEND",
+        os.environ.get("BACKEND"),
+        _BACKEND_RE,
+        "echo|mlx|parakeet|nemotron|kyutai|moonshine",
     )
     model = _require(
         "MODEL",
         os.environ.get("MODEL"),
         _MODEL_RE,
-        "alphanumerics / . _ / -",
+        "alphanumerics / . _ / @ , -",
     )
     home = _require("HOME", os.environ.get("HOME"), _ABSPATH_RE, "absolute path")
     log_dir = _require("LOG_DIR", os.environ.get("LOG_DIR"), _ABSPATH_RE, "absolute path")

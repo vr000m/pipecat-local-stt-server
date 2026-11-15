@@ -552,7 +552,13 @@ KYUTAI_DEFAULT_PYTHON = REPO_ROOT / ".venv-kyutai" / "bin" / "python"
 
 # backend -> canonical port (kyutai/echo need an explicit model: the model
 # default is not under test here and the renderer requires a valid one).
-CANONICAL_PORTS = {"mlx": 9565, "parakeet": 9765, "nemotron": 9865, "kyutai": 9665}
+CANONICAL_PORTS = {
+    "mlx": 9565,
+    "parakeet": 9765,
+    "nemotron": 9865,
+    "kyutai": 9665,
+    "moonshine": 9965,
+}
 
 
 def _agents(home: Path) -> Path:
@@ -2661,3 +2667,29 @@ def test_probe_client_token_file_stays_lenient(tmp_path: Path):
     tok.chmod(0o644)
     (tmp_path / "link").symlink_to(tok)
     assert _resolve_auth_token(str(tmp_path / "link"), client=True) == SECRET
+
+
+@pytest.mark.parametrize("model", ["medium-streaming@en", "medium-streaming@en,ja"])
+def test_moonshine_model_spec_passes_installer_model_check(tmp_path: Path, model: str):
+    """``<arch>@<lang>[,<lang>...]`` specs contain ``@`` and ``,``; the
+    installer's model-value character check must let them through."""
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    r = _run_install(
+        tmp_path,
+        stub_dir,
+        env_overrides={"PIPECAT_STT_BACKEND": "moonshine", "PIPECAT_STT_MODEL": model},
+    )
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    args = _rendered(home)["ProgramArguments"]
+    assert "moonshine" in args
+    assert _flag(args, "--model") == model
+    assert _flag(args, "--port") == "9965"
+
+
+def test_moonshine_default_model_install(tmp_path: Path):
+    stub_dir, _ = _make_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    r = _run_install(tmp_path, stub_dir, env_overrides={"PIPECAT_STT_BACKEND": "moonshine"})
+    assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert _flag(_rendered(home)["ProgramArguments"], "--model") == "medium-streaming@en"

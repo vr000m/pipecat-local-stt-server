@@ -50,13 +50,14 @@ RENDERER = REPO_ROOT / "scripts" / "render_stt_plist.py"
 VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 FAKE_UID = "501"
-BACKENDS = ("whisper", "parakeet", "nemotron", "kyutai")
+BACKENDS = ("whisper", "parakeet", "nemotron", "kyutai", "moonshine")
 # backend -> (label, port, installer backend-name)
 EXPECTED = {
     "whisper": ("pipecat.stt-server", 9565, "mlx"),
     "parakeet": ("pipecat.stt-server.parakeet", 9765, "parakeet"),
     "nemotron": ("pipecat.stt-server.nemotron", 9865, "nemotron"),
     "kyutai": ("pipecat.stt-server.kyutai", 9665, "kyutai"),
+    "moonshine": ("pipecat.stt-server.moonshine", 9965, "moonshine"),
 }
 
 pytestmark = pytest.mark.skipif(
@@ -2181,6 +2182,7 @@ def test_ensure_extra_kyutai_present_does_not_sync(tmp_path):
         ("whisper", "mlx", "import mlx_whisper"),
         ("parakeet", "parakeet", "import parakeet_mlx"),
         ("nemotron", "nemotron", "from mlx_audio.stt import load"),
+        ("moonshine", "moonshine", "import moonshine_voice"),
     ],
 )
 def test_ensure_extra_shared_venv_arms_never_touch_kyutai_venv(tmp_path, backend, extra, probe):
@@ -2207,7 +2209,7 @@ def test_ensure_extra_shared_venv_arms_never_touch_kyutai_venv(tmp_path, backend
     assert probe in _read(logs["main"])
 
 
-@pytest.mark.parametrize("backend", ["whisper", "parakeet", "nemotron"])
+@pytest.mark.parametrize("backend", ["whisper", "parakeet", "nemotron", "moonshine"])
 def test_ensure_extra_shared_arms_ignore_ambient_uv_project_environment(tmp_path, backend):
     """Regression: an exported ``UV_PROJECT_ENVIRONMENT`` (e.g. left over from a
     kyutai session) must NOT be inherited by the shared-venv sync, or the extra

@@ -268,7 +268,7 @@ def test_explicit_legacy_label_renders_legacy_label_and_log_paths(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("backend", ["echo", "mlx", "parakeet", "nemotron"])
+@pytest.mark.parametrize("backend", ["echo", "mlx", "parakeet", "nemotron", "moonshine"])
 def test_backend_allowlist_accepts_supported_backends(tmp_path: Path, backend: str):
     """``_BACKEND_RE`` must accept ``echo``, ``mlx``, ``parakeet``, and the new
     ``nemotron``."""
@@ -279,6 +279,8 @@ def test_backend_allowlist_accepts_supported_backends(tmp_path: Path, backend: s
         overrides["MODEL"] = _DEFAULT_PARAKEET_MODEL
     elif backend == "nemotron":
         overrides["MODEL"] = _DEFAULT_NEMOTRON_MODEL
+    elif backend == "moonshine":
+        overrides["MODEL"] = "medium-streaming@en"
     r = _run_render(overrides, dst)
     assert r.returncode == 0, f"backend={backend}: stdout={r.stdout!r} stderr={r.stderr!r}"
     plist = plistlib.loads(dst.read_bytes())
@@ -305,13 +307,16 @@ def test_backend_allowlist_rejects_bogus_backend(tmp_path: Path):
         ("mlx", "mlx-community/whisper-large-v3-turbo"),
         ("parakeet", _DEFAULT_PARAKEET_MODEL),
         ("nemotron", _DEFAULT_NEMOTRON_MODEL),
+        ("moonshine", "medium-streaming@en"),
+        ("moonshine", "medium-streaming@en,ja"),
     ],
 )
 def test_backend_aware_model_default_passes_model_regex(tmp_path: Path, backend: str, model: str):
     """The model id chosen as the backend-aware default must satisfy
     ``_MODEL_RE`` — otherwise a two-agent install with ``KODA_STT_MODEL``
     unset would trip the renderer's allowlist."""
-    dst = tmp_path / f"{backend}-model.plist"
+    slug = "".join(c if c.isalnum() else "_" for c in model)
+    dst = tmp_path / f"{backend}-{slug}-model.plist"
     r = _run_render({"BACKEND": backend, "MODEL": model}, dst)
     assert r.returncode == 0, (
         f"backend={backend} model={model!r} rejected: stdout={r.stdout!r} stderr={r.stderr!r}"
