@@ -20,8 +20,10 @@ cold, run is discarded. This is not an extension of ``benchmark_asr_ab.py``
 is printed or reported; audio never leaves memory.
 
 The pure helpers (``cut_utterance``, ``resample_pcm16``, ``p50``,
-``discard_cold``, ``summarise``, ``format_report``) import without
-``moonshine-voice``; only ``load_two_cities`` and ``measure_stop_flush`` need it.
+``discard_cold``, ``summarise``, ``format_report``, ``parse_lengths``) import
+without ``moonshine-voice``; only ``load_two_cities``, ``measure_stop_flush`` and
+the flush test's transcriber loader need it. A wire run fails (never hangs) on a
+server ``error`` event, and gives up ``TERMINAL_TIMEOUT_S`` after the commit.
 
 Usage:
     uv run --inexact python scripts/benchmark_moonshine_latency.py \\
@@ -35,6 +37,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 import wave
@@ -52,6 +55,8 @@ from stt_server import protocol as P  # noqa: E402
 DEFAULT_LENGTHS_S = (3, 5, 10)
 DEFAULT_RUNS = 10
 FRAME_MS = 100
+#: Upper bound on commit -> terminal event for one run (a 10 s decode takes ~2 s).
+TERMINAL_TIMEOUT_S = 60.0
 _BYTES_PER_SAMPLE = 2
 
 
@@ -169,11 +174,17 @@ async def paced_send(
 
 
 async def measure_one_shot_wire(
-    make_client: Callable[[], object], pcm: bytes, *, pace: bool
+    make_client: Callable[[], object],
+    pcm: bytes,
+    *,
+    pace: bool,
+    timeout_s: float = TERMINAL_TIMEOUT_S,
 ) -> float:
     """Seconds from ``commit`` to ``transcription.completed`` for one utterance.
 
-    Raises ``RuntimeError`` on ``transcription.failed`` or a socket closed early.
+    Raises ``RuntimeError`` on ``transcription.failed``, on a server ``error`` event
+    (e.g. ``BUFFER_EMPTY`` for a commit with no audio), on a socket closed early, or
+    when no terminal event arrives within ``timeout_s`` of the commit.
     """
     client = make_client()
     try:
@@ -182,13 +193,25 @@ async def measure_one_shot_wire(
         await paced_send(client.send_audio, pcm, pace=pace)
         t0 = time.perf_counter()
         await client.commit()
-        async for ev in client.events():
-            etype = ev.get("type")
-            if etype == P.EVT_TRANSCRIPT_COMPLETED:
-                return time.perf_counter() - t0
-            if etype == P.EVT_TRANSCRIPT_FAILED:
-                raise RuntimeError("backend reported transcript.failed")
-        raise RuntimeError("socket closed before a terminal event")
+
+        async def terminal() -> float:
+            async for ev in client.events():
+                etype = ev.get("type")
+                if etype == P.EVT_TRANSCRIPT_COMPLETED:
+                    return time.perf_counter() - t0
+                if etype == P.EVT_TRANSCRIPT_FAILED:
+                    raise RuntimeError("backend reported transcript.failed")
+                if etype == P.EVT_ERROR:
+                    err = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+                    raise RuntimeError(
+                        f"server error {err.get('code', '?')}: {err.get('message', '')}".rstrip()
+                    )
+            raise RuntimeError("socket closed before a terminal event")
+
+        try:
+            return await asyncio.wait_for(terminal(), timeout_s)
+        except TimeoutError:
+            raise RuntimeError(f"no terminal event within {timeout_s:g}s of the commit") from None
     finally:
         await client.close()
 
@@ -277,6 +300,32 @@ def load_two_cities() -> tuple[bytes, int]:
     return read_wav_mono_pcm16(get_assets_path() / "two_cities.wav")
 
 
+def parse_lengths(text: str) -> list[int]:
+    """``"3,5,10"`` -> ``[3, 5, 10]``; ``ValueError`` unless every entry is a positive
+    integer (a 0 s utterance sends no audio, so its commit could never complete)."""
+    out: list[int] = []
+    for raw in text.split(","):
+        if not raw.strip():
+            continue
+        try:
+            n = int(raw)
+        except ValueError:
+            raise ValueError(f"not an integer number of seconds: {raw.strip()!r}") from None
+        if n <= 0:
+            raise ValueError(f"utterance lengths must be positive, got {n}")
+        out.append(n)
+    if not out:
+        raise ValueError("no utterance lengths given")
+    return out
+
+
+def _lengths_arg(text: str) -> list[int]:
+    try:
+        return parse_lengths(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def build_utterances(
     pcm: bytes, rate: int, lengths: Sequence[int] = DEFAULT_LENGTHS_S
 ) -> dict[int, bytes]:
@@ -287,26 +336,35 @@ def build_utterances(
 
 def resolve_auth_token(token_file: str | None) -> str | None:
     """The bearer token the way ``stt_server status`` resolves it (the client probe
-    policy): ``--auth-token-file``, else ``STT_WS_TOKEN``. Never taken from argv."""
-    from stt_server.__main__ import _resolve_auth_token
+    policy): ``--auth-token-file`` (lenient), else ``STT_WS_TOKEN``, never the
+    server-side ``PIPECAT_STT_AUTH_TOKEN``. Never taken from argv. Built from public
+    names like ``benchmark_asr_ab.py``; a test pins it to the CLI's own resolver."""
+    from stt_server.auth import read_token_file
 
-    return _resolve_auth_token(token_file, client=True)
+    if token_file:
+        return read_token_file(token_file, strict=False)
+    return (os.environ.get("STT_WS_TOKEN") or "").strip() or None
 
 
-def _load_streaming_transcriber(arch_name: str):
+def _load_streaming_transcriber(arch_name: str | None):
+    """A ``Transcriber`` for the English model of ``arch_name``, resolved against the
+    live catalog by the backend's own ``resolve_arch`` (licence guard included)."""
     from moonshine_voice import Transcriber  # type: ignore
-    from moonshine_voice.download import get_model_for_language  # type: ignore
-    from moonshine_voice.moonshine_api import ModelArch  # type: ignore
+    from moonshine_voice.download import _stt_catalog, get_model_for_language  # type: ignore
 
-    path, arch = get_model_for_language("en", ModelArch[arch_name.upper().replace("-", "_")])
+    from stt_server.backends.moonshine import resolve_arch
+
+    arch = resolve_arch("en", arch_name, _stt_catalog())
+    path, arch = get_model_for_language("en", arch)
     return Transcriber(path, arch)
 
 
 def main(argv: list[str] | None = None) -> int:
     from stt_server.backends import DEFAULT_MOONSHINE_MODEL
+    from stt_server.backends.moonshine import parse_model_spec
     from stt_server.client import TranscriptionClient
 
-    default_arch = DEFAULT_MOONSHINE_MODEL.partition("@")[0]
+    default_arch, _langs = parse_model_spec(DEFAULT_MOONSHINE_MODEL)
     # allow_abbrev=False: the old ``--auth-token <token>`` must fail, not be read as
     # ``--auth-token-file`` naming a file called ``<token>``.
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], allow_abbrev=False)
@@ -320,7 +378,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS, help="runs per length (>= 2)")
     parser.add_argument(
-        "--lengths", default=",".join(map(str, DEFAULT_LENGTHS_S)), help="seconds, comma-separated"
+        "--lengths",
+        type=_lengths_arg,
+        default=list(DEFAULT_LENGTHS_S),
+        help="seconds, comma-separated positive integers",
     )
     parser.add_argument("--arch", default=default_arch, help="streaming arch for the flush test")
     parser.add_argument(
@@ -332,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.runs < 2:
         parser.error("--runs must be at least 2")
-    lengths = [int(x) for x in args.lengths.split(",") if x.strip()]
+    lengths = args.lengths
 
     pcm, rate = read_wav_mono_pcm16(args.wav) if args.wav else load_two_cities()
     utterances = build_utterances(pcm, rate, lengths)

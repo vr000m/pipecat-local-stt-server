@@ -12,10 +12,12 @@ import asyncio
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from stt_server import protocol as P
 from scripts.benchmark_moonshine_latency import (
     DEFAULT_LENGTHS_S,
     DEFAULT_RUNS,
@@ -25,9 +27,11 @@ from scripts.benchmark_moonshine_latency import (
     format_report,
     frame_bytes,
     main,
+    measure_one_shot_wire,
     measure_stop_flush,
     p50,
     paced_send,
+    parse_lengths,
     pcm16_to_float_list,
     resample_pcm16,
     resolve_auth_token,
@@ -270,6 +274,8 @@ def _token_file(tmp_path, text: str) -> str:
         (None, "env-token", "env-token"),
         ("file-token\n", None, "file-token"),
         ("file-token\n", "env-token", "file-token"),  # the file wins
+        ("\n", "env-token", None),  # an empty file is lenient (no token), as the probe
+        (None, "   ", None),  # a blank env token is unset
     ],
 )
 def test_resolve_auth_token_is_the_status_probe_policy(
@@ -284,3 +290,119 @@ def test_resolve_auth_token_is_the_status_probe_policy(
         monkeypatch.setenv("STT_WS_TOKEN", env)
     token_file = None if file_text is None else _token_file(tmp_path, file_text)
     assert resolve_auth_token(token_file) == expected
+    # The script builds this from public names; pin it to the CLI's own client resolver.
+    from stt_server.__main__ import _resolve_auth_token
+
+    assert resolve_auth_token(token_file) == _resolve_auth_token(token_file, client=True)
+
+
+def test_benchmark_script_imports_no_private_cli_helper():
+    text = Path(__file__).resolve().parent.parent / "scripts" / "benchmark_moonshine_latency.py"
+    assert "stt_server.__main__" not in text.read_text(encoding="utf-8")
+
+
+# --- one-shot wire measurement: every run ends ----------------------------------------------------
+
+
+class _FakeWireClient:
+    """Stands in for ``TranscriptionClient``: yields ``events`` after the commit, then
+    either closes (``hang=False``) or waits forever (``hang=True``)."""
+
+    def __init__(self, events: list[dict], *, hang: bool = False) -> None:
+        self._events = events
+        self._hang = hang
+        self.sent: list[bytes] = []
+        self.committed = False
+        self.closed = False
+
+    async def connect(self) -> None:
+        pass
+
+    async def update_session(self, **_kw) -> None:
+        pass
+
+    async def send_audio(self, chunk: bytes) -> None:
+        self.sent.append(chunk)
+
+    async def commit(self) -> None:
+        self.committed = True
+
+    async def events(self):
+        for ev in self._events:
+            yield ev
+        if self._hang:
+            await asyncio.Event().wait()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def test_measure_one_shot_wire_times_commit_to_completed():
+    client = _FakeWireClient(
+        [{"type": P.EVT_AUDIO_COMMITTED}, {"type": P.EVT_TRANSCRIPT_COMPLETED}]
+    )
+    elapsed = asyncio.run(measure_one_shot_wire(lambda: client, _tone(0.3), pace=False))
+    assert elapsed >= 0 and client.committed and client.closed
+
+
+def test_measure_one_shot_wire_fails_on_a_server_error_event():
+    """A commit with no audio is answered with ``error``/``BUFFER_EMPTY`` and nothing else:
+    the run must fail naming the code, not wait for a ``completed`` that never comes."""
+    error = {
+        "type": P.EVT_ERROR,
+        "error": {"type": "invalid_request_error", "code": "BUFFER_EMPTY", "message": "empty"},
+    }
+    client = _FakeWireClient([error], hang=True)
+
+    async def run():
+        return await asyncio.wait_for(
+            measure_one_shot_wire(lambda: client, b"", pace=False, timeout_s=30), 5
+        )
+
+    with pytest.raises(RuntimeError, match="BUFFER_EMPTY: empty"):
+        asyncio.run(run())
+    assert client.closed
+
+
+def test_measure_one_shot_wire_is_bounded_by_a_timeout():
+    client = _FakeWireClient([{"type": P.EVT_AUDIO_COMMITTED}], hang=True)
+
+    async def run():
+        # the outer bound only keeps a regression from hanging the suite
+        return await asyncio.wait_for(
+            measure_one_shot_wire(lambda: client, _tone(0.1), pace=False, timeout_s=0.2), 5
+        )
+
+    with pytest.raises(RuntimeError, match="no terminal event within"):
+        asyncio.run(run())
+    assert client.closed
+
+
+def test_measure_one_shot_wire_fails_on_transcript_failed_and_early_close():
+    failed = _FakeWireClient([{"type": P.EVT_TRANSCRIPT_FAILED}])
+    with pytest.raises(RuntimeError, match="transcript.failed"):
+        asyncio.run(measure_one_shot_wire(lambda: failed, _tone(0.1), pace=False))
+    closed = _FakeWireClient([])
+    with pytest.raises(RuntimeError, match="socket closed"):
+        asyncio.run(measure_one_shot_wire(lambda: closed, _tone(0.1), pace=False))
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"), [("3,5,10", [3, 5, 10]), (" 5 ", [5]), ("3,,5", [3, 5])]
+)
+def test_parse_lengths_accepts_positive_integers(text, expected):
+    assert parse_lengths(text) == expected
+
+
+@pytest.mark.parametrize("text", ["0", "3,0", "-5", "x", "1.5", "", ","])
+def test_parse_lengths_rejects_anything_else(text):
+    with pytest.raises(ValueError):
+        parse_lengths(text)
+
+
+@pytest.mark.parametrize("lengths", ["0", "3,-1", "abc"])
+def test_cli_rejects_non_positive_lengths_before_any_work(lengths, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--uri", "ws://127.0.0.1:9965/", "--lengths", lengths])
+    assert excinfo.value.code == 2
+    assert "--lengths" in capsys.readouterr().err
