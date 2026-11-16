@@ -1026,3 +1026,45 @@ def test_moonshine_invalid_spec_is_a_config_error(
     code, events, _ = _ms(monkeypatch, capsys, *argv)
     assert code == 1 and events[-1]["code"] == "ConfigError"
     assert fake_moonshine.downloads == []
+
+
+def test_same_named_cwd_dir_is_a_model_name_for_a_backend_without_local_paths(
+    tmp_path, monkeypatch, capsys
+):
+    """``base`` is a moonshine/whisper-style name; a ``./base`` directory in the cwd
+    must not turn it into a local path (serve accepts the same spec)."""
+    (tmp_path / "base").mkdir()
+    monkeypatch.chdir(tmp_path)
+    seen: list[tuple[str, str | None]] = []
+
+    def specs_for(backend, model):
+        seen.append((backend, model))
+        return [
+            PF.SnapshotSpec(
+                "moonshine-voice/base-en",
+                revision="1",
+                check=lambda spec: ("/cache/base", 1),
+                fetch=lambda spec, progress: "/cache/base",
+            )
+        ]
+
+    monkeypatch.setattr(PF, "specs_for", specs_for)
+
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "moonshine", "--model", "base", "--check", "--json"
+    )
+
+    assert code == 0, events
+    assert seen == [("moonshine", "base")]
+
+
+def test_is_local_model_ignores_cwd_names_only_for_backends_without_local_paths(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "base").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert PF.is_local_model("base") is True
+    assert PF.is_local_model("base", backend="mlx") is True
+    assert PF.is_local_model("base", backend="moonshine") is False
+    assert PF.is_local_model("base", backend="kyutai") is False
+    assert PF.is_local_model("./base", backend="moonshine") is True

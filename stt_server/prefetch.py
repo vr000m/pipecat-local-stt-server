@@ -97,9 +97,21 @@ def _validated(spec: SnapshotSpec, path: str | Path, *, what: str) -> SnapshotSp
     return spec
 
 
-def is_local_model(model: str) -> bool:
-    """True when ``model`` names a local path rather than a hub repo id."""
-    return model.startswith(("/", "./", "../", "~")) or Path(model).expanduser().exists()
+def is_local_model(model: str, *, backend: str | None = None) -> bool:
+    """True when ``model`` names a local path rather than a hub repo id.
+
+    A backend whose registry entry has ``local_model_paths=False`` (moonshine,
+    kyutai) takes a model name, never a path, so a bare name that happens to exist
+    in the cwd stays a name; only an explicit path form (``/``, ``./``, ``../``,
+    ``~``) is still read as a path, and ``local_specs_for`` then refuses it."""
+    if model.startswith(("/", "./", "../", "~")):
+        return True
+    from .backends import BACKENDS
+
+    entry = BACKENDS.get(backend) if backend is not None else None
+    if entry is not None and not entry.local_model_paths:
+        return False
+    return Path(model).expanduser().exists()
 
 
 def _module_specs(loaded, model: str | None) -> list[SnapshotSpec]:
@@ -422,7 +434,7 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
         try:
             specs = (
                 local_specs_for(backend, model)
-                if model and is_local_model(model)
+                if model and is_local_model(model, backend=backend)
                 else specs_for(backend, model)
             )
             return (
