@@ -32,6 +32,10 @@ plan index. Append a correction to the earlier README restructuring plan only
 for the changed ownership of security and testing. No runtime, dependency, or
 release changes, commits, or publication are needed for this editing request.
 
+**Scope update (2026-11-16):** The subsequent user requests authorise committing
+the documentation and opening a PR with a visual guide to the split. This
+supersedes the original commit/publication boundary; runtime scope is unchanged.
+
 Use the existing documentation link/anchor, ownership, size, and port checks.
 Review the diff for lost contracts and run the full local test suite. Do not
 install models or modify LaunchAgents to validate prose changes.
