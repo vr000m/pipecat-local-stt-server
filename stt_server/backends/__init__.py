@@ -79,7 +79,8 @@ BACKENDS: dict[str, BackendEntry] = {
         DEFAULT_KYUTAI_MODEL,
         local_model_paths=False,
     ),
-    # Models come from the ``moonshine-voice`` package's CDN, not a local dir.
+    # Weights come from the ``moonshine-voice`` package's CDN (sizes and CRC32C from
+    # its wheel), not a local dir.
     "moonshine": BackendEntry(
         "stt_server.backends.moonshine",
         "MoonshineBackend",

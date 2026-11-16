@@ -84,10 +84,13 @@ joined with a space, so their output reads with spaces (known limitation).
 
 Cache and pin: `prefetch --backend moonshine` (and `--check`) uses the
 package's own manifest and verifies each file's CRC32C; it does not use
-`HF_HOME`. CRC32C detects corruption, not deliberate tampering: the manifest
-and the files both come from `download.moonshine.ai`, so trusting that CDN is
-your call. If a CRC32C cannot be computed (`google-crc32c` not importable),
-`--check` and the repair fail instead of passing. The files live under the
+`HF_HOME`. The pinned wheel supplies the expected sizes and CRC32C values,
+and `download.moonshine.ai` supplies the weights. CRC32C detects corruption
+and a swapped download, but it is not a cryptographic digest, so it does not
+defend against a deliberately crafted file. If a CRC32C cannot be computed (`google-crc32c` not importable),
+`--check` and the repair fail instead of passing. A cached file that vanishes
+during a repair (another prefetch removed it) counts as a cache miss and is
+downloaded again. The files live under the
 package's cache directory. There is no
 Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 `pyproject.toml` fixes the model URLs, so moving it moves the models. Models
@@ -111,7 +114,9 @@ and 10 s utterances fed in real time (JSON key `one_shot_p50_s` with
 `--json-out`), plus the library `stop()` flush after a streamed feed. Run it with
 `uv run --inexact python scripts/benchmark_moonshine_latency.py --uri
 ws://127.0.0.1:9965/` (or `--socket <path>`; token from `--auth-token-file` or
-`STT_WS_TOKEN`).
+`STT_WS_TOKEN`). The run fails on a server `error` event, and after 60 s
+(`TERMINAL_TIMEOUT_S`) if no terminal event arrives. `--lengths` accepts only
+positive integers.
 
 ## Models and revisions
 
