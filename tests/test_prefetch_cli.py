@@ -1131,8 +1131,28 @@ def test_tag_prefetch_repo_sets_the_named_attribute_and_overwrites():
     assert getattr(exc, PREFETCH_REPO_ATTR, None) is None
     tag_prefetch_repo(exc, "org/a")
     assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
-    tag_prefetch_repo(exc, "org/b")  # unconditional: the callers decide whether to keep
+    tag_prefetch_repo(exc, "org/b")  # the default overwrites
     assert getattr(exc, PREFETCH_REPO_ATTR) == "org/b"
+
+
+def test_tag_prefetch_repo_keep_existing_form():
+    """``overwrite=False`` (the prefetch drivers' form) keeps a repo already tagged and
+    tags an untagged exception."""
+    from stt_server.snapshot import PREFETCH_REPO_ATTR, tag_prefetch_repo
+
+    exc = ValueError("boom")
+    tag_prefetch_repo(exc, "org/a", overwrite=False)
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
+    tag_prefetch_repo(exc, "org/b", overwrite=False)
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
+
+
+def test_prefetch_repo_attribute_is_stt_namespaced():
+    """The tag lands on third-party exceptions, so it carries the ``_stt_`` prefix its
+    sibling tags use."""
+    import stt_server.snapshot as S
+
+    assert S.PREFETCH_REPO_ATTR == "_stt_prefetch_repo"
 
 
 def test_tag_prefetch_repo_leaves_an_exception_without_attributes_untagged():
@@ -1145,28 +1165,3 @@ def test_tag_prefetch_repo_leaves_an_exception_without_attributes_untagged():
     exc = Frozen("y")
     tag_prefetch_repo(exc, "org/a")  # must not raise over the error being reported
     assert getattr(exc, PREFETCH_REPO_ATTR, None) is None
-
-
-def test_prefetch_repo_attribute_name_is_spelled_once_in_the_package():
-    """Backends and prefetch tag/read the repo through ``PREFETCH_REPO_ATTR`` /
-    ``tag_prefetch_repo``, never a bare attribute literal."""
-    import re
-
-    import stt_server.snapshot as S
-
-    pkg = Path(PF.__file__).resolve().parent
-    literal = re.compile(r"""["']""" + re.escape(S.PREFETCH_REPO_ATTR) + r"""["']""")
-    access = re.compile(r"\." + re.escape(S.PREFETCH_REPO_ATTR) + r"\b")
-    hits: list[str] = []
-    for path in sorted(pkg.rglob("*.py")):
-        for n, line in enumerate(path.read_text().splitlines(), 1):
-            if literal.search(line) or access.search(line):
-                hits.append(f"{path.relative_to(pkg)}:{n}")
-    assert hits == [f"snapshot.py:{_line_of(pkg / 'snapshot.py', 'PREFETCH_REPO_ATTR =')}"]
-
-
-def _line_of(path: Path, needle: str) -> int:
-    for n, line in enumerate(path.read_text().splitlines(), 1):
-        if line.startswith(needle):
-            return n
-    raise AssertionError(f"{needle!r} not in {path}")

@@ -365,26 +365,17 @@ def test_resolve_arch_licence_guard_over_the_whole_catalog(mod, catalog):
 # --- prefetch validates the whole spec exactly as start() does --------------------
 
 
-def _record_build_served(mod, monkeypatch, *, fail_whole: bool = False):
-    """Wrap ``build_served``: record each call's languages and each exception raised.
-    ``fail_whole`` makes a multi-language call fail while every single language passes
-    (a cross-language rule no per-language call reproduces)."""
+def _record_build_served(mod, monkeypatch):
+    """Wrap ``build_served``: record each call's languages."""
     real = mod.build_served
     calls: list[tuple[str, ...]] = []
-    raised: list[BaseException] = []
 
     def wrapper(langs, arch, catalog):
         calls.append(tuple(langs))
-        try:
-            if fail_whole and len(langs) > 1:
-                raise ConfigError("moonshine: cross-language rule")
-            return real(langs, arch, catalog)
-        except Exception as exc:
-            raised.append(exc)
-            raise
+        return real(langs, arch, catalog)
 
     monkeypatch.setattr(mod, "build_served", wrapper)
-    return calls, raised
+    return calls
 
 
 @pytest.mark.parametrize(
@@ -401,33 +392,60 @@ def test_validated_arch_is_whole_spec_build_served(mod, monkeypatch, languages, 
     ``build_served`` call on the whole tuple, as ``start()`` calls it."""
     download = mod._import_package()[1]
     expected = mod.build_served(languages, requested, download._stt_catalog())
-    calls, _ = _record_build_served(mod, monkeypatch)
+    calls = _record_build_served(mod, monkeypatch)
     for language in languages:
         calls.clear()
         assert mod._validated_arch(download, language, requested, languages) == (expected[language])
         assert calls == [languages]
 
 
-def test_validated_arch_tags_the_first_failing_language_on_the_original_error(mod, monkeypatch):
+@pytest.mark.parametrize(
+    ("languages", "requested", "bad"),
+    [
+        (("en", "xx", "ko"), None, "xx"),  # a later language fails (ko fails too, after it)
+        (("xx", "en"), None, "xx"),  # the first language fails
+        (("en", "es"), "medium-streaming", "es"),
+    ],
+)
+def test_build_served_tags_the_first_failing_language_on_the_original_error(
+    mod, catalog, monkeypatch, languages, requested, bad
+):
+    """``build_served`` (the validator ``start()`` and prefetch share) tags the repo of the
+    first language ``resolve_arch`` refuses on that very exception, and re-raises it with its
+    message untouched (``start()``'s ``ConfigError`` text does not change)."""
     from stt_server.snapshot import PREFETCH_REPO_ATTR
 
-    download = mod._import_package()[1]
-    _, raised = _record_build_served(mod, monkeypatch)
-    with pytest.raises(ConfigError, match="'xx'") as info:
-        mod._validated_arch(download, "en", None, ("en", "xx", "ko"))
-    assert info.value is raised[0], "the whole-spec exception is re-raised unchanged"
-    assert getattr(info.value, PREFETCH_REPO_ATTR) == "moonshine-voice/default-xx"
+    with pytest.raises(ConfigError) as plain:
+        mod.resolve_arch(bad, requested, catalog)
+    real = mod.resolve_arch
+    raised: list[BaseException] = []
+
+    def spy(code, arch, cat):
+        try:
+            return real(code, arch, cat)
+        except Exception as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(mod, "resolve_arch", spy)
+    with pytest.raises(ConfigError) as info:
+        mod.build_served(languages, requested, catalog)
+    assert raised and info.value is raised[0], "the original exception is re-raised"
+    assert len(raised) == 1, "validation stops at the first failing language"
+    assert (
+        getattr(info.value, PREFETCH_REPO_ATTR) == f"moonshine-voice/{requested or 'default'}-{bad}"
+    )
+    assert str(info.value) == str(plain.value), "the refusal's message is unchanged"
 
 
-def test_validated_arch_leaves_a_cross_language_refusal_untagged(mod, monkeypatch):
-    from stt_server.snapshot import PREFETCH_REPO_ATTR
-
-    download = mod._import_package()[1]
-    _, raised = _record_build_served(mod, monkeypatch, fail_whole=True)
-    with pytest.raises(ConfigError, match="cross-language") as info:
-        mod._validated_arch(download, "en", None, ("en", "es"))
-    assert info.value is raised[0]
-    assert getattr(info.value, PREFETCH_REPO_ATTR, None) is None
+async def test_start_refusal_message_is_resolve_arch_s_own(mod, catalog):
+    """``start()`` raises the same ``ConfigError`` text ``resolve_arch`` produces for the
+    failing language (the prefetch tag is invisible to it)."""
+    with pytest.raises(ConfigError) as plain:
+        mod.resolve_arch("ko", None, catalog)
+    with pytest.raises(ConfigError) as info:
+        await _backend(mod, "@en,ko").start()
+    assert str(info.value) == str(plain.value)
 
 
 def test_live_wheel_manifest_directory_matches_the_cached_model():

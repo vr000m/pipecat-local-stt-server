@@ -86,7 +86,7 @@ class SnapshotSpec:
 
 DOWNLOAD_PHASE_ATTR = "_stt_download_phase"
 MODEL_INVALID_ATTR = "_stt_model_invalid"
-PREFETCH_REPO_ATTR = "_prefetch_repo"
+PREFETCH_REPO_ATTR = "_stt_prefetch_repo"
 
 
 def _tag(exc: BaseException, attr: str, value: object = True) -> None:
@@ -107,9 +107,16 @@ def mark_model_invalid(exc: BaseException) -> None:
     _tag(exc, MODEL_INVALID_ATTR)
 
 
-def tag_prefetch_repo(exc: BaseException, repo: str) -> None:
+def tag_prefetch_repo(exc: BaseException, repo: str, *, overwrite: bool = True) -> None:
     """Tag ``exc`` with the repo ``prefetch``'s ``error`` event reports (read back
-    with ``getattr(exc, PREFETCH_REPO_ATTR, None)``). Overwrites any earlier tag."""
+    with ``getattr(exc, PREFETCH_REPO_ATTR, None)``).
+
+    By default it overwrites any earlier tag (the raiser knows the repo). The
+    prefetch drivers pass ``overwrite=False``: a tag a backend already set (the
+    language that failed) wins over the spec being checked or fetched.
+    """
+    if not overwrite and getattr(exc, PREFETCH_REPO_ATTR, None) is not None:
+        return
     _tag(exc, PREFETCH_REPO_ATTR, repo)
 
 

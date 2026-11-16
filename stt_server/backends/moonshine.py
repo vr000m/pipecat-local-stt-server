@@ -175,8 +175,21 @@ def resolve_language(lang: Any, served: Any) -> tuple[str, str | None]:
 
 
 def build_served(langs: tuple[str, ...], arch: str | None, catalog: dict) -> dict[str, Any]:
-    """Language -> catalog ``model_arch`` for every served language (``ConfigError`` if invalid)."""
-    return {code: resolve_arch(code, arch, catalog) for code in langs}
+    """Language -> catalog ``model_arch`` for every served language (``ConfigError`` if invalid).
+
+    The one validator ``start()`` and prefetch share. A refusal is the first failing
+    language's own exception, re-raised unchanged after it is tagged with that
+    language's prefetch repo (prefetch's ``error`` event reports it; ``start()``
+    ignores the tag).
+    """
+    served: dict[str, Any] = {}
+    for code in langs:
+        try:
+            served[code] = resolve_arch(code, arch, catalog)
+        except Exception as exc:
+            tag_prefetch_repo(exc, _spec_repo_id(arch, code))
+            raise
+    return served
 
 
 # --- package access ------------------------------------------------------------
@@ -522,23 +535,10 @@ def _validated_arch(
 
     ``build_served`` is called on the whole ``languages`` tuple, exactly as
     ``start()`` calls it, so a spec serve refuses fails here before any language
-    downloads, not after the earlier ones finished. On a refusal, the first
-    language that fails on its own has its repo tagged on the ORIGINAL exception
-    (prefetch's error event reports it, not the repo whose check/fetch happens to
-    be running); a refusal no single language reproduces stays untagged.
+    downloads, not after the earlier ones finished; its refusal already names the
+    failing language's repo, not the one whose check/fetch happens to be running.
     """
-    catalog = download._stt_catalog()
-    try:
-        served = build_served(languages, requested_arch, catalog)
-    except Exception as exc:
-        for code in languages:
-            try:
-                build_served((code,), requested_arch, catalog)
-            except Exception:
-                tag_prefetch_repo(exc, _spec_repo_id(requested_arch, code))
-                break
-        raise
-    return served[language]
+    return build_served(languages, requested_arch, download._stt_catalog())[language]
 
 
 def _check_model(

@@ -274,8 +274,7 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         except Exception as exc:
             # Keep a repo the backend already tagged (a whole-spec refusal names
             # the language that failed, not the spec being checked).
-            if getattr(exc, PREFETCH_REPO_ATTR, None) is None:
-                tag_prefetch_repo(exc, spec.repo_id)
+            tag_prefetch_repo(exc, spec.repo_id, overwrite=False)
             raise
         if found is not None:
             row.update(cached=True, path=found[0], size_bytes=found[1])
@@ -508,8 +507,7 @@ def _run_fetch(backend: str, model: str | None, specs: list[SnapshotSpec], emit)
             # Origin tags (download vs unusable snapshot) are set where the
             # failure happened inside ``fetch_spec``; only attach the repo here,
             # unless the raiser already named one (see ``check_spec``).
-            if getattr(exc, PREFETCH_REPO_ATTR, None) is None:
-                tag_prefetch_repo(exc, spec.repo_id)
+            tag_prefetch_repo(exc, spec.repo_id, overwrite=False)
             raise
     if emit is not None:
         emit(
