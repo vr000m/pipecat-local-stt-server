@@ -24,12 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `moonshine-voice==0.1.6`; another version fails with a
   `uv sync --extra moonshine --inexact` hint. `just stt-install moonshine`
   installs a LaunchAgent on port 9965. The plist renderer now accepts `@` and
-  `,` in the model value. See `docs/backends.md`.
+  `,` in the model value. A relative `MOONSHINE_VOICE_CACHE` is refused with a
+  `ConfigError`; it must be an absolute path. `prefetch --check --json` reports
+  each model's directory (`path`) and `size_bytes`. A multi-language spec that
+  `serve` refuses (such as `medium-streaming@en,es`) fails before any model
+  downloads. See `docs/backends.md`.
 - `scripts/benchmark_moonshine_latency.py`: paced single-endpoint benchmark of
   the moonshine backend (one-shot commit-to-completed and library `stop()`
   flush at 3, 5 and 10 s; JSON key `one_shot_p50_s`). The auth token comes
   from `--auth-token-file` or `STT_WS_TOKEN`; there is no `--auth-token`
-  argument. A failed `stop()` flush fails the run.
+  argument. A failed `stop()` flush fails the run, as does a server whose
+  `server.hello` does not report the `moonshine` backend.
 - `prefetch` specs (`SnapshotSpec`) take optional `check` and `fetch`
   callables, so a backend whose models do not come from the Hugging Face Hub
   can still use `prefetch` and `--check`. Set `check` and `fetch` together or
