@@ -1119,3 +1119,54 @@ def test_is_local_model_ignores_cwd_names_only_for_backends_without_local_paths(
     assert PF.is_local_model("base", backend="moonshine") is False
     assert PF.is_local_model("base", backend="kyutai") is False
     assert PF.is_local_model("./base", backend="moonshine") is True
+
+
+# --- the prefetch-repo tag: one named attribute, set through one helper -------------
+
+
+def test_tag_prefetch_repo_sets_the_named_attribute_and_overwrites():
+    from stt_server.snapshot import PREFETCH_REPO_ATTR, tag_prefetch_repo
+
+    exc = ValueError("boom")
+    assert getattr(exc, PREFETCH_REPO_ATTR, None) is None
+    tag_prefetch_repo(exc, "org/a")
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
+    tag_prefetch_repo(exc, "org/b")  # unconditional: the callers decide whether to keep
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/b"
+
+
+def test_tag_prefetch_repo_leaves_an_exception_without_attributes_untagged():
+    from stt_server.snapshot import PREFETCH_REPO_ATTR, tag_prefetch_repo
+
+    class Frozen(Exception):
+        def __setattr__(self, name, value):
+            raise AttributeError(name)
+
+    exc = Frozen("y")
+    tag_prefetch_repo(exc, "org/a")  # must not raise over the error being reported
+    assert getattr(exc, PREFETCH_REPO_ATTR, None) is None
+
+
+def test_prefetch_repo_attribute_name_is_spelled_once_in_the_package():
+    """Backends and prefetch tag/read the repo through ``PREFETCH_REPO_ATTR`` /
+    ``tag_prefetch_repo``, never a bare attribute literal."""
+    import re
+
+    import stt_server.snapshot as S
+
+    pkg = Path(PF.__file__).resolve().parent
+    literal = re.compile(r"""["']""" + re.escape(S.PREFETCH_REPO_ATTR) + r"""["']""")
+    access = re.compile(r"\." + re.escape(S.PREFETCH_REPO_ATTR) + r"\b")
+    hits: list[str] = []
+    for path in sorted(pkg.rglob("*.py")):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            if literal.search(line) or access.search(line):
+                hits.append(f"{path.relative_to(pkg)}:{n}")
+    assert hits == [f"snapshot.py:{_line_of(pkg / 'snapshot.py', 'PREFETCH_REPO_ATTR =')}"]
+
+
+def _line_of(path: Path, needle: str) -> int:
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        if line.startswith(needle):
+            return n
+    raise AssertionError(f"{needle!r} not in {path}")

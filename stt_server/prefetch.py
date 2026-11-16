@@ -53,7 +53,14 @@ from .errors import ConfigError, is_config_error
 
 # ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
 # import it from there); re-exported here for existing callers.
-from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
+from .snapshot import (
+    PREFETCH_REPO_ATTR,
+    SnapshotSpec,
+    check_plain_filenames,
+    download_phase,
+    mark_model_invalid,
+    tag_prefetch_repo,
+)
 
 __all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 
@@ -267,8 +274,8 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         except Exception as exc:
             # Keep a repo the backend already tagged (a whole-spec refusal names
             # the language that failed, not the spec being checked).
-            if getattr(exc, "_prefetch_repo", None) is None:
-                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            if getattr(exc, PREFETCH_REPO_ATTR, None) is None:
+                tag_prefetch_repo(exc, spec.repo_id)
             raise
         if found is not None:
             row.update(cached=True, path=found[0], size_bytes=found[1])
@@ -286,7 +293,7 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
             if is_config_error(exc):
                 # A malformed repo id / revision is bad input, not a cache miss:
                 # report ``ConfigError`` exactly as a fetch does.
-                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+                tag_prefetch_repo(exc, spec.repo_id)
                 raise
             logger.debug("prefetch: %s not cached (%s)", spec.repo_id, exc)
             return row
@@ -455,7 +462,7 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
                 message = (
                     f"{message} (prefetch needs huggingface_hub, which every model extra installs)"
                 )
-            repo = getattr(exc, "_prefetch_repo", None)
+            repo = getattr(exc, PREFETCH_REPO_ATTR, None)
             if emit is not None:
                 emit({"event": "error", "code": code, "message": message, "repo": repo})
             else:
@@ -501,8 +508,8 @@ def _run_fetch(backend: str, model: str | None, specs: list[SnapshotSpec], emit)
             # Origin tags (download vs unusable snapshot) are set where the
             # failure happened inside ``fetch_spec``; only attach the repo here,
             # unless the raiser already named one (see ``check_spec``).
-            if getattr(exc, "_prefetch_repo", None) is None:
-                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            if getattr(exc, PREFETCH_REPO_ATTR, None) is None:
+                tag_prefetch_repo(exc, spec.repo_id)
             raise
     if emit is not None:
         emit(

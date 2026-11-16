@@ -46,7 +46,7 @@ from typing import Any
 from ..backend import TranscriptEvent
 from ..errors import ConfigError
 from ..protocol import AUDIO_SAMPLE_RATE_HZ
-from ..snapshot import SnapshotSpec, download_phase, mark_model_invalid
+from ..snapshot import SnapshotSpec, download_phase, mark_model_invalid, tag_prefetch_repo
 from . import DEFAULT_MOONSHINE_MODEL
 from ._thread_util import DecodeGuardMixin
 
@@ -520,21 +520,24 @@ def _validated_arch(
 ) -> Any:
     """The arch for ``language``, after validating the WHOLE spec as serve does.
 
-    ``build_served`` (what ``start()`` calls) checks every listed language, so a
-    spec serve refuses fails here before any language downloads, not after the
-    earlier ones finished. ``build_served`` is applied one language at a time
-    (it validates each language independently) so that a refusal is tagged with
-    the repo of the language that failed (prefetch's error event reports it),
-    not the repo whose check/fetch happens to be running.
+    ``build_served`` is called on the whole ``languages`` tuple, exactly as
+    ``start()`` calls it, so a spec serve refuses fails here before any language
+    downloads, not after the earlier ones finished. On a refusal, the first
+    language that fails on its own has its repo tagged on the ORIGINAL exception
+    (prefetch's error event reports it, not the repo whose check/fetch happens to
+    be running); a refusal no single language reproduces stays untagged.
     """
     catalog = download._stt_catalog()
-    served: dict[str, Any] = {}
-    for code in languages:
-        try:
-            served.update(build_served((code,), requested_arch, catalog))
-        except Exception as exc:
-            exc._prefetch_repo = _spec_repo_id(requested_arch, code)  # type: ignore[attr-defined]
-            raise
+    try:
+        served = build_served(languages, requested_arch, catalog)
+    except Exception as exc:
+        for code in languages:
+            try:
+                build_served((code,), requested_arch, catalog)
+            except Exception:
+                tag_prefetch_repo(exc, _spec_repo_id(requested_arch, code))
+                break
+        raise
     return served[language]
 
 

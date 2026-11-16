@@ -86,11 +86,12 @@ class SnapshotSpec:
 
 DOWNLOAD_PHASE_ATTR = "_stt_download_phase"
 MODEL_INVALID_ATTR = "_stt_model_invalid"
+PREFETCH_REPO_ATTR = "_prefetch_repo"
 
 
-def _tag(exc: BaseException, attr: str) -> None:
+def _tag(exc: BaseException, attr: str, value: object = True) -> None:
     try:
-        setattr(exc, attr, True)
+        setattr(exc, attr, value)
     except AttributeError:  # exotic exception without a __dict__: stay unmarked
         pass
 
@@ -104,6 +105,12 @@ def mark_download_phase(exc: BaseException) -> None:
 def mark_model_invalid(exc: BaseException) -> None:
     """Tag ``exc`` as "the model snapshot is unusable" (``ModelInvalidError``)."""
     _tag(exc, MODEL_INVALID_ATTR)
+
+
+def tag_prefetch_repo(exc: BaseException, repo: str) -> None:
+    """Tag ``exc`` with the repo ``prefetch``'s ``error`` event reports (read back
+    with ``getattr(exc, PREFETCH_REPO_ATTR, None)``). Overwrites any earlier tag."""
+    _tag(exc, PREFETCH_REPO_ATTR, repo)
 
 
 @contextlib.contextmanager

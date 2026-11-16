@@ -298,28 +298,28 @@ def catalog():
     return build_catalog()
 
 
-@pytest.mark.parametrize(
-    ("code", "requested", "expected"),
-    [
-        # omitted arch: first MIT-allowed catalog entry
-        ("en", None, "medium-streaming"),
-        ("es", None, "small-streaming"),
-        ("de", None, "small-streaming"),
-        ("ja", None, "small-streaming"),
-        ("ar", None, "tiny-streaming"),
-        ("zh", None, "tiny-streaming"),
-        ("vi", None, "tiny-streaming"),
-        ("tl", None, "tiny-streaming"),
-        # explicit arch
-        ("en", "small-streaming", "small-streaming"),
-        ("en", "tiny-streaming", "tiny-streaming"),
-        ("en", "base", "base"),  # non-streaming, en: MIT
-        ("en", "tiny", "tiny"),
-        ("es", "tiny-streaming", "tiny-streaming"),
-        ("ja", "small-streaming", "small-streaming"),
-        ("zh", "tiny-streaming", "tiny-streaming"),
-    ],
-)
+_VALID_ARCH_CELLS = [
+    # omitted arch: first MIT-allowed catalog entry
+    ("en", None, "medium-streaming"),
+    ("es", None, "small-streaming"),
+    ("de", None, "small-streaming"),
+    ("ja", None, "small-streaming"),
+    ("ar", None, "tiny-streaming"),
+    ("zh", None, "tiny-streaming"),
+    ("vi", None, "tiny-streaming"),
+    ("tl", None, "tiny-streaming"),
+    # explicit arch
+    ("en", "small-streaming", "small-streaming"),
+    ("en", "tiny-streaming", "tiny-streaming"),
+    ("en", "base", "base"),  # non-streaming, en: MIT
+    ("en", "tiny", "tiny"),
+    ("es", "tiny-streaming", "tiny-streaming"),
+    ("ja", "small-streaming", "small-streaming"),
+    ("zh", "tiny-streaming", "tiny-streaming"),
+]
+
+
+@pytest.mark.parametrize(("code", "requested", "expected"), _VALID_ARCH_CELLS)
 def test_resolve_arch_valid(mod, catalog, code, requested, expected):
     assert arch_name(mod.resolve_arch(code, requested, catalog)) == expected
 
@@ -360,6 +360,74 @@ def test_resolve_arch_licence_guard_over_the_whole_catalog(mod, catalog):
             else:
                 with pytest.raises(ConfigError):
                     mod.resolve_arch(code, name, catalog)
+
+
+# --- prefetch validates the whole spec exactly as start() does --------------------
+
+
+def _record_build_served(mod, monkeypatch, *, fail_whole: bool = False):
+    """Wrap ``build_served``: record each call's languages and each exception raised.
+    ``fail_whole`` makes a multi-language call fail while every single language passes
+    (a cross-language rule no per-language call reproduces)."""
+    real = mod.build_served
+    calls: list[tuple[str, ...]] = []
+    raised: list[BaseException] = []
+
+    def wrapper(langs, arch, catalog):
+        calls.append(tuple(langs))
+        try:
+            if fail_whole and len(langs) > 1:
+                raise ConfigError("moonshine: cross-language rule")
+            return real(langs, arch, catalog)
+        except Exception as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(mod, "build_served", wrapper)
+    return calls, raised
+
+
+@pytest.mark.parametrize(
+    ("languages", "requested"),
+    [((code,), requested) for code, requested, _ in _VALID_ARCH_CELLS]
+    + [
+        (("en", "es", "zh"), "tiny-streaming"),
+        (("en", "es", "ar", "tl"), None),
+        (("ja", "en", "de", "es"), "small-streaming"),
+    ],
+)
+def test_validated_arch_is_whole_spec_build_served(mod, monkeypatch, languages, requested):
+    """Every language's arch is ``build_served(<whole tuple>)[language]``, computed by one
+    ``build_served`` call on the whole tuple, as ``start()`` calls it."""
+    download = mod._import_package()[1]
+    expected = mod.build_served(languages, requested, download._stt_catalog())
+    calls, _ = _record_build_served(mod, monkeypatch)
+    for language in languages:
+        calls.clear()
+        assert mod._validated_arch(download, language, requested, languages) == (expected[language])
+        assert calls == [languages]
+
+
+def test_validated_arch_tags_the_first_failing_language_on_the_original_error(mod, monkeypatch):
+    from stt_server.snapshot import PREFETCH_REPO_ATTR
+
+    download = mod._import_package()[1]
+    _, raised = _record_build_served(mod, monkeypatch)
+    with pytest.raises(ConfigError, match="'xx'") as info:
+        mod._validated_arch(download, "en", None, ("en", "xx", "ko"))
+    assert info.value is raised[0], "the whole-spec exception is re-raised unchanged"
+    assert getattr(info.value, PREFETCH_REPO_ATTR) == "moonshine-voice/default-xx"
+
+
+def test_validated_arch_leaves_a_cross_language_refusal_untagged(mod, monkeypatch):
+    from stt_server.snapshot import PREFETCH_REPO_ATTR
+
+    download = mod._import_package()[1]
+    _, raised = _record_build_served(mod, monkeypatch, fail_whole=True)
+    with pytest.raises(ConfigError, match="cross-language") as info:
+        mod._validated_arch(download, "en", None, ("en", "es"))
+    assert info.value is raised[0]
+    assert getattr(info.value, PREFETCH_REPO_ATTR, None) is None
 
 
 def test_live_wheel_manifest_directory_matches_the_cached_model():
