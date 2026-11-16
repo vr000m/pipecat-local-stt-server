@@ -98,16 +98,16 @@ Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with
 `prefetch` before installing an agent. Local model paths are not supported.
 
-Removing models: the server never deletes a healthy model. A file that fails
-its CRC32C check is the one exception: `prefetch` removes it and downloads it
-once more. A model you no longer serve stays in the cache, including after a
-`--model` change to another architecture. `prefetch --backend moonshine --model
-<spec> --check --json` reports each model's directory (`path`) and size
-(`size_bytes`) without using the network, so a deployment tool can remove that
-directory. The optional `spelling-<lang>` model sits beside it, outside the
-check. The cache is shared with any other program that uses `moonshine-voice`
-(on macOS, `~/Library/Caches/moonshine_voice`), so removing models is the
-operator's or the supervising tool's job.
+Removing models: the server never deletes a healthy model. A same-size cached
+file whose CRC32C does not match is the one exception: `prefetch` removes it
+and downloads it once more. A model you no longer serve stays in the cache,
+including after a `--model` change to another architecture. `prefetch --backend
+moonshine --model <spec> --check --json` reports each model's directory
+(`path`) and size (`size_bytes`) without using the network, so a deployment
+tool can remove that directory. The optional `spelling-<lang>` model sits
+beside it, outside the check. The cache is shared with any other program that
+uses `moonshine-voice` (on macOS, `~/Library/Caches/moonshine_voice`), so
+removing models is the operator's or the supervising tool's job.
 
 Latency: `scripts/benchmark_moonshine_latency.py` measures, against a running
 moonshine server, the p50 from `commit` to `transcription.completed` for 3, 5
@@ -115,10 +115,10 @@ and 10 s utterances fed in real time (JSON key `one_shot_p50_s` with
 `--json-out`), plus the library `stop()` flush after a streamed feed. Run it with
 `uv run --inexact python scripts/benchmark_moonshine_latency.py --uri
 ws://127.0.0.1:9965/` (or `--socket <path>`; token from `--auth-token-file` or
-`STT_WS_TOKEN`). The run refuses a server whose `server.hello` does not report the `moonshine`
-backend, before it sends any audio. It fails on a server `error` event, and after 60 s
-(`TERMINAL_TIMEOUT_S`) if no terminal event arrives. `--lengths` accepts only
-positive integers.
+`STT_WS_TOKEN`). The run refuses a server whose `server.hello` does not report
+the `moonshine` backend, before it sends any audio. It fails on a server
+`error` event, and after 60 s (`TERMINAL_TIMEOUT_S`) if no terminal event
+arrives. `--lengths` accepts only positive integers.
 
 ## Models and revisions
 
