@@ -1,6 +1,6 @@
 # Server architecture
 
-How the server starts, stops and cleans up, and what a supervisor (a menu bar
+How the server starts, stops, and cleans up, and what a supervisor (a menu bar
 app, launchd, a test harness) can rely on. For running it, see
 [Operations](operations.md). For the wire format, see [Protocol](protocol.md).
 
@@ -118,10 +118,12 @@ keeps the lock until it ends.
 continues on stderr; stdout becomes a machine-readable JSON Lines channel:
 
 - After the listener is bound and the model warm-up succeeds, the server emits
-  one `{"event":"ready","backend","model","host","port","socket_path","rate","pid"}`
-  event. With `--port 0`, `port` contains the assigned port.
+  one `ready` event with fields `event`, `backend`, `model`, `host`, `port`,
+  `socket_path`, `rate`, and `pid`. With `--port 0`, `port` contains the
+  assigned port.
 - A fatal startup error emits
-  `{"event":"error","code","message","exc_type"}` and exits with status 1.
+  an `error` event with fields `event`, `code`, `message`, and `exc_type`,
+  then exits with status 1.
 - stdin EOF stops the server like SIGTERM. During non-cancellable model loading,
   the CLI performs safe synchronous cleanup and exits promptly.
 
@@ -155,8 +157,9 @@ different codes. A shared supervisor should treat unknown values as
 
 ## What a supervisor can rely on
 
-- stdout carries only JSON lines. `ready` is printed once, after the listener is
-  bound and the model is warm, and never after a stop has won.
+- The supervisor channel uses JSON Lines; skip non-JSON native-library output.
+  `ready` is printed once, after the listener is bound and the model is warm,
+  and never after a stop has won.
 - A fatal error prints one `error` event with a stable `code` and exits 1.
   See [Stable process error codes](#stable-process-error-codes).
 - stdin EOF and SIGTERM both stop the server. The server exits when its parent

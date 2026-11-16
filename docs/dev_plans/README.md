@@ -16,6 +16,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [Shorten the README and make focused guides canonical](20261104-docs-readme-restructure.md) | Documentation | ✅ Complete (2026-11-04) |
 | [Moonshine Voice STT backend (multilingual, commit-oriented)](20261114-feature-moonshine-backend.md) | ASR Backends | ✅ Shipped in 0.6.0 (PR #21); ja/zh output unverified, streaming mode deferred |
 | [Moonshine streaming mode](20261114-feature-moonshine-streaming-mode.md) | ASR Backends | ⏸️ Deferred, unimplemented — go/no-go rule not met: it needs a 5 s one-shot p50 above 300 ms AND a flush below half of it; the one-shot measured 245 ms, so the flush condition is moot |
+| [Documentation readability and focused operator guides](20261116-docs-readability.md) | Documentation | Complete (2026-11-16) |
 
 ## Conventions
 
