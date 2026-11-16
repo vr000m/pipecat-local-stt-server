@@ -18,7 +18,8 @@ selection, and `prefetch`.
    `SnapshotSpec.required` value is a glob relative to the snapshot root. A
    tuple is a set of alternatives where any one match is sufficient. A backend
    whose weights are not on the Hugging Face Hub (`moonshine`) sets the
-   `SnapshotSpec` `check` and `fetch` callables instead, and `prefetch` calls
+   `SnapshotSpec` `check` and `fetch` callables instead (both or neither;
+   `SnapshotSpec` raises `ValueError` otherwise), and `prefetch` calls
    them without touching `huggingface_hub`. The exact field contract lives in
    `stt_server/snapshot.py`.
 3. **Optional dependency boundary.** Import the backend's optional extra only

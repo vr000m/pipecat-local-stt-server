@@ -746,6 +746,24 @@ def test_hf_specs_keep_no_callables():
             assert spec.check is None and spec.fetch is None
 
 
+def test_snapshot_spec_check_and_fetch_come_as_a_pair():
+    """``prefetch`` treats ``check`` and ``fetch`` as a pair, so one alone is rejected."""
+    from stt_server.snapshot import SnapshotSpec
+
+    def check(spec):
+        return None
+
+    def fetch(spec, progress):
+        return "/x"
+
+    assert SnapshotSpec("a/b", check=check, fetch=fetch).check is check
+    assert SnapshotSpec("a/b").fetch is None
+    with pytest.raises(ValueError, match="both check and fetch"):
+        SnapshotSpec("a/b", check=check)
+    with pytest.raises(ValueError, match="both check and fetch"):
+        SnapshotSpec("a/b", fetch=fetch)
+
+
 def test_moonshine_uncached_then_cached(fake_moonshine, monkeypatch, capsys):
     code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
     assert code == 0

@@ -54,7 +54,7 @@ class SnapshotSpec:
     #: with ``fnmatch``.
     resolve: Callable[[dict], tuple[str, ...]] | None = None
     #: For backends whose weights do not come from the Hugging Face Hub
-    #: (``moonshine``: the package's own CDN and manifest). When set, ``prefetch``
+    #: (``moonshine``: the package's own CDN for weights, its wheel's manifest for sizes and CRC32C). When set, ``prefetch``
     #: calls it instead of the Hub probe: it is given this spec and returns
     #: ``(path, size_bytes)`` of a complete snapshot, or ``None`` when files are
     #: missing or incomplete. A snapshot that is present but corrupt raises an
@@ -76,6 +76,12 @@ class SnapshotSpec:
         ]
         | None
     ) = None
+
+    def __post_init__(self) -> None:
+        # ``prefetch`` picks the check and the fetch path independently, so a spec
+        # with only one would send the other down the Hugging Face path.
+        if (self.check is None) != (self.fetch is None):
+            raise ValueError(f"SnapshotSpec {self.repo_id!r}: set both check and fetch, or neither")
 
 
 DOWNLOAD_PHASE_ATTR = "_stt_download_phase"
