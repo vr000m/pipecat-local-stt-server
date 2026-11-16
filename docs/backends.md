@@ -91,7 +91,8 @@ defend against a deliberately crafted file. If a CRC32C cannot be computed (`goo
 `--check` and the repair fail instead of passing. A cached file that vanishes
 during a repair (another prefetch removed it) counts as a cache miss and is
 downloaded again. The files live under the
-package's cache directory. There is no
+package's cache directory. If you set `MOONSHINE_VOICE_CACHE`, it must be an
+absolute path; a relative one is refused. There is no
 Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 `pyproject.toml` fixes the model URLs, so moving it moves the models. Models
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with

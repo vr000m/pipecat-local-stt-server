@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   argument. A failed `stop()` flush fails the run.
 - `prefetch` specs (`SnapshotSpec`) take optional `check` and `fetch`
   callables, so a backend whose models do not come from the Hugging Face Hub
-  can still use `prefetch` and `--check`.
+  can still use `prefetch` and `--check`. Set `check` and `fetch` together or
+  leave both unset; `SnapshotSpec` raises `ValueError` otherwise.
 - The Linux client CI job runs `tests/test_moonshine_backend.py`.
 
 ## [0.5.1] - 2026-10-30
