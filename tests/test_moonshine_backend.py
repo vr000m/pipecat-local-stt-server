@@ -1505,3 +1505,38 @@ def test_fetch_fails_clearly_when_the_library_serves_another_directory(mod, fake
         spec.fetch(spec, None)
     msg = str(excinfo.value)
     assert str(elsewhere) in msg and str(fake.group_dir("en", _ARCH)) in msg
+
+
+# --- a relative MOONSHINE_VOICE_CACHE is refused (the library doubles the prefix) ----
+
+
+@pytest.fixture
+def relative_cache(monkeypatch):
+    monkeypatch.setenv("MOONSHINE_VOICE_CACHE", "review-model-cache")
+
+
+def test_relative_cache_root_is_refused_by_check(mod, fake, relative_cache):
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    with pytest.raises(ConfigError, match="MOONSHINE_VOICE_CACHE.*absolute"):
+        spec.check(spec)
+    assert fake.downloads == []
+
+
+def test_relative_cache_root_is_refused_by_fetch(mod, fake, relative_cache):
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    with pytest.raises(ConfigError, match="MOONSHINE_VOICE_CACHE.*absolute"):
+        spec.fetch(spec, None)
+    assert fake.downloads == []
+
+
+async def test_relative_cache_root_is_refused_by_start(mod, fake, relative_cache):
+    with pytest.raises(ConfigError, match="MOONSHINE_VOICE_CACHE.*absolute"):
+        await _backend(mod).start()
+
+
+async def test_absolute_cache_root_still_works(mod, fake, monkeypatch, tmp_path):
+    monkeypatch.setenv("MOONSHINE_VOICE_CACHE", str(tmp_path / "abs-cache"))
+    await _backend(mod).start()
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    root = spec.fetch(spec, None)
+    assert Path(root).is_absolute() and spec.check(spec)[0] == root

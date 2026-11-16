@@ -37,6 +37,7 @@ import asyncio
 import contextlib
 import functools
 import logging
+import os
 import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -344,6 +345,7 @@ class MoonshineBackend(DecodeGuardMixin):
             if self._configured:
                 return
             _, download = _import_package()
+            _cache_root(download)
             arch, langs = parse_model_spec(self._model_id)
             served = build_served(langs, arch, download._stt_catalog())
             self._served = served
@@ -412,6 +414,24 @@ class MoonshineBackend(DecodeGuardMixin):
 # --- prefetch ------------------------------------------------------------------
 
 
+def _cache_root(download: Any) -> Path:
+    """The library's model cache root, which must be absolute.
+
+    The library joins a relative ``MOONSHINE_VOICE_CACHE`` onto itself twice
+    (``download_model`` prepends the cache dir to a path that already has it), so
+    a download lands under ``<cache>/<cache>/...`` while the manifest path and the
+    path serve loads from name it once. ``--check``, fetch and ``start()`` all
+    derive the root here, so a relative value is refused up front.
+    """
+    root = Path(download._cache_root_dir(None))
+    if not root.is_absolute():
+        raise ConfigError(
+            f"MOONSHINE_VOICE_CACHE={os.environ.get('MOONSHINE_VOICE_CACHE')!r} is a "
+            "relative path; it must be an absolute path"
+        )
+    return root
+
+
 def _model_manifest(download: Any, code: str, arch: Any) -> tuple[Path, list[dict]]:
     """``(model root dir, files)`` from the package's own manifest.
 
@@ -428,7 +448,7 @@ def _model_manifest(download: Any, code: str, arch: Any) -> tuple[Path, list[dic
     """
     # An empty manifest raises the library's own error here, as it would in serve.
     group = download._primary_stt_group(download.find_model_info(code, arch))
-    root = Path(download._cache_root_dir(None)) / group["base_url"].replace("https://", "")
+    root = _cache_root(download) / group["base_url"].replace("https://", "")
     return root, list(group.get("files", []))
 
 
