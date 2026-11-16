@@ -1,6 +1,6 @@
 # Task: Moonshine Voice STT backend (multilingual, commit-oriented)
 
-**Status**: In Progress
+**Status**: Shipped in 0.6.0 (PR #21; two review gauntlets converged, full suite 2951 passed and CI green on the PR head)
 **Component**: ASR Backends
 **Assigned to**: Varun Singh
 **Priority**: Medium
