@@ -880,13 +880,18 @@ def test_moonshine_prefetch_repairs_a_size_matching_corrupt_file_once(
 def test_moonshine_prefetch_still_corrupt_after_one_redownload_names_the_path(
     fake_moonshine, monkeypatch, capsys
 ):
+    """The library's post-download CRC32C check raises naming only the file name (and
+    leaves nothing on disk); prefetch's error names the full destination path."""
     root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
     fake_moonshine.corrupt_downloads = True  # the CDN copy is bad too
     code, events, _ = _ms(monkeypatch, capsys, "--json")
     assert code == 1
     assert events[-1]["event"] == "error" and events[-1]["code"] == "ModelInvalidError"
     assert events[-1]["repo"] == _MS_DEFAULT_REPO
-    assert str(root) in events[-1]["message"], "the corrupt file's path is named"
+    # the first file the download reaches; every cached file was corrupt and removed
+    assert str(root / "encoder.onnx") in events[-1]["message"], "the full path is named"
+    assert "CRC32C mismatch for encoder.onnx" in events[-1]["message"]
+    assert not (root / "encoder.onnx").exists(), "the bad copy is never kept"
     assert fake_moonshine.downloads == [("en", "medium-streaming")], "one re-download, no loop"
 
 

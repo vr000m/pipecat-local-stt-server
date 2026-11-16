@@ -208,16 +208,6 @@ def _import_package():
     return moonshine_voice, download
 
 
-def _package_version() -> str:
-    """The installed ``moonshine-voice`` version (the pin), without importing it."""
-    from importlib import metadata
-
-    try:
-        return metadata.version("moonshine-voice")
-    except metadata.PackageNotFoundError:
-        return MOONSHINE_VOICE_VERSION
-
-
 # --- backend -------------------------------------------------------------------
 
 
@@ -425,18 +415,20 @@ class MoonshineBackend(DecodeGuardMixin):
 def _model_manifest(download: Any, code: str, arch: Any) -> tuple[Path, list[dict]]:
     """``(model root dir, files)`` from the package's own manifest.
 
-    Mirrors ``download._download_manifest_group``: the root is the cache dir plus
-    ``base_url`` without its scheme, and each file carries ``name``, ``size`` and
-    a base64 CRC32C. Directory names (dated or not) are never hard-coded.
+    The one derivation ``--check`` (``_check_model``) and prefetch
+    (``_fetch_model``) share, built from the same library calls serve's
+    ``get_model_for_language(code, arch)`` makes, without downloading:
+    ``find_model_info`` -> ``_primary_stt_group`` for the group, and
+    ``_cache_root_dir(None)`` for the cache root. Only the final join is
+    restated, because the library does it inline in ``_download_manifest_group``
+    (which downloads): cache root plus ``base_url`` without its scheme. Each file
+    carries ``name``, ``size`` and a base64 CRC32C. Directory names (dated or
+    not) are never hard-coded. ``_fetch_model`` still compares the result with
+    the path the library returns.
     """
-    from moonshine_voice.download_file import get_cache_dir  # type: ignore
-
-    manifest = download._stt_dependency_manifest(code, arch)
-    groups = manifest.get("groups", [])
-    if not groups:
-        raise ConfigError(f"moonshine: empty download manifest for {code!r}")
-    group = groups[0]
-    root = Path(get_cache_dir()) / group["base_url"].replace("https://", "")
+    # An empty manifest raises the library's own error here, as it would in serve.
+    group = download._primary_stt_group(download.find_model_info(code, arch))
+    root = Path(download._cache_root_dir(None)) / group["base_url"].replace("https://", "")
     return root, list(group.get("files", []))
 
 
@@ -471,7 +463,12 @@ def _file_state(path: Path, info: dict) -> str:
     expected = info.get("size")
     if isinstance(expected, int) and expected >= 0 and size != expected:
         return "incomplete"
-    if _crc_mismatch(path, info):
+    try:
+        corrupt = _crc_mismatch(path, info)
+    except FileNotFoundError:
+        # Removed after the stat by a concurrent prefetch's locked repair or download.
+        return "missing"
+    if corrupt:
         exc = ValueError(f"CRC32C mismatch for {path}: cached file is corrupt")
         mark_model_invalid(exc)
         raise exc
@@ -527,11 +524,23 @@ def _fetch_model(
 
     # Self-repair, once: the library's cache fast path accepts a size match, so a
     # same-size file with a bad CRC32C would never be re-downloaded. Delete it so
-    # the download below fetches it again; if it is still bad afterwards, the
-    # final verification raises ``ModelInvalidError`` naming the path.
+    # the download below fetches it again. If the fresh copy is bad too, the
+    # library's post-download check raises (naming only the file, and leaving
+    # nothing on disk); that is re-raised below as ``ModelInvalidError`` naming
+    # the full path.
     for info in files:
         path = root / info["name"]
-        if have(info) and _crc_mismatch(path, info):
+        if not have(info):
+            continue
+        # This unlocked read is only a hint: a concurrent prefetch may remove or
+        # replace the file at any point, so a file that vanished is a cache miss
+        # (the download below fetches it) and the delete is rechecked under the
+        # library's lock in ``_remove_if_still_corrupt``.
+        try:
+            corrupt = _crc_mismatch(path, info)
+        except FileNotFoundError:
+            continue
+        if corrupt:
             _remove_if_still_corrupt(path, info)
     pending = [info for info in files if not have(info)]
     total = sum(int(i.get("size") or 0) for i in pending)
@@ -568,10 +577,16 @@ def _fetch_model(
         try:
             served_path, _ = download.get_model_for_language(language, arch)
         except ValueError as exc:
-            # The library verifies size/CRC32C after a fresh download.
-            if "mismatch" in str(exc):
-                mark_model_invalid(exc)
-            raise
+            # The library verifies size/CRC32C after a fresh download and raises
+            # ``ValueError("<kind> mismatch for <file name>: ...")``, deleting the
+            # bad copy. Name the full destination so the operator can find it.
+            if "mismatch" not in str(exc):
+                raise
+            named = [i["name"] for i in files if f" for {i['name']}:" in str(exc)]
+            where = root / named[0] if named else root
+            invalid = ValueError(f"moonshine {language}: {exc} (downloading to {where})")
+            mark_model_invalid(invalid)
+            raise invalid from exc
     finally:
         done.set()
         if reporter is not None:
@@ -604,11 +619,12 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     import the package lazily and derive completeness from its own manifest.
     """
     arch, langs = parse_model_spec(model or DEFAULT_MOONSHINE_MODEL)
-    version = _package_version()
     return [
         SnapshotSpec(
             f"moonshine-voice/{arch or 'default'}-{code}",
-            revision=version,
+            # The pin itself, as hub backends report their pinned revision; any
+            # other installed version is refused by ``_import_package``.
+            revision=MOONSHINE_VOICE_VERSION,
             check=functools.partial(_check_model, language=code, requested_arch=arch),
             fetch=functools.partial(_fetch_model, language=code, requested_arch=arch),
         )

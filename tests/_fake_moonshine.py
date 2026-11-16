@@ -394,7 +394,10 @@ def install(monkeypatch, cache_root: Path) -> FakeMoonshine:
         return st.group(model_info["language"], model_info["model_arch"])
 
     def _cache_root_dir(cache_root_arg: Any = None) -> Path:
-        return Path(cache_root_arg) if cache_root_arg else st.cache_root
+        # As the real one: an explicit root, else ``download_file.get_cache_dir()``.
+        if cache_root_arg is not None:
+            return Path(cache_root_arg).resolve()
+        return Path(os.environ.get("MOONSHINE_VOICE_CACHE", st.cache_root))
 
     def download_model_from_info(model_info: dict, *, cache_root=None, on_progress=None, **_kw):
         language, arch = model_info["language"], model_info["model_arch"]
@@ -403,7 +406,7 @@ def install(monkeypatch, cache_root: Path) -> FakeMoonshine:
         st.downloads.append((language, arch_name(arch)))
         total = max(1, st.total_size(language, arch))
         done = 0
-        root = Path(_cache_root_dir(cache_root))
+        root = Path(dl._cache_root_dir(cache_root))  # a module-global lookup, as the real one
         target = root / st.group(language, arch)["base_url"].replace("https://", "")
         target.mkdir(parents=True, exist_ok=True)
         for f in st.group(language, arch)["files"]:
@@ -414,6 +417,13 @@ def install(monkeypatch, cache_root: Path) -> FakeMoonshine:
             # The real library's cache fast path is size-only (CRC32C is checked only
             # after a fresh download): a same-size corrupt file is kept as it is.
             if not (dest.is_file() and dest.stat().st_size == len(data)):
+                # ``download_file`` after a fresh download: a bad CRC32C deletes the
+                # temp copy (``dest`` is never written) and raises naming only the file.
+                actual = crc32c_b64(data)
+                if actual != f["checksum"]:
+                    raise ValueError(
+                        f"CRC32C mismatch for {f['name']}: expected {f['checksum']}, got {actual}"
+                    )
                 dest.write_bytes(data)
             done += f["size"]
             if on_progress is not None:
@@ -513,7 +523,7 @@ class _ThreadFileLock:
         self._lock.acquire()
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self._lock.release()
 
 

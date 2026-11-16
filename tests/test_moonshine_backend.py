@@ -1202,7 +1202,7 @@ def _justfile_moonshine_probe() -> str:
     import re
 
     text = (Path(__file__).resolve().parent.parent / "justfile").read_text()
-    m = re.search(r'^\s*moonshine\)\s*extra="moonshine";\s*probe="([^"]*)"', text, re.M)
+    m = re.search(r'^\s*moonshine\)\s*extra="moonshine";\s*probe="([^"]*)"', text, re.MULTILINE)
     assert m, "justfile _ensure-extra has no moonshine probe"
     return m.group(1)
 
@@ -1424,6 +1424,68 @@ def test_fetch_survives_a_concurrent_repair_of_the_same_file(mod, fake, monkeypa
     assert spec.fetch(spec, None) == str(root)
     assert (root / _NAME).read_bytes() == good
     assert spec.check(spec) == (str(root), fake.total_size("en", _ARCH))
+
+
+def _race_on_first_crc_read(fake, monkeypatch, other: str) -> None:
+    """Between the size check and the CRC32C read of ``_NAME``, another prefetch
+    leaves the file ``other``: "present" (untouched), "vanishes" (its locked
+    repair removed it) or "replaced" (its download renamed a good copy in)."""
+    dfile = sys.modules["moonshine_voice.download_file"]
+    real = dfile.crc32c_file
+    fired: list[bool] = []
+
+    def racing(path):
+        if Path(path).name == _NAME and not fired:
+            fired.append(True)
+            if other == "vanishes":
+                Path(path).unlink()
+            elif other == "replaced":
+                Path(path).write_bytes(fake.file_bytes("en", _ARCH, _NAME))
+        return real(path)
+
+    monkeypatch.setattr(dfile, "crc32c_file", racing)
+
+
+@pytest.mark.parametrize("other", ["present", "vanishes", "replaced"])
+def test_fetch_survives_the_file_changing_before_its_unlocked_crc_read(
+    mod, fake, monkeypatch, other
+):
+    """The repair's first CRC32C read runs outside the lock: a file that vanishes
+    after its size check is a cache miss (re-downloaded), never a ``FileNotFoundError``."""
+    root = Path(fake.write_model("en", _ARCH, corrupt=True))
+    _race_on_first_crc_read(fake, monkeypatch, other)
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    assert spec.fetch(spec, None) == str(root)
+    assert (root / _NAME).read_bytes() == fake.file_bytes("en", _ARCH, _NAME)
+    assert spec.check(spec) == (str(root), fake.total_size("en", _ARCH))
+
+
+@pytest.mark.parametrize(("other", "expected"), [("vanishes", "missing"), ("replaced", "ok")])
+def test_file_state_treats_a_file_changing_before_its_crc_read_as_its_new_state(
+    mod, fake, monkeypatch, other, expected
+):
+    """``--check`` reads without the lock too: a file removed between the stat and the
+    CRC32C read is ``missing`` (not cached), never a ``FileNotFoundError``."""
+    path = fake.group_dir("en", _ARCH) / _NAME
+    _place(fake, path, "crc_bad")
+    _race_on_first_crc_read(fake, monkeypatch, other)
+    assert mod._file_state(path, _info(fake)) == expected
+
+
+def test_check_derives_the_model_directory_the_way_serve_does(mod, fake, monkeypatch):
+    """``--check`` (the readiness signal) and prefetch take the cache root and the
+    manifest group from the same library calls ``get_model_for_language`` makes, so
+    a library-side change to either moves the checked directory with the served one."""
+    dl = sys.modules["moonshine_voice.download"]
+    real_root = dl._cache_root_dir
+    moved = fake.cache_root / "moved-root"
+    monkeypatch.setattr(
+        dl, "_cache_root_dir", lambda arg=None: moved if arg is None else real_root(arg)
+    )
+    served, _ = dl.get_model_for_language("en", _ARCH)
+    (spec,) = mod.prefetch_specs("medium-streaming@en")
+    assert spec.check(spec) == (served, fake.total_size("en", _ARCH))
+    assert Path(served).is_relative_to(moved)
 
 
 def test_fetch_fails_clearly_when_the_library_serves_another_directory(mod, fake, monkeypatch):
