@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ConfigError`; it must be an absolute path. `prefetch --check --json` reports
   each model's directory (`path`) and `size_bytes`. A multi-language spec that
   `serve` refuses (such as `medium-streaming@en,es`) fails before any model
-  downloads. See `docs/backends.md`.
+  downloads, and its prefetch `error` event's `repo` names the failing
+  language (`moonshine-voice/<arch>-<lang>`, `default` for an omitted arch).
+  See `docs/backends.md`.
 - `scripts/benchmark_moonshine_latency.py`: paced single-endpoint benchmark of
   the moonshine backend (one-shot commit-to-completed and library `stop()`
   flush at 3, 5 and 10 s; JSON key `one_shot_p50_s`). The auth token comes

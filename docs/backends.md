@@ -92,7 +92,7 @@ defend against a deliberately crafted file. If a CRC32C cannot be computed (`goo
 during a repair (another prefetch removed it) counts as a cache miss and is
 downloaded again. The files live under the
 package's cache directory. If you set `MOONSHINE_VOICE_CACHE`, it must be an
-absolute path; a relative one is refused. There is no
+absolute path; a relative one is refused with a `ConfigError`. There is no
 Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 `pyproject.toml` fixes the model URLs, so moving it moves the models. Models
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with
@@ -198,6 +198,11 @@ answer. With `--json`, stdout contains one event per line:
 | `check` | `repo`, `revision`, `kind`, `required`, `cached`, `path`, `size_bytes` |
 | `summary` | `backend`, `model`, `cached`, `size_bytes` |
 | `error` | `code`, `message`, `repo` |
+
+For a moonshine multi-language spec that `serve` refuses, the `error` event's
+`repo` names the language that fails, as `moonshine-voice/<arch>-<lang>`
+(`default` for an omitted arch), such as `moonshine-voice/medium-streaming-es`
+for `medium-streaming@en,es`.
 
 Progress counts only files this run must download. Cached files are excluded
 from `total_bytes` and `files_total`; resumed partial bytes count toward
