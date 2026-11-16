@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -17,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from stt_server import protocol as P
 from scripts.benchmark_moonshine_latency import (
     DEFAULT_LENGTHS_S,
     DEFAULT_RUNS,
@@ -35,8 +35,10 @@ from scripts.benchmark_moonshine_latency import (
     pcm16_to_float_list,
     resample_pcm16,
     resolve_auth_token,
+    run_one_shot_wire,
     summarise,
 )
+from stt_server import protocol as P
 
 _RATE = 16_000
 
@@ -400,6 +402,40 @@ def test_measure_one_shot_wire_refuses_a_server_that_is_not_moonshine(hello):
     with pytest.raises(RuntimeError, match=r"reports backend .*expected 'moonshine'"):
         asyncio.run(measure_one_shot_wire(lambda: client, _tone(0.3), pace=False))
     assert client.sent == [] and not client.committed and client.closed
+
+
+def test_refusal_names_the_endpoint_the_caller_passes():
+    """The label comes from the caller (``main()``'s ``--uri``/``--socket``), not from the
+    client's private attributes."""
+    client = _FakeWireClient([], hello={"backend": {"name": "whisper"}})
+    with pytest.raises(RuntimeError, match=r"^endpoint ws://127\.0\.0\.1:9 reports backend"):
+        asyncio.run(
+            measure_one_shot_wire(
+                lambda: client, _tone(0.1), pace=False, endpoint="ws://127.0.0.1:9"
+            )
+        )
+    client = _FakeWireClient([], hello={"backend": {"name": "whisper"}})
+    with pytest.raises(RuntimeError, match=r"^endpoint /tmp/stt\.sock reports backend"):
+        asyncio.run(
+            run_one_shot_wire(
+                lambda: client, {1: _tone(0.1)}, runs=1, pace=False, endpoint="/tmp/stt.sock"
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"), [("--uri", "ws://127.0.0.1:9965/"), ("--socket", "/tmp/stt.sock")]
+)
+def test_cli_refusal_names_the_uri_or_socket_given(monkeypatch, flag, value):
+    import scripts.benchmark_moonshine_latency as B
+    import stt_server.client as C
+
+    monkeypatch.setattr(B, "load_two_cities", lambda: (_tone(2.0), _RATE))
+    monkeypatch.setattr(
+        C, "TranscriptionClient", lambda **_kw: _FakeWireClient([], hello={"backend": None})
+    )
+    with pytest.raises(RuntimeError, match=rf"^endpoint {re.escape(value)} reports backend"):
+        main([flag, value, "--lengths", "1", "--skip-flush"])
 
 
 @pytest.mark.parametrize(

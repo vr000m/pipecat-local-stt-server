@@ -176,19 +176,17 @@ async def paced_send(
 EXPECTED_BACKEND = "moonshine"
 
 
-async def connect_moonshine(client) -> dict:
+async def connect_moonshine(client, *, endpoint: str = "<endpoint>") -> dict:
     """Connect ``client`` and refuse a server that does not report the moonshine backend.
 
     Fail-closed like ``benchmark_asr_ab._probe``: a server too old to put ``backend`` in
     ``server.hello`` reports ``None`` and is rejected too. Runs before any audio is sent,
     so a wrong endpoint cannot produce a report labelled as Moonshine latency.
+    ``endpoint`` labels the refusal (``main()`` passes ``--uri``/``--socket``).
     """
     hello = await client.connect()
     reported = ((hello or {}).get("backend") or {}).get("name")
     if reported != EXPECTED_BACKEND:
-        endpoint = (
-            getattr(client, "_uri", None) or getattr(client, "_socket_path", None) or "<endpoint>"
-        )
         raise RuntimeError(
             f"endpoint {endpoint} reports backend {reported!r}, expected "
             f"{EXPECTED_BACKEND!r}; this server is not running the backend being benchmarked"
@@ -202,6 +200,7 @@ async def measure_one_shot_wire(
     *,
     pace: bool,
     timeout_s: float = TERMINAL_TIMEOUT_S,
+    endpoint: str = "<endpoint>",
 ) -> float:
     """Seconds from ``commit`` to ``transcription.completed`` for one utterance.
 
@@ -211,7 +210,7 @@ async def measure_one_shot_wire(
     """
     client = make_client()
     try:
-        await connect_moonshine(client)
+        await connect_moonshine(client, endpoint=endpoint)
         await client.update_session(turn_detection=None)
         await paced_send(client.send_audio, pcm, pace=pace)
         t0 = time.perf_counter()
@@ -245,11 +244,13 @@ async def run_one_shot_wire(
     *,
     runs: int,
     pace: bool,
+    endpoint: str = "<endpoint>",
 ) -> dict[int, list[float]]:
     out: dict[int, list[float]] = {}
     for length, pcm in pcm_by_length.items():
         out[length] = [
-            await measure_one_shot_wire(make_client, pcm, pace=pace) for _ in range(runs)
+            await measure_one_shot_wire(make_client, pcm, pace=pace, endpoint=endpoint)
+            for _ in range(runs)
         ]
     return out
 
@@ -427,7 +428,9 @@ def main(argv: list[str] | None = None) -> int:
         return TranscriptionClient(socket_path=args.socket, uri=args.uri, auth_token=auth_token)
 
     one_shot_runs = asyncio.run(
-        run_one_shot_wire(make_client, utterances, runs=args.runs, pace=pace)
+        run_one_shot_wire(
+            make_client, utterances, runs=args.runs, pace=pace, endpoint=args.uri or args.socket
+        )
     )
     one_shot = summarise(one_shot_runs)
     flush = None
