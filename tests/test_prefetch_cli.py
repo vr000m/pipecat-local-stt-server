@@ -1028,6 +1028,22 @@ def test_moonshine_invalid_spec_is_a_config_error(
     assert fake_moonshine.downloads == []
 
 
+@pytest.mark.parametrize(
+    "model", ["medium-streaming@en,es", "base@en,ja", "@en,xx", "@en,ko"], ids=str
+)
+@pytest.mark.parametrize("check", [True, False])
+def test_moonshine_multi_language_spec_is_refused_before_any_download(
+    fake_moonshine, monkeypatch, capsys, model, check
+):
+    """The first language is valid and the second is not: serve's ``build_served`` refuses the
+    spec at ``start()``, so prefetch must refuse it before the first language downloads."""
+    argv = ["--model", model, "--json"] + (["--check"] if check else [])
+    code, events, _ = _ms(monkeypatch, capsys, *argv)
+    assert code == 1 and events[-1]["code"] == "ConfigError"
+    assert fake_moonshine.downloads == []
+    assert not any(e.get("event") in ("progress", "complete", "result") for e in events)
+
+
 def test_same_named_cwd_dir_is_a_model_name_for_a_backend_without_local_paths(
     tmp_path, monkeypatch, capsys
 ):

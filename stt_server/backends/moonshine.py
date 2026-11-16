@@ -515,11 +515,23 @@ def _remove_if_still_corrupt(path: Path, info: dict) -> None:
             path.unlink(missing_ok=True)
 
 
+def _validated_arch(
+    download: Any, language: str, requested_arch: str | None, languages: tuple[str, ...]
+) -> Any:
+    """The arch for ``language``, after validating the WHOLE spec as serve does.
+
+    ``build_served`` (what ``start()`` calls) checks every listed language, so a
+    spec serve refuses fails here before any language downloads, not after the
+    earlier ones finished.
+    """
+    return build_served(languages, requested_arch, download._stt_catalog())[language]
+
+
 def _check_model(
-    spec: SnapshotSpec, language: str, requested_arch: str | None
+    spec: SnapshotSpec, language: str, requested_arch: str | None, languages: tuple[str, ...]
 ) -> tuple[str, int] | None:
     _, download = _import_package()
-    arch = resolve_arch(language, requested_arch, download._stt_catalog())
+    arch = _validated_arch(download, language, requested_arch, languages)
     root, files = _model_manifest(download, language, arch)
     total = 0
     for info in files:
@@ -530,10 +542,14 @@ def _check_model(
 
 
 def _fetch_model(
-    spec: SnapshotSpec, progress: Any, language: str, requested_arch: str | None
+    spec: SnapshotSpec,
+    progress: Any,
+    language: str,
+    requested_arch: str | None,
+    languages: tuple[str, ...],
 ) -> str:
     _, download = _import_package()
-    arch = resolve_arch(language, requested_arch, download._stt_catalog())
+    arch = _validated_arch(download, language, requested_arch, languages)
     root, files = _model_manifest(download, language, arch)
 
     def have(info: dict) -> bool:
@@ -637,6 +653,8 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     (``moonshine-voice/<arch>-<lang>``, ``default`` for an omitted arch),
     ``revision`` is the ``moonshine-voice`` version, and ``check``/``fetch``
     import the package lazily and derive completeness from its own manifest.
+    Each callable validates the whole spec (every language) through ``build_served``,
+    as ``start()`` does, before it checks or downloads anything.
     """
     arch, langs = parse_model_spec(model or DEFAULT_MOONSHINE_MODEL)
     return [
@@ -645,8 +663,12 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
             # The pin itself, as hub backends report their pinned revision; any
             # other installed version is refused by ``_import_package``.
             revision=MOONSHINE_VOICE_VERSION,
-            check=functools.partial(_check_model, language=code, requested_arch=arch),
-            fetch=functools.partial(_fetch_model, language=code, requested_arch=arch),
+            check=functools.partial(
+                _check_model, language=code, requested_arch=arch, languages=langs
+            ),
+            fetch=functools.partial(
+                _fetch_model, language=code, requested_arch=arch, languages=langs
+            ),
         )
         for code in langs
     ]
