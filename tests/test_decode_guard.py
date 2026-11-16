@@ -12,10 +12,11 @@ from stt_server.backends import DEFAULT_MLX_MODEL
 from stt_server.backends._thread_util import DecodeGuardMixin
 from stt_server.backends.kyutai import KyutaiBackend
 from stt_server.backends.mlx_whisper import MLXWhisperBackend
+from stt_server.backends.moonshine import MoonshineBackend
 from stt_server.backends.nemotron import NemotronBackend
 from stt_server.backends.parakeet import ParakeetBackend
 
-BACKENDS = [MLXWhisperBackend, ParakeetBackend, NemotronBackend, KyutaiBackend]
+BACKENDS = [MLXWhisperBackend, ParakeetBackend, NemotronBackend, KyutaiBackend, MoonshineBackend]
 
 
 @pytest.mark.parametrize("cls", BACKENDS)

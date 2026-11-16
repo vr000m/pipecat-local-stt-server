@@ -137,7 +137,7 @@ UNKNOWN = _smoke_lib.UNKNOWN
 DEFAULT_PORT = 9998
 HOST = "127.0.0.1"
 # Installer backends with a canonical port (the justfile's "whisper" is "mlx").
-CANONICAL_BACKENDS = ("mlx", "kyutai", "parakeet", "nemotron")
+CANONICAL_BACKENDS = ("mlx", "kyutai", "parakeet", "nemotron", "moonshine")
 UNLOAD_WAIT = 30  # PIPECAT_STT_UNLOAD_WAIT given to the installer, in seconds
 INSTALL_TIMEOUT = UNLOAD_WAIT + 90
 UP_TIMEOUT = 60  # how long an agent gets to answer after an install
@@ -616,7 +616,7 @@ def acquire_run_lock(path: Path) -> int:
 
 
 def canonical_ports(run=subprocess.run) -> set[int]:
-    """The four canonical ports, read from ``install_stt_agent.sh port <backend>``."""
+    """The canonical ports, read from ``install_stt_agent.sh port <backend>``."""
     ports: set[int] = set()
     for backend in CANONICAL_BACKENDS:
         try:

@@ -25,7 +25,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class SnapshotSpec:
-    """One Hugging Face snapshot a backend needs before it can decode offline."""
+    """One model snapshot a backend needs before it can decode offline (a Hugging
+    Face snapshot unless ``check``/``fetch`` are set)."""
 
     repo_id: str
     revision: str | None = None  # None = the repo's main branch, as the loaders use
@@ -52,15 +53,45 @@ class SnapshotSpec:
     #: characters or ``|``): they are used as ``allow_patterns`` and matched
     #: with ``fnmatch``.
     resolve: Callable[[dict], tuple[str, ...]] | None = None
+    #: For backends whose weights do not come from the Hugging Face Hub
+    #: (``moonshine``: the package's own CDN for weights, its wheel's manifest for sizes and CRC32C). When set, ``prefetch``
+    #: calls it instead of the Hub probe: it is given this spec and returns
+    #: ``(path, size_bytes)`` of a complete snapshot, or ``None`` when files are
+    #: missing or incomplete. A snapshot that is present but corrupt raises an
+    #: exception tagged with :func:`mark_model_invalid`. ``allow_patterns``,
+    #: ``required``, ``resolve`` are ignored when it is set.
+    check: Callable[["SnapshotSpec"], tuple[str, int] | None] | None = None
+    #: Counterpart of ``check`` for a fetch. Given this spec and an optional
+    #: ``progress(downloaded_bytes, total_bytes, files_done, files_total)``
+    #: callback (``None`` when no JSON progress was requested), it downloads
+    #: what is missing and returns the snapshot's path. It reports progress with
+    #: the same meaning as the Hub path (only not-yet-cached files count) and a
+    #: final 100% event; a corrupt result raises an exception tagged with
+    #: :func:`mark_model_invalid`. ``prefetch`` emits ``start`` and ``done`` and
+    #: runs the call inside :func:`download_phase`.
+    fetch: (
+        Callable[
+            ["SnapshotSpec", Callable[[int, int, int, int], None] | None],
+            str,
+        ]
+        | None
+    ) = None
+
+    def __post_init__(self) -> None:
+        # ``prefetch`` picks the check and the fetch path independently, so a spec
+        # with only one would send the other down the Hugging Face path.
+        if (self.check is None) != (self.fetch is None):
+            raise ValueError(f"SnapshotSpec {self.repo_id!r}: set both check and fetch, or neither")
 
 
 DOWNLOAD_PHASE_ATTR = "_stt_download_phase"
 MODEL_INVALID_ATTR = "_stt_model_invalid"
+PREFETCH_REPO_ATTR = "_stt_prefetch_repo"
 
 
-def _tag(exc: BaseException, attr: str) -> None:
+def _tag(exc: BaseException, attr: str, value: object = True) -> None:
     try:
-        setattr(exc, attr, True)
+        setattr(exc, attr, value)
     except AttributeError:  # exotic exception without a __dict__: stay unmarked
         pass
 
@@ -74,6 +105,19 @@ def mark_download_phase(exc: BaseException) -> None:
 def mark_model_invalid(exc: BaseException) -> None:
     """Tag ``exc`` as "the model snapshot is unusable" (``ModelInvalidError``)."""
     _tag(exc, MODEL_INVALID_ATTR)
+
+
+def tag_prefetch_repo(exc: BaseException, repo: str, *, overwrite: bool = True) -> None:
+    """Tag ``exc`` with the repo ``prefetch``'s ``error`` event reports (read back
+    with ``getattr(exc, PREFETCH_REPO_ATTR, None)``).
+
+    By default it overwrites any earlier tag (the raiser knows the repo). The
+    prefetch drivers pass ``overwrite=False``: a tag a backend already set (the
+    language that failed) wins over the spec being checked or fetched.
+    """
+    if not overwrite and getattr(exc, PREFETCH_REPO_ATTR, None) is not None:
+        return
+    _tag(exc, PREFETCH_REPO_ATTR, repo)
 
 
 @contextlib.contextmanager

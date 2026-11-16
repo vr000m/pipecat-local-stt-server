@@ -17,7 +17,7 @@
 #                       the agent listens on loopback TCP (the default).
 #   PIPECAT_STT_HOST    loopback host for TCP mode (default: 127.0.0.1)
 #   PIPECAT_STT_PORT    TCP port (default: backend canonical port — whisper/mlx
-#                       9565, kyutai 9665, parakeet 9765, nemotron 9865; the echo
+#                       9565, kyutai 9665, parakeet 9765, nemotron 9865, moonshine 9965; the echo
 #                       backend has none and requires an explicit port)
 #   PIPECAT_STT_AUTH_TOKEN_FILE  absolute path to a file holding the auth token
 #                       (TCP mode). Raw PIPECAT_STT_AUTH_TOKEN is refused. The
@@ -40,11 +40,12 @@
 #                       (default 30)
 #   PIPECAT_STT_PYTHON  interpreter (default: .venv/bin/python, or
 #                       .venv-kyutai/bin/python for the kyutai backend)
-#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai (default: mlx)
+#   PIPECAT_STT_BACKEND (KODA_STT_BACKEND) backend name: echo|mlx|parakeet|nemotron|kyutai|moonshine (default: mlx)
 #   PIPECAT_STT_MODEL   (KODA_STT_MODEL)   model id (default: backend-aware — Whisper repo for
 #                       mlx/echo, mlx-community/parakeet-tdt-0.6b-v3 for parakeet,
 #                       mlx-community/nemotron-3.5-asr-streaming-0.6b for nemotron,
-#                       kyutai/stt-1b-en_fr-mlx for kyutai)
+#                       kyutai/stt-1b-en_fr-mlx for kyutai, medium-streaming@en for
+#                       moonshine; spec grammar [<arch>][@<lang>[,<lang>...]])
 #
 # Two-agent install recipe (run Whisper and Parakeet ASR side by side). The
 # default transport is loopback TCP on the backend's canonical port:
@@ -139,6 +140,8 @@ elif [[ "$BACKEND" == "nemotron" ]]; then
     DEFAULT_MODEL="mlx-community/nemotron-3.5-asr-streaming-0.6b"
 elif [[ "$BACKEND" == "kyutai" ]]; then
     DEFAULT_MODEL="kyutai/stt-1b-en_fr-mlx"
+elif [[ "$BACKEND" == "moonshine" ]]; then
+    DEFAULT_MODEL="medium-streaming@en"
 else
     DEFAULT_MODEL="mlx-community/whisper-large-v3-turbo"
 fi
@@ -160,6 +163,7 @@ canonical_port() {
     kyutai) echo 9665 ;;
     parakeet) echo 9765 ;;
     nemotron) echo 9865 ;;
+    moonshine) echo 9965 ;;
     *) return 1 ;;
     esac
 }
@@ -188,7 +192,7 @@ cmd="${1:-install}"
 # nothing on stdout, for a backend that has no canonical port.
 if [[ "$cmd" == "port" ]]; then
     if ! canonical_port "${2:-$BACKEND}"; then
-        echo "error: backend '${2:-$BACKEND}' has no canonical port (backends with one: mlx|kyutai|parakeet|nemotron)" >&2
+        echo "error: backend '${2:-$BACKEND}' has no canonical port (backends with one: mlx|kyutai|parakeet|nemotron|moonshine)" >&2
         exit 1
     fi
     exit 0
@@ -615,9 +619,9 @@ validate_socket_path() {
 render_plist() {
     # Same names as the renderer's _BACKEND_RE; fail here, before any mkdir.
     case "$BACKEND" in
-    echo | mlx | parakeet | nemotron | kyutai) : ;;
+    echo | mlx | parakeet | nemotron | kyutai | moonshine) : ;;
     *)
-        echo "error: unknown backend '$BACKEND' (valid: echo|mlx|parakeet|nemotron|kyutai)" >&2
+        echo "error: unknown backend '$BACKEND' (valid: echo|mlx|parakeet|nemotron|kyutai|moonshine)" >&2
         exit 2
         ;;
     esac

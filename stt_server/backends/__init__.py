@@ -25,11 +25,17 @@ DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 DEFAULT_NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
 DEFAULT_KYUTAI_MODEL = "kyutai/stt-1b-en_fr-mlx"
+# Moonshine's ``--model`` is a spec, not a repo id: ``[<arch>][@<lang>[,<lang>...]]``
+# (see ``backends.moonshine.parse_model_spec``).
+DEFAULT_MOONSHINE_MODEL = "medium-streaming@en"
 
 # Hub commit each pinned default loads, so a push to the repo's ``main`` cannot
 # change the weights under a released server. Keyed by the exact repo id: any
 # other ``--model`` (including a local path) is unpinned and follows ``main``.
 # Bump a SHA only after re-running the live decode tests against it.
+# ``moonshine`` has deliberately NO entry: its weights do not come from the Hub,
+# so the pin is the exact ``moonshine-voice`` version in ``pyproject.toml`` (which
+# fixes the model URLs), not a commit SHA.
 PINNED_REVISIONS: dict[str, str] = {
     DEFAULT_MLX_MODEL: "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
     DEFAULT_KYUTAI_MODEL: "2b995724eef1e964b7ccb6a762b35a665c4abe0d",
@@ -71,6 +77,14 @@ BACKENDS: dict[str, BackendEntry] = {
         "stt_server.backends.kyutai",
         "KyutaiBackend",
         DEFAULT_KYUTAI_MODEL,
+        local_model_paths=False,
+    ),
+    # Weights come from the ``moonshine-voice`` package's CDN (sizes and CRC32C from
+    # its wheel), not a local dir.
+    "moonshine": BackendEntry(
+        "stt_server.backends.moonshine",
+        "MoonshineBackend",
+        DEFAULT_MOONSHINE_MODEL,
         local_model_paths=False,
     ),
 }

@@ -17,7 +17,7 @@ The PyPI package is `pipecat-local-stt-server`; the import and CLI module remain
 - pipeline-provided VAD (`turn_detection: null`); no server-side VAD
 - Unix sockets with same-uid peer checks, or loopback-only TCP with optional
   bearer-token authentication
-- MLX Whisper, Parakeet, Nemotron, and Kyutai backends
+- MLX Whisper, Parakeet, Nemotron, Kyutai, and Moonshine backends
 - supervised lifecycle events for launchd, menu bar apps, and other parents
 
 The protocol is intentionally smaller than OpenAI Realtime transcription. See
@@ -83,10 +83,12 @@ Production backends require their optional extra before first use:
 | Parakeet | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` |
 | Nemotron | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` |
 | Kyutai | `just stt-install kyutai` | `kyutai/stt-1b-en_fr-mlx` |
+| Moonshine | `uv sync --extra moonshine` | `medium-streaming@en` (CPU) |
 
 Kyutai needs Python 3.12 and a separate `.venv-kyutai` because its MLX pins
-conflict with the other extras. The defaults are pinned to immutable Hugging
-Face revisions. Custom repositories and local model paths are supported where
+conflict with the other extras. The Hugging Face defaults are pinned to
+immutable revisions; Moonshine is pinned by its package version. Custom
+repositories and local model paths are supported where
 the backend allows them.
 
 See [Backends and models](docs/backends.md) for model selection, pinning,

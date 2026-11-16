@@ -1,11 +1,11 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.13' and extra != 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-mlx'",
+    "python_full_version >= '3.13' and extra != 'extra-24-pipecat-local-stt-server-kyutai' and extra != 'extra-24-pipecat-local-stt-server-mlx'",
     "python_full_version < '3.13' and extra != 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-mlx'",
     "extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra != 'extra-24-pipecat-local-stt-server-mlx' and extra != 'extra-24-pipecat-local-stt-server-nemotron' and extra != 'extra-24-pipecat-local-stt-server-parakeet'",
-    "python_full_version >= '3.13' and extra != 'extra-24-pipecat-local-stt-server-kyutai' and extra != 'extra-24-pipecat-local-stt-server-mlx'",
     "python_full_version < '3.13' and extra != 'extra-24-pipecat-local-stt-server-kyutai' and extra != 'extra-24-pipecat-local-stt-server-mlx'",
 ]
 conflicts = [[
@@ -546,6 +546,34 @@ wheels = [
 ]
 
 [[package]]
+name = "google-crc32c"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/fa/25/9cb0c1c31c45b893eb8f11ae70b3f4309432d59b5acaebca5dbe791729a4/google_crc32c-1.9.0.tar.gz", hash = "sha256:7b8c84c3d159ab6817fe3f74e6e6cef099c3f95dcec3abc0d8afb1404642efbe", size = 14857, upload-time = "2026-09-24T21:39:32.067Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/5d/0730e1b3a14d054d1466f2fec88dadf978509c749a3d96d8b069cc56d38a/google_crc32c-1.9.0-cp312-cp312-macosx_12_0_arm64.whl", hash = "sha256:53fdafef58e230d0c946ab5f8446d123d9f548230a73b29c8b41c9546f268bc1", size = 31961, upload-time = "2026-09-24T21:19:01.724Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/32/d085abaf2fd907121975b92245bb3480fb8be40c37d03f9d6c41857f84c3/google_crc32c-1.9.0-cp312-cp312-macosx_12_0_x86_64.whl", hash = "sha256:8b91f41645b15a720357183fa5716682ada441873e3c462c15f9714be36f146b", size = 31804, upload-time = "2026-09-24T21:22:25.81Z" },
+    { url = "https://files.pythonhosted.org/packages/94/78/dd1935432337e5da7af391a6fc9f161c1c8e9b9002a402b9190135fe1b59/google_crc32c-1.9.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:16865b477d7941712cb0e0aad8ad4815e984fb5fc16d3fdaef7d986e26e53c95", size = 37775, upload-time = "2026-09-24T21:38:09.249Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/43/9db03635bb10188d93dcbab9baa2a8670a0da4e868b4370cdbd98d65fed8/google_crc32c-1.9.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:3abb18297d9ef0ab120531838be0e6d68c9fa876570e11c229c48f2edac23ce7", size = 36347, upload-time = "2026-09-24T21:38:10.141Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/eb/94dee516c846bd9382c3f566d8f8e5fb9e90599e45afeb697f9fc2533528/google_crc32c-1.9.0-cp312-cp312-win_amd64.whl", hash = "sha256:fb63a8d7fa2e95dcff1ca16af2f4d88b526fa5ff72d1696285884ac2d49b6963", size = 35097, upload-time = "2026-09-24T21:39:28.934Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/34/cb484e8b6174f130f8c6dc79c733a9dd8869b410ad6511fb6104c46b973a/google_crc32c-1.9.0-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:f1dc17d987ddcc5eba12a7ce48f0eb93141dea236b170c1101151396edf2f0cf", size = 31960, upload-time = "2026-09-24T21:19:02.454Z" },
+    { url = "https://files.pythonhosted.org/packages/af/25/3e8e567bd48448e225ea27318ccf2b94e05124e7b8b97b13eaec9e127199/google_crc32c-1.9.0-cp313-cp313-macosx_12_0_x86_64.whl", hash = "sha256:f894a2877650b56201d26a012a257b76d54a68834dc3913a93830ca8a047b075", size = 31803, upload-time = "2026-09-24T21:22:27.008Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/18/bee0dd59ae622482dc6463636c79e4bde7c954d061c859c9256362c9931a/google_crc32c-1.9.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4488f1553a9ab7e86cdedc833374a7e904031803b995dc0bd0be48c271fa6556", size = 37776, upload-time = "2026-09-24T21:38:11.056Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/b6/e76e80fed5f2558273c7839e622f98095c9b36c719c7147e38e3c055cb70/google_crc32c-1.9.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0568b17ed90ac596f29400d99e243fd0cc6276766183def888d1bf8d1dc13827", size = 36350, upload-time = "2026-09-24T21:38:12.138Z" },
+    { url = "https://files.pythonhosted.org/packages/87/34/165542bfa99dfef91a76471cc48cce74b8ff4e295722896087ab2b8e8611/google_crc32c-1.9.0-cp313-cp313-win_amd64.whl", hash = "sha256:8583ec21d56b565d68ab2963cc7e21b3b271247c29b04286068255ef65f221bd", size = 35090, upload-time = "2026-09-24T21:39:29.764Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/eb/43ea41f4061a1cad87b2b6559c98e960e45bf551fe66f83d833b98aaf0c9/google_crc32c-1.9.0-cp314-cp314-macosx_12_0_arm64.whl", hash = "sha256:6a3b2c8a343c570ed8100a7627c20badfd92c6caa2067093a86be45af27f5b1b", size = 31963, upload-time = "2026-09-24T21:19:03.208Z" },
+    { url = "https://files.pythonhosted.org/packages/45/d2/a968c0c29ccd2b0c980ff4f9e3f7035cee28c23a1c57541825cc8221858c/google_crc32c-1.9.0-cp314-cp314-macosx_12_0_x86_64.whl", hash = "sha256:13179f7e3282617923e957b8e54b8f9c3968030f48640a9f47fd7c5c38c4a215", size = 31805, upload-time = "2026-09-24T21:22:27.917Z" },
+    { url = "https://files.pythonhosted.org/packages/03/73/388e493d6c3e252e37165d22efe5a1361f872a24425391b999822861b23a/google_crc32c-1.9.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:265233aff33d835f5b909584fe36ab29647b598c271b661a300001099109e53e", size = 37925, upload-time = "2026-09-24T21:38:13.32Z" },
+    { url = "https://files.pythonhosted.org/packages/98/36/190d32caa363ef25d685f422ed1bbf93ff1140fb22fd4d90f24cec209977/google_crc32c-1.9.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:dee799544cae42a42b17a88e38b59cf2c271051dc001da2117a8ff240ffa0548", size = 36495, upload-time = "2026-09-24T21:38:14.211Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/fd/81cefea6adae7bd92abb23d4567d199f6485a20ec0a305ca5fa04c52b9c5/google_crc32c-1.9.0-cp314-cp314-win_amd64.whl", hash = "sha256:af73200fa9791ccd380f3598235dba8d82b8af0905df045b3dc60b59836e8ddd", size = 35535, upload-time = "2026-09-24T21:39:30.52Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/18/19d4f17f3f33f8fdffcb3e1e69219d6f7ec2c359c160867b04dac1d0a64d/google_crc32c-1.9.0-cp315-cp315-macosx_12_0_arm64.whl", hash = "sha256:e6e8be8a94436079cb5340f6d495d9d7ba30124d8b952703994c739c7c06e236", size = 31977, upload-time = "2026-09-24T21:19:03.976Z" },
+    { url = "https://files.pythonhosted.org/packages/81/b4/8010372c4b46f2ee2352dfdb630c397570cd85522a315df024ad2f9459aa/google_crc32c-1.9.0-cp315-cp315-macosx_12_0_x86_64.whl", hash = "sha256:f2b64641bca27497b986b9d87883014035aa904cb4fa333407c6752b3afee9ba", size = 31809, upload-time = "2026-09-24T21:22:29.1Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/f8/7e33845d6b90ce1cf37cfabf25cb859277c7d3533ef1b6b1e1ca58581549/google_crc32c-1.9.0-cp315-cp315-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:f97c3806dcea41c29c04965347b0e12481561b75e0045dc7a4f69d75dec5d9b1", size = 38359, upload-time = "2026-09-24T21:38:14.983Z" },
+    { url = "https://files.pythonhosted.org/packages/36/ff/556b2423f449a7515af6b8222a4d7833cbe09ff3e8d2f0b80471f5f6d02e/google_crc32c-1.9.0-cp315-cp315-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:0abe7e202c25909869c35672ab0f2fe748a7acf276eb78577332a7c38999740f", size = 36858, upload-time = "2026-09-24T21:38:15.799Z" },
+    { url = "https://files.pythonhosted.org/packages/40/71/4733f1b7c921d04a2bb9b9916cf66498bf7ad0860a06289413830da83192/google_crc32c-1.9.0-cp315-cp315-win_amd64.whl", hash = "sha256:5695c8b9327e040b2aba12c6659b0acb5995314ef0af0192da66e662e011103b", size = 35534, upload-time = "2026-09-24T21:39:31.337Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -997,6 +1025,29 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/22/b7/a35232812a2ccfffcb7614ba96a91338551a660a0e9815cee668bf5743f0/mlx_whisper-0.4.3-py3-none-any.whl", hash = "sha256:6b82b6597a994643a3e5496c7bc229a672e5ca308458455bfe276e76ae024489", size = 890544, upload-time = "2025-08-29T14:56:13.815Z" },
+]
+
+[[package]]
+name = "moonshine-voice"
+version = "0.1.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "google-crc32c" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-24-pipecat-local-stt-server-kyutai'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-24-pipecat-local-stt-server-kyutai' or extra == 'extra-24-pipecat-local-stt-server-mlx' or extra == 'extra-24-pipecat-local-stt-server-nemotron' or extra == 'extra-24-pipecat-local-stt-server-parakeet'" },
+    { name = "platformdirs" },
+    { name = "requests" },
+    { name = "sounddevice", version = "0.5.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-24-pipecat-local-stt-server-kyutai'" },
+    { name = "sounddevice", version = "0.5.5", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-24-pipecat-local-stt-server-kyutai' or extra == 'extra-24-pipecat-local-stt-server-mlx' or extra == 'extra-24-pipecat-local-stt-server-nemotron' or extra == 'extra-24-pipecat-local-stt-server-parakeet'" },
+    { name = "tqdm" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/ad/91ef5908f592faff47dd4e03073b3eb073ce88f984f6bc86031e02057a69/moonshine_voice-0.1.6-py3-none-macosx_15_0_arm64.whl", hash = "sha256:71f0fa9d0b01fa317f86a85e846e9faa247be985f92b50970817dd999e400ff4", size = 18670056, upload-time = "2026-11-06T04:57:00.332Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/ad/f6cad5893e822303fed6c0931127274e7bfc19ebdad5aaa7af87888d242b/moonshine_voice-0.1.6-py3-none-manylinux_2_31_aarch64.whl", hash = "sha256:16589b0e86e4a66fbbb7bb1429deaa56a47f33fdc1cd0aef4b781ccbf49c95df", size = 18607530, upload-time = "2026-11-06T05:49:20.851Z" },
+    { url = "https://files.pythonhosted.org/packages/83/88/c2088ad66599aa81db816a4c0f1d25d00d40d1d9781c76a132990a86bedd/moonshine_voice-0.1.6-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:41bfd82ca61f1878e4681c25cf1a6c8f2692a14c2ca88a6840ffa00c452891fe", size = 18744603, upload-time = "2026-11-06T05:34:31.978Z" },
+    { url = "https://files.pythonhosted.org/packages/54/47/20993e0676642cf05273b6b2fed13076a5b4028156c938dd86136bb71797/moonshine_voice-0.1.6-py3-none-manylinux_2_34_x86_64.whl", hash = "sha256:04e438f393af3f963ac7988204f379d04a9c8949801595cab4bd68a7ceedf6c7", size = 20020861, upload-time = "2026-11-06T05:11:54.436Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/07/aafde753e2819bc5dca333b45a90f3dad475a41da2c97ddd60ccc6e37479/moonshine_voice-0.1.6-py3-none-win_amd64.whl", hash = "sha256:29a54f9249d41735db62b1f97272905cf114554f293c166f0f4f81655a4a2cfc", size = 16616460, upload-time = "2026-11-06T07:20:05.965Z" },
 ]
 
 [[package]]
@@ -1551,7 +1602,7 @@ wheels = [
 
 [[package]]
 name = "pipecat-local-stt-server"
-version = "0.5.1"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "websockets" },
@@ -1571,6 +1622,12 @@ mlx = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
     { name = "websockets" },
 ]
+moonshine = [
+    { name = "moonshine-voice" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-24-pipecat-local-stt-server-kyutai'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-24-pipecat-local-stt-server-kyutai' or extra == 'extra-24-pipecat-local-stt-server-mlx' or extra == 'extra-24-pipecat-local-stt-server-nemotron' or extra == 'extra-24-pipecat-local-stt-server-parakeet'" },
+    { name = "websockets" },
+]
 nemotron = [
     { name = "mlx-audio" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" } },
@@ -1585,7 +1642,7 @@ parakeet = [
 [package.dev-dependencies]
 dev = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-24-pipecat-local-stt-server-kyutai'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-24-pipecat-local-stt-server-mlx' or extra == 'extra-24-pipecat-local-stt-server-nemotron' or extra == 'extra-24-pipecat-local-stt-server-parakeet' or extra != 'extra-24-pipecat-local-stt-server-kyutai'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-24-pipecat-local-stt-server-kyutai' or extra == 'extra-24-pipecat-local-stt-server-mlx' or extra == 'extra-24-pipecat-local-stt-server-nemotron' or extra == 'extra-24-pipecat-local-stt-server-parakeet'" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -1595,9 +1652,11 @@ dev = [
 requires-dist = [
     { name = "mlx-audio", marker = "extra == 'nemotron'", specifier = ">=0.4.4" },
     { name = "mlx-whisper", marker = "extra == 'mlx'", specifier = ">=0.4.0" },
+    { name = "moonshine-voice", marker = "extra == 'moonshine'", specifier = "==0.1.6" },
     { name = "moshi-mlx", marker = "extra == 'kyutai'", specifier = "==0.3.0" },
     { name = "numpy", marker = "extra == 'kyutai'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'mlx'", specifier = ">=1.26" },
+    { name = "numpy", marker = "extra == 'moonshine'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'nemotron'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'parakeet'", specifier = ">=1.26" },
     { name = "parakeet-mlx", marker = "extra == 'parakeet'", specifier = ">=0.5.1" },
@@ -1605,10 +1664,11 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'client'", specifier = ">=16,<17" },
     { name = "websockets", marker = "extra == 'kyutai'", specifier = ">=16,<17" },
     { name = "websockets", marker = "extra == 'mlx'", specifier = ">=16,<17" },
+    { name = "websockets", marker = "extra == 'moonshine'", specifier = ">=16,<17" },
     { name = "websockets", marker = "extra == 'nemotron'", specifier = ">=16,<17" },
     { name = "websockets", marker = "extra == 'parakeet'", specifier = ">=16,<17" },
 ]
-provides-extras = ["client", "mlx", "parakeet", "nemotron", "kyutai"]
+provides-extras = ["client", "mlx", "parakeet", "nemotron", "kyutai", "moonshine"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1799,7 +1859,7 @@ name = "pytest"
 version = "9.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-mlx') or (extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-nemotron') or (extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-parakeet')" },
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -1816,7 +1876,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pytest" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13' or (extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-mlx') or (extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-nemotron') or (extra == 'extra-24-pipecat-local-stt-server-kyutai' and extra == 'extra-24-pipecat-local-stt-server-parakeet')" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/7c/d36d04db312ecf4298932ef77e6e4a9e8ad017906e24e34f0b0c361a2473/pytest_asyncio-1.4.0.tar.gz", hash = "sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42", size = 58514, upload-time = "2026-05-26T09:56:04.083Z" }
 wheels = [
@@ -2284,7 +2344,7 @@ name = "sounddevice"
 version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi" },
+    { name = "cffi", marker = "extra == 'extra-24-pipecat-local-stt-server-kyutai'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/87/92/62d87d7b53a4e1041f0d9e049e225fce3c7bc266c0162c023feb245b999d/sounddevice-0.5.0.tar.gz", hash = "sha256:0de95277654b3d403d9c15ded3c6cedf307e9b27cc9ce7bd995a2891d0c955af", size = 52564, upload-time = "2024-08-11T12:56:28.15Z" }
 wheels = [
@@ -2303,7 +2363,7 @@ resolution-markers = [
     "python_full_version < '3.13'",
 ]
 dependencies = [
-    { name = "cffi" },
+    { name = "cffi", marker = "extra != 'extra-24-pipecat-local-stt-server-kyutai' or extra == 'extra-24-pipecat-local-stt-server-mlx' or extra == 'extra-24-pipecat-local-stt-server-nemotron' or extra == 'extra-24-pipecat-local-stt-server-parakeet'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2a/f9/2592608737553638fca98e21e54bfec40bf577bb98a61b2770c912aab25e/sounddevice-0.5.5.tar.gz", hash = "sha256:22487b65198cb5bf2208755105b524f78ad173e5ab6b445bdab1c989f6698df3", size = 143191, upload-time = "2026-01-23T18:36:43.529Z" }
 wheels = [

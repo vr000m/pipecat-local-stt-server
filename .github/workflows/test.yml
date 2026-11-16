@@ -58,7 +58,8 @@ jobs:
             tests/test_render_stt_plist.py \
             tests/test_supervised_cli.py \
             tests/test_prefetch_cli.py \
-            tests/test_kyutai_backend.py
+            tests/test_kyutai_backend.py \
+            tests/test_moonshine_backend.py
 
   # The kyutai extra pins an older MLX stack (moshi_mlx: mlx<0.27,
   # huggingface-hub<0.29) and is declared conflicting with the other MLX extras,

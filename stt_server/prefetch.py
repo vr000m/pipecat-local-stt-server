@@ -1,6 +1,6 @@
 """``python -m stt_server prefetch`` — fetch a backend's weights without serving.
 
-The ``mlx``, ``parakeet`` and ``nemotron`` backends download their checkpoint
+The ``mlx``, ``parakeet``, ``nemotron`` and ``moonshine`` backends download their checkpoint
 on the first decode, so a fresh server answers its first request only after a
 silent multi-GB download. ``prefetch`` does that download up front, with
 optional JSON-lines progress for a supervising app, and ``--check`` answers
@@ -29,6 +29,8 @@ JSON events (one object per stdout line; the same schema as
 Progress is measured from the Hugging Face cache on disk (bytes landing in the
 repo's ``blobs/``), so it works with every ``huggingface_hub`` version the
 backends pin; Kyutai's ``moshi_mlx`` requires ``huggingface-hub<0.29``.
+``moonshine`` (not on the Hub) reports the same events from its own cache
+directory, through the ``SnapshotSpec`` ``check``/``fetch`` callables.
 
 Lean at import: ``huggingface_hub`` is imported only inside the seams.
 """
@@ -47,10 +49,18 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .errors import ConfigError, is_config_error
+
 # ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
 # import it from there); re-exported here for existing callers.
-from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
-from .errors import ConfigError, is_config_error
+from .snapshot import (
+    PREFETCH_REPO_ATTR,
+    SnapshotSpec,
+    check_plain_filenames,
+    download_phase,
+    mark_model_invalid,
+    tag_prefetch_repo,
+)
 
 __all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 
@@ -95,9 +105,21 @@ def _validated(spec: SnapshotSpec, path: str | Path, *, what: str) -> SnapshotSp
     return spec
 
 
-def is_local_model(model: str) -> bool:
-    """True when ``model`` names a local path rather than a hub repo id."""
-    return model.startswith(("/", "./", "../", "~")) or Path(model).expanduser().exists()
+def is_local_model(model: str, *, backend: str | None = None) -> bool:
+    """True when ``model`` names a local path rather than a hub repo id.
+
+    A backend whose registry entry has ``local_model_paths=False`` (moonshine,
+    kyutai) takes a model name, never a path, so a bare name that happens to exist
+    in the cwd stays a name; only an explicit path form (``/``, ``./``, ``../``,
+    ``~``) is still read as a path, and ``local_specs_for`` then refuses it."""
+    if model.startswith(("/", "./", "../", "~")):
+        return True
+    from .backends import BACKENDS
+
+    entry = BACKENDS.get(backend) if backend is not None else None
+    if entry is not None and not entry.local_model_paths:
+        return False
+    return Path(model).expanduser().exists()
 
 
 def _module_specs(loaded, model: str | None) -> list[SnapshotSpec]:
@@ -229,7 +251,10 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
 
     ``ImportError`` and a config error (a malformed Hub repo id or revision,
     ``errors.is_config_error``) propagate, so ``--check`` and a fetch classify
-    bad input the same way; any other probe failure is a cache miss."""
+    bad input the same way; any other probe failure is a cache miss. The one
+    exception is a spec with a ``check`` callable (``moonshine``): the backend
+    decides what a miss is (``None``), and every exception it raises propagates
+    (a corrupt snapshot is tagged ``mark_model_invalid``)."""
     row: dict[str, Any] = {
         "event": "check",
         "repo": spec.repo_id,
@@ -240,6 +265,20 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         "path": None,
         "size_bytes": 0,
     }
+    if spec.local_path is None and spec.check is not None:
+        # Non-Hub snapshot (``moonshine``): the backend's own completeness probe.
+        try:
+            found = spec.check(spec)
+        except ImportError:
+            raise
+        except Exception as exc:
+            # Keep a repo the backend already tagged (a whole-spec refusal names
+            # the language that failed, not the spec being checked).
+            tag_prefetch_repo(exc, spec.repo_id, overwrite=False)
+            raise
+        if found is not None:
+            row.update(cached=True, path=found[0], size_bytes=found[1])
+        return row
     if spec.local_path is not None:
         path = spec.local_path
         if not Path(path).is_dir():
@@ -253,7 +292,7 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
             if is_config_error(exc):
                 # A malformed repo id / revision is bad input, not a cache miss:
                 # report ``ConfigError`` exactly as a fetch does.
-                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+                tag_prefetch_repo(exc, spec.repo_id)
                 raise
             logger.debug("prefetch: %s not cached (%s)", spec.repo_id, exc)
             return row
@@ -279,6 +318,33 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
             mark_model_invalid(exc)
             raise exc
         spec = _validated(spec, path, what=f"{path}: local model")
+        result = {
+            "event": "done",
+            "repo": spec.repo_id,
+            "path": path,
+            "size_bytes": _snapshot_size(path),
+        }
+        if emit is not None:
+            emit(result)
+        return result
+    if spec.fetch is not None:
+        # Non-Hub snapshot (``moonshine``): the backend downloads and verifies
+        # it; the events keep the Hub path's fields.
+        def relay(got: int, total: int, n_done: int, n_total: int) -> None:
+            assert emit is not None
+            emit(
+                {
+                    "event": "progress",
+                    "repo": spec.repo_id,
+                    "downloaded_bytes": got,
+                    "total_bytes": total,
+                    "files_done": n_done,
+                    "files_total": n_total,
+                }
+            )
+
+        with download_phase():
+            path = spec.fetch(spec, relay if emit is not None else None)
         result = {
             "event": "done",
             "repo": spec.repo_id,
@@ -374,10 +440,11 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
     ctx = supervise.json_channel() if json_mode else contextlib.nullcontext()
     with ctx:
         emit = supervise.emit if json_mode else None
+        specs: list[SnapshotSpec] = []
         try:
             specs = (
                 local_specs_for(backend, model)
-                if model and is_local_model(model)
+                if model and is_local_model(model, backend=backend)
                 else specs_for(backend, model)
             )
             return (
@@ -387,11 +454,14 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
             )
         except Exception as exc:  # noqa: BLE001 - CLI boundary: report, exit 1
             code, message = supervise.classify_startup_error(exc)
-            if code == supervise.CODE_MODULE_NOT_FOUND:
+            # The hint is for Hub snapshots only; a spec with ``check``/``fetch``
+            # callables (``moonshine``) never touches ``huggingface_hub``.
+            non_hub = any(sp.check is not None or sp.fetch is not None for sp in specs)
+            if code == supervise.CODE_MODULE_NOT_FOUND and not non_hub:
                 message = (
                     f"{message} (prefetch needs huggingface_hub, which every model extra installs)"
                 )
-            repo = getattr(exc, "_prefetch_repo", None)
+            repo = getattr(exc, PREFETCH_REPO_ATTR, None)
             if emit is not None:
                 emit({"event": "error", "code": code, "message": message, "repo": repo})
             else:
@@ -435,8 +505,9 @@ def _run_fetch(backend: str, model: str | None, specs: list[SnapshotSpec], emit)
             raise
         except Exception as exc:
             # Origin tags (download vs unusable snapshot) are set where the
-            # failure happened inside ``fetch_spec``; only attach the repo here.
-            exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            # failure happened inside ``fetch_spec``; only attach the repo here,
+            # unless the raiser already named one (see ``check_spec``).
+            tag_prefetch_repo(exc, spec.repo_id, overwrite=False)
             raise
     if emit is not None:
         emit(

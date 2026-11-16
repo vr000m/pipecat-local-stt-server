@@ -55,7 +55,8 @@ def _set_exception_safe(fut: "asyncio.Future", exc: BaseException) -> None:
 
 class DecodeGuardMixin:
     """Decode-lock pair, in-flight counter and ``close()`` drain, shared by the
-    MLX/Metal-backed backends (mlx_whisper, parakeet, nemotron, kyutai).
+    decode backends (mlx_whisper, parakeet, nemotron, kyutai on MLX/Metal;
+    moonshine on ONNX Runtime/CPU).
 
     ``_decode_lock`` (asyncio) serialises decodes across sessions on the event
     loop; ``_thread_lock`` (threading) serialises the actual MLX/Metal work on
@@ -150,7 +151,7 @@ class DecodeGuardMixin:
         if not drained:
             log.warning(
                 "%s: in-flight decode did not finish within %.1fs; "
-                "Metal assertion possible at process exit",
+                "exiting now may abort it (a Metal assertion on the MLX backends)",
                 label,
                 timeout_s,
             )

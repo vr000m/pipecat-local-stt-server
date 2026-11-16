@@ -14,6 +14,7 @@ import pytest
 
 from stt_server.backends.kyutai import KyutaiBackend
 from stt_server.backends.mlx_whisper import MLXWhisperBackend
+from stt_server.backends.moonshine import MoonshineBackend
 from stt_server.backends.nemotron import NemotronBackend
 from stt_server.backends.parakeet import ParakeetBackend
 
@@ -25,6 +26,8 @@ from stt_server.backends.parakeet import ParakeetBackend
         (lambda: NemotronBackend(model="fake"), "mlx_audio", "nemotron"),
         (lambda: ParakeetBackend(model="fake"), "parakeet_mlx", "parakeet"),
         (lambda: KyutaiBackend(model="fake"), "moshi_mlx", "kyutai"),
+        # the spec is not validated before the import: ``start()`` fails on the package first
+        (lambda: MoonshineBackend(model="fake"), "moonshine_voice", "moonshine"),
     ],
 )
 def test_backend_missing_extra_raises_actionable_error(monkeypatch, factory, missing, extra):

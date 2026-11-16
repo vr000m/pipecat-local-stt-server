@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-15
+
+### Added
+
+- **Moonshine Voice backend** (`--backend moonshine`, extra `moonshine`).
+  CPU ASR (ONNX Runtime, no MLX), commit-oriented, default model
+  `medium-streaming@en`. `--model` is a spec, `[<arch>][@<lang>[,<lang>...]]`,
+  and the served set is fixed at startup. Only MIT models are served (streaming
+  archs for any language, non-streaming for `en`). A client `auto` or blank
+  language means `en` if served, else the first listed. `prefetch` downloads
+  and CRC32C-checks models through the package's own manifest (not the Hugging
+  Face cache). It fails when a CRC32C cannot be computed, and repairs a
+  corrupt same-size cached file once, under the library's per-file lock. The
+  server and the installer's import probe require exactly
+  `moonshine-voice==0.1.6`; another version fails with a
+  `uv sync --extra moonshine --inexact` hint. `just stt-install moonshine`
+  installs a LaunchAgent on port 9965. The plist renderer now accepts `@` and
+  `,` in the model value. A relative `MOONSHINE_VOICE_CACHE` is refused with a
+  `ConfigError`; it must be an absolute path. `prefetch --check --json` reports
+  each model's directory (`path`) and `size_bytes`. A multi-language spec that
+  `serve` refuses (such as `medium-streaming@en,es`) fails before any model
+  downloads, and its prefetch `error` event's `repo` names the first failing
+  language (`moonshine-voice/<arch>-<lang>`, `default` for an omitted arch).
+  See `docs/backends.md`.
+- `scripts/benchmark_moonshine_latency.py`: paced single-endpoint benchmark of
+  the moonshine backend (one-shot commit-to-completed and library `stop()`
+  flush at 3, 5 and 10 s; JSON key `one_shot_p50_s`). The auth token comes
+  from `--auth-token-file` or `STT_WS_TOKEN`; there is no `--auth-token`
+  argument. A failed `stop()` flush fails the run, as does a server whose
+  `server.hello` does not report the `moonshine` backend.
+- `prefetch` specs (`SnapshotSpec`) take optional `check` and `fetch`
+  callables, so a backend whose models do not come from the Hugging Face Hub
+  can still use `prefetch` and `--check`. Set `check` and `fetch` together or
+  leave both unset; `SnapshotSpec` raises `ValueError` otherwise.
+- The Linux client CI job runs `tests/test_moonshine_backend.py`.
+
 ## [0.5.1] - 2026-10-30
 
 ### Added
@@ -823,6 +859,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.6.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.6.0
 [0.5.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.1
 [0.5.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.5.0
 [0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0

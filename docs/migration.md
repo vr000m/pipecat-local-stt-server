@@ -127,3 +127,9 @@ PIPECAT_STT_SOCKET=<path> just stt-install <backend>
 
 The socket plist is byte-identical to the 0.4.x one. Loopback TCP has no
 peer-uid check; the socket keeps it.
+
+---
+
+# Upgrading to 0.6.0
+
+0.6.0 adds an optional `moonshine` backend on port 9965. Existing installs need no change.

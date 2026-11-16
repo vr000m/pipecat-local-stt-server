@@ -715,3 +715,453 @@ def test_prefetch_unknown_or_unsupported_backend_input_is_config_error(
         argv.append("--check")
     code, events, _ = _run(monkeypatch, capsys, *argv)
     assert code == 1 and events[-1]["code"] == "ConfigError"
+
+
+# ---------------------------------------------------------------------------
+# moonshine: ``SnapshotSpec`` check/fetch callables over a fake
+# ``moonshine_voice.download`` (no wheel, no network)
+# ---------------------------------------------------------------------------
+
+_MS_DEFAULT_REPO = "moonshine-voice/medium-streaming-en"
+
+
+@pytest.fixture
+def fake_moonshine(monkeypatch, tmp_path):
+    from _fake_moonshine import install
+
+    return install(monkeypatch, tmp_path / "moonshine-cache")
+
+
+def _ms(monkeypatch, capsys, *argv: str):
+    return _run(monkeypatch, capsys, "--backend", "moonshine", *argv)
+
+
+def test_hf_specs_keep_no_callables():
+    """The shared contract: Hugging Face specs leave ``check``/``fetch`` unset."""
+    from stt_server.snapshot import SnapshotSpec
+
+    assert SnapshotSpec("a/b").check is None and SnapshotSpec("a/b").fetch is None
+    for backend in ("mlx", "parakeet", "nemotron", "kyutai"):
+        for spec in PF.specs_for(backend, None):
+            assert spec.check is None and spec.fetch is None
+
+
+def test_snapshot_spec_check_and_fetch_come_as_a_pair():
+    """``prefetch`` treats ``check`` and ``fetch`` as a pair, so one alone is rejected."""
+    from stt_server.snapshot import SnapshotSpec
+
+    def check(spec):
+        return None
+
+    def fetch(spec, progress):
+        return "/x"
+
+    assert SnapshotSpec("a/b", check=check, fetch=fetch).check is check
+    assert SnapshotSpec("a/b").fetch is None
+    with pytest.raises(ValueError, match="both check and fetch"):
+        SnapshotSpec("a/b", check=check)
+    with pytest.raises(ValueError, match="both check and fetch"):
+        SnapshotSpec("a/b", fetch=fetch)
+
+
+def test_moonshine_uncached_then_cached(fake_moonshine, monkeypatch, capsys):
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0
+    assert [e["event"] for e in events] == ["check", "summary"]
+    assert events[0]["repo"] == _MS_DEFAULT_REPO
+    assert events[0]["revision"] == fake_moonshine.version
+    assert events[-1]["cached"] is False
+    assert fake_moonshine.downloads == [], "--check never goes online"
+
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 0 and events[-1]["event"] == "complete" and events[-1]["cached"] is True
+    assert fake_moonshine.downloads == [("en", "medium-streaming")]
+
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0
+    assert events[0]["cached"] is True and events[-1]["cached"] is True
+    assert events[-1]["size_bytes"] == fake_moonshine.total_size("en", "medium-streaming")
+    assert fake_moonshine.downloads == [("en", "medium-streaming")], "--check did not refetch"
+
+
+def test_moonshine_fetches_the_whole_served_set(fake_moonshine, monkeypatch, capsys):
+    code, events, _ = _ms(monkeypatch, capsys, "--model", "small-streaming@en,es", "--json")
+    assert code == 0
+    starts = [e["repo"] for e in events if e["event"] == "start"]
+    assert starts == ["moonshine-voice/small-streaming-en", "moonshine-voice/small-streaming-es"]
+    assert sorted(fake_moonshine.downloads) == [
+        ("en", "small-streaming"),
+        ("es", "small-streaming"),
+    ]
+
+
+@pytest.mark.parametrize("damage", ["missing-file", "truncated-file"])
+def test_moonshine_incomplete_snapshot_is_not_cached(fake_moonshine, monkeypatch, capsys, damage):
+    root = Path(fake_moonshine.write_model("en", "medium-streaming"))
+    victim = sorted(root.iterdir())[0]
+    if damage == "missing-file":
+        victim.unlink()
+    else:
+        victim.write_bytes(victim.read_bytes()[:-3])
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0
+    assert events[0]["cached"] is False and events[-1]["cached"] is False
+    assert fake_moonshine.downloads == []
+
+
+def test_moonshine_check_with_a_populated_cache_but_one_language_missing(
+    fake_moonshine, monkeypatch, capsys
+):
+    fake_moonshine.write_model("en", "small-streaming")
+    code, events, _ = _ms(
+        monkeypatch, capsys, "--model", "small-streaming@en,es", "--check", "--json"
+    )
+    assert code == 0
+    cached = {e["repo"]: e["cached"] for e in events if e["event"] == "check"}
+    assert cached == {
+        "moonshine-voice/small-streaming-en": True,
+        "moonshine-voice/small-streaming-es": False,
+    }
+    assert events[-1]["cached"] is False
+
+
+def test_moonshine_fetch_event_order_and_fields(fake_moonshine, monkeypatch, capsys):
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 0
+    kinds = [e["event"] for e in events]
+    assert kinds[0] == "start" and kinds[-2:] == ["done", "complete"]
+    assert set(kinds[1:-2]) <= {"progress"}
+    start, done, complete = events[0], events[-2], events[-1]
+    assert start["repo"] == _MS_DEFAULT_REPO
+    assert start["revision"] == fake_moonshine.version and start["kind"] == "model"
+    assert done["repo"] == _MS_DEFAULT_REPO
+    assert done["size_bytes"] == fake_moonshine.total_size("en", "medium-streaming")
+    assert Path(done["path"]).is_dir()
+    assert complete["backend"] == "moonshine" and complete["cached"] is True
+    assert complete["size_bytes"] == done["size_bytes"]
+    for e in events[1:-2]:
+        assert {"repo", "downloaded_bytes", "total_bytes", "files_done", "files_total"} <= set(e)
+
+
+def test_moonshine_fetch_failure_reports_the_repo(fake_moonshine, monkeypatch, capsys):
+    fake_moonshine.raise_on_download = RuntimeError("cdn returned 503")
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["repo"] == _MS_DEFAULT_REPO
+    assert events[-1]["event"] != "complete" and "complete" not in [e["event"] for e in events]
+
+
+def test_moonshine_connection_error_is_a_download_error(fake_moonshine, monkeypatch, capsys):
+    fake_moonshine.raise_on_download = ConnectionResetError("peer reset")
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1 and events[-1]["code"] == "ModelDownloadError"
+    assert events[-1]["repo"] == _MS_DEFAULT_REPO
+
+
+def test_moonshine_failed_fetch_leaves_the_set_not_cached(fake_moonshine, monkeypatch, capsys):
+    fake_moonshine.raise_on_download = RuntimeError("cdn returned 503")
+    _ms(monkeypatch, capsys, "--json")
+    fake_moonshine.raise_on_download = None
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is False
+
+
+def test_moonshine_corrupt_snapshot_after_fetch_is_model_invalid(
+    fake_moonshine, monkeypatch, capsys
+):
+    """Same size, wrong bytes: the library's size-only acceptance would pass it, so the
+    check must compute CRC32C itself and report ``ModelInvalidError``."""
+    fake_moonshine.corrupt_downloads = True
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModelInvalidError"
+    assert events[-1]["repo"] == _MS_DEFAULT_REPO
+
+
+def test_moonshine_prefetch_repairs_a_size_matching_corrupt_file_once(
+    fake_moonshine, monkeypatch, capsys
+):
+    """Same size, bad CRC32C: the library would accept it, so prefetch deletes the bad file
+    and downloads it again (once); the snapshot then verifies and reads as cached."""
+    root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
+    good = fake_moonshine.file_bytes("en", "medium-streaming", "decoder.onnx")
+    assert (root / "decoder.onnx").read_bytes() != good
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 0 and events[-1]["event"] == "complete"
+    assert fake_moonshine.downloads == [("en", "medium-streaming")], "exactly one re-download"
+    assert (root / "decoder.onnx").read_bytes() == good
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is True
+    assert fake_moonshine.downloads == [("en", "medium-streaming")]
+
+
+def test_moonshine_prefetch_still_corrupt_after_one_redownload_names_the_path(
+    fake_moonshine, monkeypatch, capsys
+):
+    """The library's post-download CRC32C check raises naming only the file name (and
+    leaves nothing on disk); prefetch's error names the full destination path."""
+    root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
+    fake_moonshine.corrupt_downloads = True  # the CDN copy is bad too
+    code, events, _ = _ms(monkeypatch, capsys, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModelInvalidError"
+    assert events[-1]["repo"] == _MS_DEFAULT_REPO
+    # the first file the download reaches; every cached file was corrupt and removed
+    assert str(root / "encoder.onnx") in events[-1]["message"], "the full path is named"
+    assert "CRC32C mismatch for encoder.onnx" in events[-1]["message"]
+    assert not (root / "encoder.onnx").exists(), "the bad copy is never kept"
+    assert fake_moonshine.downloads == [("en", "medium-streaming")], "one re-download, no loop"
+
+
+def test_moonshine_check_reports_corruption_with_the_path_and_deletes_nothing(
+    fake_moonshine, monkeypatch, capsys
+):
+    root = Path(fake_moonshine.write_model("en", "medium-streaming", corrupt=True))
+    before = {p.name: p.read_bytes() for p in root.iterdir()}
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+    assert str(root) in events[-1]["message"]
+    assert {p.name: p.read_bytes() for p in root.iterdir()} == before
+    assert fake_moonshine.downloads == []
+
+
+def test_moonshine_corrupt_cached_snapshot_is_never_reported_cached(
+    fake_moonshine, monkeypatch, capsys
+):
+    fake_moonshine.write_model("en", "medium-streaming", corrupt=True)
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    # either a clean "not cached" summary or a model-invalid error, never ``cached: true``
+    assert events[-1].get("cached") is not True
+    if events[-1]["event"] == "error":
+        assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+    else:
+        assert code == 0 and events[-1]["cached"] is False
+
+
+def test_moonshine_missing_extra_is_a_clean_error_without_the_hub_hint(monkeypatch, capsys):
+    import builtins
+
+    real = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name == "moonshine_voice" or name.startswith("moonshine_voice."):
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return real(name, *a, **k)
+
+    for m in [m for m in sys.modules if m.split(".")[0] == "moonshine_voice"]:
+        monkeypatch.delitem(sys.modules, m)
+    monkeypatch.delitem(sys.modules, "stt_server.backends.moonshine", raising=False)
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModuleNotFoundError"
+    assert "huggingface_hub" not in events[-1]["message"], "the hint is conditional"
+    assert "moonshine" in events[-1]["message"]
+
+
+def test_moonshine_missing_transitive_dependency_has_no_hub_hint(
+    fake_moonshine, monkeypatch, capsys
+):
+    """The hint is keyed on the spec type (``check``/``fetch`` set), not on message text: a
+    moonshine spec never gets it, whichever module is missing."""
+    import stt_server.backends.moonshine as MS
+
+    def missing(*_a, **_k):
+        raise ModuleNotFoundError("No module named 'filelock'", name="filelock")
+
+    monkeypatch.setattr(MS, "_import_package", missing)
+    code, events, _ = _ms(monkeypatch, capsys, "--check", "--json")
+    assert code == 1 and events[-1]["code"] == "ModuleNotFoundError"
+    assert "filelock" in events[-1]["message"]
+    assert "huggingface_hub" not in events[-1]["message"]
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_hf_missing_transitive_dependency_keeps_the_hub_hint(monkeypatch, capsys, check):
+    """Unchanged since before the moonshine backend: any missing module on the Hugging Face
+    path (here ``filelock``, which ``huggingface_hub`` needs) gets the hint."""
+
+    def no_filelock(spec, *, local_files_only):
+        raise ModuleNotFoundError("No module named 'filelock'", name="filelock")
+
+    monkeypatch.setattr(PF, "_snapshot_download", no_filelock)
+    argv = ("--backend", "kyutai", "--json") + (("--check",) if check else ())
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+    assert code == 1 and events[-1]["code"] == "ModuleNotFoundError"
+    assert "filelock" in events[-1]["message"]
+    assert (
+        "prefetch needs huggingface_hub, which every model extra installs"
+        in (events[-1]["message"])
+    )
+
+
+def test_missing_huggingface_hub_hint_is_kept_for_hf_backends(monkeypatch, capsys):
+    def no_hub(spec, *, local_files_only):
+        raise ModuleNotFoundError("No module named 'huggingface_hub'", name="huggingface_hub")
+
+    monkeypatch.setattr(PF, "_snapshot_download", no_hub)
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
+    assert code == 1 and "huggingface_hub" in events[-1]["message"]
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_moonshine_local_model_path_is_refused(
+    fake_moonshine, tmp_path, monkeypatch, capsys, check
+):
+    model = tmp_path / "some-dir"
+    model.mkdir()
+    argv = ["--model", str(model), "--json"] + (["--check"] if check else [])
+    code, events, _ = _ms(monkeypatch, capsys, *argv)
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ConfigError"
+    assert fake_moonshine.downloads == []
+
+
+@pytest.mark.parametrize("model", ["@ko", "@uk", "base@es", "bogus-arch", "@xx"])
+@pytest.mark.parametrize("check", [True, False])
+def test_moonshine_invalid_spec_is_a_config_error(
+    fake_moonshine, monkeypatch, capsys, model, check
+):
+    argv = ["--model", model, "--json"] + (["--check"] if check else [])
+    code, events, _ = _ms(monkeypatch, capsys, *argv)
+    assert code == 1 and events[-1]["code"] == "ConfigError"
+    assert fake_moonshine.downloads == []
+
+
+@pytest.mark.parametrize(
+    ("model", "bad_repo"),
+    [
+        # the first language is valid, a later one is not
+        ("medium-streaming@en,es", "moonshine-voice/medium-streaming-es"),
+        ("base@en,ja", "moonshine-voice/base-ja"),
+        ("@en,xx", "moonshine-voice/default-xx"),
+        ("@en,ko", "moonshine-voice/default-ko"),
+        # the first language is the invalid one
+        ("@xx,en", "moonshine-voice/default-xx"),
+    ],
+    ids=["medium-streaming@en,es", "base@en,ja", "@en,xx", "@en,ko", "@xx,en"],
+)
+@pytest.mark.parametrize("cache", ["empty", "corrupt", "healthy"])
+@pytest.mark.parametrize("check", [True, False])
+def test_moonshine_multi_language_spec_is_refused_before_any_download(
+    fake_moonshine, monkeypatch, capsys, model, bad_repo, cache, check
+):
+    """A spec serve's ``build_served`` refuses at ``start()`` is refused by ``--check`` and by a
+    fetch before any cached file is read or any language downloads, whatever the cache holds
+    for the valid languages, and the error's ``repo`` names the language that is invalid."""
+    import stt_server.backends.moonshine as MS
+
+    arch, langs = MS.parse_model_spec(model)
+    seeded: dict[Path, bytes] = {}
+    for code in langs:
+        if cache == "empty":
+            break
+        try:
+            resolved = MS.resolve_arch(code, arch, fake_moonshine.catalog)
+        except Exception:  # noqa: BLE001 - the invalid language has nothing to seed
+            continue
+        root = Path(fake_moonshine.write_model(code, resolved, corrupt=cache == "corrupt"))
+        seeded.update({p: p.read_bytes() for p in root.iterdir()})
+    crc_reads: list[str] = []
+    dfile = sys.modules["moonshine_voice.download_file"]
+    real_crc = dfile.crc32c_file
+    monkeypatch.setattr(dfile, "crc32c_file", lambda p: crc_reads.append(str(p)) or real_crc(p))
+
+    argv = ["--model", model, "--json"] + (["--check"] if check else [])
+    code, events, _ = _ms(monkeypatch, capsys, *argv)
+
+    assert code == 1 and events[-1]["code"] == "ConfigError", events[-1]
+    assert events[-1]["repo"] == bad_repo
+    assert repr(bad_repo.rsplit("-", 1)[1]) in events[-1]["message"]
+    assert fake_moonshine.downloads == []
+    assert crc_reads == [], "no cached file is read before the spec is refused"
+    assert {p: p.read_bytes() for p in seeded} == seeded, "no cached file is touched"
+    assert not any(e.get("event") in ("check", "progress", "done", "complete") for e in events)
+
+
+def test_same_named_cwd_dir_is_a_model_name_for_a_backend_without_local_paths(
+    tmp_path, monkeypatch, capsys
+):
+    """``base`` is a moonshine/whisper-style name; a ``./base`` directory in the cwd
+    must not turn it into a local path (serve accepts the same spec)."""
+    (tmp_path / "base").mkdir()
+    monkeypatch.chdir(tmp_path)
+    seen: list[tuple[str, str | None]] = []
+
+    def specs_for(backend, model):
+        seen.append((backend, model))
+        return [
+            PF.SnapshotSpec(
+                "moonshine-voice/base-en",
+                revision="1",
+                check=lambda spec: ("/cache/base", 1),
+                fetch=lambda spec, progress: "/cache/base",
+            )
+        ]
+
+    monkeypatch.setattr(PF, "specs_for", specs_for)
+
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "moonshine", "--model", "base", "--check", "--json"
+    )
+
+    assert code == 0, events
+    assert seen == [("moonshine", "base")]
+
+
+def test_is_local_model_ignores_cwd_names_only_for_backends_without_local_paths(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "base").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert PF.is_local_model("base") is True
+    assert PF.is_local_model("base", backend="mlx") is True
+    assert PF.is_local_model("base", backend="moonshine") is False
+    assert PF.is_local_model("base", backend="kyutai") is False
+    assert PF.is_local_model("./base", backend="moonshine") is True
+
+
+# --- the prefetch-repo tag: one named attribute, set through one helper -------------
+
+
+def test_tag_prefetch_repo_sets_the_named_attribute_and_overwrites():
+    from stt_server.snapshot import PREFETCH_REPO_ATTR, tag_prefetch_repo
+
+    exc = ValueError("boom")
+    assert getattr(exc, PREFETCH_REPO_ATTR, None) is None
+    tag_prefetch_repo(exc, "org/a")
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
+    tag_prefetch_repo(exc, "org/b")  # the default overwrites
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/b"
+
+
+def test_tag_prefetch_repo_keep_existing_form():
+    """``overwrite=False`` (the prefetch drivers' form) keeps a repo already tagged and
+    tags an untagged exception."""
+    from stt_server.snapshot import PREFETCH_REPO_ATTR, tag_prefetch_repo
+
+    exc = ValueError("boom")
+    tag_prefetch_repo(exc, "org/a", overwrite=False)
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
+    tag_prefetch_repo(exc, "org/b", overwrite=False)
+    assert getattr(exc, PREFETCH_REPO_ATTR) == "org/a"
+
+
+def test_prefetch_repo_attribute_is_stt_namespaced():
+    """The tag lands on third-party exceptions, so it carries the ``_stt_`` prefix its
+    sibling tags use."""
+    import stt_server.snapshot as S
+
+    assert S.PREFETCH_REPO_ATTR == "_stt_prefetch_repo"
+
+
+def test_tag_prefetch_repo_leaves_an_exception_without_attributes_untagged():
+    from stt_server.snapshot import PREFETCH_REPO_ATTR, tag_prefetch_repo
+
+    class Frozen(Exception):
+        def __setattr__(self, name, value):
+            raise AttributeError(name)
+
+    exc = Frozen("y")
+    tag_prefetch_repo(exc, "org/a")  # must not raise over the error being reported
+    assert getattr(exc, PREFETCH_REPO_ATTR, None) is None

@@ -20,8 +20,13 @@ def test_cli_choices_are_the_registry():
 
 
 @pytest.mark.parametrize("name", [n for n, e in BACKENDS.items() if e.module])
-def test_entry_matches_its_module(name):
+def test_entry_matches_its_module(name, monkeypatch, tmp_path):
     entry = BACKENDS[name]
+    if name == "moonshine":
+        # Its prefetch specs read the package's model catalog: use the fake wheel.
+        from _fake_moonshine import install
+
+        install(monkeypatch, tmp_path / "moonshine-cache")
     module = importlib.import_module(entry.module)
     cls = getattr(module, entry.class_name)
     assert cls.backend_name == name
@@ -33,7 +38,9 @@ def test_entry_matches_its_module(name):
         getattr(backend, "abort", lambda: None)()
     assert callable(module.prefetch_specs)
     (spec,) = PF.specs_for(name, None)
-    assert spec.repo_id == entry.default_model
+    assert spec.repo_id
+    if name != "moonshine":  # the synthetic moonshine repo id is not the model spec
+        assert spec.repo_id == entry.default_model
 
 
 def test_echo_entry():
@@ -145,3 +152,23 @@ def test_config_error_lives_outside_the_cli_layer():
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_moonshine_entry_has_no_hub_pin_and_no_local_paths():
+    from stt_server.backends import DEFAULT_MOONSHINE_MODEL, PINNED_REVISIONS
+
+    entry = BACKENDS["moonshine"]
+    assert entry.default_model == DEFAULT_MOONSHINE_MODEL == "medium-streaming@en"
+    assert entry.local_model_paths is False
+    assert DEFAULT_MOONSHINE_MODEL not in PINNED_REVISIONS
+    with pytest.raises(ValueError, match="local model paths"):
+        PF.local_specs_for("moonshine", "/tmp/m")
+
+
+def test_moonshine_default_spec_carries_the_package_pin(monkeypatch, tmp_path):
+    from _fake_moonshine import install
+
+    fake = install(monkeypatch, tmp_path / "moonshine-cache")
+    (spec,) = PF.specs_for("moonshine", None)
+    assert spec.revision == fake.version
+    assert callable(spec.check) and callable(spec.fetch)
