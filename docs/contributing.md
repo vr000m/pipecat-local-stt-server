@@ -51,6 +51,12 @@ selection, and `prefetch`.
     [operations port table](operations.md#per-backend-port-convention) if the
     backend gets a LaunchAgent, and `CHANGELOG.md`.
 
+Keep `CHANGELOG.md` bullets short: say what changed and what a user must do, in
+about 40 words. Put mechanism, rationale and error cases in
+[Backends and models](backends.md) or the dev plan and name them in the bullet.
+GitHub release notes repeat the changelog section, so a long bullet is repeated
+there.
+
 ## Verification
 
 Run formatting and linting before the complete test suite:

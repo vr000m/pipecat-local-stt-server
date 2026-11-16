@@ -199,7 +199,8 @@ answer. With `--json`, stdout contains one event per line:
 | `summary` | `backend`, `model`, `cached`, `size_bytes` |
 | `error` | `code`, `message`, `repo` |
 
-For a moonshine multi-language spec that `serve` refuses, the `error` event's
+For a moonshine multi-language spec that `serve` refuses, `prefetch` fails
+before any model downloads, and the `error` event's
 `repo` names the first listed language that fails, as
 `moonshine-voice/<arch>-<lang>` (`default` for an omitted arch), such as
 `moonshine-voice/medium-streaming-es` for `medium-streaming@en,es`.
