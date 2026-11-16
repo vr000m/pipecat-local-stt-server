@@ -49,10 +49,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .errors import ConfigError, is_config_error
+
 # ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
 # import it from there); re-exported here for existing callers.
 from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
-from .errors import ConfigError, is_config_error
 
 __all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 
@@ -264,7 +265,10 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         except ImportError:
             raise
         except Exception as exc:
-            exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            # Keep a repo the backend already tagged (a whole-spec refusal names
+            # the language that failed, not the spec being checked).
+            if getattr(exc, "_prefetch_repo", None) is None:
+                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
             raise
         if found is not None:
             row.update(cached=True, path=found[0], size_bytes=found[1])
@@ -495,8 +499,10 @@ def _run_fetch(backend: str, model: str | None, specs: list[SnapshotSpec], emit)
             raise
         except Exception as exc:
             # Origin tags (download vs unusable snapshot) are set where the
-            # failure happened inside ``fetch_spec``; only attach the repo here.
-            exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            # failure happened inside ``fetch_spec``; only attach the repo here,
+            # unless the raiser already named one (see ``check_spec``).
+            if getattr(exc, "_prefetch_repo", None) is None:
+                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
             raise
     if emit is not None:
         emit(

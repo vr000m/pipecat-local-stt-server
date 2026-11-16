@@ -1029,19 +1029,54 @@ def test_moonshine_invalid_spec_is_a_config_error(
 
 
 @pytest.mark.parametrize(
-    "model", ["medium-streaming@en,es", "base@en,ja", "@en,xx", "@en,ko"], ids=str
+    ("model", "bad_repo"),
+    [
+        # the first language is valid, a later one is not
+        ("medium-streaming@en,es", "moonshine-voice/medium-streaming-es"),
+        ("base@en,ja", "moonshine-voice/base-ja"),
+        ("@en,xx", "moonshine-voice/default-xx"),
+        ("@en,ko", "moonshine-voice/default-ko"),
+        # the first language is the invalid one
+        ("@xx,en", "moonshine-voice/default-xx"),
+    ],
+    ids=["medium-streaming@en,es", "base@en,ja", "@en,xx", "@en,ko", "@xx,en"],
 )
+@pytest.mark.parametrize("cache", ["empty", "corrupt", "healthy"])
 @pytest.mark.parametrize("check", [True, False])
 def test_moonshine_multi_language_spec_is_refused_before_any_download(
-    fake_moonshine, monkeypatch, capsys, model, check
+    fake_moonshine, monkeypatch, capsys, model, bad_repo, cache, check
 ):
-    """The first language is valid and the second is not: serve's ``build_served`` refuses the
-    spec at ``start()``, so prefetch must refuse it before the first language downloads."""
+    """A spec serve's ``build_served`` refuses at ``start()`` is refused by ``--check`` and by a
+    fetch before any cached file is read or any language downloads, whatever the cache holds
+    for the valid languages, and the error's ``repo`` names the language that is invalid."""
+    import stt_server.backends.moonshine as MS
+
+    arch, langs = MS.parse_model_spec(model)
+    seeded: dict[Path, bytes] = {}
+    for code in langs:
+        if cache == "empty":
+            break
+        try:
+            resolved = MS.resolve_arch(code, arch, fake_moonshine.catalog)
+        except Exception:  # noqa: BLE001 - the invalid language has nothing to seed
+            continue
+        root = Path(fake_moonshine.write_model(code, resolved, corrupt=cache == "corrupt"))
+        seeded.update({p: p.read_bytes() for p in root.iterdir()})
+    crc_reads: list[str] = []
+    dfile = sys.modules["moonshine_voice.download_file"]
+    real_crc = dfile.crc32c_file
+    monkeypatch.setattr(dfile, "crc32c_file", lambda p: crc_reads.append(str(p)) or real_crc(p))
+
     argv = ["--model", model, "--json"] + (["--check"] if check else [])
     code, events, _ = _ms(monkeypatch, capsys, *argv)
-    assert code == 1 and events[-1]["code"] == "ConfigError"
+
+    assert code == 1 and events[-1]["code"] == "ConfigError", events[-1]
+    assert events[-1]["repo"] == bad_repo
+    assert repr(bad_repo.rsplit("-", 1)[1]) in events[-1]["message"]
     assert fake_moonshine.downloads == []
-    assert not any(e.get("event") in ("progress", "complete", "result") for e in events)
+    assert crc_reads == [], "no cached file is read before the spec is refused"
+    assert {p: p.read_bytes() for p in seeded} == seeded, "no cached file is touched"
+    assert not any(e.get("event") in ("check", "progress", "done", "complete") for e in events)
 
 
 def test_same_named_cwd_dir_is_a_model_name_for_a_backend_without_local_paths(

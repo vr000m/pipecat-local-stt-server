@@ -522,9 +522,20 @@ def _validated_arch(
 
     ``build_served`` (what ``start()`` calls) checks every listed language, so a
     spec serve refuses fails here before any language downloads, not after the
-    earlier ones finished.
+    earlier ones finished. ``build_served`` is applied one language at a time
+    (it validates each language independently) so that a refusal is tagged with
+    the repo of the language that failed (prefetch's error event reports it),
+    not the repo whose check/fetch happens to be running.
     """
-    return build_served(languages, requested_arch, download._stt_catalog())[language]
+    catalog = download._stt_catalog()
+    served: dict[str, Any] = {}
+    for code in languages:
+        try:
+            served.update(build_served((code,), requested_arch, catalog))
+        except Exception as exc:
+            exc._prefetch_repo = _spec_repo_id(requested_arch, code)  # type: ignore[attr-defined]
+            raise
+    return served[language]
 
 
 def _check_model(
@@ -645,6 +656,11 @@ def _fetch_model(
     return str(root)
 
 
+def _spec_repo_id(arch: str | None, code: str) -> str:
+    """The synthetic prefetch ``repo_id`` of one served language."""
+    return f"moonshine-voice/{arch or 'default'}-{code}"
+
+
 def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend moonshine`` fetches.
 
@@ -653,13 +669,14 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     (``moonshine-voice/<arch>-<lang>``, ``default`` for an omitted arch),
     ``revision`` is the ``moonshine-voice`` version, and ``check``/``fetch``
     import the package lazily and derive completeness from its own manifest.
-    Each callable validates the whole spec (every language) through ``build_served``,
-    as ``start()`` does, before it checks or downloads anything.
+    Each callable validates the whole spec (every language) as ``start()``'s
+    ``build_served`` does, before it checks or downloads anything; a refusal names
+    the repo of the language that failed.
     """
     arch, langs = parse_model_spec(model or DEFAULT_MOONSHINE_MODEL)
     return [
         SnapshotSpec(
-            f"moonshine-voice/{arch or 'default'}-{code}",
+            _spec_repo_id(arch, code),
             # The pin itself, as hub backends report their pinned revision; any
             # other installed version is refused by ``_import_package``.
             revision=MOONSHINE_VOICE_VERSION,
