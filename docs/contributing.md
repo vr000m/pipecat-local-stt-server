@@ -21,7 +21,10 @@ selection, and `prefetch`.
    `SnapshotSpec` `check` and `fetch` callables instead (both or neither;
    `SnapshotSpec` raises `ValueError` otherwise), and `prefetch` calls
    them without touching `huggingface_hub`. The exact field contract lives in
-   `stt_server/snapshot.py`.
+   `stt_server/snapshot.py`. A `check`/`fetch` that refuses something per
+   language tags the exception with `tag_prefetch_repo`
+   (`stt_server/snapshot.py`) so prefetch's `error` event names the right
+   repo; prefetch keeps a tag already set.
 3. **Optional dependency boundary.** Import the backend's optional extra only
    inside `start()` or lazy model loading. Re-raise a missing extra as
    `ModuleNotFoundError` with the `uv sync --extra <name> --inexact` remedy.

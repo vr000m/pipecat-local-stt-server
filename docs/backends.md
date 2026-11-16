@@ -112,8 +112,8 @@ removing models is the operator's or the supervising tool's job.
 Latency: `scripts/benchmark_moonshine_latency.py` measures, against a running
 moonshine server, the p50 from `commit` to `transcription.completed` for 3, 5
 and 10 s utterances fed in real time (JSON key `one_shot_p50_s` with
-`--json-out`), plus the library `stop()` flush after a streamed feed. Run it with
-`uv run --inexact python scripts/benchmark_moonshine_latency.py --uri
+`--json-out`), plus the library `stop()` flush after a streamed feed. Run it
+with `uv run --inexact python scripts/benchmark_moonshine_latency.py --uri
 ws://127.0.0.1:9965/` (or `--socket <path>`; token from `--auth-token-file` or
 `STT_WS_TOKEN`). The run refuses a server whose `server.hello` does not report
 the `moonshine` backend, before it sends any audio. It fails on a server
@@ -200,9 +200,9 @@ answer. With `--json`, stdout contains one event per line:
 | `error` | `code`, `message`, `repo` |
 
 For a moonshine multi-language spec that `serve` refuses, the `error` event's
-`repo` names the language that fails, as `moonshine-voice/<arch>-<lang>`
-(`default` for an omitted arch), such as `moonshine-voice/medium-streaming-es`
-for `medium-streaming@en,es`.
+`repo` names the first listed language that fails, as
+`moonshine-voice/<arch>-<lang>` (`default` for an omitted arch), such as
+`moonshine-voice/medium-streaming-es` for `medium-streaming@en,es`.
 
 Progress counts only files this run must download. Cached files are excluded
 from `total_bytes` and `files_total`; resumed partial bytes count toward
