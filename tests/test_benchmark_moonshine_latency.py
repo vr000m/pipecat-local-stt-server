@@ -308,15 +308,18 @@ class _FakeWireClient:
     """Stands in for ``TranscriptionClient``: yields ``events`` after the commit, then
     either closes (``hang=False``) or waits forever (``hang=True``)."""
 
-    def __init__(self, events: list[dict], *, hang: bool = False) -> None:
+    def __init__(
+        self, events: list[dict], *, hang: bool = False, hello: dict | None = None
+    ) -> None:
+        self._hello = {"backend": {"name": "moonshine"}} if hello is None else hello
         self._events = events
         self._hang = hang
         self.sent: list[bytes] = []
         self.committed = False
         self.closed = False
 
-    async def connect(self) -> None:
-        pass
+    async def connect(self) -> dict:
+        return self._hello
 
     async def update_session(self, **_kw) -> None:
         pass
@@ -385,6 +388,18 @@ def test_measure_one_shot_wire_fails_on_transcript_failed_and_early_close():
     closed = _FakeWireClient([])
     with pytest.raises(RuntimeError, match="socket closed"):
         asyncio.run(measure_one_shot_wire(lambda: closed, _tone(0.1), pace=False))
+
+
+@pytest.mark.parametrize(
+    "hello", [{"backend": {"name": "whisper"}}, {}, {"backend": None}, {"backend": {}}]
+)
+def test_measure_one_shot_wire_refuses_a_server_that_is_not_moonshine(hello):
+    """A wrong endpoint, or one too old to report ``backend`` (as ``_probe`` treats it), fails
+    before any audio is sent."""
+    client = _FakeWireClient([{"type": P.EVT_TRANSCRIPT_COMPLETED}], hello=hello)
+    with pytest.raises(RuntimeError, match=r"reports backend .*expected 'moonshine'"):
+        asyncio.run(measure_one_shot_wire(lambda: client, _tone(0.3), pace=False))
+    assert client.sent == [] and not client.committed and client.closed
 
 
 @pytest.mark.parametrize(
