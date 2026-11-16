@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Clarified setup and contributor guidance, and split detailed operations
+  reference into [Transport security](docs/security.md) and
+  [Testing and benchmarks](docs/testing.md). Existing operations links remain
+  valid; runtime behaviour is unchanged.
+
 ## [0.6.0] - 2026-11-16
 
 ### Added

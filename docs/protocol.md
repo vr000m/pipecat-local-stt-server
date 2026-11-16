@@ -2,7 +2,7 @@
 
 > Wire protocol for [pipecat-local-stt-server](../README.md). See also the [client and integration guide](integration.md).
 
-Client -> server JSON events:
+## Client-to-server events
 
 - `session.update`
 - `input_audio_buffer.append` (base64 compat mode; binary frames are the V1 default)
@@ -11,7 +11,7 @@ Client -> server JSON events:
 - `session.close`
 - `session.cancel`
 
-Server -> client JSON events:
+## Server-to-client events
 
 - `server.hello`
 - `session.created`
@@ -23,7 +23,9 @@ Server -> client JSON events:
 - `server.status`
 - `error`
 
-Deviations from the OpenAI Realtime transcription snapshot (2026-04-20):
+## Differences from OpenAI Realtime
+
+Compared with the transcription snapshot used by this implementation (2026-04-20):
 
 - no conversation graph, no output audio, no tools/assistant responses
 - `item_id` and server `event_id` are server-minted; `previous_item_id`
@@ -54,5 +56,5 @@ returned as plain HTTP responses, not protocol JSON envelopes (there is no
 
 The UDS peer-credential check (`403 peer not permitted`) is server-side only and
 requires no client change — see
-[Trust model and socket security](operations.md#trust-model-and-socket-security-same-host-uds).
+[Trust model and socket security](security.md#trust-model-and-socket-security-same-host-uds).
 

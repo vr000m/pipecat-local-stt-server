@@ -1,17 +1,81 @@
 # Operations and deployment
 
-> Multi-backend deployment, LaunchAgent management, health checks, smoke tests,
-> and transport security for [pipecat-local-stt-server](../README.md). Backend
-> selection and model tuning live in [Backends and models](backends.md).
+Install and manage persistent macOS LaunchAgents for
+[pipecat-local-stt-server](../README.md). For a foreground server, start with
+the [README](../README.md). Choose a model in [Backends and models](backends.md).
+
+- [Install an agent](#installing-agents)
+- [Enable, disable, or remove an agent](#everyday-commands)
+- [Choose an endpoint](#per-backend-port-convention)
+- [Check server health](#checking-server-health)
+- [Transport security](security.md)
+- [Testing and benchmarks](testing.md)
+
+## Installing agents
+
+Run these commands from the repository checkout on macOS with `uv` and
+`just` installed. Each agent runs at login and restarts if its process exits.
+Warm the model cache before installing a production agent:
+
+```bash
+uv sync --extra parakeet --inexact
+uv run --no-sync python -m stt_server prefetch --backend parakeet
+just stt-install parakeet
+```
+
+`just stt-install` and `just stt-enable` ensure the selected backend's extra
+is present without pruning other extras. Kyutai uses a separate environment;
+see [Kyutai](#kyutai-agent-and-its-own-venv). Set
+`PIPECAT_STT_SKIP_DEP_SYNC=1` only if you manage dependencies yourself.
+A bare `uv sync` or `uv run` can remove extras, so use `uv run --no-sync`
+for commands in an existing environment.
+
+Replace `parakeet` with `whisper`, `nemotron`, `kyutai`, or `moonshine` to
+install another backend. The [port table](#per-backend-port-convention) lists
+their endpoints. Each install starts that agent.
+
+A cold start can spend minutes downloading weights. Prefetch first so a
+launch failure does not repeat that work under launchd's restart policy. See
+[Prefetching and cache checks](backends.md#prefetching-and-cache-checks) for
+progress events, local model paths, and pinned revisions.
+
+### Custom agents
+
+The installer manages one agent per invocation, identified by
+`PIPECAT_STT_LABEL`. A default invocation targets `pipecat.stt-server`.
+Set a distinct label and backend for a custom agent, then reuse those settings
+for `uninstall`, `start`, `stop`, `restart`, `status`, or `logs`.
+The `just` recipes carry the canonical labels for you.
+
+Configure the installer with `PIPECAT_STT_LABEL`, `PIPECAT_STT_BACKEND`,
+`PIPECAT_STT_HOST`, `PIPECAT_STT_PORT`, and `PIPECAT_STT_SOCKET`.
+Legacy `KODA_STT_*` aliases remain supported where they exist; `HOST`, `PORT`,
+and `AUTH_TOKEN_FILE` have no `KODA_` alias. Uninstall reads the socket path
+from the installed plist, not the environment, and waits for the old job to
+unload before cleanup. See [Socket agents](#socket-agents-opt-in).
+
+## Everyday commands
+
+| Task | Command |
+|---|---|
+| List agents, pids, and live endpoints | `just stt-list` |
+| Probe one agent | `just stt-status parakeet` |
+| Probe a socket path | `just stt-status ~/Library/Caches/pipecat-stt/stt.sock` |
+| Stop until the next login; keep the plist | `just stt-disable parakeet` |
+| Start an installed agent | `just stt-enable parakeet` |
+| Remove the agent and its plist | `just stt-uninstall parakeet` |
+
+`stt-disable` does not persist across login: launchd reloads the saved plist.
+Use `stt-uninstall` to remove it, or `launchctl disable` for persistent
+suppression while keeping the plist. Check the installed endpoint with
+`stt-list` after changing transport or port.
 
 ## Multi-backend operation
 
-Each server process loads exactly **one** backend, pinned at launch via
-`--backend {echo,mlx,parakeet,nemotron,kyutai,moonshine}`. To run more than one ASR — for example to
-A/B-benchmark Parakeet against Whisper — start a second server process on its
-own endpoint: a **separate port** (the default for agents) or, for a socket
-agent, a separate socket. The V1 wire protocol is unchanged; the only difference
-between two ASRs from the bot's perspective is which endpoint it connects to.
+Each process loads one backend, selected at launch with `--backend`. To run
+Whisper and Parakeet together, start two processes on separate ports or socket
+paths. Clients use the same wire protocol for both; they select the backend
+by choosing its endpoint.
 
 ### Per-backend port convention
 
@@ -25,27 +89,31 @@ between two ASRs from the bot's perspective is which endpoint it connects to.
 
 Agents bind loopback TCP (`127.0.0.1:<port>`) by default. A Unix socket is
 opt-in: set `PIPECAT_STT_SOCKET` when running `just stt-install` (see
-[Socket agents](#socket-agents-opt-in)). Point the bot at the agent with
-`STT_WS_HOST`/`STT_WS_PORT`.
+[Socket agents](#socket-agents-opt-in)). Set `STT_WS_HOST=127.0.0.1` and `STT_WS_PORT=<port>` on the client.
+The client library has no built-in endpoint default. For a socket agent, set
+`STT_WS_SOCKET` instead.
 
-The sibling TTS server uses ports 8665-9365; do not copy one of those ports into
-an STT example. The macOS menu bar app uses the same STT port convention. It
-does not yet adopt an occupied port, so an agent and the app contend if both try
-to own the same endpoint.
+Use a different endpoint for any second server, including one launched by a
+menu bar app. Two processes cannot own the same listening port.
 
-For a TCP agent, `just stt-install` / `just stt-uninstall` always use the
-canonical host and port from this table (the recipe strips an ambient
-`PIPECAT_STT_HOST`/`PIPECAT_STT_PORT`; the installer owns the socket-vs-TCP rule and
-applies its canonical defaults, and with `PIPECAT_STT_SOCKET`/`KODA_STT_SOCKET` set it
-installs a socket agent and has no TCP settings to ignore). For a custom host or port, run the installer directly, e.g.
-`PIPECAT_STT_LABEL=pipecat.stt-server.alt PIPECAT_STT_BACKEND=mlx
-PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh install`. The installer
-defaults the port to the backend's canonical one when `PIPECAT_STT_PORT` is
-unset; the `echo` backend has no canonical port and requires one. The installer
-holds the one backend-to-port map: `scripts/install_stt_agent.sh port <backend>`
-(installer backend names: `mlx`, `parakeet`, `nemotron`, `kyutai`, `moonshine`) prints it
-without touching launchd or any file, the justfile asks it rather than keeping a
-copy, and a test checks this table against it.
+`just stt-install` and `just stt-uninstall` use the canonical host and port,
+ignoring ambient `PIPECAT_STT_HOST` and `PIPECAT_STT_PORT`. Setting
+`PIPECAT_STT_SOCKET` (or its legacy alias `KODA_STT_SOCKET`) selects a socket
+agent instead.
+
+For a custom TCP endpoint, call the installer with a distinct label:
+
+```bash
+PIPECAT_STT_LABEL=pipecat.stt-server.alt PIPECAT_STT_BACKEND=mlx \
+  PIPECAT_STT_PORT=9570 scripts/install_stt_agent.sh install
+```
+
+The installer defaults to the backend's canonical port when none is set.
+`echo` has no canonical port and requires one. The executable port map lives
+in `scripts/install_stt_agent.sh`: `port <backend>` prints it without changing
+launchd or files. The justfile reads that map, and tests check this table
+against it.
+
 `just stt-status <backend>` probes the endpoint in the installed plist (socket
 or TCP, with its `--auth-token-file`) and falls back to the canonical port only
 when no plist exists; `just stt-list` shows each agent's live endpoint from its
@@ -73,7 +141,7 @@ agent).
 
 - **Loopback TCP has no peer-uid check**: any local process (any uid) can
   connect to the port. Unix sockets keep the peer-uid check and the owner-only
-  directory chain (see [Trust model](#trust-model-and-socket-security-same-host-uds)).
+  directory chain (see [Trust model](security.md#trust-model-and-socket-security-same-host-uds)).
   A TCP agent has no token by default; add one with `--auth-token-file` if that
   matters on a shared host.
 - **A local process that binds the port first can impersonate the server.**
@@ -87,131 +155,6 @@ agent).
   (for example `pipecat-stt-server-parakeet.err`; the default whisper agent logs
   to `pipecat-stt.err`) and free the port or reinstall on another one.
 
-### Port squat detection
-
-Decision for [issue #17](https://github.com/vr000m/pipecat-local-stt-server/issues/17):
-the trust boundary stays as described above. Loopback TCP is open to every local
-user, the token file is opt-in, and token-by-default is deferred until the TTS
-server moves. What this adds is a warning, not a gate.
-
-`just stt-list` and `just stt-status <backend>` compare the pid listening on a
-TCP agent's port (from `lsof`) with the pid launchd reports for that agent
-(`launchctl print`; the recipes hand that answer to `scripts/squat_check.py` on
-stdin, never as an argument, because it carries the job's environment block and
-a plist from before 0.5.0 keeps its bearer token there, while any local user can
-read a process's arguments with `ps`). They warn on stderr, after a 1-second re-check so a restart
-in flight stays quiet (the re-check reads the launchd pid and `runs` counter before and after its
-`lsof` read; a pid or `runs` that changed in between, as when the job started,
-listened and exited between two reads with no pid, or an answer with no `runs =`
-line, gives no warning but a "cannot tell" note), when:
-
-- the agent is running but a different pid holds the port (the warning names the
-  port, the listener pid(s) and command(s), and the launchd pid), or
-- the agent is not running and something holds the port
-  (`port N held by pid X; label not running`).
-
-A listener counts when its address could block the agent's bind: either side is
-a wildcard (`*`, `::`, `0.0.0.0`), the addresses are equal, or the agent's host is
-`localhost` and the listener is on `127.0.0.1` or `::1` (IPv6 brackets ignored).
-
-Stdout and exit codes do not change. Socket agents are not checked, and neither
-is the canonical-port fallback used when no plist is installed. Only launchd's
-own "could not find service" answer counts as not running; when `launchctl
-print` fails any other way the check prints one `squat-check: cannot read the
-launchd state` note and no warning, so an unreadable state is never taken as
-"not loaded" (which would silence the check).
-
-**Limit:** `lsof` run as you lists only your own processes' sockets, so a
-squatter running as another user is invisible. No warning means no visible
-squatter, not that the port is free.
-
-If you see the warning:
-
-```bash
-launchctl print gui/$(id -u)/<label>      # the pid launchd thinks it runs
-lsof -nP -iTCP:<port> -sTCP:LISTEN        # who actually holds the port
-```
-
-Kill the squatter, or reinstall the agent on another port.
-
-### Token file (replaces env tokens)
-
-`render_stt_plist.py` and `install_stt_agent.sh` now **refuse**
-`PIPECAT_STT_AUTH_TOKEN` and `KODA_STT_AUTH_TOKEN` in their environment: an env
-token would be written into the plist. Put the token in a file and pass its
-absolute path instead:
-
-```bash
-install -d -m 700 ~/.config/pipecat-stt                # your own directory; sets mode 700
-install -m 600 /dev/null ~/.config/pipecat-stt/token   # then write the token into it
-PIPECAT_STT_AUTH_TOKEN_FILE=$HOME/.config/pipecat-stt/token \
-  PIPECAT_STT_BACKEND=mlx scripts/install_stt_agent.sh install
-```
-
-In TCP mode the installer checks the file before writing the plist: a regular
-file (not a symlink), owned by you, with no group/other permission bits and no ACL
-allow entry, in a directory chain (symlinks resolved) that only you or root own and
-that no one else can write to. A group-writable directory passes only when root
-owns it and its group is `wheel` or `admin` (whose members can act as root anyway).
-A sticky bit (`t` or `T` in `ls -ld`) is no exception, so a token file under
-`/tmp` is refused: the sticky bit stops others deleting your file, but once the
-name is gone (macOS empties `/tmp` at boot) anyone can create it before the agent
-starts, and the server opens the path afresh at every start. ACLs count too: a directory on the path
-with an ACL allow entry carrying a write-class right (`write`, `append`, `add_file`,
-`add_subdirectory`, `delete`, `delete_child`, `writeattr`, `writeextattr`,
-`writesecurity`, `chown`) for anyone fails the install, as does any allow entry on
-the file itself; deny entries are fine. `ls -le` shows them and `chmod -N` removes
-them. The plist records the resolved path, the one that was checked, so a
-symlinked directory in the path you gave cannot be repointed later. The content must be what the server accepts: it reads the file as
-UTF-8 and strips surrounding whitespace, and the result must be one token of
-visible ASCII characters with no internal whitespace. An empty file would disable
-auth, and a token with a space, tab or newline left inside it after stripping, or a
-non-ASCII character, can never match an `Authorization` header, so both fail the
-install. Leading and trailing whitespace, including the trailing
-newline an editor or `echo` adds, is stripped and fine. A missing file would
-crash-loop the agent, so the installer refuses that too. The probe (`status`)
-stays lenient for a client-side token file.
-
-**`serve --auth-token-file` enforces the same policy at every start.** All of the
-rules above, file and content alike, are one implementation,
-`stt_server.auth.load_token_file`, which the installer's preflight and `serve`
-both run, so an installed agent never trips over them. `serve` opens the file
-with `O_NOFOLLOW`, checks the descriptor it opened (a regular file owned by the
-user running the server, no group/other bits, no ACL allow entry) and then walks
-its resolved directory chain, and reads the token from that same descriptor. The
-path must be absolute. This applies to a server you launch by hand, or one a
-supervising app (Koda, the menu bar app) launches with `--auth-token-file`: a
-file the installer would refuse now stops startup with exit 1 and a one-line
-message naming the file, the problem and the fix, for example
-
-```text
-stt_server: auth token file '/Users/me/token' has mode 644; it must not be group/other accessible; fix: chmod 600 '/Users/me/token'
-```
-
-To fix a refused file: `chmod 600 <file>` for group/other bits; `chmod -N <file>`
-(or `<dir>`) for an ACL; for a parent directory others can write (a shared
-directory, `/tmp`, a group-writable folder) move the file into a directory only you
-can write, e.g. `install -d -m 700 ~/.config/pipecat-stt`, and pass the new
-absolute path; recreate a file someone else owns as yourself (`install -m 600
-/dev/null <file>`, then write the token); pass the real file, not a symlink to it.
-
-A reinstall never silently drops auth: if the installed plist carries a token (a
-pre-0.5.0 env token or `--auth-token-file`) and a TCP install sets no
-`PIPECAT_STT_AUTH_TOKEN_FILE`, the install fails. Set the token file, or run
-`uninstall` first to install without a token. The installer reads the installed
-plist's flags with the server's own grammar (`serve` takes full flag names only),
-so `--auth-token-file /x` and `--auth-token-file=/x` both count as a token. An
-installed plist the installer
-cannot read (malformed, truncated, or the reader's interpreter missing: `install`
-runs it under the venv python, `uninstall` under the system `python3`) also fails the install,
-since it cannot tell whether that agent required a token; `uninstall` still
-removes such an agent but leaves any socket in place, with a warning.
-
-The plist then passes `--auth-token-file <path>` to the server. `just
-stt-install` forwards the caller's environment, so exporting
-`PIPECAT_STT_AUTH_TOKEN_FILE` before the recipe has the same effect. Clients
-send the token with `STT_WS_TOKEN`.
-
 ### Socket agents (opt-in)
 
 Set `PIPECAT_STT_SOCKET` (alias `KODA_STT_SOCKET`; empty counts as unset) to get
@@ -222,14 +165,14 @@ PIPECAT_STT_SOCKET="$HOME/Library/Caches/pipecat-stt/stt.sock" just stt-install 
 ```
 
 Socket mode keeps the directory validation, `0700` socket directory, peer-uid
-check and lock file described below. It ignores `PIPECAT_STT_HOST`, `PORT` and
+check and lock file described in [Transport security](security.md). It ignores `PIPECAT_STT_HOST`, `PORT` and
 `AUTH_TOKEN_FILE` (the installer warns on stderr). Reinstalling a previously-socket agent
 without `PIPECAT_STT_SOCKET` switches it to TCP and removes the old socket; a
 reinstall onto a different socket path removes the old one too. The old socket
 is removed only after the new agent bootstrapped and launchd no longer lists the
 old job (up to `PIPECAT_STT_UNLOAD_WAIT` seconds, default 30), and only while no
 process holds its `.lock` (a server started by hand can own the path); otherwise
-it is left in place with a warning. The `.lock` is never removed (see below). `uninstall` waits the same way,
+it is left in place with a warning. The `.lock` is never removed (see [Lock files](security.md#single-server-lock-file)). `uninstall` waits the same way,
 for a TCP agent too (its server can own the port until it exits): it prints
 `uninstalled: <label>` only once launchd no longer lists the job, and otherwise a
 warning and `uninstall incomplete (still loaded): <label>` (exit 0 either way).
@@ -241,170 +184,6 @@ is printed only for a path the installer would clean itself (absolute, no `..`,
 under `$HOME`, no symlinked directory); for any other recorded path the warning
 says it looks unsafe and offers no command.
 
-### Single-server lock file
-
-Each Unix socket gets a sibling lock file, `<socket>.lock` (for example
-`~/Library/Caches/pipecat-stt/parakeet.sock.lock`). A server takes an exclusive
-`flock` on it before loading the model, so a second server for the same socket
-fails in milliseconds with `EADDRINUSE` instead of after a multi-GB load, and a
-live server whose listen backlog is full is never mistaken for a stale socket.
-
-- Mode `0600`, owned by the server user, set on the open file so the umask
-  never matters. A pre-existing lock file you own that opens read-write is set
-  to `0600` whatever its mode. One you own but cannot open read-write (e.g. mode
-  `000` or `0400`) is reported as `EACCES` with the remedy: `chmod 600` it, or
-  remove it while no server runs. One owned by another user, a symlink or a
-  non-regular file (e.g. a FIFO) makes the server refuse to start.
-- The kernel releases the lock when the server process exits for any reason
-  (including `SIGKILL` and the immediate exit on a stop during startup), so it
-  cannot go stale.
-- The server never unlinks it: deleting it while a server runs, or between two
-  starters, would let two servers own one socket. Leaving it behind is
-  harmless. Clients never open it. The installer never unlinks it either: its
-  check drops the lock when it exits, so unlinking the file afterwards would let
-  a starter that just locked it run beside a later one that creates a new file.
-  On a transport change and on `uninstall` of a socket agent it removes only the
-  stale socket, once launchd no longer lists the old job and no process holds
-  the lock. A held lock (or one it cannot check) leaves the socket in place,
-  with a warning. The check and the unlink are one step under a shared lock on
-  the `.lock`, so a server starting at that moment waits for it (a starter
-  retries a contended lock for 250 ms) and binds only after the unlink; it never
-  loses its fresh socket. With no `.lock` there, nothing is locked (the installer
-  never creates one): a `.lock` that exists when the installer re-reads the
-  entry just before the unlink is honoured (a held one keeps the socket), but
-  one created after that re-read is not seen, so a starter in that window of a
-  few syscalls can lose its fresh socket. A 0.3.x server takes no lock at all,
-  and a server still holding a `.lock` inode an older installer unlinked is not
-  seen either.
-- `serve --supervised` checks it before binding (a held lock is reported as
-  `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
-  a contended lock for 250 ms, so the check never makes a real start fail. It
-  opens the file non-blocking and treats anything but a plain file you own as
-  "not held" (the real start then refuses it), so a planted FIFO cannot hang it.
-- The lock stays held while the server still has work that can touch the
-  socket or the backend:
-  - **Work that outlived its grace or bound** keeps it until that work
-    finishes: a session task that ignores cancellation past the shutdown
-    grace, a decode thread still running on the GPU after its task was
-    cancelled, `backend.close()` running past its bound (the drain timeout,
-    10 s), a listener close that has not completed (a connection handler that
-    will not finish keeps it open past its grace), or a startup / readiness
-    step that ignored `serve`'s cancel (a stop, or `serve` itself being
-    cancelled). This holds also when the shutdown itself was cancelled.
-  - **A cleanup that raises** (an orphaned listener whose close failed) keeps
-    it until the process exits.
-  - **A failed start that left work running** keeps it the same way; that
-    server stays `stopping` and is single-use.
-  - **A failed start that left nothing running** releases it: the server
-    returns to `new` and may be retried.
-
-  In-process callers await `TranscriptionServer.wait_stopped()` for the lock
-  to be free: `shutdown()` returning does not guarantee it.
-  `python -m stt_server serve` exits the process at that point, which
-  releases it. A failure in flight at that exit (for example
-  `backend.close()` raising) is still printed and, under `--supervised`,
-  emitted as the `error` event, with exit status 1.
-- **Mixed versions during an upgrade.** The lock only protects against servers
-  that take it. A server started from a release before the lock existed holds
-  none, and on macOS its socket answers `ECONNREFUSED` when its listen backlog
-  is full, which the preflight reads as stale: a new server could then replace
-  that live server's socket. Stop old servers (`just stt-disable <backend>`, or unload their
-  LaunchAgents) before starting upgraded ones on the same socket path.
-
-A bare install binds TCP, and a client with no endpoint env resolves nothing
-(the library has no built-in default), so set `STT_WS_HOST=127.0.0.1` and
-`STT_WS_PORT=<port>` on the client. Selecting Parakeet is a flip of
-`STT_WS_PORT` to 9765. The flip is **bot-wide** — in the dual-input bot both the
-Me and Them branches connect to the same resolved endpoint, so both arms always
-use the same ASR. A socket agent is selected with `STT_WS_SOCKET` instead. See
-`.env.example` for the client-side configuration.
-
-### Installing agents
-
-> **Backend dependencies.** A backend imports its ASR library lazily at startup,
-> and a bare `uv run` / `uv sync` prunes the optional extras, so an installed
-> agent can crash-loop on `ModuleNotFoundError`. `just stt-install <backend>` /
-> `just stt-enable <backend>` ensure the matching extra is present
-> (`uv sync --extra <backend> --inexact`, additive — it won't prune other
-> backends; kyutai goes to its own `.venv-kyutai`); set
-> `PIPECAT_STT_SKIP_DEP_SYNC=1` to manage extras yourself. If an
-> agent does crash on a missing import, the server now exits with an actionable
-> `stt_server: the '<extra>' extra is not installed … run: uv sync --extra
-> <extra> --inexact` instead of a bare traceback.
-
-```bash
-just stt-install whisper      # 127.0.0.1:9565
-just stt-install parakeet     # 127.0.0.1:9765 — warm the model cache first (below)
-just stt-install nemotron     # 127.0.0.1:9865
-just stt-install kyutai       # 127.0.0.1:9665, own .venv-kyutai
-just stt-install moonshine    # 127.0.0.1:9965, CPU; prefetch first (backends.md#moonshine)
-just stt-list                 # agents, state, pid, live endpoint and backend
-just stt-status               # no argument: same as stt-list
-just stt-status parakeet      # probe the installed plist's endpoint (canonical port 9765 if no plist)
-just stt-status ~/Library/Caches/pipecat-stt/stt.sock   # a path is probed as --socket-path
-just stt-probe --host 127.0.0.1 --port 9565   # status probe of any endpoint
-```
-
-Warm the model cache before installing a production backend. A cold first
-launch downloads under `KeepAlive` + `ThrottleInterval=10`, so launchd can
-throttle-loop the agent before a large download finishes:
-
-```bash
-uv sync --extra parakeet
-.venv/bin/python -m stt_server prefetch --backend parakeet
-```
-
-See [Prefetching and cache checks](backends.md#prefetching-and-cache-checks) for
-cache validation, local model paths, progress events, and pinned revisions.
-
-`scripts/install_stt_agent.sh` is parameterised by `PIPECAT_STT_LABEL` /
-`PIPECAT_STT_BACKEND` / `PIPECAT_STT_HOST` / `PIPECAT_STT_PORT` /
-`PIPECAT_STT_SOCKET` (the legacy `KODA_STT_*` names, where they exist, are still
-honoured as deprecated aliases; `HOST`, `PORT` and `AUTH_TOKEN_FILE` have no
-`KODA_` alias) so several LaunchAgents can coexist without plist or log
-collisions. The script manages exactly **one** agent per invocation, identified
-by `PIPECAT_STT_LABEL` — there is no registry or "all" mode. To run any
-subcommand (`uninstall`/`start`/`stop`/`restart`/`status`/`logs`) against a
-non-default agent you must re-export its `PIPECAT_STT_LABEL` (and
-`PIPECAT_STT_BACKEND` when it is not the default); `uninstall` removes the socket
-named in the *installed* plist, not the env (once the job has unloaded, as above). A default-env invocation always
-targets the default `pipecat.stt-server` agent. Prefer the `just` recipes, which carry
-the label for you. See the recipe in the `install_stt_agent.sh` header.
-
-### A/B benchmark — Whisper vs Parakeet
-
-With both agents installed and live, `scripts/benchmark_asr_ab.py`
-replays a corpus of utterances through **both** servers and reports
-per-utterance Word Error Rate (WER) + decode latency, plus aggregates. It is
-a pure V1 client — no protocol surface added — and a one-off operator tool
-(no REST counterpart, not a CI gate).
-
-```bash
-# 0.5.0 default agents are loopback TCP, so pass the URIs. --whisper-uri /
-# --parakeet-uri override the socket flags.
-uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
-    --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765
-
-# Socket agents: with no endpoint flags the script defaults to
-# ~/Library/Caches/pipecat-stt/stt.sock and .../parakeet.sock
-# (override with --whisper-socket / --parakeet-socket).
-uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus
-
-# Write a full JSON report alongside the console summary.
-uv run --no-sync python scripts/benchmark_asr_ab.py --corpus path/to/corpus \
-    --whisper-uri ws://127.0.0.1:9565 --parakeet-uri ws://127.0.0.1:9765 \
-    --json-out benchmarks/results/asr_ab.json
-```
-
-The corpus is a directory of `<stem>.wav` (16 kHz mono PCM16) + `<stem>.txt`
-reference-transcript pairs, named explicitly on the command line. The
-benchmark **fails fast** if only one of the two endpoints answers — it never
-silently benchmarks a single ASR. The corpus is never baked into the script;
-`docs/benchmarks` / `~/koda-data` JSON corpora carry real names and
-financials, so the script refuses a `--corpus` under those roots unless
-`--allow-pii-corpus` is passed. Use a synthetic or consented-recording corpus
-and keep it outside the repo.
-
 ### Model cache warm-up
 
 `prefetch --json` exposes byte/file progress, and `prefetch --check` inspects
@@ -415,7 +194,7 @@ The server never deletes a healthy cached model; the one exception is a
 same-size Moonshine file whose CRC32C does not match, which `prefetch` removes
 and downloads again. For Moonshine, `prefetch --check --json` reports each
 model's directory and size; see
-[Removing models](backends.md#moonshine) before cleaning the cache.
+[Removing models](backends.md#removing-models) before cleaning the cache.
 
 ## Checking server health
 
@@ -432,7 +211,8 @@ than trust the socket path or port. The `status` subcommand wraps that round-tri
 uv run --no-sync python -m stt_server status --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 
 # Raw JSON for scripting / monitoring
-uv run --no-sync python -m stt_server status --socket-path ... --json
+uv run --no-sync python -m stt_server status \
+  --socket-path ~/Library/Caches/pipecat-stt/stt.sock --json
 
 # Loopback TCP agent (whisper's canonical port; add --auth-token-file if set)
 uv run --no-sync python -m stt_server status --host 127.0.0.1 --port 9565
@@ -443,8 +223,9 @@ just stt-probe --host 127.0.0.1 --port 9565
 
 Representative text output:
 
-```
+```text
 stt_server status: ok
+  backend: parakeet (model: mlx-community/parakeet-tdt-0.6b-v3)
   protocol: 0.1
   audio: pcm16 @ 16000 Hz / 1ch
   capabilities: binary_audio=True base64=True server_vad=False
@@ -456,10 +237,9 @@ stt_server status: ok
   rss: 1800.3MB (peak)
 ```
 
-`rss` is **peak** resident set size from `resource.getrusage` — it
-climbs monotonically within a process lifetime and resets on
-LaunchAgent restart. Useful for leak detection (peak only grows when
-a leak is actually growing), not for real-time memory monitoring.
+`rss` is peak resident set size from `resource.getrusage`, not current memory
+use. It only rises within a process lifetime and resets when the agent restarts;
+a higher peak alone does not prove a leak.
 
 The `server.status` reply fields, for scripting against `--json`:
 
@@ -471,274 +251,68 @@ The `server.status` reply fields, for scripting against `--json`:
 | `uncommitted_bytes` | int | PCM bytes buffered but not yet committed |
 | `uptime_seconds` | float | seconds since this session was created |
 | `pid` | int | server process id |
-| `rss_bytes` | int | peak RSS in bytes, normalized across macOS/Linux |
+| `rss_bytes` | int | peak RSS in bytes, normalised across macOS/Linux |
+| `backend` | object | active backend `name` and `model` |
 
 Use this as a preflight before starting a client, in CI smoke tests, or
 from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 `--port`/`--auth-token-file` endpoint flags work for both `serve` and
 `status` subcommands.
 
+## Detailed references
+
+The following sections retain the previous guide's link targets. Follow each
+link for the full contract.
+
+### Port squat detection
+
+See [Port squat detection](security.md#port-squat-detection) for warnings,
+identity checks, and their limits.
+
+### Token file (replaces env tokens)
+
+See [Token files](security.md#token-file-replaces-env-tokens) for setup,
+permissions, content validation, and authenticated reinstalls.
+
+### Single-server lock file
+
+Never delete a live server's `.lock`. See [Lock files](security.md#single-server-lock-file)
+for ownership, cleanup, and mixed-version upgrade rules.
+
+### A/B benchmark — Whisper vs Parakeet
+
+See [A/B benchmarks](testing.md#ab-benchmark-whisper-vs-parakeet).
+
 ## Smoke tests (`just smoke`)
 
-`just smoke [--agents] [--launchd]` runs the local checks in one command and
-prints one table of PASS, FAIL or SKIPPED with a reason per step; the exit status
-is 1 if any step FAILED (SKIPPED never fails). It runs `.venv/bin/python
-scripts/smoke.py`, never `uv run` (which prunes the backend extras).
-
-| Step | What it runs |
-| --- | --- |
-| `supervised` | `scripts/smoke_supervised.py --backend echo` (see below) |
-| `peercred` | `scripts/smoke_peercred.py`; SKIPPED when no second uid is reachable via passwordless `sudo` (the same-uid leg still ran) |
-| `token-file` | an echo server on a spare port with a token file; a request without the token (or with a wrong one) must get `401`, with it `101`; each request goes over a connection whose server end `lsof` shows is that server's own process |
-| `agents` | `--agents` only: decodes a clip through every installed `pipecat.stt-server*` agent, using the endpoint in its plist, read once (its `--port` parsed as the server parses it; installed plists only: a loaded job without a plist is not decoded; the `launchd` harness's real-agent snapshot covers those). The token is the one the agent's server uses: its `--auth-token-file`, read under the server's own token-file policy (a symlink, a FIFO, a file with group or other access, or a token the server would refuse makes that agent FAIL with nothing sent), else `PIPECAT_STT_AUTH_TOKEN`, else `KODA_STT_AUTH_TOKEN` from the plist's environment; it reaches the decode process on stdin, never on its command line. It is sent only over a connection whose server end was checked: one `launchctl print` gives the agent's pid and `runs` counter; the decode opens the connection and sends nothing until the process holding the server end of that same connection is that pid (`LOCAL_PEERPID` for a socket agent, `lsof` for a TCP agent) and a second `launchctl print` still shows the same pid and `runs`; then the token and the clip go over that connection, through the production
-client's own `connect` (its headers and its `server.hello` / `session.created`
-handshake; only the transport is the verified socket; before anything is sent the decode refuses a `connect` the swap cannot be shown to carry: one that runs outside the client module's globals, uses a name outside the allowlist checked against `client.py` (which includes `ws_unix_connect` and `_socket_path` for its socket branch), or no longer looks up the module-global `ws_connect`; at run time the swapped `ws_connect` must be called exactly once, for the client's own URI, or the decode fails). After the decode a fresh `launchctl print` must still show the same pid and `runs` for a PASS. An installed plist whose job is not loaded in launchd (the servers are run by another app, such as a menu bar app, not launchd) makes that agent SKIPPED: its plist and token file are not read and nothing is sent; servers run that way are not covered by `--agents`. A job that is loaded but not running, a server end held by another process (or not visible to `lsof`, as another user's socket is), a restart in between, or a `launchctl print` answer that cannot be read (never taken as not loaded) makes that agent FAIL, and when the check refused, no token was sent. The step is FAIL if any agent FAILED, else PASS if any agent PASSED, else SKIPPED. Not covered: a process running as root. Read-only: two `launchctl print` calls per agent in the runner (the identity, then the fresh one after the decode; only the first for a job that is not loaded or not decoded) and one in the decode (the re-read once the server end is verified), no bootout, bootstrap, kickstart or installer call. The clip is generated at run time with `say` and `afconvert` (16 kHz mono) and the transcript must contain the spoken key word; SKIPPED when there are no installed agents, every installed agent's job is not loaded, or `say` is absent |
-| `launchd` | `--launchd` only: `scripts/smoke_launchd.py` on the spare label `pipecat.stt-server.smoke` and spare port 9998 |
-
-`--launchd` is opt-in and macOS-only (SKIPPED elsewhere and when `CI` is set).
-The harness refuses to run unless both `PIPECAT_STT_LABEL` and `KODA_STT_LABEL`
-name the spare label; the runner sets both itself, so do the same when calling
-`scripts/smoke_launchd.py` directly. The individual scripts below still run on
-their own, but `just smoke` is the entry point.
-
-Every step has a timeout (`scripts/smoke.py`): `supervised` 600 s, `peercred`
-180 s, `token-file` 90 s; in `agents`, 60 s for each `say` / `afconvert` call
-and 180 s for each decode. The `launchd` step's timeout is the harness's own
-worst case, teardown included (`smoke_launchd.run_budget`, summed from the
-bounds it waits on, for every real agent its snapshot reads: installed plists
-plus loaded jobs with no plist, from `launchctl list`; about 31 minutes with
-none, plus about 2 minutes per agent). A
-timed-out step gets SIGTERM, and Ctrl-C (or a SIGINT or SIGTERM sent to the
-runner) sends the running step SIGINT; the step then has 180 s to clean up (the
-`launchd` step: the harness's whole teardown, `smoke_launchd.teardown_budget`,
-about 3 minutes plus 25 s per agent). Once the step has exited, or that grace ran out, its
-whole process group is killed, before the step's own process is reaped, so the
-kill can only reach that step's group. A further signal to the runner during
-that grace is held until the step has stopped and then stops the run: no later
-step starts, the interrupted step is FAIL, the rest are SKIPPED, and the table
-still prints. A step that crashes is a FAIL row and the run goes on to the next
-step.
-
-Inside the launchd harness each installer call runs in its own process group,
-with a 120 s timeout: a SIGINT or SIGTERM during an install kills the
-installer's whole group before teardown starts, so teardown never runs beside a
-half-finished install. An installer group that cannot be shown stopped (its
-kill failed, or its leader was not reaped) is a failure that stops the
-remaining checks, never a result, also when a signal arrived during it. That
-installer may still bootstrap the spare or rewrite its plist, so the teardown
-then changes nothing (no uninstall, nothing removed): its row FAILs with the
-spare's launchd state, what is left behind and the cleanup commands
-(shell-quoted) to run once no installer process is left. The same holds when
-the teardown's own uninstall cannot be shown stopped. The teardown's uninstall
-is not interrupted.
-The harness runs everything (the installer included) with a scrubbed
-environment: `HOME`, `USER`, `TMPDIR`, the spare label and log-dir variables
-and the fixed `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; `BASH_ENV`, `ENV`,
-exported shell functions, `PYTHON*`, `DYLD_*` and `LD_*` never reach it, and
-bash is `/bin/bash`. An agent
-gets 60 s to answer after each install, and the collision check polls its log
-for 30 s.
-
-The harness's proof that it left the real agents alone is a snapshot of each
-one (every installed `pipecat.stt-server*` plist and every loaded such job):
-from one `launchctl print` of the job, its loaded state, pid, `runs` counter
-(which moves on a restart even when the pid is reused) and the endpoint the job
-is serving; a digest of its plist (the plist is only the intended endpoint and
-can change without a reload) and the port recorded in those same bytes (parsed
-as the server parses `--port`, so `+9998` or `09998` is 9998; a value the
-server would refuse is unreadable and refuses the run); and the
-pid holding the job's endpoint (a socket job's `<socket>.lock`). A job with no
-pid serves nothing; anything it cannot read on a running job refuses the run
-before the first install, a running job whose `launchctl print` has no `runs =`
-line included (the live run is what confirms launchctl prints one). The
-baseline is taken before the guard (which refuses every port a real job serves
-or a real plist recorded, both taken from the baseline) and compared before every check and after teardown; a difference stops
-the remaining checks. A real agent that was not loaded, then loaded and unloaded
-again between two of those comparisons with its plist untouched, leaves nothing
-to compare. A real agent that restarts on its own during the run (a crash loop)
-fails the comparison too: fix it before the run.
-
-Every `launchctl print` answer here, in `smoke.py --agents` and in the
-recipes' squat check is read by one parser, in `scripts/squat_check.py`
-(`read_print` / `parse_print`): only "could not find service" is "not
-loaded", any other failure is "cannot tell", and a running job whose answer
-has no `runs =` line is unreadable everywhere (never "no restart counter").
-
-The token check sends its throwaway token (and a wrong one) only over
-connections whose server end `lsof` shows is the spare job's pid, with the same
-pid and `runs` before and after; it waits for the agent with requests that carry
-no token. The collision check's "agent up" and every rollback transport are
-proved the same way: their no-token request goes over a connection whose server
-end is the spare job, so a listener that is not the spare cannot pass them.
-
-Teardown removes the spare socket and its `.lock` only while it holds that
-`.lock`'s `flock` itself, so no live server can own them; anything it cannot prove
-is its own and unheld is left and reported. A removal that fails, or anything
-still there afterwards, makes the `teardown` row FAIL. On a FAIL the harness
-prints one `FAIL: launchd check failed: <check>: <detail>` line per failed row,
-and `just smoke` shows those in its `launchd` row.
-
-Only one `smoke_launchd.py` run at a time: it takes an exclusive lock on
-`~/Library/Caches/pipecat-stt-smoke-launchd.lock` (in the account home, not
-`$HOME`) before touching anything, and a second run is refused. The lock is
-released when the run exits; the file stays.
-
-The launchd harness uses spare port 9998 by default; when that port is busy, run
-it on another spare port with `scripts/smoke_launchd.py --port <port>` (the guard
-still refuses a canonical port, a port recorded by an installed or loaded agent,
-and a port that is already listening). Its socket-rollback check always uses
-the fixed spare socket `$HOME/Library/Caches/pipecat-stt-smoke-launchd/spare.sock`
-(`PIPECAT_STT_SOCKET` is not read), so it can never be a real agent's socket.
-
-Before it installs anything the harness refuses leftover spare state, and
-prints the cleanup commands (shell-quoted, safe to paste): a loaded spare job, a
-spare plist under `$HOME` or under the account home's `~/Library/LaunchAgents`
-(the label is one launchd job per user, whatever `HOME` says), the spare socket
-or its `.lock`, and spare logs. An installer `warning:` line fails the install
-or the teardown unless it is one of three known harmless ones (socket mode
-ignoring TCP settings, a dropped token for a socket agent, a retried bootstrap).
-
-**Current coverage boundary.** The harness, collision, rollback, token-file,
-and teardown paths have live coverage. The `--agents` child is fully exercised
-against stubbed `launchctl`/`lsof` and a fake agent, but still needs a live run
-with a loaded LaunchAgent. A service managed by another app is SKIPPED rather
-than treated as a launchd-backed agent. Historical run evidence lives in the
-[0.5.1 development plan](dev_plans/20261027-feature-stt-squat-detection-unified-smoke.md).
+See [Smoke tests](testing.md#smoke-tests-just-smoke) for `just smoke`, optional
+agent decoding, and the launchd harness.
 
 ## Supervised smoke test
 
-`scripts/smoke_supervised.py` drives `serve --supervised` the way a menubar or
-other supervising app does: it spawns real server processes and checks the JSON
-`ready`/`error` events, stdin-EOF and SIGTERM stops (including during warm-up),
-a parent that dies, a second instance on a live socket, a stale socket after
-`kill -9`, concurrent clients, and a real transcription. It is opt-in (not in CI
-or pytest) and needs the backend's extra installed; run it with that
-environment's interpreter:
-
-```bash
-.venv/bin/python scripts/smoke_supervised.py --backend echo
-.venv/bin/python scripts/smoke_supervised.py --backend mlx \
-    --model mlx-community/whisper-large-v3-turbo-q4
-```
-
-It exits 0 only if every scenario passes, and 2 (running nothing) when the
-model is not cached: `prefetch` it first.
+See [Supervised smoke tests](testing.md#supervised-smoke-test).
 
 ## Trust model and socket security (same-host UDS)
 
-The Unix-domain-socket transport is hardened on the server side by two
-independent measures. They are layered, not redundant:
-
-1. **Primary filesystem boundary — owner-only ancestor chain.** Before bind,
-   the server walks every directory from the socket's parent up to and
-   including the trusted root (`$HOME`) and **refuses to start** unless each
-   component is owned by the running uid and is not group/other-writable
-   (sticky-bit directories excepted). The walk is over the **literal** socket
-   path clients traverse — not a symlink-resolved one — and **rejects any
-   symlink component**: resolving past a symlink would verify the target's chain
-   while a foreign uid who can write a symlinked-but-writable lexical ancestor
-   could repoint it after startup and hijack the path clients connect to. This
-   makes the socket *un-plantable*: an
-   attacker cannot `unlink()` our socket and `bind()` their own, because they
-   have no write access on any directory that could replace it. On stock macOS
-   the chain (`~/Library/Caches/pipecat-stt` → `~/Library/Caches` → `~/Library`
-   → `~`) already satisfies this once the socket dir is `0700`. A foreign uid
-   cannot even *traverse* to the socket (no `+x` → `connect()` fails `EACCES`
-   at path resolution), so this layer alone closes the same-host foreign-uid
-   vector at the filesystem layer.
-2. **Kernel-authoritative backstop — peer-credential auth.** On every UDS
-   connection the server reads the peer's uid from the kernel
-   (`SO_PEERCRED` on Linux, `getpeereid(2)` on macOS) and rejects any peer
-   whose `uid != server uid` with a pre-handshake `403` before the WebSocket
-   handshake completes. The uid is kernel-supplied and unforgeable, so this
-   holds even if the filesystem perms are ever looser than intended. It is
-   *defense-in-depth behind* the filesystem boundary — not a strictly-stronger
-   replacement for it. Every failure path (resolver returns `None`, resolver
-   raises, missing transport socket, unsupported platform) **fails closed**
-   (rejects), logging one warning.
-3. **Bearer token — TCP/remote only.** For UDS the token is redundant (the
-   filesystem boundary + peer-cred both dominate it), so it is kept but not
-   relied on. For TCP/remote — which has neither a file-permission boundary nor
-   peer credentials — the bearer token remains the trust mechanism, alongside
-   the Origin check. This change does not weaken the TCP path.
-
-**Same-uid precondition.** Peer-cred auth assumes the client and server run as
-the **same uid** (the per-user LaunchAgent deployment satisfies this). A uid
-mismatch is treated as **reject**, not warn-and-allow. A future deployment that
-runs the server as a daemon user and the client as the logged-in user would be
-correctly rejected and would need coordination — but still no client code
-change.
+See [Unix socket security](security.md#trust-model-and-socket-security-same-host-uds).
 
 ### Socket directory permissions (`0700`) — upgrade note
 
-`scripts/install_stt_agent.sh` validates a custom `PIPECAT_STT_SOCKET` against
-the same rules the server enforces — absolute path, under `$HOME`, no symlink
-component — **before** any `mkdir`/`chmod`. A path the server would reject fails
-the install cleanly with no filesystem mutation. It then creates the socket's
-parent directory `0700` from birth (`mkdir -m 700`) and also `chmod 700`s it,
-which **self-heals** a pre-existing `0755` directory left by an older install.
-Because the new startup check refuses to bind against a group/other-writable ancestor:
-
-- **Upgrading an existing host:** re-run `install_stt_agent.sh` (it repairs the
-  dir in place), or manually `chmod 700 ~/Library/Caches/pipecat-stt`.
-- **Custom socket paths:** a `PIPECAT_STT_SOCKET` / `KODA_STT_SOCKET` /
-  `STT_WS_SOCKET` pointing outside `$HOME` (e.g. `/tmp`, `/var`, a shared dir)
-  now makes the server **refuse to start** with
-  `socket directory <path> is not under the trusted root <home>`. Keep custom
-  socket paths under `$HOME`.
-
-If the server refuses to start, the error is printed as `stt_server: <message>`
-on stderr (exit 1) — grep the agent's `.err` log for
-`is not under the trusted root` or `is group/other-writable`.
+See [Socket directory permissions](security.md#socket-directory-permissions).
 
 ### Cross-repo note (Koda)
 
-Koda consumes this repo two ways: it pins the **Python client** at an immutable
-git SHA, and it runs the **server** from this repo's working **checkout at
-HEAD** (not a tagged/PyPI release). Consequences for this hardening:
-
-- **No version bump gates it, and no client pin bump is needed.** The client
-  library and wire protocol are unchanged, so Koda's pinned client stays valid
-  (a pin bump is only required when the imported client/protocol surface
-  changes). PyPI releases are irrelevant to Koda's coupling.
-- **The trigger is the checkout update, not the merge.** The hardening lands on
-  a Koda host the moment its server checkout is updated — decoupled from
-  merging to `main` (which touches no machine until something pulls). Fold the
-  coordination into that window: **re-run `install_stt_agent.sh`** so the socket
-  dir is `0700`, and confirm `KODA_STT_SOCKET` (if set) stays under `$HOME`.
-- Because the startup check is **fail-closed**, the "runtime change takes effect
-  on checkout update" property is now a startup risk if perms/path are not
-  squared away in the same step — that is the entire content of the
-  coordination.
+See [Koda checkout updates](security.md#cross-repo-note-koda).
 
 ### Maintainer note — macOS `getpeereid` via `ctypes`
 
-macOS has no `socket.SO_PEERCRED`, so the resolver in `stt_server/_peercred.py`
-calls `getpeereid(2)` through `ctypes`. Two details are load-bearing and must
-not be dropped: `uid_t`/`gid_t` are `c_uint32` on Darwin, and the libc function
-must have explicit `argtypes`/`restype` set (a wrong width or signature can fail
-*open* by comparing equal). libc is loaded with `use_errno=True`. The
-`socketpair()` unit test asserting `peer_uid() == os.geteuid()` is the gate that
-catches a width/signature regression — keep it.
+See [macOS peer credentials](security.md#macos-peer-credentials).
 
 ### Verifying the boundary locally
 
-Two local checks exercise what single-uid CI cannot:
-
-- `just smoke-peercred` (also part of `just smoke`; `scripts/smoke_peercred.py`) — opens N concurrent
-  same-uid sessions (regression guard) and, when a second local uid is reachable
-  via passwordless `sudo`, drives a foreign-uid connection that must be rejected
-  `403`. The cross-uid leg skips cleanly when no second uid is available.
-- `scripts/verify_peercred_crossuid.py` — a stdlib-only verifier (no venv /
-  `websockets`) that drives a probe as **both** the owning uid (expect `101`) and
-  `nobody` (expect `403`) against one permissive socket. Same socket + perms,
-  only the uid differs, so a `101`-vs-`403` split proves peer-cred — not the
-  filesystem — is the discriminator. Run with `sudo -v && uv run --no-sync python
-  scripts/verify_peercred_crossuid.py`. It binds under `/tmp` (world-traversable)
-  and asserts every ancestor is traversable, so a filesystem-boundary failure is
-  reported as inconclusive rather than masquerading as a peer-cred result.
+See [Local security checks](security.md#verifying-the-boundary-locally).
 
 ## Backend-specific tuning
 
-Backend defaults, model revisions, and the canonical Whisper hallucination
-suppression variables live in [Backends and models](backends.md).
+See [Backends and models](backends.md) for defaults, model revisions, and
+Whisper hallucination suppression.

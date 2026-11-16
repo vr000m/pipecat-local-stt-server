@@ -1,6 +1,10 @@
 # Client and integration
 
-> Python client usage, Pipecat integration, and the Koda reference consumer for [pipecat-local-stt-server](../README.md).
+Connect to a running [server](../README.md) from Python or a Pipecat pipeline.
+
+- [Python client](#client-usage)
+- [Pipecat service](#pipecat-integration)
+- [Koda reference consumer](#reference-consumer-koda)
 
 ## Client usage
 
@@ -8,41 +12,52 @@ Only `TranscriptionClient` (plus `protocol`, `backend` interfaces, and
 `EchoBackend`) is re-exported from the package root — server runtime
 (`TranscriptionServer`, `ServerConfig`, `serve`) lives under
 `stt_server.server`. This lets a client-only install (`client` extra)
-skip the `websockets.asyncio.server` dependency.
+avoid importing the server runtime. The client and server both depend on
+`websockets`; the client extra does not install an ASR engine.
+
+The function below accepts raw 16 kHz mono PCM16 audio. Call it with your
+utterance bytes; WAV headers must not be included.
 
 ```python
 from stt_server import TranscriptionClient
 
-async def run():
-    # UDS (recommended)
+
+async def transcribe(pcm_bytes: bytes) -> str:
     async with TranscriptionClient(
         socket_path="~/Library/Caches/pipecat-stt/stt.sock"
-    ) as c:
-        await c.update_session(turn_detection=None)
-        await c.send_audio(pcm_bytes)     # binary PCM16LE frames
-        await c.commit()
-        async for ev in c.events():
-            if ev["type"] == "conversation.item.input_audio_transcription.completed":
-                print(ev["transcript"])
-                await c.close_session()
-                break
-
-    # Loopback TCP with bearer token
-    async with TranscriptionClient(
-        host="127.0.0.1", port=9565, auth_token="..."
-    ) as c:
-        ...
+    ) as client:
+        await client.update_session(turn_detection=None)
+        await client.send_audio(pcm_bytes)
+        await client.commit()
+        async for event in client.events():
+            if event["type"] == "error":
+                raise RuntimeError(event)
+            if event["type"] == "conversation.item.input_audio_transcription.completed":
+                await client.close_session()
+                return event["transcript"]
+    raise ConnectionError("Session ended before a transcript arrived")
 ```
 
-The example `stt_server/examples/file_stream.py` streams a WAV file end to end.
+For loopback TCP, replace `socket_path=...` with `host="127.0.0.1", port=9565`.
+Pass `auth_token=...` when the server requires a bearer token.
+
+For an end-to-end WAV example against a running TCP server without token auth:
+
+```bash
+uv run --no-sync python -m stt_server.examples.file_stream \
+  --host 127.0.0.1 --port 9565 path/to/file.wav
+```
+
+The file must be 16 kHz mono PCM16. See
+[`file_stream.py`](../stt_server/examples/file_stream.py) for the complete code.
 
 
 ## Pipecat integration
 
-`stt_server/examples/pipecat_stt_service.py` is a runnable
+`stt_server/examples/pipecat_stt_service.py` provides a
 `SegmentedSTTService` subclass (`LocalWebSocketSTTService`) that wires
-`TranscriptionClient` into a Pipecat pipeline. It is an example, not part of
-the installed package — Pipecat is not a dependency of this project. Install
+`TranscriptionClient` into a Pipecat pipeline. It is an integration example;
+Pipecat is not a dependency of this project. Install
 both to use it:
 
 ```bash
@@ -95,7 +110,7 @@ package imports or requires Koda. `bot/stt/websocket_stt_service.py`
 - drives `commit` from Koda's branch-local VAD (server-side VAD stays
   disabled via `turn_detection: null`)
 - translates `conversation.item.input_audio_transcription.completed` into
-  a single finalized `TranscriptionFrame` per segment
+  a single final `TranscriptionFrame` per segment
 - awaits `session.updated` via a one-shot future before returning from
   `_ensure_connected`, so the first commit cannot race the language
   config

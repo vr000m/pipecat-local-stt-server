@@ -262,3 +262,12 @@ operations.
 ### Follow-up Work
 
 - None required for this documentation split.
+
+## Ownership update (2026-11-16)
+
+The [readability follow-up](20261116-docs-readability.md) moves detailed
+transport security and live-test/benchmark contracts from operations into
+[Transport security](../security.md) and [Testing and benchmarks](../testing.md).
+Operations keeps installation, the canonical port table, health checks, and
+forwarding sections for existing anchors. The contributor guide now also
+covers development setup; its backend checklist remains canonical.

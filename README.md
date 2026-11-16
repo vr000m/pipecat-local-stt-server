@@ -1,7 +1,8 @@
 # pipecat-local-stt-server
 
-Standalone local WebSocket transcription server, minimal Python client, and
-pluggable ASR backends for the Pipecat ecosystem.
+Run speech recognition locally and connect over WebSocket from Python or a
+Pipecat pipeline. The server supports five speech-recognition backends and
+includes a small Python client.
 
 The PyPI package is `pipecat-local-stt-server`; the import and CLI module remain
 `stt_server`. BSD-2-Clause.
@@ -27,16 +28,19 @@ the [wire protocol](docs/protocol.md) for the event set and deviations.
 
 ## Quick start
 
-Install the base environment, then run commands through `uv run --no-sync`.
-Bare `python -m stt_server` uses the system interpreter and usually misses the
-project dependencies.
+Use Python 3.12+ and `uv`. These commands run from a repository checkout.
+MLX backends need Apple silicon; see [backend requirements](docs/backends.md)
+for platform constraints. The `echo` backend below tests the connection without
+downloading a model; it does not recognise speech.
 
 The legacy flat CLI form, `python -m stt_server <serve flags>`, remains
 supported and routes to `serve`; new commands should use the explicit
 `python -m stt_server serve <flags>` form shown below.
 
 ```bash
-uv sync
+git clone https://github.com/vr000m/pipecat-local-stt-server.git
+cd pipecat-local-stt-server
+uv sync --inexact
 
 # Recommended local transport: owner-only Unix socket with peer-uid checking.
 uv run --no-sync python -m stt_server serve \
@@ -44,8 +48,11 @@ uv run --no-sync python -m stt_server serve \
   --backend echo
 ```
 
-Or use loopback TCP. There is no default port, and non-loopback hosts are
-rejected.
+Keep the server running and open a second terminal for the status probe below.
+Use `uv run --no-sync` to keep the installed dependencies.
+
+Or use loopback TCP instead of the Unix socket. There is no default port;
+non-loopback hosts are rejected.
 
 ```bash
 uv run --no-sync python -m stt_server serve \
@@ -58,9 +65,9 @@ host, add `--auth-token-file /absolute/path/to/token`. The file must be a
 regular file you own, mode `0600`, under directories only you or root can
 write. Browser `Origin` headers are rejected. See
 [Endpoint security](docs/operations.md#loopback-tcp-caveats) and
-[token-file requirements](docs/operations.md#token-file-replaces-env-tokens).
+[token-file requirements](docs/security.md#token-file-replaces-env-tokens).
 
-Probe either endpoint through the wire protocol:
+In the second terminal, run the matching probe from the repository root:
 
 ```bash
 uv run --no-sync python -m stt_server status \
@@ -75,15 +82,16 @@ uv run --no-sync python -m stt_server status \
 
 ## Backends
 
-Production backends require their optional extra before first use:
+To transcribe speech, install a backend extra and replace `--backend echo`
+with that backend in the quick-start command. Stop the echo server first.
 
 | Backend | Install | Default model |
 |---|---|---|
-| MLX Whisper (`mlx`) | `uv sync --extra mlx` | `mlx-community/whisper-large-v3-turbo` |
-| Parakeet | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` |
-| Nemotron | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` |
+| MLX Whisper (`mlx`) | `uv sync --extra mlx --inexact` | `mlx-community/whisper-large-v3-turbo` |
+| Parakeet | `uv sync --extra parakeet --inexact` | `mlx-community/parakeet-tdt-0.6b-v3` |
+| Nemotron | `uv sync --extra nemotron --inexact` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` |
 | Kyutai | `just stt-install kyutai` | `kyutai/stt-1b-en_fr-mlx` |
-| Moonshine | `uv sync --extra moonshine` | `medium-streaming@en` (CPU) |
+| Moonshine | `uv sync --extra moonshine --inexact` | `medium-streaming@en` (CPU) |
 
 Kyutai needs Python 3.12 and a separate `.venv-kyutai` because its MLX pins
 conflict with the other extras. The Hugging Face defaults are pinned to
@@ -118,29 +126,15 @@ Agents use canonical loopback ports by default; Unix sockets are opt-in with
 `PIPECAT_STT_SOCKET`. Use `PIPECAT_STT_AUTH_TOKEN_FILE` for authenticated TCP
 agents—environment tokens are refused because a plist would persist them.
 
-The [operations guide](docs/operations.md) covers all recipes, canonical ports,
-custom agents, enable/disable semantics, health checks, smoke tests, socket
-security, and troubleshooting.
+The [operations guide](docs/operations.md) covers installation, agent commands,
+canonical ports, custom endpoints, and health checks.
 
 ## Python and Pipecat clients
 
-The package root exports `TranscriptionClient`; server runtime types live under
-`stt_server.server`. A client chooses an endpoint, not an ASR backend.
-
-```python
-from stt_server import TranscriptionClient
-
-async with TranscriptionClient(
-    socket_path="~/Library/Caches/pipecat-stt/stt.sock"
-) as client:
-    await client.update_session(turn_detection=None)
-    await client.send_audio(pcm16_bytes)
-    await client.commit()
-```
-
-See [Client and integration](docs/integration.md) for the complete event loop,
-loopback TCP configuration, the runnable Pipecat `SegmentedSTTService` example,
-and a reference consumer.
+Use `TranscriptionClient` to send 16 kHz mono PCM16 audio, commit an utterance,
+and read its transcript. The [client guide](docs/integration.md) includes the
+event loop, a WAV-file example, and a Pipecat `SegmentedSTTService` integration.
+A client chooses the server's endpoint; the server chooses the backend.
 
 <a id="supervised-mode"></a>
 <a id="error-codes-per-repo"></a>
@@ -164,7 +158,9 @@ for ready/error events and stop-during-startup guarantees.
 | Understand lifecycle and supervision | [Server architecture](docs/architecture.md) |
 | Implement the wire protocol | [Protocol subset](docs/protocol.md) |
 | Upgrade an older installation | [Migration guide](docs/migration.md) |
-| Add a backend | [Contributing a backend](docs/contributing.md) |
+| Change code, docs, or add a backend | [Contributing](docs/contributing.md) |
+| Check a deployment or compare models | [Testing and benchmarks](docs/testing.md) |
+| Configure authentication and socket access | [Transport security](docs/security.md) |
 
 Development decisions and historical verification live in
 [`docs/dev_plans/`](docs/dev_plans/).

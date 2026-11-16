@@ -1,4 +1,14 @@
-# Upgrading from 0.1.x to 0.2.0
+# Migration guide
+
+Choose the version transition that applies to your installation. Consumer
+examples record the versions inspected at the time; check your wrapper before
+reusing their settings.
+
+- [0.1.x to 0.2.0: renamed paths and labels](#upgrading-from-01x-to-020)
+- [0.4.x to 0.5.0: loopback TCP agents](#upgrading-from-04x-to-050)
+- [0.6.0: optional Moonshine backend](#upgrading-to-060)
+
+## Upgrading from 0.1.x to 0.2.0
 
 > Migration guide for [pipecat-local-stt-server](../README.md).
 
@@ -44,7 +54,7 @@ To upgrade an existing v0.1.x install:
 
 ---
 
-# Upgrading from 0.4.x to 0.5.0
+## Upgrading from 0.4.x to 0.5.0
 
 0.5.0 changes the default LaunchAgent transport from a Unix socket to loopback
 TCP, on the ports in the [per-backend table](operations.md#per-backend-port-convention)
@@ -130,6 +140,6 @@ peer-uid check; the socket keeps it.
 
 ---
 
-# Upgrading to 0.6.0
+## Upgrading to 0.6.0
 
 0.6.0 adds an optional `moonshine` backend on port 9965. Existing installs need no change.

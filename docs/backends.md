@@ -4,6 +4,12 @@
 > [pipecat-local-stt-server](../README.md). For persistent multi-backend
 > deployment, see [Operations](operations.md#multi-backend-operation).
 
+- [Choose and install a backend](#choosing-a-backend)
+- [Configure Moonshine](#moonshine)
+- [Select a model or revision](#models-and-revisions)
+- [Prefetch and check the cache](#prefetching-and-cache-checks)
+- [Tune Whisper](#whisper-hallucination-suppression)
+
 ## Choosing a backend
 
 The server loads exactly one ASR backend at launch. Clients select an endpoint,
@@ -13,11 +19,11 @@ endpoints and point the client at the one you want.
 | `--backend` | Install | Default model | Notes |
 |---|---|---|---|
 | `echo` | base package | none | Test and smoke-check backend; returns deterministic output. |
-| `mlx` | `uv sync --extra mlx` | `mlx-community/whisper-large-v3-turbo` | MLX Whisper on Apple silicon. |
-| `parakeet` | `uv sync --extra parakeet` | `mlx-community/parakeet-tdt-0.6b-v3` | Writes raw utterance audio (PII) to a private per-process `0700` temporary directory and removes it on close. |
-| `nemotron` | `uv sync --extra nemotron` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | Requires `mlx-audio>=0.4.4`; writes raw utterance audio (PII) with the same private temporary-WAV boundary as Parakeet. |
+| `mlx` | `uv sync --extra mlx --inexact` | `mlx-community/whisper-large-v3-turbo` | MLX Whisper on Apple silicon. |
+| `parakeet` | `uv sync --extra parakeet --inexact` | `mlx-community/parakeet-tdt-0.6b-v3` | Writes raw utterance audio (PII) to a private per-process `0700` temporary directory and removes it on close. |
+| `nemotron` | `uv sync --extra nemotron --inexact` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | Requires `mlx-audio>=0.4.4`; writes raw utterance audio (PII) with the same private temporary-WAV boundary as Parakeet. |
 | `kyutai` | `uv sync --extra kyutai` | `kyutai/stt-1b-en_fr-mlx` | English and French; CC-BY-4.0; Python 3.12; runs from its own `.venv-kyutai` because its MLX pins conflict with the other extras. |
-| `moonshine` | `uv sync --extra moonshine` | `medium-streaming@en` | Moonshine Voice on CPU (ONNX Runtime, no MLX); commit-oriented. `--model` is a spec, not a repo id; see [Moonshine](#moonshine). |
+| `moonshine` | `uv sync --extra moonshine --inexact` | `medium-streaming@en` | Moonshine Voice on CPU (ONNX Runtime, no MLX); commit-oriented. `--model` is a spec, not a repo id; see [Moonshine](#moonshine). |
 
 Missing extras fail with an actionable `uv sync --extra <name> --inexact`
 message. `just stt-install kyutai` creates the separate Python 3.12 environment
@@ -28,17 +34,17 @@ Start backends directly over Unix sockets:
 
 ```bash
 # Whisper
-uv sync --extra mlx
+uv sync --extra mlx --inexact
 uv run --no-sync python -m stt_server serve --backend mlx \
   --socket-path ~/Library/Caches/pipecat-stt/stt.sock
 
 # Parakeet
-uv sync --extra parakeet
+uv sync --extra parakeet --inexact
 uv run --no-sync python -m stt_server serve --backend parakeet \
   --socket-path ~/Library/Caches/pipecat-stt/parakeet.sock
 
 # Nemotron
-uv sync --extra nemotron
+uv sync --extra nemotron --inexact
 uv run --no-sync python -m stt_server serve --backend nemotron \
   --socket-path ~/Library/Caches/pipecat-stt/nemotron.sock
 ```
@@ -54,15 +60,19 @@ environment. It buffers audio until `end()`, then decodes once and emits one
 `delta` equal to `completed`; the wire protocol is unchanged. The first install
 is `just stt-install moonshine` (port 9965). The `moonshine-voice==0.1.6` macOS
 wheel is `macosx_15_0_arm64` only: macOS 14 or earlier, and Intel Macs, have no
-matching wheel, so `uv sync --extra moonshine` fails there. The server
+matching wheel, so `uv sync --extra moonshine --inexact` fails there. The server
 requires exactly `moonshine-voice==0.1.6` at start; any other installed
 version fails with an `ImportError` that names the fix.
+
+#### Model and language selection
 
 `--model` is a spec, `[<arch>][@<lang>[,<lang>...]]`, default
 `medium-streaming@en`. Examples: `medium-streaming@en`, `tiny-streaming@en,es`,
 `@en,es` (first MIT model for each language). The served set is fixed at
 startup; memory is the sum of the listed models, and nothing is downloaded for
 a language outside it. Spec errors fail at start with a `ConfigError`.
+
+#### Model licences
 
 Licence guard: only MIT models are served, which means streaming archs for any
 language and non-streaming archs for `en` only. A non-streaming non-`en` arch
@@ -73,7 +83,9 @@ it downloads a model for a non-`en` language, naming its non-commercial
 Moonshine Community License for some models. Whether a model's licence suits
 your use is your call.
 
-Language: Moonshine has no language identification, so a client `auto`, blank
+#### Language fallback
+
+Moonshine has no language identification, so a client `auto`, blank
 or missing `language` silently means `en` if served, else the first listed
 language. This departs from the uniform "auto means detect" contract of the
 other backends. A region suffix is stripped (`en-US` is `en`). An unserved
@@ -82,7 +94,9 @@ request. `ja` and `zh` models are downloadable and servable with
 `--model <arch>@ja`, but carry no verified-support claim, and line texts are
 joined with a space, so their output reads with spaces (known limitation).
 
-Cache and pin: `prefetch --backend moonshine` (and `--check`) uses the
+#### Cache and pinning
+
+`prefetch --backend moonshine` (and `--check`) uses the
 package's own manifest and verifies each file's CRC32C; it does not use
 `HF_HOME`. The pinned wheel supplies the expected sizes and CRC32C values,
 and `download.moonshine.ai` supplies the weights. CRC32C detects corruption
@@ -98,7 +112,9 @@ Hugging Face revision: the exact `moonshine-voice==0.1.6` pin in
 download from a CDN, so a CDN outage blocks a cold start; warm the cache with
 `prefetch` before installing an agent. Local model paths are not supported.
 
-Removing models: the server never deletes a healthy model. A same-size cached
+#### Removing models
+
+The server never deletes a healthy model. A same-size cached
 file whose CRC32C does not match is the one exception: `prefetch` removes it
 and downloads it once more. A model you no longer serve stays in the cache,
 including after a `--model` change to another architecture. `prefetch --backend
@@ -109,8 +125,10 @@ beside it, outside the check. The cache is shared with any other program that
 uses `moonshine-voice` (on macOS, `~/Library/Caches/moonshine_voice`), so
 removing models is the operator's or the supervising tool's job.
 
-Latency: `scripts/benchmark_moonshine_latency.py` measures, against a running
-moonshine server, the p50 from `commit` to `transcription.completed` for 3, 5
+#### Latency benchmark
+
+`scripts/benchmark_moonshine_latency.py` measures, against a running
+moonshine server, the p50 from `commit` to `transcription.completed` for 3, 5,
 and 10 s utterances fed in real time (JSON key `one_shot_p50_s` with
 `--json-out`), plus the library `stop()` flush after a streamed feed. Run it
 with `uv run --inexact python scripts/benchmark_moonshine_latency.py --uri
@@ -157,7 +175,7 @@ Common Whisper choices:
 | `mlx-community/whisper-base` | Fast with lower accuracy. |
 | `mlx-community/whisper-tiny` | Fastest and least accurate. |
 
-Compatible `mlx-community` forks and quantized variants can also be passed as
+Compatible `mlx-community` forks and quantised variants can also be passed as
 `--model`; this list is not an allowlist. Use `python -m stt_server status` to
 confirm the backend and model loaded by a running server.
 
@@ -174,9 +192,10 @@ uv run --no-sync python -m stt_server prefetch --backend mlx \
   --model mlx-community/whisper-small --json
 ```
 
-Models are stored in the standard Hugging Face cache (`HF_HOME` /
-`HF_HUB_CACHE`). A value beginning with `/`, `./`, `../`, or `~`—or an existing
-relative path—is treated as a local model directory. Local models are never
+Hugging Face models are stored in the standard cache (`HF_HOME` /
+`HF_HUB_CACHE`). Moonshine uses its [own cache](#cache-and-pinning).
+For backends that support local models, a value beginning with `/`, `./`,
+`../`, or `~`, or an existing relative path, is treated as a model directory. Local models are never
 downloaded. `--check` reports one as cached only when every backend-required
 file exists; fetch mode raises `ModelInvalidError` when it is incomplete.
 Kyutai accepts Hub repository IDs only and rejects local paths in `prefetch`.
