@@ -246,18 +246,18 @@ Context lifecycle:
 ## Testing Notes
 
 ### Test Approach
-- [ ] Unit tests for the backend with a fake `moonshine_voice` module (no wheel needed in CI)
-- [ ] Table tests for spec grammar, licence guard and language normalisation
-- [ ] Prefetch tests through `SnapshotSpec` callables with a fake `moonshine_voice.download`
-- [ ] Contract tests extended with moonshine rows: `tests/test_decode_guard.py`, `tests/test_supervised_cli.py` (download and model-invalid tagging, `abort()`), `tests/test_stt_server.py` (`_make_backend`, argparse, lazy import: rows added, no existing assertion changed)
-- [ ] Backend-enumeration tests pass (`test_justfile_recipes`, `test_render_stt_plist`, `test_smoke_launchd`, `test_backend_registry`)
+- [x] Unit tests for the backend with a fake `moonshine_voice` module (no wheel needed in CI)
+- [x] Table tests for spec grammar, licence guard and language normalisation
+- [x] Prefetch tests through `SnapshotSpec` callables with a fake `moonshine_voice.download`
+- [x] Contract tests extended with moonshine rows: `tests/test_decode_guard.py`, `tests/test_supervised_cli.py` (download and model-invalid tagging, `abort()`), `tests/test_stt_server.py` (`_make_backend`, argparse, lazy import: rows added, no existing assertion changed)
+- [x] Backend-enumeration tests pass (`test_justfile_recipes`, `test_render_stt_plist`, `test_smoke_launchd`, `test_backend_registry`)
 - [ ] Manual: real decode of `moonshine_voice/assets/two_cities.wav` through the running server for en medium-streaming; one non-English model with an operator-supplied clip of a known phrase (the repo has no non-English audio); one decode through an installed LaunchAgent, with the model cache populated and empty
 - [ ] Run the suite with `uv run --inexact` (or `--no-sync`): plain `uv run` prunes the installed backend extras and crash-loops LaunchAgents. `--inexact` is accepted by uv 0.13.8; whether it keeps the extras is confirmed on the first run. Invoke pytest as `python -m pytest`: `uv run --inexact pytest` failed with "Failed to spawn: pytest" in this checkout (2026-11-14), while `uv run --inexact python -m pytest` ran `tests/test_docs_navigation.py` (5 passed).
 - [ ] Run the full suite in the background, not the foreground
 
 ### Test Results
-- [ ] All existing tests pass
-- [ ] New tests added and passing
+- [x] All existing tests pass
+- [x] New tests added and passing
 - [ ] Manual verification complete
 
 ### Edge Cases Tested
@@ -372,6 +372,11 @@ Context lifecycle:
 - Cross-backend spread (one-off driver above): per-utterance real-time factor varied 1.3x (nemotron) to 2.8x (whisper), moonshine 1.9x, so in that run the load did not single moonshine out; the other backends use MLX, so a quiet-machine comparison could still shift moonshine relative to them. The four-way was not rerun: the whisper and parakeet agents were removed after the first comparison.
 - Empty-cache decode through an installed agent: uninstalled the agent, moved `~/Library/Caches/moonshine_voice` to `moonshine_voice.bak-20261115` (583 MB, includes the ja/zh spike models; left in place for the user to remove), ran `just stt-install moonshine`, then decoded a 3 s clip over `ws://127.0.0.1:9965/`. The agent listens before any model exists; the first decode downloads the `medium-streaming-en` and `spelling-en` models (269 MB) and succeeds, 12 s end to end including the download. The warm decode that followed took 158 ms. The populated-cache case is covered by the benchmark runs above.
 - Go/no-go rule (Phase 2 last step): start the streaming-mode plan only if the 5 s one-shot p50 exceeds 300 ms and the flush p50 is below half of it. Measured 245 ms, so the first condition is **not met** (the flush condition, 80 ms against 122 ms, holds but does not matter without the first). By the rule the streaming plan is not started: a one-shot decode of a 5 s utterance already finishes in under a third of a second after the commit. Disposition (user, 2026-11-15): `20261114-feature-moonshine-streaming-mode.md` stays unimplemented and is marked deferred.
+
+### Review gauntlets (2026-11-15 to 2026-11-16)
+- First gauntlet: five rounds, 35 findings, terminal token `non-converge`; fixes committed through `ad5ef50`.
+- Second, confirming gauntlet over the round-5 fix commits: four rounds with 8, 4, 6 and 2 findings. Round 3 moved the failing-language `repo` tag into `build_served` and `tag_prefetch_repo(..., overwrite=False)`. Round 4: Codex approved; only docstring-width nits from the documentation lens remained, declined because ruff's limit is 100.
+- Full suite after round 3: 2951 passed, 23 skipped. The one commit after that run (`0f2df46`) changed docs only.
 
 ### Review Waivers
 
